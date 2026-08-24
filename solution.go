@@ -49,6 +49,7 @@ type config struct {
 	hostRegisterURL             string
 	gatewayRegisterURL          string
 	selfUpstream, assetsDir     string
+	internalToken               string
 }
 
 func env(key, fallback string) string {
@@ -69,6 +70,7 @@ func loadConfig(id string) config {
 		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", "http://localhost:42152/solutions/_register"),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
+		internalToken:      env("CODEFLY_INTERNAL_TOKEN", ""),
 	}
 }
 
@@ -160,6 +162,9 @@ func (s *Server) heartbeat(url string, body []byte, label string) {
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 		if err == nil {
 			req.Header.Set("content-type", "application/json")
+			if s.cfg.internalToken != "" {
+				req.Header.Set("x-codefly-internal-token", s.cfg.internalToken)
+			}
 			if resp, doErr := http.DefaultClient.Do(req); doErr == nil {
 				resp.Body.Close()
 				if resp.StatusCode < 300 && !logged {
