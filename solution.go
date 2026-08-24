@@ -49,6 +49,7 @@ type config struct {
 	hostRegisterURL             string
 	gatewayRegisterURL          string
 	selfUpstream, assetsDir     string
+	internalToken               string
 }
 
 func env(key, fallback string) string {
@@ -69,6 +70,7 @@ func loadConfig(id string) config {
 		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", "http://localhost:42152/solutions/_register"),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
+		internalToken:      env("CODEFLY_INTERNAL_TOKEN", ""),
 	}
 }
 
@@ -104,8 +106,8 @@ func (s *Server) Serve() error {
 
 	manifestBody, _ := json.Marshal(s.manifestMap())
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})
-	go s.heartbeat(s.cfg.hostRegisterURL, manifestBody, "host")
-	go s.heartbeat(s.cfg.gatewayRegisterURL, upstreamBody, "gateway")
+	go s.heartbeat(context.Background(), s.cfg.hostRegisterURL, manifestBody, "host")
+	go s.heartbeat(context.Background(), s.cfg.gatewayRegisterURL, upstreamBody, "gateway")
 
 	log.Printf("solution %q listening on :%s (gateway=%s)", s.manifest.ID, s.cfg.port, s.cfg.gatewayURL)
 	return http.ListenAndServe(":"+s.cfg.port, mux)
@@ -154,21 +156,32 @@ func (s *Server) wrap(handler Handler) http.HandlerFunc {
 	}
 }
 
-func (s *Server) heartbeat(url string, body []byte, label string) {
-	logged := false
+func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label string) {
+	lastStatus := 0
 	for {
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err == nil {
 			req.Header.Set("content-type", "application/json")
+			if s.cfg.internalToken != "" {
+				req.Header.Set("x-codefly-internal-token", s.cfg.internalToken)
+			}
 			if resp, doErr := http.DefaultClient.Do(req); doErr == nil {
 				resp.Body.Close()
-				if resp.StatusCode < 300 && !logged {
-					log.Printf("registered with %s as %q", label, s.manifest.ID)
-					logged = true
+				if resp.StatusCode != lastStatus {
+					if resp.StatusCode < 300 {
+						log.Printf("registered with %s as %q", label, s.manifest.ID)
+					} else {
+						log.Printf("registration with %s rejected (status %d) for %q", label, resp.StatusCode, s.manifest.ID)
+					}
+					lastStatus = resp.StatusCode
 				}
 			}
 		}
-		time.Sleep(15 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(15 * time.Second):
+		}
 	}
 }
 
