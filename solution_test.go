@@ -201,6 +201,94 @@ func frontendManifestURL(t *testing.T, base string) string {
 	return manifest.Frontend.ManifestURL
 }
 
+// TestConfigValidate guards the boot-time floor: an unresolved value (empty port,
+// or a scheme-less register URL as loadConfig produces when the SDK resolves
+// nothing and no override is set) must be rejected, not silently accepted into a
+// ":"+"" bind and heartbeats to relative URLs.
+func TestConfigValidate(t *testing.T) {
+	valid := config{
+		port:               "8090",
+		gatewayURL:         "http://gateway:42152",
+		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
+		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
+	}
+	if err := valid.validate(); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*config)
+	}{
+		{"empty port", func(c *config) { c.port = "" }},
+		{"non-numeric port", func(c *config) { c.port = "http" }},
+		{"port out of range", func(c *config) { c.port = "70000" }},
+		{"empty gateway URL", func(c *config) { c.gatewayURL = "" }},
+		{"relative host register URL", func(c *config) { c.hostRegisterURL = "/api/solutions/register" }},
+		{"relative gateway register URL", func(c *config) { c.gatewayRegisterURL = "/solutions/_register" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid
+			tc.mutate(&c)
+			if err := c.validate(); err == nil {
+				t.Errorf("validate accepted an unresolved config (%s)", tc.name)
+			}
+		})
+	}
+}
+
+// TestServeRejectsUnresolvedConfig proves Serve refuses to boot on an unresolved
+// config instead of binding a random port and registering into the void. A
+// relative HOST_REGISTER_URL stands in for the empty frontendURL loadConfig
+// yields when the SDK cannot resolve the host frontend endpoint.
+func TestServeRejectsUnresolvedConfig(t *testing.T) {
+	t.Setenv("PORT", "8090")
+	t.Setenv("GATEWAY_URL", "http://127.0.0.1:1")
+	t.Setenv("GATEWAY_REGISTER_URL", "http://127.0.0.1:1/solutions/_register")
+	t.Setenv("HOST_REGISTER_URL", "/api/solutions/register")
+
+	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
+	err := s.Serve()
+	if err == nil {
+		t.Fatal("Serve returned nil for an unresolved config; expected a boot error and no bind")
+	}
+	if !strings.Contains(err.Error(), "host register URL") {
+		t.Errorf("boot error should name the unresolved field, got: %v", err)
+	}
+}
+
+// TestHeartbeatLogsTransportError guards finding #4: a round trip that never
+// yields an HTTP status (scheme-less URL, connection refused) must be logged, not
+// swallowed — a permanently-failing registration was previously indistinguishable
+// from a working one.
+func TestHeartbeatLogsTransportError(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{cfg: config{internalToken: "t"}}
+	done := make(chan struct{})
+	go func() { s.heartbeat(ctx, "/solutions/_register", []byte("{}"), "gateway"); close(done) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "failed") {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("no transport failure logged within timeout, got: %q", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if strings.Contains(buf.String(), "registered with") {
+		t.Errorf("logged success on a transport failure: %q", buf.String())
+	}
+}
+
 func TestHeartbeatLogsRejection(t *testing.T) {
 	buf := &syncBuffer{}
 	log.SetOutput(buf)
