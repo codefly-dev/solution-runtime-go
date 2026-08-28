@@ -35,6 +35,12 @@ type Manifest struct {
 	ExposedModule string   // MF exposed module (default "./Page")
 	Contract      string   // capability contract id (default: ID)
 	Capabilities  []string // capability feature ids
+	// Dashboard is an optional data-graph (events / metrics / dashboards, per
+	// @codefly/saas-plugin-manifest's DataGraph) the host renders. The runtime
+	// carries it verbatim and never interprets it: the graph's schema and its
+	// validation are owned by the host, so this stays an opaque declaration to
+	// keep the runtime host-agnostic.
+	Dashboard any
 }
 
 // Handler is a solution endpoint. It receives a Gateway bound to the caller's
@@ -198,7 +204,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 }
 
 func (s *Server) manifestMap() map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"id":  s.manifest.ID,
 		"nav": map[string]any{"title": s.manifest.Title, "path": "/s/" + s.manifest.ID, "order": s.manifest.Order},
 		"frontend": map[string]any{
@@ -209,6 +215,13 @@ func (s *Server) manifestMap() map[string]any {
 		},
 		"backend": map[string]any{"serviceAlias": s.manifest.ID, "capabilityPath": "/.well-known/capabilities"},
 	}
+	// Only emit the slot when declared: a null dashboard would break a host that
+	// feeds a present slot straight into its data-graph validator, and it keeps
+	// the wire byte-identical for solutions that declare no dashboard.
+	if s.manifest.Dashboard != nil {
+		m["dashboard"] = s.manifest.Dashboard
+	}
+	return m
 }
 
 func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request) {
