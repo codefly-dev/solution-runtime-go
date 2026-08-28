@@ -16,11 +16,13 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"connectrpc.com/connect"
+	codefly "github.com/codefly-dev/sdk-go"
 )
 
 // Manifest is the small, solution-specific description the author provides.
@@ -59,18 +61,70 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func loadConfig(id string) config {
-	port := env("PORT", "8090")
-	public := env("PUBLIC_URL", "http://localhost:"+port)
+// address returns a resolved endpoint's "scheme://host:port", or "" if the SDK
+// could not resolve it. Using the SDK keeps addresses and ports out of the
+// runtime: they come from Codefly's runtime-injected endpoint map (or, in a
+// local run, its deterministic native workspace map) — never a hardcoded port.
+func address(ctx context.Context, module, service, endpoint, api string) string {
+	q := codefly.For(ctx).Endpoint(endpoint)
+	if module != "" {
+		q = q.Module(module)
+	}
+	if service != "" {
+		q = q.Service(service)
+	}
+	if api != "" {
+		q = q.API(api)
+	}
+	if ni := q.NetworkInstance(); ni != nil {
+		return ni.Address
+	}
+	return ""
+}
+
+// loadConfig resolves every address, port, and secret through the Codefly SDK
+// so nothing is hardcoded. The host it plugs into is named by Codefly-convention
+// roles (overridable), and their concrete addresses are resolved from the SDK —
+// the same source `codefly endpoint` and the host services themselves use.
+func loadConfig(ctx context.Context, id string) config {
+	hostModule := env("CODEFLY_HOST_MODULE", "saas-starter")
+	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
+	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-sidecar")
+
+	// Own endpoint: the port Codefly assigned this service, not a fixed default.
+	port := env("PORT", "")
+	if port == "" {
+		if self := address(ctx, "", "", "http", "http"); self != "" {
+			if u, err := url.Parse(self); err == nil {
+				port = u.Port()
+			}
+		}
+	}
+	public := env("PUBLIC_URL", "")
+	if public == "" {
+		public = "http://localhost:" + port
+	}
+
+	// Host endpoints, resolved via the SDK (no localhost:port literals).
+	gatewayURL := strings.TrimRight(env("GATEWAY_URL", address(ctx, hostModule, hostGateway, "rest", "rest")), "/")
+	frontendURL := strings.TrimRight(address(ctx, hostModule, hostFrontend, "http", "http"), "/")
+
+	// Internal token: the namespaced workspace secret Codefly injects, resolved
+	// by name through the SDK rather than a bare os.Getenv the runtime never sees.
+	token := env("CODEFLY_INTERNAL_TOKEN", "")
+	if token == "" {
+		token, _ = codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")
+	}
+
 	return config{
 		port:               port,
 		publicURL:          public,
-		gatewayURL:         strings.TrimRight(env("GATEWAY_URL", "http://localhost:42152"), "/"),
-		hostRegisterURL:    env("HOST_REGISTER_URL", "http://localhost:21931/api/solutions/register"),
-		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", "http://localhost:42152/solutions/_register"),
+		gatewayURL:         gatewayURL,
+		hostRegisterURL:    env("HOST_REGISTER_URL", frontendURL+"/api/solutions/register"),
+		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", gatewayURL+"/solutions/_register"),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
-		internalToken:      env("CODEFLY_INTERNAL_TOKEN", ""),
+		internalToken:      token,
 	}
 }
 
@@ -93,7 +147,14 @@ func (s *Server) Handle(path string, handler Handler) *Server {
 
 // Serve reads env config, self-registers, and blocks serving the solution.
 func (s *Server) Serve() error {
-	s.cfg = loadConfig(s.manifest.ID)
+	ctx := context.Background()
+	// The SDK owns environment resolution: load Codefly's injected carriers so
+	// endpoint and workspace-secret lookups resolve from them (falling back to
+	// the local native workspace map when not running under the runtime).
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		log.Printf("codefly: load environment: %v", err)
+	}
+	s.cfg = loadConfig(ctx, s.manifest.ID)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/solution.json", withCORS(s.handleManifest))
 	mux.HandleFunc("/.well-known/capabilities", withCORS(s.handleCapabilities))
