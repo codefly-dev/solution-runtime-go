@@ -14,7 +14,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -155,6 +157,18 @@ func (s *Server) Serve() error {
 		log.Printf("codefly: load environment: %v", err)
 	}
 	s.cfg = loadConfig(ctx, s.manifest.ID)
+	ln, err := net.Listen("tcp", ":"+s.cfg.port)
+	if err != nil {
+		return err
+	}
+	return s.serve(ctx, ln)
+}
+
+// serve wires the routes, starts the host and gateway registration heartbeats,
+// and serves on ln until ctx is cancelled. Split from Serve so a test can boot a
+// real solution on an ephemeral listener and exercise the whole registration and
+// manifest path.
+func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/solution.json", withCORS(s.handleManifest))
 	mux.HandleFunc("/.well-known/capabilities", withCORS(s.handleCapabilities))
@@ -167,11 +181,20 @@ func (s *Server) Serve() error {
 
 	manifestBody, _ := json.Marshal(s.manifestMap())
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})
-	go s.heartbeat(context.Background(), s.cfg.hostRegisterURL, manifestBody, "host")
-	go s.heartbeat(context.Background(), s.cfg.gatewayRegisterURL, upstreamBody, "gateway")
+	go s.heartbeat(ctx, s.cfg.hostRegisterURL, manifestBody, "host")
+	go s.heartbeat(ctx, s.cfg.gatewayRegisterURL, upstreamBody, "gateway")
+
+	srv := &http.Server{Handler: mux}
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
 
 	log.Printf("solution %q listening on :%s (gateway=%s)", s.manifest.ID, s.cfg.port, s.cfg.gatewayURL)
-	return http.ListenAndServe(":"+s.cfg.port, mux)
+	if serveErr := srv.Serve(ln); !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
+	}
+	return nil
 }
 
 func (s *Server) manifestMap() map[string]any {
