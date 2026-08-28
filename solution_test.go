@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -157,6 +159,122 @@ func TestServeRegistersOnListenPort(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// sampleDataGraph is a minimal but structurally complete DataGraph
+// (events / metrics / dashboards) a solution might declare, matching the shape
+// the host's @codefly/saas-plugin-manifest validates.
+func sampleDataGraph() map[string]any {
+	return map[string]any{
+		"events": []any{
+			map[string]any{"name": "signin", "type": "user.signed_in.v1"},
+		},
+		"metrics": []any{
+			map[string]any{
+				"id":          "logins",
+				"kind":        "source",
+				"filter":      map[string]any{"event": "signin"},
+				"groupBy":     "time",
+				"bucket":      "day",
+				"aggregation": "count",
+			},
+		},
+		"dashboards": []any{
+			map[string]any{
+				"id":     "activity",
+				"layout": "grid",
+				"widgets": []any{
+					map[string]any{"id": "logins_over_time", "metric": "logins", "visualization": "line"},
+				},
+			},
+		},
+	}
+}
+
+// The served manifest must carry a declared dashboard data-graph verbatim
+// through JSON, so the host receives exactly what the solution declared.
+func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
+	graph := sampleDataGraph()
+	s := &Server{manifest: Manifest{ID: "lastlogin-go", Dashboard: graph}}
+
+	var got map[string]any
+	body, err := json.Marshal(s.manifestMap())
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	if !reflect.DeepEqual(got["dashboard"], graph) {
+		t.Errorf("served dashboard = %#v, want %#v", got["dashboard"], graph)
+	}
+}
+
+// A solution that declares no dashboard must not gain a dashboard key at all —
+// not even a null one, which would break a host that feeds a present slot into
+// its data-graph validator and would perturb the existing wire contract.
+func TestManifestOmitsAbsentDashboard(t *testing.T) {
+	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	if _, ok := s.manifestMap()["dashboard"]; ok {
+		t.Errorf("emitted a dashboard key with no dashboard declared")
+	}
+}
+
+// The host registration payload (the heartbeat body) must carry the declared
+// data-graph verbatim, not just the GET manifest — that is the surface the host
+// self-registration path reads.
+func TestRegistrationPayloadCarriesDashboardVerbatim(t *testing.T) {
+	graph := sampleDataGraph()
+
+	body := make(chan []byte, 1)
+	hostSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		select {
+		case body <- b:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hostSrv.Close()
+	gatewaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer gatewaySrv.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login", Dashboard: graph})
+	s.cfg = config{
+		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
+		publicURL:          "http://127.0.0.1",
+		hostRegisterURL:    hostSrv.URL,
+		gatewayRegisterURL: gatewaySrv.URL,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = s.serve(ctx, ln); close(done) }()
+
+	var raw []byte
+	select {
+	case raw = <-body:
+	case <-time.After(5 * time.Second):
+		t.Fatal("host did not receive a registration within timeout")
+	}
+	cancel()
+	<-done
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal registration body: %v", err)
+	}
+	if !reflect.DeepEqual(payload["dashboard"], graph) {
+		t.Errorf("registration dashboard = %#v, want %#v", payload["dashboard"], graph)
+	}
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
