@@ -15,11 +15,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -136,6 +138,30 @@ func loadConfig(ctx context.Context, id string) config {
 	}
 }
 
+// validate rejects a config the runtime cannot actually serve or register with.
+// When neither the SDK nor an explicit env override resolves a value, loadConfig
+// leaves it empty; without this check Serve would bind ":"+"" — which the kernel
+// happily accepts as a random port — and POST registrations to scheme-less URLs
+// like "/solutions/_register" that http.Client.Do rejects and the heartbeat then
+// retries forever in silence. Both are the exact silent no-op this whole SDK
+// resolution effort exists to eliminate, so an unresolved config must fail loud
+// at boot rather than come up looking healthy on the wrong port.
+func (c config) validate() error {
+	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
+	}
+	for name, raw := range map[string]string{
+		"gateway URL":          c.gatewayURL,
+		"host register URL":    c.hostRegisterURL,
+		"gateway register URL": c.gatewayRegisterURL,
+	} {
+		if u, err := url.Parse(raw); err != nil || !u.IsAbs() || u.Host == "" {
+			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
+		}
+	}
+	return nil
+}
+
 // New starts a solution builder for the given manifest.
 func New(manifest Manifest) *Server {
 	if manifest.ExposedModule == "" {
@@ -163,6 +189,9 @@ func (s *Server) Serve() error {
 		log.Printf("codefly: load environment: %v", err)
 	}
 	s.cfg = loadConfig(ctx, s.manifest.ID)
+	if err := s.cfg.validate(); err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	ln, err := net.Listen("tcp", ":"+s.cfg.port)
 	if err != nil {
 		return err
@@ -255,24 +284,33 @@ func (s *Server) wrap(handler Handler) http.HandlerFunc {
 
 func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label string) {
 	lastStatus := 0
+	lastErr := ""
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err == nil {
-			req.Header.Set("content-type", "application/json")
-			if s.cfg.internalToken != "" {
-				req.Header.Set("x-codefly-internal-token", s.cfg.internalToken)
+		status, err := s.beat(ctx, url, body)
+		switch {
+		case err != nil:
+			// A shutdown cancels the in-flight request; that error is expected,
+			// not a registration failure, so don't log it.
+			if ctx.Err() != nil {
+				return
 			}
-			if resp, doErr := http.DefaultClient.Do(req); doErr == nil {
-				resp.Body.Close()
-				if resp.StatusCode != lastStatus {
-					if resp.StatusCode < 300 {
-						log.Printf("registered with %s as %q", label, s.manifest.ID)
-					} else {
-						log.Printf("registration with %s rejected (status %d) for %q", label, resp.StatusCode, s.manifest.ID)
-					}
-					lastStatus = resp.StatusCode
-				}
+			// Transport/URL errors (connection refused, scheme-less URL) never
+			// surface a status. Left unlogged they made a permanently-failing
+			// registration indistinguishable from a working one. Throttle to one
+			// line per distinct error so a persistent outage doesn't spam.
+			if msg := err.Error(); msg != lastErr {
+				log.Printf("registration with %s failed for %q: %v", label, s.manifest.ID, err)
+				lastErr, lastStatus = msg, 0
 			}
+		case status != lastStatus:
+			if status < 300 {
+				log.Printf("registered with %s as %q", label, s.manifest.ID)
+			} else {
+				log.Printf("registration with %s rejected (status %d) for %q", label, status, s.manifest.ID)
+			}
+			lastStatus, lastErr = status, ""
+		default:
+			lastErr = ""
 		}
 		select {
 		case <-ctx.Done():
@@ -280,6 +318,25 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 		case <-time.After(15 * time.Second):
 		}
 	}
+}
+
+// beat performs one registration POST and returns the HTTP status, or an error
+// if the request could not be built or the round trip failed.
+func (s *Server) beat(ctx context.Context, url string, body []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("content-type", "application/json")
+	if s.cfg.internalToken != "" {
+		req.Header.Set("x-codefly-internal-token", s.cfg.internalToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	resp.Body.Close()
+	return resp.StatusCode, nil
 }
 
 // Gateway is a client bound to the caller's bearer. It exposes an HTTP client

@@ -49,6 +49,6 @@ frontend (host registration) and the gateway (gateway registration), sending the
 internal token as the `x-codefly-internal-token` header on every beat.
 
 > **Note:** SDK in-process endpoint resolution for a solution composed on an
-> out-of-repo host currently depends on codefly-core accepting the composed
-> module path in its workspace loader (tracked in codefly-dev/core#365). Until
-> that ships it is wired via a `go.mod` `replace`.
+> out-of-repo host depends on codefly-core accepting the composed module path in
+> its workspace loader (codefly-dev/core#365, merged); the `core`/`sdk-go` pins
+> in `go.mod` carry that fix, so no `replace` is needed.
