@@ -18,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	codefly "github.com/codefly-dev/sdk-go"
 )
 
 type syncBuffer struct {
@@ -440,5 +442,49 @@ func TestHeartbeatLogsRejection(t *testing.T) {
 	}
 	if !strings.Contains(out, "401") {
 		t.Errorf("expected rejection log naming the status, got: %q", out)
+	}
+}
+
+// setEndpoint injects a single Codefly endpoint into the SDK's env-var snapshot
+// for the duration of the test, then restores the snapshot on cleanup.
+func setEndpoint(t *testing.T, key, addr string) {
+	t.Helper()
+	if err := os.Setenv(key, addr); err != nil {
+		t.Fatal(err)
+	}
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Unsetenv(key)
+		_ = codefly.LoadEnvironmentVariables()
+	})
+}
+
+// TestLoadConfigResolvesRenamedGateway proves the gateway default follows the
+// saas-starter auth-sidecar → auth-gateway rename (v0.0.49): loadConfig resolves
+// the gateway URL from the SDK against either service name, with no explicit
+// CODEFLY_HOST_GATEWAY or GATEWAY_URL override — so a solution boots against both
+// the renamed host and older ones.
+func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
+	const addr = "http://gateway:42152"
+	cases := []struct {
+		name    string
+		service string
+	}{
+		{"auth-gateway (v0.0.49+)", "auth-gateway"},
+		{"auth-sidecar (pre-v0.0.49 fallback)", "auth-sidecar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "CODEFLY__ENDPOINT__SAAS_STARTER__" +
+				strings.ToUpper(strings.ReplaceAll(tc.service, "-", "_")) + "__REST__REST"
+			setEndpoint(t, key, addr)
+
+			cfg := loadConfig(context.Background(), "lastlogin-go")
+			if cfg.gatewayURL != addr {
+				t.Fatalf("gatewayURL = %q, want %q resolved from %s without an override", cfg.gatewayURL, addr, tc.service)
+			}
+		})
 	}
 }
