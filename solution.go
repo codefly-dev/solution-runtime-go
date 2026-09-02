@@ -92,6 +92,20 @@ func address(ctx context.Context, module, service, endpoint, api string) string 
 	return ""
 }
 
+// resolveGateway resolves the host gateway's rest endpoint. saas-starter renamed
+// this service auth-sidecar → auth-gateway (v0.0.49); when the default role
+// resolves empty, we retry the old name so a solution boots against either host
+// version without an explicit CODEFLY_HOST_GATEWAY override.
+func resolveGateway(ctx context.Context, module, gateway string) string {
+	if addr := address(ctx, module, gateway, "rest", "rest"); addr != "" {
+		return addr
+	}
+	if gateway == "auth-gateway" {
+		return address(ctx, module, "auth-sidecar", "rest", "rest")
+	}
+	return ""
+}
+
 // loadConfig resolves every address, port, and secret through the Codefly SDK
 // so nothing is hardcoded. The host it plugs into is named by Codefly-convention
 // roles (overridable), and their concrete addresses are resolved from the SDK —
@@ -99,7 +113,7 @@ func address(ctx context.Context, module, service, endpoint, api string) string 
 func loadConfig(ctx context.Context, id string) config {
 	hostModule := env("CODEFLY_HOST_MODULE", "saas-starter")
 	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
-	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-sidecar")
+	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-gateway")
 
 	// Own endpoint: the port Codefly assigned this service, not a fixed default.
 	port := env("PORT", "")
@@ -116,7 +130,7 @@ func loadConfig(ctx context.Context, id string) config {
 	}
 
 	// Host endpoints, resolved via the SDK (no localhost:port literals).
-	gatewayURL := strings.TrimRight(env("GATEWAY_URL", address(ctx, hostModule, hostGateway, "rest", "rest")), "/")
+	gatewayURL := strings.TrimRight(env("GATEWAY_URL", resolveGateway(ctx, hostModule, hostGateway)), "/")
 	frontendURL := strings.TrimRight(address(ctx, hostModule, hostFrontend, "http", "http"), "/")
 
 	// Internal token: the namespaced workspace secret Codefly injects, resolved

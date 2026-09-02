@@ -31,7 +31,7 @@ the SDK-resolved value is the default.
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Public URL | `http://localhost:<port>` | `PUBLIC_URL` |
-| Gateway URL (auth-sidecar `rest`) | `Endpoint("rest").Module(...).Service(...)` | `GATEWAY_URL` |
+| Gateway URL (auth-gateway `rest`) | `Endpoint("rest").Module(...).Service(...)` | `GATEWAY_URL` |
 | Host frontend URL | `Endpoint("http").Module(...).Service(...)` | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
@@ -42,7 +42,8 @@ the SDK-resolved value is the default.
 The host it plugs into is named by Codefly-convention roles, themselves
 overridable: `CODEFLY_HOST_MODULE` (default `saas-starter`),
 `CODEFLY_HOST_FRONTEND` (default `frontend`), `CODEFLY_HOST_GATEWAY` (default
-`auth-sidecar`); their concrete addresses come from the SDK.
+`auth-gateway`, falling back to the pre-v0.0.49 `auth-sidecar` when unresolved);
+their concrete addresses come from the SDK.
 
 On boot the runtime self-registers on a 15s heartbeat with **both** the host
 frontend (host registration) and the gateway (gateway registration), sending the
