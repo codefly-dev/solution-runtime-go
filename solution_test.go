@@ -490,22 +490,35 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 }
 
 // TestLoadConfigDefaultsToSaasModule proves the host-module default follows
-// lodestar's saas-starter → saas rename: loadConfig resolves both the gateway
-// and frontend URLs against a module named saas with no CODEFLY_HOST_MODULE
-// override.
+// lodestar's saas-starter → saas rename while still booting against a host
+// synced before it: loadConfig resolves both the gateway and frontend URLs with
+// no CODEFLY_HOST_MODULE override, whether the host module is the current saas
+// (auth-gateway service) or the pre-rename saas-starter (auth-sidecar).
 func TestLoadConfigDefaultsToSaasModule(t *testing.T) {
 	const (
 		gatewayAddr  = "http://gateway:42152"
 		frontendAddr = "http://frontend:42153"
 	)
-	setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", gatewayAddr)
-	setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__FRONTEND__HTTP__HTTP", frontendAddr)
-
-	cfg := loadConfig(context.Background(), "lastlogin-go")
-	if cfg.gatewayURL != gatewayAddr {
-		t.Errorf("gatewayURL = %q, want %q resolved from module saas without an override", cfg.gatewayURL, gatewayAddr)
+	cases := []struct {
+		name    string
+		module  string
+		gateway string
+	}{
+		{"saas host (post-rename)", "SAAS", "AUTH_GATEWAY"},
+		{"saas-starter host (pre-rename)", "SAAS_STARTER", "AUTH_SIDECAR"},
 	}
-	if want := frontendAddr + "/api/solutions/register"; cfg.hostRegisterURL != want {
-		t.Errorf("hostRegisterURL = %q, want %q resolved from module saas without an override", cfg.hostRegisterURL, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__REST__REST", gatewayAddr)
+			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__FRONTEND__HTTP__HTTP", frontendAddr)
+
+			cfg := loadConfig(context.Background(), "lastlogin-go")
+			if cfg.gatewayURL != gatewayAddr {
+				t.Errorf("gatewayURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.gatewayURL, gatewayAddr)
+			}
+			if want := frontendAddr + "/api/solutions/register"; cfg.hostRegisterURL != want {
+				t.Errorf("hostRegisterURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.hostRegisterURL, want)
+			}
+		})
 	}
 }
