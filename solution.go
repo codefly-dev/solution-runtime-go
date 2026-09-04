@@ -111,7 +111,7 @@ func resolveGateway(ctx context.Context, module, gateway string) string {
 // roles (overridable), and their concrete addresses are resolved from the SDK —
 // the same source `codefly endpoint` and the host services themselves use.
 func loadConfig(ctx context.Context, id string) config {
-	hostModule := env("CODEFLY_HOST_MODULE", "saas-starter")
+	hostModule := env("CODEFLY_HOST_MODULE", "saas")
 	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
 	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-gateway")
 

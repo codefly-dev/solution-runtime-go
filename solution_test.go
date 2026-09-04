@@ -477,7 +477,7 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			key := "CODEFLY__ENDPOINT__SAAS_STARTER__" +
+			key := "CODEFLY__ENDPOINT__SAAS__" +
 				strings.ToUpper(strings.ReplaceAll(tc.service, "-", "_")) + "__REST__REST"
 			setEndpoint(t, key, addr)
 
@@ -486,5 +486,26 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 				t.Fatalf("gatewayURL = %q, want %q resolved from %s without an override", cfg.gatewayURL, addr, tc.service)
 			}
 		})
+	}
+}
+
+// TestLoadConfigDefaultsToSaasModule proves the host-module default follows
+// lodestar's saas-starter → saas rename: loadConfig resolves both the gateway
+// and frontend URLs against a module named saas with no CODEFLY_HOST_MODULE
+// override.
+func TestLoadConfigDefaultsToSaasModule(t *testing.T) {
+	const (
+		gatewayAddr  = "http://gateway:42152"
+		frontendAddr = "http://frontend:42153"
+	)
+	setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", gatewayAddr)
+	setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__FRONTEND__HTTP__HTTP", frontendAddr)
+
+	cfg := loadConfig(context.Background(), "lastlogin-go")
+	if cfg.gatewayURL != gatewayAddr {
+		t.Errorf("gatewayURL = %q, want %q resolved from module saas without an override", cfg.gatewayURL, gatewayAddr)
+	}
+	if want := frontendAddr + "/api/solutions/register"; cfg.hostRegisterURL != want {
+		t.Errorf("hostRegisterURL = %q, want %q resolved from module saas without an override", cfg.hostRegisterURL, want)
 	}
 }
