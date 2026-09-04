@@ -92,16 +92,43 @@ func address(ctx context.Context, module, service, endpoint, api string) string 
 	return ""
 }
 
+// hostModules returns the host-module names to try when resolving a host
+// endpoint. lodestar renamed its base-synced module saas-starter → saas; when
+// the role is the current default we retry the pre-rename name so a solution
+// boots against a host synced on either side of that rename without an explicit
+// CODEFLY_HOST_MODULE override. An explicit override is used as-is.
+func hostModules(module string) []string {
+	if module == "saas" {
+		return []string{"saas", "saas-starter"}
+	}
+	return []string{module}
+}
+
 // resolveGateway resolves the host gateway's rest endpoint. saas-starter renamed
 // this service auth-sidecar → auth-gateway (v0.0.49); when the default role
 // resolves empty, we retry the old name so a solution boots against either host
 // version without an explicit CODEFLY_HOST_GATEWAY override.
 func resolveGateway(ctx context.Context, module, gateway string) string {
-	if addr := address(ctx, module, gateway, "rest", "rest"); addr != "" {
-		return addr
+	for _, m := range hostModules(module) {
+		if addr := address(ctx, m, gateway, "rest", "rest"); addr != "" {
+			return addr
+		}
+		if gateway == "auth-gateway" {
+			if addr := address(ctx, m, "auth-sidecar", "rest", "rest"); addr != "" {
+				return addr
+			}
+		}
 	}
-	if gateway == "auth-gateway" {
-		return address(ctx, module, "auth-sidecar", "rest", "rest")
+	return ""
+}
+
+// resolveFrontend resolves the host frontend's http endpoint, retrying the
+// pre-rename host-module name the same way resolveGateway does.
+func resolveFrontend(ctx context.Context, module, frontend string) string {
+	for _, m := range hostModules(module) {
+		if addr := address(ctx, m, frontend, "http", "http"); addr != "" {
+			return addr
+		}
 	}
 	return ""
 }
@@ -111,7 +138,7 @@ func resolveGateway(ctx context.Context, module, gateway string) string {
 // roles (overridable), and their concrete addresses are resolved from the SDK —
 // the same source `codefly endpoint` and the host services themselves use.
 func loadConfig(ctx context.Context, id string) config {
-	hostModule := env("CODEFLY_HOST_MODULE", "saas-starter")
+	hostModule := env("CODEFLY_HOST_MODULE", "saas")
 	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
 	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-gateway")
 
@@ -131,7 +158,7 @@ func loadConfig(ctx context.Context, id string) config {
 
 	// Host endpoints, resolved via the SDK (no localhost:port literals).
 	gatewayURL := strings.TrimRight(env("GATEWAY_URL", resolveGateway(ctx, hostModule, hostGateway)), "/")
-	frontendURL := strings.TrimRight(address(ctx, hostModule, hostFrontend, "http", "http"), "/")
+	frontendURL := strings.TrimRight(resolveFrontend(ctx, hostModule, hostFrontend), "/")
 
 	// Internal token: the namespaced workspace secret Codefly injects, resolved
 	// by name through the SDK rather than a bare os.Getenv the runtime never sees.

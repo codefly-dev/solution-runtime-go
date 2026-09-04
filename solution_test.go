@@ -477,13 +477,47 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			key := "CODEFLY__ENDPOINT__SAAS_STARTER__" +
+			key := "CODEFLY__ENDPOINT__SAAS__" +
 				strings.ToUpper(strings.ReplaceAll(tc.service, "-", "_")) + "__REST__REST"
 			setEndpoint(t, key, addr)
 
 			cfg := loadConfig(context.Background(), "lastlogin-go")
 			if cfg.gatewayURL != addr {
 				t.Fatalf("gatewayURL = %q, want %q resolved from %s without an override", cfg.gatewayURL, addr, tc.service)
+			}
+		})
+	}
+}
+
+// TestLoadConfigDefaultsToSaasModule proves the host-module default follows
+// lodestar's saas-starter → saas rename while still booting against a host
+// synced before it: loadConfig resolves both the gateway and frontend URLs with
+// no CODEFLY_HOST_MODULE override, whether the host module is the current saas
+// (auth-gateway service) or the pre-rename saas-starter (auth-sidecar).
+func TestLoadConfigDefaultsToSaasModule(t *testing.T) {
+	const (
+		gatewayAddr  = "http://gateway:42152"
+		frontendAddr = "http://frontend:42153"
+	)
+	cases := []struct {
+		name    string
+		module  string
+		gateway string
+	}{
+		{"saas host (post-rename)", "SAAS", "AUTH_GATEWAY"},
+		{"saas-starter host (pre-rename)", "SAAS_STARTER", "AUTH_SIDECAR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__REST__REST", gatewayAddr)
+			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__FRONTEND__HTTP__HTTP", frontendAddr)
+
+			cfg := loadConfig(context.Background(), "lastlogin-go")
+			if cfg.gatewayURL != gatewayAddr {
+				t.Errorf("gatewayURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.gatewayURL, gatewayAddr)
+			}
+			if want := frontendAddr + "/api/solutions/register"; cfg.hostRegisterURL != want {
+				t.Errorf("hostRegisterURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.hostRegisterURL, want)
 			}
 		})
 	}

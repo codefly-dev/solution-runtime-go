@@ -40,10 +40,11 @@ the SDK-resolved value is the default.
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
 
 The host it plugs into is named by Codefly-convention roles, themselves
-overridable: `CODEFLY_HOST_MODULE` (default `saas-starter`),
-`CODEFLY_HOST_FRONTEND` (default `frontend`), `CODEFLY_HOST_GATEWAY` (default
-`auth-gateway`, falling back to the pre-v0.0.49 `auth-sidecar` when unresolved);
-their concrete addresses come from the SDK.
+overridable: `CODEFLY_HOST_MODULE` (default `saas`, falling back to the
+pre-rename `saas-starter` when unresolved), `CODEFLY_HOST_FRONTEND` (default
+`frontend`), `CODEFLY_HOST_GATEWAY` (default `auth-gateway`, falling back to the
+pre-v0.0.49 `auth-sidecar` when unresolved); their concrete addresses come from
+the SDK.
 
 On boot the runtime self-registers on a 15s heartbeat with **both** the host
 frontend (host registration) and the gateway (gateway registration), sending the
