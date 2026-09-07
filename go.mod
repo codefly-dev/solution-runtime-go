@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	connectrpc.com/connect v1.20.0
-	github.com/codefly-dev/core v0.3.11-0.20260827214326-50cfbcfbec29
+	github.com/codefly-dev/core v0.3.20
 	github.com/codefly-dev/sdk-go v0.1.65
 )
 
