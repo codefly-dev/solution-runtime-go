@@ -31,20 +31,26 @@ the SDK-resolved value is the default.
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Public URL | `http://localhost:<port>` | `PUBLIC_URL` |
-| Gateway URL (auth-gateway `rest`) | `Endpoint("rest").Module(...).Service(...)` | `GATEWAY_URL` |
-| Host frontend URL | `Endpoint("http").Module(...).Service(...)` | — (feeds the host register URL) |
+| Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally) | `GATEWAY_URL` |
+| Host frontend URL | resolved by role — the single module owning the `frontend` `http`/`http` endpoint, discovered the same way | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
 
-The host it plugs into is named by Codefly-convention roles, themselves
-overridable: `CODEFLY_HOST_MODULE` (default `saas`, falling back to the
-pre-rename `saas-starter` when unresolved), `CODEFLY_HOST_FRONTEND` (default
-`frontend`), `CODEFLY_HOST_GATEWAY` (default `auth-gateway`, falling back to the
-pre-v0.0.49 `auth-sidecar` when unresolved); their concrete addresses come from
-the SDK.
+The host it plugs into is named by Codefly-convention **service roles**, not by
+its workspace module name: the runtime discovers the single module that owns each
+role — from the injected endpoint carriers when deployed, or the workspace on
+disk when run locally — so a solution composing the host as `saas`,
+`saas-starter`, or any other name resolves identically (codefly-dev/core#382).
+The roles are overridable: `CODEFLY_HOST_FRONTEND` (default `frontend`),
+`CODEFLY_HOST_GATEWAY` (default `auth-gateway`, falling back to the pre-v0.0.49
+`auth-sidecar` when unresolved). `CODEFLY_HOST_MODULE` is empty by default and
+only needs setting to disambiguate a composition where **more than one** module
+exposes the same role — otherwise an ambiguous match resolves to nothing and the
+runtime fails loud at boot rather than picking a host arbitrarily. Concrete
+addresses always come from the SDK.
 
 On boot the runtime self-registers on a 15s heartbeat with **both** the host
 frontend (host registration) and the gateway (gateway registration), sending the

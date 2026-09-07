@@ -523,3 +523,115 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 		})
 	}
 }
+
+// writeFile writes content to path, creating parent directories, for building
+// on-disk workspace fixtures.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestResolveGatewayAmbiguousModuleFailsLoud proves that when more than one host
+// module exposes the same role, host resolution returns "" — so validate() fails
+// loud at boot — instead of silently returning whichever module the injected env
+// happened to surface first. The single-module control shows "" is caused by the
+// ambiguity, not by resolution being broken.
+func TestResolveGatewayAmbiguousModuleFailsLoud(t *testing.T) {
+	// Hermetic: no workspace on disk, so local-native discovery finds nothing
+	// and only the injected carriers drive resolution.
+	t.Chdir(t.TempDir())
+
+	t.Run("single owning module resolves", func(t *testing.T) {
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "http://gateway:42152")
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "http://gateway:42152" {
+			t.Fatalf("resolveGateway = %q, want the single module's address", got)
+		}
+	})
+
+	t.Run("two modules owning the same role are ambiguous", func(t *testing.T) {
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "http://gateway-a:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__REST__REST", "http://gateway-b:42152")
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
+			t.Fatalf("resolveGateway = %q, want %q so validate() fails loud on the ambiguous host", got, "")
+		}
+	})
+}
+
+// TestResolveHostByRoleFromWorkspace proves host-by-role resolution works in a
+// local run with no injected endpoint carriers: the owning module is discovered
+// from the workspace on disk, so resolving by role alone (module "") matches
+// resolving with the module named explicitly. This is the regression the empty
+// CODEFLY_HOST_MODULE default introduced — the env scan finds nothing locally,
+// and without workspace discovery the host would never resolve.
+func TestResolveHostByRoleFromWorkspace(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	writeFile(t, filepath.Join(root, "workspace.codefly.yaml"), `name: solution-test
+layout: modules
+modules:
+  - name: platform
+`)
+	writeFile(t, filepath.Join(root, "modules", "platform", "module.codefly.yaml"), `kind: module
+name: platform
+services:
+  - name: auth-gateway
+  - name: frontend
+`)
+	writeFile(t, filepath.Join(root, "modules", "platform", "services", "auth-gateway", "service.codefly.yaml"), `kind: service
+name: auth-gateway
+version: 0.0.0
+agent:
+  kind: codefly:service
+  name: go
+  version: 0.0.1
+  publisher: codefly.dev
+endpoints:
+  - name: rest
+`)
+	writeFile(t, filepath.Join(root, "modules", "platform", "services", "frontend", "service.codefly.yaml"), `kind: service
+name: frontend
+version: 0.0.0
+agent:
+  kind: codefly:service
+  name: go
+  version: 0.0.1
+  publisher: codefly.dev
+endpoints:
+  - name: http
+`)
+
+	// Force the SDK's local-native resolution (no injected carriers), and restore
+	// the shared env snapshot afterwards so later tests see a clean state.
+	t.Setenv("CODEFLY__ENVIRONMENT", "")
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
+	t.Chdir(root)
+
+	// Resolving by role alone must match resolving with the module named, and
+	// both must actually resolve (non-empty) from the workspace map.
+	gotGW := resolveGateway(ctx, "", "auth-gateway")
+	wantGW := resolveGateway(ctx, "platform", "auth-gateway")
+	if wantGW == "" {
+		t.Fatal("resolveGateway with explicit module resolved empty; the workspace fixture did not expose the gateway endpoint")
+	}
+	if gotGW != wantGW {
+		t.Errorf("resolveGateway(module=\"\") = %q, want %q discovered from the workspace", gotGW, wantGW)
+	}
+
+	gotFE := resolveFrontend(ctx, "", "frontend")
+	wantFE := resolveFrontend(ctx, "platform", "frontend")
+	if wantFE == "" {
+		t.Fatal("resolveFrontend with explicit module resolved empty; the workspace fixture did not expose the frontend endpoint")
+	}
+	if gotFE != wantFE {
+		t.Errorf("resolveFrontend(module=\"\") = %q, want %q discovered from the workspace", gotFE, wantFE)
+	}
+}

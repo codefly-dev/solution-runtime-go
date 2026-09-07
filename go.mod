@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	connectrpc.com/connect v1.20.0
+	github.com/codefly-dev/core v0.3.11-0.20260827214326-50cfbcfbec29
 	github.com/codefly-dev/sdk-go v0.1.65
 )
 
@@ -13,7 +14,6 @@ require (
 	cel.dev/expr v0.25.1 // indirect
 	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
-	github.com/codefly-dev/core v0.3.11-0.20260827214326-50cfbcfbec29 // indirect
 	github.com/go-openapi/analysis v0.25.0 // indirect
 	github.com/go-openapi/errors v0.22.7 // indirect
 	github.com/go-openapi/jsonpointer v0.23.1 // indirect
