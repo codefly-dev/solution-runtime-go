@@ -489,12 +489,12 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 	}
 }
 
-// TestLoadConfigDefaultsToSaasModule proves the host-module default follows
-// lodestar's saas-starter → saas rename while still booting against a host
-// synced before it: loadConfig resolves both the gateway and frontend URLs with
-// no CODEFLY_HOST_MODULE override, whether the host module is the current saas
-// (auth-gateway service) or the pre-rename saas-starter (auth-sidecar).
-func TestLoadConfigDefaultsToSaasModule(t *testing.T) {
+// TestLoadConfigResolvesHostByRole proves the host gateway/frontend resolve by
+// service role alone, independent of the host module's workspace name: loadConfig
+// resolves both URLs with no CODEFLY_HOST_MODULE override whether the host module
+// is the current saas (auth-gateway service), the pre-rename saas-starter
+// (auth-sidecar), or any other name a solution composes it under (codefly-dev/core#382).
+func TestLoadConfigResolvesHostByRole(t *testing.T) {
 	const (
 		gatewayAddr  = "http://gateway:42152"
 		frontendAddr = "http://frontend:42153"
@@ -506,6 +506,7 @@ func TestLoadConfigDefaultsToSaasModule(t *testing.T) {
 	}{
 		{"saas host (post-rename)", "SAAS", "AUTH_GATEWAY"},
 		{"saas-starter host (pre-rename)", "SAAS_STARTER", "AUTH_SIDECAR"},
+		{"arbitrary host module name", "SOME_OTHER_HOST", "AUTH_GATEWAY"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
