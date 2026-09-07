@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
 )
 
@@ -92,45 +93,101 @@ func address(ctx context.Context, module, service, endpoint, api string) string 
 	return ""
 }
 
-// hostModules returns the host-module names to try when resolving a host
-// endpoint. lodestar renamed its base-synced module saas-starter → saas; when
-// the role is the current default we retry the pre-rename name so a solution
-// boots against a host synced on either side of that rename without an explicit
-// CODEFLY_HOST_MODULE override. An explicit override is used as-is.
-func hostModules(module string) []string {
-	if module == "saas" {
-		return []string{"saas", "saas-starter"}
-	}
-	return []string{module}
+// endpointKey normalizes a name into the segment Codefly uses in an endpoint
+// environment variable: upper-cased, dashes to underscores.
+func endpointKey(s string) string {
+	return strings.ToUpper(strings.ReplaceAll(s, "-", "_"))
 }
 
-// resolveGateway resolves the host gateway's rest endpoint. saas-starter renamed
-// this service auth-sidecar → auth-gateway (v0.0.49); when the default role
-// resolves empty, we retry the old name so a solution boots against either host
-// version without an explicit CODEFLY_HOST_GATEWAY override.
+// discoverHostModule finds the single host module that owns a role
+// (service+endpoint+api), so host resolution never depends on the host's
+// workspace module name. It returns the owning module, or "" when the role is
+// unresolved or ambiguous — an empty result makes loadConfig leave the address
+// empty so validate() fails loud at boot rather than the runtime silently
+// picking an arbitrary host.
+//
+// Deployed under the runtime, Codefly injects each resolved endpoint as
+// CODEFLY__ENDPOINT__<MODULE>__<SERVICE>__<ENDPOINT>__<API>, so scanning the
+// injected carriers for the role suffix yields the owning module segment. Run
+// locally there are no injected carriers, so the workspace on disk is the source
+// of truth: we find the unique module declaring a service of that name — the same
+// resolution the SDK's native map performs. Either way more than one distinct
+// owner is genuinely ambiguous and resolves to "" (see codefly-dev/core#382).
+func discoverHostModule(ctx context.Context, service, endpoint, api string) string {
+	prefix := resources.EndpointPrefix + "__"
+	suffix := "__" + endpointKey(service) + "__" + endpointKey(endpoint) + "__" + endpointKey(api)
+	found := ""
+	for _, kv := range os.Environ() {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok || value == "" {
+			continue
+		}
+		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+			continue
+		}
+		// The single segment between the prefix and the role suffix is the host
+		// module; a longer service name would leave "__" in it and must not match.
+		mod := strings.TrimSuffix(strings.TrimPrefix(key, prefix), suffix)
+		if mod == "" || strings.Contains(mod, "__") {
+			continue
+		}
+		if found != "" && found != mod {
+			return "" // two host modules own the same role: ambiguous
+		}
+		found = mod
+	}
+	if found != "" {
+		return found
+	}
+	// No injected carrier (local run): resolve the owning module from the
+	// workspace on disk. FindUniqueServiceAndModuleByName returns an error when
+	// the service name is not unique across modules, which we treat as ambiguous.
+	ws, err := resources.FindWorkspaceUp(ctx)
+	if err != nil || ws == nil {
+		return ""
+	}
+	svc, err := ws.FindUniqueServiceAndModuleByName(ctx, service)
+	if err != nil || svc == nil {
+		return ""
+	}
+	return svc.Module
+}
+
+// hostAddress resolves a host endpoint by its role. With an explicit module it
+// scopes to that module. With the module unset it discovers the single module
+// owning the role (see discoverHostModule) and then resolves the concrete
+// address through the SDK, so both deployed and local-native runs resolve the
+// host identically — the host's workspace name/alias is irrelevant, with no
+// CODEFLY_HOST_MODULE coupling and no hardcoded list of known host names.
+func hostAddress(ctx context.Context, module, service, endpoint, api string) string {
+	if module == "" {
+		if module = discoverHostModule(ctx, service, endpoint, api); module == "" {
+			return ""
+		}
+	}
+	return address(ctx, module, service, endpoint, api)
+}
+
+// resolveGateway resolves the host gateway's rest endpoint by role, independent of
+// the host module's name (see hostAddress). saas-starter renamed this service
+// auth-sidecar → auth-gateway (v0.0.49); when the current name resolves empty we
+// retry the old one so a solution boots against either host version.
 func resolveGateway(ctx context.Context, module, gateway string) string {
-	for _, m := range hostModules(module) {
-		if addr := address(ctx, m, gateway, "rest", "rest"); addr != "" {
+	if addr := hostAddress(ctx, module, gateway, "rest", "rest"); addr != "" {
+		return addr
+	}
+	if gateway == "auth-gateway" {
+		if addr := hostAddress(ctx, module, "auth-sidecar", "rest", "rest"); addr != "" {
 			return addr
-		}
-		if gateway == "auth-gateway" {
-			if addr := address(ctx, m, "auth-sidecar", "rest", "rest"); addr != "" {
-				return addr
-			}
 		}
 	}
 	return ""
 }
 
-// resolveFrontend resolves the host frontend's http endpoint, retrying the
-// pre-rename host-module name the same way resolveGateway does.
+// resolveFrontend resolves the host frontend's http endpoint by role, like
+// resolveGateway — host-module-name-agnostic.
 func resolveFrontend(ctx context.Context, module, frontend string) string {
-	for _, m := range hostModules(module) {
-		if addr := address(ctx, m, frontend, "http", "http"); addr != "" {
-			return addr
-		}
-	}
-	return ""
+	return hostAddress(ctx, module, frontend, "http", "http")
 }
 
 // loadConfig resolves every address, port, and secret through the Codefly SDK
@@ -138,7 +195,10 @@ func resolveFrontend(ctx context.Context, module, frontend string) string {
 // roles (overridable), and their concrete addresses are resolved from the SDK —
 // the same source `codefly endpoint` and the host services themselves use.
 func loadConfig(ctx context.Context, id string) config {
-	hostModule := env("CODEFLY_HOST_MODULE", "saas")
+	// Empty by default: the host is resolved by service+endpoint role, not by its
+	// workspace module name (see resolveGateway). An explicit CODEFLY_HOST_MODULE
+	// scopes the lookup only when a composition is genuinely ambiguous.
+	hostModule := env("CODEFLY_HOST_MODULE", "")
 	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
 	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-gateway")
 
