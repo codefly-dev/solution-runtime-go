@@ -487,6 +487,11 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 			if cfg.gatewayURL != addr {
 				t.Fatalf("gatewayURL = %q, want %q resolved from %s without an override", cfg.gatewayURL, addr, tc.service)
 			}
+			// The gateway module-register URL defaults to the resolved gateway plus
+			// the /modules/_register path, with no explicit override.
+			if want := addr + "/modules/_register"; cfg.moduleRegisterURL != want {
+				t.Errorf("moduleRegisterURL = %q, want %q derived from the resolved gateway", cfg.moduleRegisterURL, want)
+			}
 		})
 	}
 }
@@ -640,10 +645,13 @@ endpoints:
 
 // moduleRegistration is the wire payload the gateway's /modules/_register accepts:
 // a bare single-segment prefix (the gateway builds /v1/<prefix>/* itself) and the
-// resolved upstream.
+// resolved upstream. Token is not part of the body — it is the captured
+// x-codefly-internal-token header, so a test can assert the registration is
+// authenticated the same way the host and gateway self-registrations are.
 type moduleRegistration struct {
 	Prefix   string `json:"prefix"`
 	Upstream string `json:"upstream"`
+	Token    string `json:"-"`
 }
 
 // bootWithModuleRegistry boots a real solution on ln against a fake gateway that
@@ -657,6 +665,7 @@ func bootWithModuleRegistry(t *testing.T, ln net.Listener) (<-chan moduleRegistr
 		if r.URL.Path == moduleRegisterPathTest {
 			var reg moduleRegistration
 			_ = json.NewDecoder(r.Body).Decode(&reg)
+			reg.Token = r.Header.Get("x-codefly-internal-token")
 			select {
 			case got <- reg:
 			default:
@@ -672,6 +681,7 @@ func bootWithModuleRegistry(t *testing.T, ln net.Listener) (<-chan moduleRegistr
 		hostRegisterURL:    srv.URL + "/host",
 		gatewayRegisterURL: srv.URL + "/gateway",
 		moduleRegisterURL:  srv.URL + moduleRegisterPathTest,
+		internalToken:      moduleRegisterTokenTest,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -687,55 +697,76 @@ func bootWithModuleRegistry(t *testing.T, ln net.Listener) (<-chan moduleRegistr
 
 const moduleRegisterPathTest = "/modules/_register"
 
+// moduleRegisterTokenTest is the internal token the fake gateway expects on the
+// x-codefly-internal-token header of a module registration.
+const moduleRegisterTokenTest = "internal-token-xyz"
+
 // TestServeRegistersConsumedAPIUpstreams proves the api.consumes federation: for
 // each consumed target core surfaces in CODEFLY__API_CONSUMES, the runtime
 // resolves the module's upstream through the SDK (the same way it resolves the
-// gateway and frontend) and registers /v1/<prefix> → that upstream with the
-// gateway. The prefix is the facade `as`, defaulting to the consumed module name
-// when the author leaves `as` empty.
+// gateway and frontend) and registers /v1/<as> → that upstream with the gateway,
+// authenticated with the internal token. The prefix is the facade `as` exactly
+// as core projected it — the runtime never invents one (see
+// TestServeSkipsConsumedAPIWithoutFacade).
 func TestServeRegistersConsumedAPIUpstreams(t *testing.T) {
 	const upstream = "http://docstore-upstream:9100"
-	cases := []struct {
-		name       string
-		as         string
-		wantPrefix string
-	}{
-		{"explicit as", "documents", "documents"},
-		{"empty as defaults to module", "", "docstore"},
+	// The consumed endpoint's address is injected because the backend depends on
+	// the consumed service; resolve it via the SDK snapshot.
+	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
+	// The api.consumes projection core surfaces to the running backend. The
+	// literal is manifest.APIConsumesEnvironmentVariable (a wire contract).
+	t.Setenv("CODEFLY__API_CONSUMES",
+		`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// The consumed endpoint's address is injected because the backend
-			// depends on the consumed service; resolve it via the SDK snapshot.
-			setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
-			// The api.consumes projection core surfaces to the running backend.
-			// The literal is manifest.APIConsumesEnvironmentVariable (a wire contract).
-			asField := ""
-			if tc.as != "" {
-				asField = `,"as":"` + tc.as + `"`
-			}
-			t.Setenv("CODEFLY__API_CONSUMES",
-				`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest"`+asField+`}]`)
+	got, stop := bootWithModuleRegistry(t, ln)
+	defer stop()
 
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, stop := bootWithModuleRegistry(t, ln)
-			defer stop()
+	select {
+	case reg := <-got:
+		if reg.Prefix != "documents" {
+			t.Errorf("registered prefix = %q, want %q (the facade as core projected)", reg.Prefix, "documents")
+		}
+		if reg.Upstream != upstream {
+			t.Errorf("registered upstream = %q, want %q resolved via the SDK", reg.Upstream, upstream)
+		}
+		if reg.Token != moduleRegisterTokenTest {
+			t.Errorf("registered with token %q, want %q — module registration must carry the internal token", reg.Token, moduleRegisterTokenTest)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not receive a module registration within timeout")
+	}
+}
 
-			select {
-			case reg := <-got:
-				if reg.Prefix != tc.wantPrefix {
-					t.Errorf("registered prefix = %q, want %q", reg.Prefix, tc.wantPrefix)
-				}
-				if reg.Upstream != upstream {
-					t.Errorf("registered upstream = %q, want %q resolved via the SDK", reg.Upstream, upstream)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("gateway did not receive a module registration within timeout")
-			}
-		})
+// TestServeSkipsConsumedAPIWithoutFacade proves the runtime never guesses a
+// facade prefix. Core derives an omitted `as` from the producing endpoint's
+// proto package — a value the runtime cannot reconstruct from the projected
+// identity — so an entry that arrives with no `as` is skipped rather than
+// registered under a fabricated prefix (e.g. the module name), which would proxy
+// a route the generated client never calls and could steal another facade's
+// prefix. The consumed endpoint resolves fine; only the missing `as` suppresses
+// registration.
+func TestServeSkipsConsumedAPIWithoutFacade(t *testing.T) {
+	const upstream = "http://docstore-upstream:9100"
+	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
+	t.Setenv("CODEFLY__API_CONSUMES",
+		`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest"}]`)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, stop := bootWithModuleRegistry(t, ln)
+	defer stop()
+
+	select {
+	case reg := <-got:
+		t.Fatalf("registered module %q → %q for a consumed api with no facade entry-point (as); the runtime must not invent a prefix", reg.Prefix, reg.Upstream)
+	case <-time.After(500 * time.Millisecond):
+		// No registration, as expected.
 	}
 }
 

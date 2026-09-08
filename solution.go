@@ -351,20 +351,29 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 func (s *Server) registerConsumedAPIs(ctx context.Context) {
 	consumed, err := manifest.ParseConsumedAPIs(os.Getenv(manifest.APIConsumesEnvironmentVariable))
 	if err != nil {
-		// A malformed projection is a build-time/CLI defect, not something the
-		// runtime can repair; log it and register the rest rather than crash.
-		log.Printf("solution %q: %v", s.manifest.ID, err)
+		// A malformed projection is a build-time/CLI defect the runtime cannot
+		// repair. ParseConsumedAPIs returns no entries on a decode error, so this
+		// registers nothing at all: every consumed facade silently 404s at the
+		// gateway. Crashing would also take down this solution's own frontend, so
+		// serve on — but log loudly, because this line is the only signal that the
+		// entire api.consumes federation was dropped.
+		log.Printf("solution %q: api.consumes federation disabled: %v", s.manifest.ID, err)
 	}
 	for _, c := range consumed {
-		// The gateway proxies /v1/<prefix>/*; the prefix is the facade entry-point
-		// (As), defaulting to the consumed module when the author left it empty.
-		prefix := c.As
-		if prefix == "" {
-			prefix = c.Module
-		}
-		if prefix == "" || c.Module == "" {
+		// The gateway proxies /v1/<As>/*, where As is the facade entry-point core
+		// derives from the producing endpoint's proto package (the last non-version
+		// segment) — not the module name. The runtime cannot reconstruct that
+		// default from the projected identity, so an entry that reached us without
+		// an explicit As is one the CLI should have resolved: registering a guessed
+		// prefix (e.g. the module name) would proxy a route the generated client
+		// never calls (a silent 404) and could even claim a prefix meant for a
+		// different facade. Skip it loudly instead of guessing.
+		if c.As == "" {
+			log.Printf("solution %q: consumed api %s/%s/%s has no facade entry-point (as); skipping gateway module registration",
+				s.manifest.ID, c.Module, c.Service, c.Endpoint)
 			continue
 		}
+		prefix := c.As
 		upstream := address(ctx, c.Module, c.Service, c.Endpoint, c.Protocol)
 		if upstream == "" {
 			// The address is injected because the backend depends on the consumed
