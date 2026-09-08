@@ -331,6 +331,7 @@ func TestConfigValidate(t *testing.T) {
 		gatewayURL:         "http://gateway:42152",
 		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
 		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
+		moduleRegisterURL:  "http://gateway:42152/modules/_register",
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -346,6 +347,7 @@ func TestConfigValidate(t *testing.T) {
 		{"empty gateway URL", func(c *config) { c.gatewayURL = "" }},
 		{"relative host register URL", func(c *config) { c.hostRegisterURL = "/api/solutions/register" }},
 		{"relative gateway register URL", func(c *config) { c.gatewayRegisterURL = "/solutions/_register" }},
+		{"relative module register URL", func(c *config) { c.moduleRegisterURL = "/modules/_register" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -633,5 +635,127 @@ endpoints:
 	}
 	if gotFE != wantFE {
 		t.Errorf("resolveFrontend(module=\"\") = %q, want %q discovered from the workspace", gotFE, wantFE)
+	}
+}
+
+// moduleRegistration is the wire payload the gateway's /modules/_register accepts:
+// a bare single-segment prefix (the gateway builds /v1/<prefix>/* itself) and the
+// resolved upstream.
+type moduleRegistration struct {
+	Prefix   string `json:"prefix"`
+	Upstream string `json:"upstream"`
+}
+
+// bootWithModuleRegistry boots a real solution on ln against a fake gateway that
+// captures POSTs to /modules/_register, returning the captured registrations
+// channel and a stop func. The host and gateway self-registrations point at the
+// same fake so their heartbeats don't spew transport errors into the test log.
+func bootWithModuleRegistry(t *testing.T, ln net.Listener) (<-chan moduleRegistration, func()) {
+	t.Helper()
+	got := make(chan moduleRegistration, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == moduleRegisterPathTest {
+			var reg moduleRegistration
+			_ = json.NewDecoder(r.Body).Decode(&reg)
+			select {
+			case got <- reg:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
+	s.cfg = config{
+		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
+		publicURL:          "http://127.0.0.1",
+		hostRegisterURL:    srv.URL + "/host",
+		gatewayRegisterURL: srv.URL + "/gateway",
+		moduleRegisterURL:  srv.URL + moduleRegisterPathTest,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = s.serve(ctx, ln); close(done) }()
+	stop := func() {
+		cancel()
+		<-done
+		srv.Close()
+	}
+	return got, stop
+}
+
+const moduleRegisterPathTest = "/modules/_register"
+
+// TestServeRegistersConsumedAPIUpstreams proves the api.consumes federation: for
+// each consumed target core surfaces in CODEFLY__API_CONSUMES, the runtime
+// resolves the module's upstream through the SDK (the same way it resolves the
+// gateway and frontend) and registers /v1/<prefix> → that upstream with the
+// gateway. The prefix is the facade `as`, defaulting to the consumed module name
+// when the author leaves `as` empty.
+func TestServeRegistersConsumedAPIUpstreams(t *testing.T) {
+	const upstream = "http://docstore-upstream:9100"
+	cases := []struct {
+		name       string
+		as         string
+		wantPrefix string
+	}{
+		{"explicit as", "documents", "documents"},
+		{"empty as defaults to module", "", "docstore"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The consumed endpoint's address is injected because the backend
+			// depends on the consumed service; resolve it via the SDK snapshot.
+			setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
+			// The api.consumes projection core surfaces to the running backend.
+			// The literal is manifest.APIConsumesEnvironmentVariable (a wire contract).
+			asField := ""
+			if tc.as != "" {
+				asField = `,"as":"` + tc.as + `"`
+			}
+			t.Setenv("CODEFLY__API_CONSUMES",
+				`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest"`+asField+`}]`)
+
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, stop := bootWithModuleRegistry(t, ln)
+			defer stop()
+
+			select {
+			case reg := <-got:
+				if reg.Prefix != tc.wantPrefix {
+					t.Errorf("registered prefix = %q, want %q", reg.Prefix, tc.wantPrefix)
+				}
+				if reg.Upstream != upstream {
+					t.Errorf("registered upstream = %q, want %q resolved via the SDK", reg.Upstream, upstream)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("gateway did not receive a module registration within timeout")
+			}
+		})
+	}
+}
+
+// TestServeRegistersNoModulesWithoutConsumes proves the no-op: a solution that
+// declares no api.consumes (empty CODEFLY__API_CONSUMES) registers no module
+// upstream at all, so nothing changes for the solutions that consume nothing.
+func TestServeRegistersNoModulesWithoutConsumes(t *testing.T) {
+	t.Setenv("CODEFLY__API_CONSUMES", "")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, stop := bootWithModuleRegistry(t, ln)
+	defer stop()
+
+	select {
+	case reg := <-got:
+		t.Fatalf("registered module %q → %q for a solution that declares no api.consumes", reg.Prefix, reg.Upstream)
+	case <-time.After(500 * time.Millisecond):
+		// No registration, as expected.
 	}
 }
