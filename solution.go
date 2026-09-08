@@ -27,6 +27,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/resources"
+	"github.com/codefly-dev/core/solution/manifest"
 	codefly "github.com/codefly-dev/sdk-go"
 )
 
@@ -61,6 +62,7 @@ type config struct {
 	port, publicURL, gatewayURL string
 	hostRegisterURL             string
 	gatewayRegisterURL          string
+	moduleRegisterURL           string
 	selfUpstream, assetsDir     string
 	internalToken               string
 }
@@ -233,6 +235,7 @@ func loadConfig(ctx context.Context, id string) config {
 		gatewayURL:         gatewayURL,
 		hostRegisterURL:    env("HOST_REGISTER_URL", frontendURL+"/api/solutions/register"),
 		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", gatewayURL+"/solutions/_register"),
+		moduleRegisterURL:  env("GATEWAY_MODULE_REGISTER_URL", gatewayURL+"/modules/_register"),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
 		internalToken:      token,
@@ -255,6 +258,7 @@ func (c config) validate() error {
 		"gateway URL":          c.gatewayURL,
 		"host register URL":    c.hostRegisterURL,
 		"gateway register URL": c.gatewayRegisterURL,
+		"module register URL":  c.moduleRegisterURL,
 	} {
 		if u, err := url.Parse(raw); err != nil || !u.IsAbs() || u.Host == "" {
 			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
@@ -319,6 +323,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})
 	go s.heartbeat(ctx, s.cfg.hostRegisterURL, manifestBody, "host")
 	go s.heartbeat(ctx, s.cfg.gatewayRegisterURL, upstreamBody, "gateway")
+	s.registerConsumedAPIs(ctx)
 
 	srv := &http.Server{Handler: mux}
 	go func() {
@@ -331,6 +336,56 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		return serveErr
 	}
 	return nil
+}
+
+// registerConsumedAPIs registers each of the solution's api.consumes targets
+// with the gateway so it can proxy /v1/<prefix>/* to the consumed module. The
+// targets are projected by core into CODEFLY__API_CONSUMES; the address of each
+// is already injected (the backend depends on the consumed service), so it is
+// resolved through the SDK exactly as the gateway and frontend are. Each target
+// gets its own heartbeat, mirroring the host and gateway registrations, so a
+// registration that is briefly unavailable at boot is retried.
+//
+// A solution that declares no api.consumes has an empty CODEFLY__API_CONSUMES
+// and registers nothing — no behavior changes unless api.consumes is declared.
+func (s *Server) registerConsumedAPIs(ctx context.Context) {
+	consumed, err := manifest.ParseConsumedAPIs(os.Getenv(manifest.APIConsumesEnvironmentVariable))
+	if err != nil {
+		// A malformed projection is a build-time/CLI defect the runtime cannot
+		// repair. ParseConsumedAPIs returns no entries on a decode error, so this
+		// registers nothing at all: every consumed facade silently 404s at the
+		// gateway. Crashing would also take down this solution's own frontend, so
+		// serve on — but log loudly, because this line is the only signal that the
+		// entire api.consumes federation was dropped.
+		log.Printf("solution %q: api.consumes federation disabled: %v", s.manifest.ID, err)
+	}
+	for _, c := range consumed {
+		// The gateway proxies /v1/<As>/*, where As is the facade entry-point core
+		// derives from the producing endpoint's proto package (the last non-version
+		// segment) — not the module name. The runtime cannot reconstruct that
+		// default from the projected identity, so an entry that reached us without
+		// an explicit As is one the CLI should have resolved: registering a guessed
+		// prefix (e.g. the module name) would proxy a route the generated client
+		// never calls (a silent 404) and could even claim a prefix meant for a
+		// different facade. Skip it loudly instead of guessing.
+		if c.As == "" {
+			log.Printf("solution %q: consumed api %s/%s/%s has no facade entry-point (as); skipping gateway module registration",
+				s.manifest.ID, c.Module, c.Service, c.Endpoint)
+			continue
+		}
+		prefix := c.As
+		upstream := address(ctx, c.Module, c.Service, c.Endpoint, c.Protocol)
+		if upstream == "" {
+			// The address is injected because the backend depends on the consumed
+			// service; if it did not resolve, registering an empty upstream would
+			// only be rejected, so skip loudly instead.
+			log.Printf("solution %q: no upstream resolved for consumed api %q (%s/%s/%s); skipping gateway module registration",
+				s.manifest.ID, prefix, c.Module, c.Service, c.Endpoint)
+			continue
+		}
+		body, _ := json.Marshal(map[string]string{"prefix": prefix, "upstream": upstream})
+		go s.heartbeat(ctx, s.cfg.moduleRegisterURL, body, "gateway module "+prefix)
+	}
 }
 
 func (s *Server) manifestMap() map[string]any {
