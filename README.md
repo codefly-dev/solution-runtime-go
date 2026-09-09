@@ -35,6 +35,8 @@ the SDK-resolved value is the default.
 | Host frontend URL | resolved by role — the single module owning the `frontend` `http`/`http` endpoint, discovered the same way | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
+| Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
+| Gateway module token URL | `<gateway>/modules/_registration-token` | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
@@ -55,6 +57,30 @@ addresses always come from the SDK.
 On boot the runtime self-registers on a 15s heartbeat with **both** the host
 frontend (host registration) and the gateway (gateway registration), sending the
 internal token as the `x-codefly-internal-token` header on every beat.
+
+### Consumed-module federation
+
+A solution that declares `api.consumes` also registers each consumed module's
+upstream with the gateway, so `/v1/<as>/*` proxies to it. Codefly projects the
+targets into `CODEFLY__API_CONSUMES`; each gets its own 15s registration
+heartbeat alongside the two above.
+
+The gateway does **not** accept the shared internal token on `/modules/_register`
+— it admits a registration only against a short-lived token signed by accounts
+and bound to a single prefix, so holding the credential for one module never lets
+you claim another's route. The runtime obtains that token per consumed module by
+presenting the module's own **registration secret** to
+`/modules/_registration-token`, which the gateway brokers to accounts (a composed
+module cannot reach accounts' internal listener itself). The token is reused
+until shortly before it expires, and re-obtained when a registration is refused.
+
+Those secrets arrive in `CODEFLY__MODULE_REGISTRATION_SECRETS` as
+comma-separated `prefix:secret` entries — the plaintext twin of the
+`prefix:sha256hex` digests the same composition declares to accounts
+(`MODULE_REGISTRATION_SECRETS`). A consumed module with no secret cannot be
+registered, so the runtime skips it with a log naming this variable rather than
+beating against a guaranteed 401. Provisioning both halves is the composition's
+job (`codefly run solution`).
 
 > **Note:** SDK in-process endpoint resolution for a solution composed on an
 > out-of-repo host depends on codefly-core accepting the composed module path in

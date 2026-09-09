@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -61,7 +62,10 @@ func TestHeartbeatSendsInternalToken(t *testing.T) {
 			defer cancel()
 			s := &Server{cfg: config{internalToken: tt.token}}
 			done := make(chan struct{})
-			go func() { s.heartbeat(ctx, srv.URL, []byte("{}"), "host"); close(done) }()
+			go func() {
+				s.heartbeat(ctx, srv.URL, []byte("{}"), "host", internalTokenAuth(tt.token))
+				close(done)
+			}()
 
 			select {
 			case header := <-got:
@@ -332,6 +336,7 @@ func TestConfigValidate(t *testing.T) {
 		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
 		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
 		moduleRegisterURL:  "http://gateway:42152/modules/_register",
+		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -348,6 +353,7 @@ func TestConfigValidate(t *testing.T) {
 		{"relative host register URL", func(c *config) { c.hostRegisterURL = "/api/solutions/register" }},
 		{"relative gateway register URL", func(c *config) { c.gatewayRegisterURL = "/solutions/_register" }},
 		{"relative module register URL", func(c *config) { c.moduleRegisterURL = "/modules/_register" }},
+		{"relative module token URL", func(c *config) { c.moduleTokenURL = "/modules/_registration-token" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -392,7 +398,10 @@ func TestHeartbeatLogsTransportError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{cfg: config{internalToken: "t"}}
 	done := make(chan struct{})
-	go func() { s.heartbeat(ctx, "/solutions/_register", []byte("{}"), "gateway"); close(done) }()
+	go func() {
+		s.heartbeat(ctx, "/solutions/_register", []byte("{}"), "gateway", internalTokenAuth("t"))
+		close(done)
+	}()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for !strings.Contains(buf.String(), "failed") {
@@ -424,7 +433,10 @@ func TestHeartbeatLogsRejection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{cfg: config{internalToken: "wrong-token"}}
 	done := make(chan struct{})
-	go func() { s.heartbeat(ctx, srv.URL, []byte("{}"), "host"); close(done) }()
+	go func() {
+		s.heartbeat(ctx, srv.URL, []byte("{}"), "host", internalTokenAuth("wrong-token"))
+		close(done)
+	}()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for !strings.Contains(buf.String(), "rejected") {
@@ -643,101 +655,281 @@ endpoints:
 	}
 }
 
-// moduleRegistration is the wire payload the gateway's /modules/_register accepts:
-// a bare single-segment prefix (the gateway builds /v1/<prefix>/* itself) and the
-// resolved upstream. Token is not part of the body — it is the captured
-// x-codefly-internal-token header, so a test can assert the registration is
-// authenticated the same way the host and gateway self-registrations are.
+// moduleRegistration is the wire payload the gateway's /modules/_register
+// accepts: a bare single-segment prefix (the gateway builds /v1/<prefix>/* from
+// it) and the resolved upstream. Registration and Internal are not part of the
+// body — they are the captured credential headers, so a test can assert the
+// registration presents the signed, prefix-bound token and not the shared
+// cluster-internal one.
 type moduleRegistration struct {
-	Prefix   string `json:"prefix"`
-	Upstream string `json:"upstream"`
-	Token    string `json:"-"`
+	Prefix       string `json:"prefix"`
+	Upstream     string `json:"upstream"`
+	Registration string `json:"-"`
+	Internal     string `json:"-"`
 }
 
-// bootWithModuleRegistry boots a real solution on ln against a fake gateway that
-// captures POSTs to /modules/_register, returning the captured registrations
-// channel and a stop func. The host and gateway self-registrations point at the
-// same fake so their heartbeats don't spew transport errors into the test log.
-func bootWithModuleRegistry(t *testing.T, ln net.Listener) (<-chan moduleRegistration, func()) {
+// moduleExchange is what the credential exchange (/modules/_registration-token)
+// received: the prefix a module asks for, plus the two credentials the gateway
+// requires — its own perimeter token and the module's registration secret.
+type moduleExchange struct {
+	Prefix   string `json:"prefix"`
+	Secret   string `json:"-"`
+	Internal string `json:"-"`
+}
+
+// fakeGateway stands in for the host gateway on the two endpoints module
+// federation uses. It mirrors the real refusal semantics: the exchange mints a
+// token only for a prefix whose declared secret the caller presents, and answers
+// 401 otherwise (accounts' refusal, relayed).
+type fakeGateway struct {
+	*httptest.Server
+	registrations chan moduleRegistration
+	exchanges     chan moduleExchange
+
+	// declared maps a prefix to the secret the composition provisioned for it —
+	// the plaintext twin of the digest accounts holds.
+	declared map[string]string
+	// tokenTTL is how long a minted token is claimed to be valid.
+	tokenTTL time.Duration
+	// registerStatus, when non-zero, is what /modules/_register answers instead
+	// of 200.
+	registerStatus int
+
+	mu     sync.Mutex
+	minted int
+}
+
+func newFakeGateway(t *testing.T, gw *fakeGateway) *fakeGateway {
 	t.Helper()
-	got := make(chan moduleRegistration, 4)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == moduleRegisterPathTest {
-			var reg moduleRegistration
-			_ = json.NewDecoder(r.Body).Decode(&reg)
-			reg.Token = r.Header.Get("x-codefly-internal-token")
-			select {
-			case got <- reg:
-			default:
-			}
+	gw.registrations = make(chan moduleRegistration, 8)
+	gw.exchanges = make(chan moduleExchange, 8)
+	if gw.tokenTTL == 0 {
+		gw.tokenTTL = time.Hour
+	}
+	gw.Server = httptest.NewServer(http.HandlerFunc(gw.serve))
+	t.Cleanup(gw.Close)
+	return gw
+}
+
+func (g *fakeGateway) serve(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case moduleRegistrationTokenPath:
+		var exchange moduleExchange
+		_ = json.NewDecoder(r.Body).Decode(&exchange)
+		exchange.Secret = r.Header.Get(moduleSecretHeader)
+		exchange.Internal = r.Header.Get(internalTokenHeader)
+		send(g.exchanges, exchange)
+		if g.declared[exchange.Prefix] == "" || g.declared[exchange.Prefix] != exchange.Secret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		g.mu.Lock()
+		g.minted++
+		token := fmt.Sprintf("minted-%s-%d", exchange.Prefix, g.minted)
+		g.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{
+			"token":     token,
+			"expiresAt": time.Now().Add(g.tokenTTL).UTC().Format(time.RFC3339),
+		})
+	case moduleRegisterPath:
+		var registration moduleRegistration
+		_ = json.NewDecoder(r.Body).Decode(&registration)
+		registration.Registration = r.Header.Get(moduleRegistrationHeader)
+		registration.Internal = r.Header.Get(internalTokenHeader)
+		send(g.registrations, registration)
+		if g.registerStatus != 0 {
+			w.WriteHeader(g.registerStatus)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
-	}))
+	default:
+		w.WriteHeader(http.StatusOK)
+	}
+}
 
+func (g *fakeGateway) mintCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.minted
+}
+
+// send records an observation without ever blocking the fake gateway's handler:
+// a heartbeat re-POSTs forever, so a full channel must not wedge the server.
+func send[T any](ch chan T, value T) {
+	select {
+	case ch <- value:
+	default:
+	}
+}
+
+// bootWithModuleRegistry boots a real solution on ln against gw. The host and
+// gateway self-registrations point at the same fake so their heartbeats don't
+// spew transport errors into the test log.
+func bootWithModuleRegistry(t *testing.T, ln net.Listener, gw *fakeGateway) func() {
+	t.Helper()
 	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
 	s.cfg = config{
 		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
 		publicURL:          "http://127.0.0.1",
-		hostRegisterURL:    srv.URL + "/host",
-		gatewayRegisterURL: srv.URL + "/gateway",
-		moduleRegisterURL:  srv.URL + moduleRegisterPathTest,
-		internalToken:      moduleRegisterTokenTest,
+		hostRegisterURL:    gw.URL + "/host",
+		gatewayRegisterURL: gw.URL + "/gateway",
+		moduleRegisterURL:  gw.URL + moduleRegisterPath,
+		moduleTokenURL:     gw.URL + moduleRegistrationTokenPath,
+		internalToken:      internalTokenTest,
+		moduleSecrets:      parseModuleRegistrationSecrets(os.Getenv(ModuleRegistrationSecretsEnvironmentVariable)),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = s.serve(ctx, ln); close(done) }()
-	stop := func() {
+	return func() {
 		cancel()
 		<-done
-		srv.Close()
 	}
-	return got, stop
 }
 
-const moduleRegisterPathTest = "/modules/_register"
+// internalTokenTest is the cluster-internal token the fake gateway's perimeter
+// check expects on the credential exchange.
+const internalTokenTest = "internal-token-xyz"
 
-// moduleRegisterTokenTest is the internal token the fake gateway expects on the
-// x-codefly-internal-token header of a module registration.
-const moduleRegisterTokenTest = "internal-token-xyz"
+// consumesDocuments is the api.consumes projection core surfaces to a running
+// backend for the wiki→documents federation. The literal key is
+// manifest.APIConsumesEnvironmentVariable (a wire contract).
+const consumesDocuments = `[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`
 
-// TestServeRegistersConsumedAPIUpstreams proves the api.consumes federation: for
-// each consumed target core surfaces in CODEFLY__API_CONSUMES, the runtime
-// resolves the module's upstream through the SDK (the same way it resolves the
-// gateway and frontend) and registers /v1/<as> → that upstream with the gateway,
-// authenticated with the internal token. The prefix is the facade `as` exactly
-// as core projected it — the runtime never invents one (see
-// TestServeSkipsConsumedAPIWithoutFacade).
+// TestServeRegistersConsumedAPIUpstreams proves the api.consumes federation end
+// to end on the runtime's side: for each consumed target core surfaces in
+// CODEFLY__API_CONSUMES, the runtime exchanges the registration secret its
+// composition provisioned for a signed, prefix-bound token, then registers
+// /v1/<as> → the SDK-resolved upstream with that token. The shared
+// cluster-internal token authenticates only the exchange — the gateway rejects
+// it on /modules/_register, so it must not be what the registration presents.
 func TestServeRegistersConsumedAPIUpstreams(t *testing.T) {
 	const upstream = "http://docstore-upstream:9100"
 	// The consumed endpoint's address is injected because the backend depends on
 	// the consumed service; resolve it via the SDK snapshot.
 	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
-	// The api.consumes projection core surfaces to the running backend. The
-	// literal is manifest.APIConsumesEnvironmentVariable (a wire contract).
-	t.Setenv("CODEFLY__API_CONSUMES",
-		`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`)
+	t.Setenv("CODEFLY__API_CONSUMES", consumesDocuments)
+	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret")
+
+	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, stop := bootWithModuleRegistry(t, ln)
-	defer stop()
+	defer bootWithModuleRegistry(t, ln, gw)()
 
 	select {
-	case reg := <-got:
+	case exchange := <-gw.exchanges:
+		if exchange.Prefix != "documents" {
+			t.Errorf("exchanged for prefix %q, want %q", exchange.Prefix, "documents")
+		}
+		if exchange.Secret != "s3cret" {
+			t.Errorf("exchange presented secret %q, want the provisioned %q", exchange.Secret, "s3cret")
+		}
+		if exchange.Internal != internalTokenTest {
+			t.Errorf("exchange presented internal token %q, want %q — the gateway's perimeter check requires it", exchange.Internal, internalTokenTest)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not receive a registration-token exchange within timeout")
+	}
+
+	select {
+	case reg := <-gw.registrations:
 		if reg.Prefix != "documents" {
 			t.Errorf("registered prefix = %q, want %q (the facade as core projected)", reg.Prefix, "documents")
 		}
 		if reg.Upstream != upstream {
 			t.Errorf("registered upstream = %q, want %q resolved via the SDK", reg.Upstream, upstream)
 		}
-		if reg.Token != moduleRegisterTokenTest {
-			t.Errorf("registered with token %q, want %q — module registration must carry the internal token", reg.Token, moduleRegisterTokenTest)
+		if reg.Registration != "minted-documents-1" {
+			t.Errorf("registered with %s = %q, want the minted token", moduleRegistrationHeader, reg.Registration)
+		}
+		if reg.Internal != "" {
+			t.Errorf("registration carried the shared internal token %q; the gateway refuses it and it must not leak to this path", reg.Internal)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("gateway did not receive a module registration within timeout")
+	}
+}
+
+// TestServeSkipsConsumedAPIWithoutSecret proves the provisioning gap fails loud
+// rather than hammering the gateway: with no secret for the prefix there is no
+// credential to exchange, so every registration would be a guaranteed 401. The
+// runtime neither exchanges nor registers, and says which variable is missing.
+func TestServeSkipsConsumedAPIWithoutSecret(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
+	t.Setenv("CODEFLY__API_CONSUMES", consumesDocuments)
+	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "")
+
+	gw := newFakeGateway(t, &fakeGateway{})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bootWithModuleRegistry(t, ln, gw)()
+
+	select {
+	case exchange := <-gw.exchanges:
+		t.Fatalf("exchanged a registration token for %q with no provisioned secret", exchange.Prefix)
+	case reg := <-gw.registrations:
+		t.Fatalf("registered module %q → %q with no provisioned secret", reg.Prefix, reg.Upstream)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if out := buf.String(); !strings.Contains(out, ModuleRegistrationSecretsEnvironmentVariable) {
+		t.Errorf("missing secret was not reported against %s, got: %q", ModuleRegistrationSecretsEnvironmentVariable, out)
+	}
+}
+
+// TestServeIsolatesFailedModuleRegistration proves a per-module failure stays
+// per-module: the composition provisions a secret for one consumed module and a
+// stale one for another, so the first federates while the second's exchange is
+// refused. The refused module must not take down the backend or the sibling
+// registration — it just retries on its own heartbeat.
+func TestServeIsolatesFailedModuleRegistration(t *testing.T) {
+	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
+	setEndpoint(t, "CODEFLY__ENDPOINT__BILLING__INVOICES__REST__REST", "http://billing-upstream:9200")
+	t.Setenv("CODEFLY__API_CONSUMES", `[`+
+		`{"id":"billing.invoices","module":"billing","service":"invoices","endpoint":"rest","protocol":"rest","as":"billing"},`+
+		`{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`)
+	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret,billing:stale")
+
+	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{
+		"documents": "s3cret",
+		"billing":   "rotated",
+	}})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bootWithModuleRegistry(t, ln, gw)()
+
+	select {
+	case reg := <-gw.registrations:
+		if reg.Prefix != "documents" {
+			t.Errorf("registered prefix = %q, want only %q to reach registration", reg.Prefix, "documents")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the module with a valid secret did not register within timeout")
+	}
+
+	// The backend is still serving: the refused module's failure did not take it
+	// down with it.
+	resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port) + "/health")
+	if err != nil {
+		t.Fatalf("backend stopped serving after a module registration failure: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health = %d, want 200", resp.StatusCode)
 	}
 }
 
@@ -750,20 +942,21 @@ func TestServeRegistersConsumedAPIUpstreams(t *testing.T) {
 // prefix. The consumed endpoint resolves fine; only the missing `as` suppresses
 // registration.
 func TestServeSkipsConsumedAPIWithoutFacade(t *testing.T) {
-	const upstream = "http://docstore-upstream:9100"
-	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
+	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
 	t.Setenv("CODEFLY__API_CONSUMES",
 		`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest"}]`)
+	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret")
+
+	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, stop := bootWithModuleRegistry(t, ln)
-	defer stop()
+	defer bootWithModuleRegistry(t, ln, gw)()
 
 	select {
-	case reg := <-got:
+	case reg := <-gw.registrations:
 		t.Fatalf("registered module %q → %q for a consumed api with no facade entry-point (as); the runtime must not invent a prefix", reg.Prefix, reg.Upstream)
 	case <-time.After(500 * time.Millisecond):
 		// No registration, as expected.
@@ -776,17 +969,156 @@ func TestServeSkipsConsumedAPIWithoutFacade(t *testing.T) {
 func TestServeRegistersNoModulesWithoutConsumes(t *testing.T) {
 	t.Setenv("CODEFLY__API_CONSUMES", "")
 
+	gw := newFakeGateway(t, &fakeGateway{})
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, stop := bootWithModuleRegistry(t, ln)
-	defer stop()
+	defer bootWithModuleRegistry(t, ln, gw)()
 
 	select {
-	case reg := <-got:
+	case reg := <-gw.registrations:
 		t.Fatalf("registered module %q → %q for a solution that declares no api.consumes", reg.Prefix, reg.Upstream)
 	case <-time.After(500 * time.Millisecond):
 		// No registration, as expected.
+	}
+}
+
+// TestModuleCredentialReusesTokenUntilRenewal proves the beat does not re-mint
+// every 15 seconds: a registration token lives 5 minutes, and each mint is an
+// audited security event on accounts, so a token still comfortably inside its
+// lifetime is reused.
+func TestModuleCredentialReusesTokenUntilRenewal(t *testing.T) {
+	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
+	credential := &moduleCredential{
+		tokenURL:      gw.URL + moduleRegistrationTokenPath,
+		internalToken: internalTokenTest,
+		prefix:        "documents",
+		secret:        "s3cret",
+	}
+
+	for beat := range 3 {
+		req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := credential.authorize(context.Background(), req); err != nil {
+			t.Fatalf("beat %d: authorize: %v", beat, err)
+		}
+		if got := req.Header.Get(moduleRegistrationHeader); got != "minted-documents-1" {
+			t.Errorf("beat %d presented %q, want the first minted token reused", beat, got)
+		}
+	}
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("minted %d tokens across 3 beats, want 1 — a live token must be reused", got)
+	}
+}
+
+// TestModuleCredentialReExchangesAfterRejection proves recovery from a refused
+// registration: the gateway answering 401 means the token it was handed is no
+// longer honoured (a restarted gateway, a rotated key), so replaying it for the
+// rest of its lifetime would strand the module. Invalidating forces a fresh
+// exchange on the next beat.
+func TestModuleCredentialReExchangesAfterRejection(t *testing.T) {
+	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
+	credential := &moduleCredential{
+		tokenURL:      gw.URL + moduleRegistrationTokenPath,
+		internalToken: internalTokenTest,
+		prefix:        "documents",
+		secret:        "s3cret",
+	}
+
+	req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.authorize(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	credential.invalidate()
+	if err := credential.authorize(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := req.Header.Get(moduleRegistrationHeader); got != "minted-documents-2" {
+		t.Errorf("presented %q after invalidation, want a freshly minted token", got)
+	}
+	if got := gw.mintCount(); got != 2 {
+		t.Errorf("minted %d tokens, want 2 — a refused credential must be re-exchanged", got)
+	}
+}
+
+// TestHeartbeatReExchangesOnRejectedRegistration proves the invalidation is
+// actually wired to the beat loop, not just available on the credential: a
+// gateway that answers 401 to /modules/_register makes the next beat run a new
+// exchange rather than replay the refused token.
+func TestHeartbeatReExchangesOnRejectedRegistration(t *testing.T) {
+	log.SetOutput(io.Discard)
+	defer log.SetOutput(os.Stderr)
+
+	gw := newFakeGateway(t, &fakeGateway{
+		declared:       map[string]string{"documents": "s3cret"},
+		registerStatus: http.StatusUnauthorized,
+	})
+	credential := &moduleCredential{
+		tokenURL:      gw.URL + moduleRegistrationTokenPath,
+		internalToken: internalTokenTest,
+		prefix:        "documents",
+		secret:        "s3cret",
+	}
+
+	restore := registrationInterval
+	registrationInterval = time.Millisecond
+	defer func() { registrationInterval = restore }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	done := make(chan struct{})
+	go func() {
+		s.heartbeat(ctx, gw.URL+moduleRegisterPath, []byte(`{"prefix":"documents"}`), "gateway module documents", credential)
+		close(done)
+	}()
+	defer func() { cancel(); <-done }()
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case reg := <-gw.registrations:
+			if seen[reg.Registration] {
+				t.Fatalf("replayed the refused token %q on the next beat", reg.Registration)
+			}
+			seen[reg.Registration] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("gateway did not receive two registration attempts within timeout")
+		}
+	}
+}
+
+func TestParseModuleRegistrationSecrets(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want map[string]string
+	}{
+		{name: "empty", raw: "", want: map[string]string{}},
+		{name: "one", raw: "documents:s3cret", want: map[string]string{"documents": "s3cret"}},
+		{
+			name: "several, spaced",
+			raw:  "documents:s3cret, billing:other",
+			want: map[string]string{"documents": "s3cret", "billing": "other"},
+		},
+		// A secret is opaque and base64 may contain "=" and "+"; only the first
+		// ":" separates it from the prefix.
+		{name: "secret keeps inner colons", raw: "documents:a:b", want: map[string]string{"documents": "a:b"}},
+		{name: "unpaired entry dropped", raw: "documents", want: map[string]string{}},
+		{name: "empty secret dropped", raw: "documents:", want: map[string]string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseModuleRegistrationSecrets(tt.raw); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseModuleRegistrationSecrets(%q) = %v, want %v", tt.raw, got, tt.want)
+			}
+		})
 	}
 }

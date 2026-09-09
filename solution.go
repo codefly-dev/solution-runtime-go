@@ -63,8 +63,12 @@ type config struct {
 	hostRegisterURL             string
 	gatewayRegisterURL          string
 	moduleRegisterURL           string
+	moduleTokenURL              string
 	selfUpstream, assetsDir     string
 	internalToken               string
+	// moduleSecrets maps a consumed module's facade prefix to the registration
+	// secret the composition provisioned for it.
+	moduleSecrets map[string]string
 }
 
 func env(key, fallback string) string {
@@ -235,10 +239,12 @@ func loadConfig(ctx context.Context, id string) config {
 		gatewayURL:         gatewayURL,
 		hostRegisterURL:    env("HOST_REGISTER_URL", frontendURL+"/api/solutions/register"),
 		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", gatewayURL+"/solutions/_register"),
-		moduleRegisterURL:  env("GATEWAY_MODULE_REGISTER_URL", gatewayURL+"/modules/_register"),
+		moduleRegisterURL:  env("GATEWAY_MODULE_REGISTER_URL", gatewayURL+moduleRegisterPath),
+		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", gatewayURL+moduleRegistrationTokenPath),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
 		internalToken:      token,
+		moduleSecrets:      parseModuleRegistrationSecrets(env(ModuleRegistrationSecretsEnvironmentVariable, "")),
 	}
 }
 
@@ -259,6 +265,7 @@ func (c config) validate() error {
 		"host register URL":    c.hostRegisterURL,
 		"gateway register URL": c.gatewayRegisterURL,
 		"module register URL":  c.moduleRegisterURL,
+		"module token URL":     c.moduleTokenURL,
 	} {
 		if u, err := url.Parse(raw); err != nil || !u.IsAbs() || u.Host == "" {
 			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
@@ -321,8 +328,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 
 	manifestBody, _ := json.Marshal(s.manifestMap())
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})
-	go s.heartbeat(ctx, s.cfg.hostRegisterURL, manifestBody, "host")
-	go s.heartbeat(ctx, s.cfg.gatewayRegisterURL, upstreamBody, "gateway")
+	internal := internalTokenAuth(s.cfg.internalToken)
+	go s.heartbeat(ctx, s.cfg.hostRegisterURL, manifestBody, "host", internal)
+	go s.heartbeat(ctx, s.cfg.gatewayRegisterURL, upstreamBody, "gateway", internal)
 	s.registerConsumedAPIs(ctx)
 
 	srv := &http.Server{Handler: mux}
@@ -383,8 +391,26 @@ func (s *Server) registerConsumedAPIs(ctx context.Context) {
 				s.manifest.ID, prefix, c.Module, c.Service, c.Endpoint)
 			continue
 		}
+		secret := s.cfg.moduleSecrets[prefix]
+		if secret == "" {
+			// The gateway admits a registration only against a token signed by
+			// accounts, and accounts issues one only to a caller holding the
+			// secret whose digest the composition declared for this prefix.
+			// Without it every beat would be a guaranteed 401, so skip loudly:
+			// this line is the signal that provisioning, not the runtime, is the
+			// missing half.
+			log.Printf("solution %q: no registration secret provisioned for consumed api %q (%s); skipping gateway module registration",
+				s.manifest.ID, prefix, ModuleRegistrationSecretsEnvironmentVariable)
+			continue
+		}
 		body, _ := json.Marshal(map[string]string{"prefix": prefix, "upstream": upstream})
-		go s.heartbeat(ctx, s.cfg.moduleRegisterURL, body, "gateway module "+prefix)
+		credential := &moduleCredential{
+			tokenURL:      s.cfg.moduleTokenURL,
+			internalToken: s.cfg.internalToken,
+			prefix:        prefix,
+			secret:        secret,
+		}
+		go s.heartbeat(ctx, s.cfg.moduleRegisterURL, body, "gateway module "+prefix, credential)
 	}
 }
 
@@ -438,11 +464,17 @@ func (s *Server) wrap(handler Handler) http.HandlerFunc {
 	}
 }
 
-func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label string) {
+func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label string, auth registrationAuth) {
 	lastStatus := 0
 	lastErr := ""
 	for {
-		status, err := s.beat(ctx, url, body)
+		status, err := s.beat(ctx, url, body, auth)
+		if status == http.StatusUnauthorized {
+			// The credential we just presented was refused. Drop it so the next
+			// beat obtains a fresh one instead of replaying a token the issuer
+			// has stopped honouring for the rest of its lifetime.
+			auth.invalidate()
+		}
 		switch {
 		case err != nil:
 			// A shutdown cancels the in-flight request; that error is expected,
@@ -471,21 +503,27 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(15 * time.Second):
+		case <-time.After(registrationInterval):
 		}
 	}
 }
 
+// registrationInterval is how long a registration heartbeat waits between
+// beats. A var rather than a const so a test can exercise the multi-beat
+// contract — that a rejected credential is re-obtained on the next beat —
+// without a fifteen-second wait.
+var registrationInterval = 15 * time.Second
+
 // beat performs one registration POST and returns the HTTP status, or an error
 // if the request could not be built or the round trip failed.
-func (s *Server) beat(ctx context.Context, url string, body []byte) (int, error) {
+func (s *Server) beat(ctx context.Context, url string, body []byte, auth registrationAuth) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
 	req.Header.Set("content-type", "application/json")
-	if s.cfg.internalToken != "" {
-		req.Header.Set("x-codefly-internal-token", s.cfg.internalToken)
+	if err := auth.authorize(ctx, req); err != nil {
+		return 0, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -493,6 +531,152 @@ func (s *Server) beat(ctx context.Context, url string, body []byte) (int, error)
 	}
 	resp.Body.Close()
 	return resp.StatusCode, nil
+}
+
+// --- Module registration credentials ---
+//
+// The gateway federates a consumed module's /v1/<prefix>/* only against a
+// signed, prefix-bound token issued by accounts — the shared cluster-internal
+// token buys no per-caller binding and is refused. A backend obtains one by
+// presenting the registration secret its composition provisioned for that
+// prefix; the gateway brokers the exchange, because a composed module cannot
+// reach accounts' internal listener itself.
+
+const (
+	moduleRegisterPath          = "/modules/_register"
+	moduleRegistrationTokenPath = "/modules/_registration-token"
+)
+
+const (
+	internalTokenHeader = "X-Codefly-Internal-Token"
+	// moduleRegistrationHeader carries the signed, prefix-bound token
+	// /modules/_register requires.
+	moduleRegistrationHeader = "X-Codefly-Module-Registration"
+	// moduleSecretHeader carries this backend's own registration secret on the
+	// exchange that mints that token.
+	moduleSecretHeader = "X-Codefly-Module-Secret"
+)
+
+// ModuleRegistrationSecretsEnvironmentVariable carries the registration secrets
+// a composition provisioned into this backend, as comma-separated
+// `prefix:secret` entries — the plaintext twin of the `prefix:sha256hex`
+// digests the same composition declared to accounts. It is absent for a
+// composition that federates nothing.
+const ModuleRegistrationSecretsEnvironmentVariable = "CODEFLY__MODULE_REGISTRATION_SECRETS"
+
+// moduleTokenRenewal re-runs the exchange this far ahead of expiry, so a beat
+// never presents a token that lapses between here and the gateway's check.
+const moduleTokenRenewal = 30 * time.Second
+
+// moduleTokenExchangeTimeout bounds one exchange. The registration beat is on a
+// 15s cycle, so a stalled gateway must surface as a failed beat rather than
+// wedge the beat loop for that module.
+const moduleTokenExchangeTimeout = 10 * time.Second
+
+// parseModuleRegistrationSecrets decodes the comma-separated `prefix:secret`
+// projection. An entry that is not a `prefix:secret` pair is dropped: the
+// consequence — that module cannot register — is reported where it is
+// actionable, by the missing-secret log in registerConsumedAPIs.
+func parseModuleRegistrationSecrets(raw string) map[string]string {
+	secrets := map[string]string{}
+	for _, entry := range strings.Split(raw, ",") {
+		prefix, secret, ok := strings.Cut(strings.TrimSpace(entry), ":")
+		if !ok || prefix == "" || secret == "" {
+			continue
+		}
+		secrets[prefix] = secret
+	}
+	return secrets
+}
+
+// registrationAuth stamps the credential one registration POST presents, and
+// drops it when the server refuses it. The host and gateway self-registrations
+// present the shared cluster-internal token; a module registration presents a
+// token bound to the single prefix it may claim.
+type registrationAuth interface {
+	authorize(ctx context.Context, req *http.Request) error
+	invalidate()
+}
+
+// internalTokenAuth presents the shared cluster-internal token. There is nothing
+// to invalidate: the token is injected configuration, not something this process
+// obtained and could re-obtain.
+type internalTokenAuth string
+
+func (t internalTokenAuth) authorize(_ context.Context, req *http.Request) error {
+	if t != "" {
+		req.Header.Set(internalTokenHeader, string(t))
+	}
+	return nil
+}
+
+func (internalTokenAuth) invalidate() {}
+
+// moduleCredential exchanges one consumed module's registration secret for the
+// short-lived token /modules/_register requires, and holds it until renewal.
+// Each instance is owned by exactly one registration beat, so its cached token
+// needs no locking.
+type moduleCredential struct {
+	tokenURL      string
+	internalToken string
+	prefix        string
+	secret        string
+
+	token   string
+	expires time.Time
+}
+
+func (c *moduleCredential) authorize(ctx context.Context, req *http.Request) error {
+	// A zero expiry — no token yet, or one just invalidated — reads as expired,
+	// so the exchange runs.
+	if !time.Now().Add(moduleTokenRenewal).Before(c.expires) {
+		token, expires, err := c.exchange(ctx)
+		if err != nil {
+			return err
+		}
+		c.token, c.expires = token, expires
+	}
+	req.Header.Set(moduleRegistrationHeader, c.token)
+	return nil
+}
+
+func (c *moduleCredential) invalidate() { c.token, c.expires = "", time.Time{} }
+
+// exchange runs the credential exchange against the gateway. It presents both
+// the module secret, which identifies this module to accounts, and the
+// cluster-internal token, which the gateway's own perimeter check requires.
+func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, error) {
+	ctx, cancel := context.WithTimeout(ctx, moduleTokenExchangeTimeout)
+	defer cancel()
+
+	body, _ := json.Marshal(map[string]string{"prefix": c.prefix})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, bytes.NewReader(body))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set(internalTokenHeader, c.internalToken)
+	req.Header.Set(moduleSecretHeader, c.secret)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", time.Time{}, fmt.Errorf("registration token exchange for %q rejected (status %d)", c.prefix, resp.StatusCode)
+	}
+	var issued struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
+		return "", time.Time{}, fmt.Errorf("registration token exchange for %q returned invalid json: %w", c.prefix, err)
+	}
+	if issued.Token == "" {
+		return "", time.Time{}, fmt.Errorf("registration token exchange for %q returned no token", c.prefix)
+	}
+	return issued.Token, issued.ExpiresAt, nil
 }
 
 // Gateway is a client bound to the caller's bearer. It exposes an HTTP client
