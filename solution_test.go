@@ -1068,12 +1068,8 @@ func TestHeartbeatReExchangesOnRejectedRegistration(t *testing.T) {
 		secret:        "s3cret",
 	}
 
-	restore := registrationInterval
-	registrationInterval = time.Millisecond
-	defer func() { registrationInterval = restore }()
-
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	s := &Server{manifest: Manifest{ID: "lastlogin-go"}, registrationInterval: time.Millisecond}
 	done := make(chan struct{})
 	go func() {
 		s.heartbeat(ctx, gw.URL+moduleRegisterPath, []byte(`{"prefix":"documents"}`), "gateway module documents", credential)
@@ -1095,6 +1091,86 @@ func TestHeartbeatReExchangesOnRejectedRegistration(t *testing.T) {
 	}
 }
 
+// TestExchangeRejectsAnUnusableExpiry proves the credential refuses an expiry
+// it cannot act on instead of caching it as "already expired". Treated as
+// expired it would re-run the exchange on every beat while every registration
+// still returned 200 — an unlogged mint, and an audited security event on the
+// issuer, four times a minute for as long as the solution runs.
+func TestExchangeRejectsAnUnusableExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body map[string]string
+	}{
+		// A response whose expiry field never arrives (an unset timestamp on the
+		// issuer, or a rename to the protobuf JSON spelling) decodes to the zero
+		// time.
+		{name: "absent", body: map[string]string{"token": "t"}},
+		{name: "epoch zero", body: map[string]string{"token": "t", "expiresAt": "1970-01-01T00:00:00Z"}},
+		// Stands in for a host clock skewed past the credential's own lifetime.
+		{name: "already past", body: map[string]string{
+			"token": "t", "expiresAt": time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)}},
+		// Inside the renewal window: usable for less than one beat, so caching it
+		// would re-exchange immediately anyway.
+		{name: "inside renewal window", body: map[string]string{
+			"token": "t", "expiresAt": time.Now().Add(5 * time.Second).UTC().Format(time.RFC3339)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exchanges := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				exchanges++
+				writeJSON(w, http.StatusOK, tc.body)
+			}))
+			defer srv.Close()
+
+			credential := &moduleCredential{
+				tokenURL: srv.URL, internalToken: internalTokenTest,
+				prefix: "documents", secret: "s3cret",
+			}
+			req, err := http.NewRequest(http.MethodPost, srv.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := credential.authorize(context.Background(), req); err == nil {
+				t.Fatal("accepted a token the runtime cannot hold; a beat loop would re-mint forever")
+			}
+			// A second beat must not have cached anything either.
+			_ = credential.authorize(context.Background(), req)
+			if exchanges != 2 {
+				t.Errorf("exchanged %d times across 2 beats, want 2 attempts and 0 cached", exchanges)
+			}
+			if credential.token != "" {
+				t.Errorf("cached a token with an unusable expiry: %q", credential.token)
+			}
+		})
+	}
+}
+
+// TestSiblingURLFollowsAnOverriddenGateway proves the two federation endpoints
+// stay on one gateway. The credential a registration presents is minted by the
+// exchange, so an explicitly overridden registration URL must carry the
+// exchange with it — minting against one host and registering with another
+// yields a token the second never trusts.
+func TestSiblingURLFollowsAnOverriddenGateway(t *testing.T) {
+	t.Setenv("PORT", "8090")
+	t.Setenv("GATEWAY_URL", "http://gateway:42152")
+	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
+	t.Setenv("GATEWAY_MODULE_REGISTER_URL", "https://other-gateway:9999/modules/_register")
+
+	cfg := loadConfig(context.Background(), "lastlogin-go")
+	want := "https://other-gateway:9999" + moduleRegistrationTokenPath
+	if cfg.moduleTokenURL != want {
+		t.Errorf("module token URL = %q, want %q — it must follow the overridden register URL", cfg.moduleTokenURL, want)
+	}
+}
+
+// An unparseable override must surface as itself, so validate() names the one
+// URL the operator actually set instead of a second one derived from it.
+func TestSiblingURLPassesThroughAnUnusableBase(t *testing.T) {
+	if got := siblingURL("/modules/_register", moduleRegistrationTokenPath); got != "/modules/_register" {
+		t.Errorf("siblingURL(relative) = %q, want the base handed back unchanged", got)
+	}
+}
+
 func TestParseModuleRegistrationSecrets(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1111,6 +1187,9 @@ func TestParseModuleRegistrationSecrets(t *testing.T) {
 		// A secret is opaque and base64 may contain "=" and "+"; only the first
 		// ":" separates it from the prefix.
 		{name: "secret keeps inner colons", raw: "documents:a:b", want: map[string]string{"documents": "a:b"}},
+		// The registrar trims both halves of its digest twin; parsing the two
+		// asymmetrically turns a pair it accepts into a lookup miss here.
+		{name: "spaces around both halves", raw: "documents : s3cret", want: map[string]string{"documents": "s3cret"}},
 		{name: "unpaired entry dropped", raw: "documents", want: map[string]string{}},
 		{name: "empty secret dropped", raw: "documents:", want: map[string]string{}},
 	}

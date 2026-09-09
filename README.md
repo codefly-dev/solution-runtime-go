@@ -36,7 +36,7 @@ the SDK-resolved value is the default.
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
 | Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
-| Gateway module token URL | `<gateway>/modules/_registration-token` | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
+| Gateway module token URL | `/modules/_registration-token` on the same gateway as the module register URL above | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
@@ -73,6 +73,13 @@ presenting the module's own **registration secret** to
 `/modules/_registration-token`, which the gateway brokers to accounts (a composed
 module cannot reach accounts' internal listener itself). The token is reused
 until shortly before it expires, and re-obtained when a registration is refused.
+A response carrying no usable expiry is refused rather than cached, so a beat
+loop can never turn one bad answer into a mint on every heartbeat.
+
+Registration traffic — the exchange and all three heartbeats — never goes
+through an HTTP proxy: every target is composition-local, and these requests
+carry the registration secret, the internal token, and the signed token in
+headers.
 
 Those secrets arrive in `CODEFLY__MODULE_REGISTRATION_SECRETS` as
 comma-separated `prefix:secret` entries — the plaintext twin of the

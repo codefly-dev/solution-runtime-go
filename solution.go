@@ -56,6 +56,12 @@ type Server struct {
 	manifest Manifest
 	handlers map[string]Handler
 	cfg      config
+	// registrationInterval is how long a registration heartbeat waits between
+	// beats. Zero means defaultRegistrationInterval. Per-server rather than a
+	// package value so a test can drive several beats without every other
+	// server in the process — including the heartbeat goroutines a finished
+	// test has not yet unwound — reading the same variable.
+	registrationInterval time.Duration
 }
 
 type config struct {
@@ -226,6 +232,12 @@ func loadConfig(ctx context.Context, id string) config {
 	gatewayURL := strings.TrimRight(env("GATEWAY_URL", resolveGateway(ctx, hostModule, hostGateway)), "/")
 	frontendURL := strings.TrimRight(resolveFrontend(ctx, hostModule, hostFrontend), "/")
 
+	// Both module-federation endpoints live on one gateway: the exchange mints the
+	// credential the registration presents, so pointing registration at another
+	// gateway while the exchange stayed on this one would mint against one host
+	// and register with a second that never trusts the result.
+	moduleRegisterURL := env("GATEWAY_MODULE_REGISTER_URL", gatewayURL+moduleRegisterPath)
+
 	// Internal token: the namespaced workspace secret Codefly injects, resolved
 	// by name through the SDK rather than a bare os.Getenv the runtime never sees.
 	token := env("CODEFLY_INTERNAL_TOKEN", "")
@@ -239,8 +251,8 @@ func loadConfig(ctx context.Context, id string) config {
 		gatewayURL:         gatewayURL,
 		hostRegisterURL:    env("HOST_REGISTER_URL", frontendURL+"/api/solutions/register"),
 		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", gatewayURL+"/solutions/_register"),
-		moduleRegisterURL:  env("GATEWAY_MODULE_REGISTER_URL", gatewayURL+moduleRegisterPath),
-		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", gatewayURL+moduleRegistrationTokenPath),
+		moduleRegisterURL:  moduleRegisterURL,
+		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", siblingURL(moduleRegisterURL, moduleRegistrationTokenPath)),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
 		internalToken:      token,
@@ -465,6 +477,10 @@ func (s *Server) wrap(handler Handler) http.HandlerFunc {
 }
 
 func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label string, auth registrationAuth) {
+	interval := s.registrationInterval
+	if interval == 0 {
+		interval = defaultRegistrationInterval
+	}
 	lastStatus := 0
 	lastErr := ""
 	for {
@@ -503,16 +519,14 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(registrationInterval):
+		case <-time.After(interval):
 		}
 	}
 }
 
-// registrationInterval is how long a registration heartbeat waits between
-// beats. A var rather than a const so a test can exercise the multi-beat
-// contract — that a rejected credential is re-obtained on the next beat —
-// without a fifteen-second wait.
-var registrationInterval = 15 * time.Second
+// defaultRegistrationInterval is how long a registration heartbeat waits
+// between beats when a server names no interval of its own.
+const defaultRegistrationInterval = 15 * time.Second
 
 // beat performs one registration POST and returns the HTTP status, or an error
 // if the request could not be built or the round trip failed.
@@ -525,7 +539,7 @@ func (s *Server) beat(ctx context.Context, url string, body []byte, auth registr
 	if err := auth.authorize(ctx, req); err != nil {
 		return 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := registrationClient.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -573,15 +587,44 @@ const moduleTokenRenewal = 30 * time.Second
 // wedge the beat loop for that module.
 const moduleTokenExchangeTimeout = 10 * time.Second
 
+// registrationClient carries every registration request: the credential
+// exchange and the three registration heartbeats. It is NOT http.DefaultClient.
+//
+// That transport carries Proxy: ProxyFromEnvironment, so with HTTP(S)_PROXY set
+// and a NO_PROXY that does not cover the host's in-cluster names, these
+// requests would be dialled to an arbitrary egress host — carrying, in headers,
+// the module's plaintext registration secret, the cluster-internal token, and
+// the signed token that decides where authenticated traffic for a prefix is
+// forwarded. Every registration target is composition-local (each is resolved
+// from the SDK's endpoint map), so none of them may be proxied. The issuing
+// side of this same exchange refuses proxying for exactly this reason
+// (module-saas-starter#527).
+var registrationClient = &http.Client{Transport: newRegistrationTransport()}
+
+func newRegistrationTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	return transport
+}
+
 // parseModuleRegistrationSecrets decodes the comma-separated `prefix:secret`
 // projection. An entry that is not a `prefix:secret` pair is dropped: the
 // consequence — that module cannot register — is reported where it is
 // actionable, by the missing-secret log in registerConsumedAPIs.
+//
+// Both halves are trimmed, matching how the registrar parses the digest twin of
+// this same projection. Trimming only the entry left "documents : s3cret"
+// keyed under "documents " with a leading space in the secret — a pair the
+// registrar accepts and this side silently mangles into a lookup miss.
 func parseModuleRegistrationSecrets(raw string) map[string]string {
 	secrets := map[string]string{}
 	for _, entry := range strings.Split(raw, ",") {
-		prefix, secret, ok := strings.Cut(strings.TrimSpace(entry), ":")
-		if !ok || prefix == "" || secret == "" {
+		prefix, secret, ok := strings.Cut(entry, ":")
+		if !ok {
+			continue
+		}
+		prefix, secret = strings.TrimSpace(prefix), strings.TrimSpace(secret)
+		if prefix == "" || secret == "" {
 			continue
 		}
 		secrets[prefix] = secret
@@ -627,8 +670,9 @@ type moduleCredential struct {
 }
 
 func (c *moduleCredential) authorize(ctx context.Context, req *http.Request) error {
-	// A zero expiry — no token yet, or one just invalidated — reads as expired,
-	// so the exchange runs.
+	// A zero expiry means no credential yet, or one just invalidated, so the
+	// exchange runs. It cannot mean a cached-but-unusable token: exchange
+	// refuses any expiry that does not clear this same renewal window.
 	if !time.Now().Add(moduleTokenRenewal).Before(c.expires) {
 		token, expires, err := c.exchange(ctx)
 		if err != nil {
@@ -658,7 +702,7 @@ func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, err
 	req.Header.Set(internalTokenHeader, c.internalToken)
 	req.Header.Set(moduleSecretHeader, c.secret)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := registrationClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -675,6 +719,18 @@ func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, err
 	}
 	if issued.Token == "" {
 		return "", time.Time{}, fmt.Errorf("registration token exchange for %q returned no token", c.prefix)
+	}
+	// An expiry this process cannot use is a boundary error, not a token to
+	// cache: treated as "already expired" it would look like success while
+	// re-running the exchange on every beat — an unlogged mint (and an audited
+	// security event on the issuer) four times a minute, for as long as the
+	// solution runs. An absent field decodes to the zero time and a clock skew
+	// wider than the credential's own lifetime lands here too, so both are
+	// refused loudly rather than turned into a hot loop.
+	if !time.Now().Add(moduleTokenRenewal).Before(issued.ExpiresAt) {
+		return "", time.Time{}, fmt.Errorf(
+			"registration token exchange for %q returned an unusable expiry %s (check the issuer's response and this host's clock)",
+			c.prefix, issued.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	return issued.Token, issued.ExpiresAt, nil
 }
@@ -747,4 +803,18 @@ func setCORS(w http.ResponseWriter) {
 	w.Header().Set("access-control-allow-origin", "*")
 	w.Header().Set("access-control-allow-headers", "authorization, content-type")
 	w.Header().Set("access-control-allow-methods", "GET, POST, OPTIONS")
+}
+
+// siblingURL returns path on the same scheme/host as base. It is how a derived
+// federation endpoint follows an explicitly overridden one: both endpoints of
+// the registration exchange must address the same gateway.
+func siblingURL(base, path string) string {
+	u, err := url.Parse(base)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		// Unparseable or relative: hand the value straight back so config
+		// validation reports the one broken URL the operator actually set,
+		// rather than a second one synthesized from it.
+		return base
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path}).String()
 }
