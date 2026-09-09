@@ -36,7 +36,7 @@ the SDK-resolved value is the default.
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
 | Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
-| Gateway module token URL | `/modules/_registration-token` on the same gateway as the module register URL above | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
+| Gateway module token URL | the module register URL above with `/modules/_register` swapped for `/modules/_registration-token`, so it keeps that gateway's base path | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
@@ -72,9 +72,25 @@ you claim another's route. The runtime obtains that token per consumed module by
 presenting the module's own **registration secret** to
 `/modules/_registration-token`, which the gateway brokers to accounts (a composed
 module cannot reach accounts' internal listener itself). The token is reused
-until shortly before it expires, and re-obtained when a registration is refused.
-A response carrying no usable expiry is refused rather than cached, so a beat
-loop can never turn one bad answer into a mint on every heartbeat.
+until shortly before it expires — or until half its life is gone, if the issuer
+chose a lifetime shorter than that lead, since how long a credential lives is
+the issuer's call and not this runtime's to veto.
+
+Obtaining one is an audited security event on accounts, so the runtime does not
+answer every failure by obtaining another. A refusal buys exactly one fresh
+token: the gateway refusing a token minted moments earlier is not refusing it for
+being stale, and re-minting cannot fix whatever it is refusing it for. Beats that
+fail also back off, doubling up to two minutes, so a broken gateway costs a
+bounded number of exchanges however long it stays broken — and the runtime keeps
+retrying, at a rate that will not flood the issuer's audit log, until it
+recovers. A response carrying no usable expiry is refused rather than cached, and
+its two causes — an issuer that sent no `expiresAt` at all, and a clock skewed
+past the credential's lifetime — are reported separately, because they have
+different fixes.
+
+No registration request is unbounded: a gateway that accepts one and never
+answers surfaces as a failed beat rather than silently parking that heartbeat
+for the life of the process.
 
 Registration traffic — the exchange and all three heartbeats — never goes
 through an HTTP proxy: every target is composition-local, and these requests

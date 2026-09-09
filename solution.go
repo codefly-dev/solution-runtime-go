@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -252,7 +253,7 @@ func loadConfig(ctx context.Context, id string) config {
 		hostRegisterURL:    env("HOST_REGISTER_URL", frontendURL+"/api/solutions/register"),
 		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", gatewayURL+"/solutions/_register"),
 		moduleRegisterURL:  moduleRegisterURL,
-		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", siblingURL(moduleRegisterURL, moduleRegistrationTokenPath)),
+		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", siblingURL(moduleRegisterURL, moduleRegisterPath, moduleRegistrationTokenPath)),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
 		internalToken:      token,
@@ -483,12 +484,18 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 	}
 	lastStatus := 0
 	lastErr := ""
+	failures := 0
 	for {
 		status, err := s.beat(ctx, url, body, auth)
-		if status == http.StatusUnauthorized {
-			// The credential we just presented was refused. Drop it so the next
-			// beat obtains a fresh one instead of replaying a token the issuer
-			// has stopped honouring for the rest of its lifetime.
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			// The credential we just presented was refused. Offer it for
+			// dropping so the next beat obtains a fresh one instead of replaying
+			// a token the issuer has stopped honouring for the rest of its
+			// lifetime. Whether that actually helps is the credential's call:
+			// re-obtaining one it has just obtained cannot fix a refusal that
+			// was never about staleness (see moduleCredential.invalidate).
+			// 403 counts too — a gateway that answers "forbidden" to a lapsed
+			// token would otherwise have it replayed for the rest of its life.
 			auth.invalidate()
 		}
 		switch {
@@ -516,12 +523,46 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 		default:
 			lastErr = ""
 		}
+		// A beat that failed is retried further and further out. Every failure
+		// on the credential path — a refused registration, a refused exchange,
+		// a response this process cannot use — otherwise resolves to "run the
+		// whole thing again in `interval`", which turns one broken deployment
+		// into a mint (and an audited security event on the issuer) four times
+		// a minute per module, for as long as the solution runs. Backing off
+		// bounds that without ever giving up: the first success resets it.
+		if err != nil || status >= 300 {
+			failures++
+		} else {
+			failures = 0
+			auth.succeeded()
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-time.After(backoff(interval, failures)):
 		}
 	}
+}
+
+// registrationBackoffCap bounds the retry interval of a failing registration.
+// It is deliberately far below a token's lifetime: the cost of waiting is that
+// a recovered gateway takes this long to see the module again, so the cap trades
+// a bounded outage for a bounded request rate rather than abandoning either.
+const registrationBackoffCap = 2 * time.Minute
+
+// backoff returns how long to wait before the next beat after `failures`
+// consecutive failed ones: the steady interval while healthy, doubling while
+// broken, never past registrationBackoffCap. An interval a caller chose that is
+// already longer than the cap is honoured as-is rather than shortened.
+func backoff(interval time.Duration, failures int) time.Duration {
+	wait := interval
+	for range failures {
+		if wait >= registrationBackoffCap/2 {
+			return registrationBackoffCap
+		}
+		wait *= 2
+	}
+	return wait
 }
 
 // defaultRegistrationInterval is how long a registration heartbeat waits
@@ -543,8 +584,17 @@ func (s *Server) beat(ctx context.Context, url string, body []byte, auth registr
 	if err != nil {
 		return 0, err
 	}
-	resp.Body.Close()
+	drainAndClose(resp)
 	return resp.StatusCode, nil
+}
+
+// drainAndClose consumes what is left of a response body before closing it, so
+// the connection returns to the pool instead of being dropped and re-dialled on
+// the next beat. Bounded: a body larger than this is not worth reading to keep
+// one connection.
+func drainAndClose(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
 }
 
 // --- Module registration credentials ---
@@ -578,9 +628,19 @@ const (
 // composition that federates nothing.
 const ModuleRegistrationSecretsEnvironmentVariable = "CODEFLY__MODULE_REGISTRATION_SECRETS"
 
-// moduleTokenRenewal re-runs the exchange this far ahead of expiry, so a beat
-// never presents a token that lapses between here and the gateway's check.
+// moduleTokenRenewal is the most lead time the credential takes before an
+// expiry, so a beat never presents a token that lapses between here and the
+// gateway's check. It is a ceiling, not a requirement on the issuer: a token
+// whose whole life is shorter is renewed at half its lifetime instead (see
+// exchange). Conflating the two rejected every token the issuer chose to make
+// short-lived — a 30s credential was refused outright, with a message blaming
+// this host's clock.
 const moduleTokenRenewal = 30 * time.Second
+
+// moduleTokenMinimumLifetime is the least remaining validity an issued token
+// must carry to be worth presenting at all. Below this the token would lapse
+// mid-flight, so it is a boundary error rather than a credential.
+const moduleTokenMinimumLifetime = 5 * time.Second
 
 // moduleTokenExchangeTimeout bounds one exchange. The registration beat is on a
 // 15s cycle, so a stalled gateway must surface as a failed beat rather than
@@ -599,7 +659,23 @@ const moduleTokenExchangeTimeout = 10 * time.Second
 // from the SDK's endpoint map), so none of them may be proxied. The issuing
 // side of this same exchange refuses proxying for exactly this reason
 // (module-saas-starter#527).
-var registrationClient = &http.Client{Transport: newRegistrationTransport()}
+//
+// It also carries a Timeout. Without one, neither the heartbeat's context (which
+// has no deadline) nor the transport bounds a gateway that accepts a
+// registration and never answers: the beat blocks in Do forever, so that module
+// — or, for the self-registrations, this whole solution — silently stops
+// registering for the lifetime of the process, with no log and no recovery. The
+// exchange bounds itself with moduleTokenExchangeTimeout; this bounds the other
+// three call sites the same way.
+var registrationClient = &http.Client{
+	Timeout:   registrationTimeout,
+	Transport: newRegistrationTransport(),
+}
+
+// registrationTimeout bounds one registration request end to end. It matches
+// moduleTokenExchangeTimeout: a stalled gateway must surface as a failed beat,
+// which the heartbeat then backs off, rather than wedge the loop.
+const registrationTimeout = 10 * time.Second
 
 func newRegistrationTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -639,6 +715,10 @@ func parseModuleRegistrationSecrets(raw string) map[string]string {
 type registrationAuth interface {
 	authorize(ctx context.Context, req *http.Request) error
 	invalidate()
+	// succeeded reports that the registration this credential authorized was
+	// accepted. It closes a refusal episode, so the next refusal is judged on
+	// its own rather than against a retry an earlier one already spent.
+	succeeded()
 }
 
 // internalTokenAuth presents the shared cluster-internal token. There is nothing
@@ -655,6 +735,8 @@ func (t internalTokenAuth) authorize(_ context.Context, req *http.Request) error
 
 func (internalTokenAuth) invalidate() {}
 
+func (internalTokenAuth) succeeded() {}
+
 // moduleCredential exchanges one consumed module's registration secret for the
 // short-lived token /modules/_register requires, and holds it until renewal.
 // Each instance is owned by exactly one registration beat, so its cached token
@@ -665,26 +747,80 @@ type moduleCredential struct {
 	prefix        string
 	secret        string
 
-	token   string
-	expires time.Time
+	token string
+	// renewAt is when the exchange must run again. Zero means "no usable
+	// credential": either none has been obtained yet, or one was dropped.
+	renewAt time.Time
+	// mintedThisBeat records that token was obtained during the beat now in
+	// flight, so a refusal of it cannot be blamed on staleness.
+	mintedThisBeat bool
+	// retriedAfterRefusal records that a refusal has already been answered with
+	// a fresh mint, and that mint has not yet been superseded by a natural
+	// renewal. It caps a refusal at one re-mint.
+	retriedAfterRefusal bool
+	warnedFreshRefusal  bool
+	warnedShortLifetime bool
 }
 
 func (c *moduleCredential) authorize(ctx context.Context, req *http.Request) error {
-	// A zero expiry means no credential yet, or one just invalidated, so the
+	c.mintedThisBeat = false
+	// A zero renewAt means no credential yet, or one just dropped, so the
 	// exchange runs. It cannot mean a cached-but-unusable token: exchange
-	// refuses any expiry that does not clear this same renewal window.
-	if !time.Now().Add(moduleTokenRenewal).Before(c.expires) {
-		token, expires, err := c.exchange(ctx)
+	// refuses any expiry this process could not act on.
+	if !time.Now().Before(c.renewAt) {
+		// Renewing a token still held is a fresh episode: whatever refusal the
+		// last re-mint was answering is over, so the next one earns its own retry.
+		natural := c.token != ""
+		token, renewAt, err := c.exchange(ctx)
 		if err != nil {
 			return err
 		}
-		c.token, c.expires = token, expires
+		if natural {
+			c.retriedAfterRefusal = false
+		}
+		c.token, c.renewAt, c.mintedThisBeat = token, renewAt, true
 	}
 	req.Header.Set(moduleRegistrationHeader, c.token)
 	return nil
 }
 
-func (c *moduleCredential) invalidate() { c.token, c.expires = "", time.Time{} }
+// invalidate drops the cached token so the next beat obtains a fresh one — but
+// only when a fresh one could plausibly help.
+//
+// A registration can be refused for reasons a new token cannot repair: a gateway
+// that does not trust the issuer, a prefix this module may not claim, skew on the
+// gateway's clock, a perimeter check rejecting the request before the token is
+// ever examined. Dropping unconditionally turned every one of those into a mint
+// on every beat — an audited security event on the issuer, four times a minute
+// per module, indefinitely, and silent after the first log line because the
+// status never changes. Staleness is the one cause re-minting fixes, so a
+// refusal buys exactly one re-mint: a token minted for this very beat is not
+// stale, and neither is the replacement a previous refusal already bought.
+func (c *moduleCredential) invalidate() {
+	if c.mintedThisBeat || c.retriedAfterRefusal {
+		if c.mintedThisBeat && !c.warnedFreshRefusal {
+			c.warnedFreshRefusal = true
+			// This is the signature of a cause outside the credential, so name
+			// it: an operator reading "rejected (status 401)" alone would go
+			// looking at provisioning, which is the one thing already proven
+			// fine — the exchange that minted this token accepted the secret.
+			log.Printf("registration for %q was refused while presenting a token minted for that same beat: the credential is not stale, so re-minting cannot fix it — check that the gateway trusts the issuer that signed it, that %q may be claimed by this module, and whether %s admits %s at all",
+				c.prefix, c.prefix, moduleRegisterPath, internalTokenHeader)
+		}
+		return
+	}
+	// Spend the retry only when a drop actually follows, so the next beat's
+	// fresh mint is the one attempt this refusal was owed.
+	c.retriedAfterRefusal = true
+	c.token, c.renewAt = "", time.Time{}
+}
+
+// succeeded ends the refusal episode: a registration this credential authorized
+// was accepted, so a later refusal is a new fault — a second key rotation, say —
+// and earns its own re-mint rather than inheriting the spent budget of the first.
+func (c *moduleCredential) succeeded() {
+	c.retriedAfterRefusal = false
+}
 
 // exchange runs the credential exchange against the gateway. It presents both
 // the module secret, which identifies this module to accounts, and the
@@ -699,14 +835,19 @@ func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, err
 		return "", time.Time{}, err
 	}
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set(internalTokenHeader, c.internalToken)
+	// Absent rather than present-and-empty when unconfigured, matching
+	// internalTokenAuth: an empty header is the harder shape to diagnose at the
+	// gateway, which sees a caller claiming a credential it does not have.
+	if c.internalToken != "" {
+		req.Header.Set(internalTokenHeader, c.internalToken)
+	}
 	req.Header.Set(moduleSecretHeader, c.secret)
 
 	resp, err := registrationClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
 		return "", time.Time{}, fmt.Errorf("registration token exchange for %q rejected (status %d)", c.prefix, resp.StatusCode)
 	}
@@ -722,17 +863,38 @@ func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, err
 	}
 	// An expiry this process cannot use is a boundary error, not a token to
 	// cache: treated as "already expired" it would look like success while
-	// re-running the exchange on every beat — an unlogged mint (and an audited
-	// security event on the issuer) four times a minute, for as long as the
-	// solution runs. An absent field decodes to the zero time and a clock skew
-	// wider than the credential's own lifetime lands here too, so both are
-	// refused loudly rather than turned into a hot loop.
-	if !time.Now().Add(moduleTokenRenewal).Before(issued.ExpiresAt) {
+	// re-running the exchange on every beat. The two unusable shapes have
+	// different causes and different fixes, so they get different messages —
+	// the old single message blamed the clock for a response that never carried
+	// an expiry at all.
+	now := time.Now()
+	lifetime := issued.ExpiresAt.Sub(now)
+	switch {
+	case issued.ExpiresAt.IsZero():
 		return "", time.Time{}, fmt.Errorf(
-			"registration token exchange for %q returned an unusable expiry %s (check the issuer's response and this host's clock)",
-			c.prefix, issued.ExpiresAt.UTC().Format(time.RFC3339))
+			"registration token exchange for %q returned no expiry: the issuer omitted expiresAt, or spelled it differently (protobuf JSON spells it expires_at, which does not decode into this field)",
+			c.prefix)
+	case lifetime < moduleTokenMinimumLifetime:
+		return "", time.Time{}, fmt.Errorf(
+			"registration token exchange for %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
+			c.prefix, issued.ExpiresAt.UTC().Format(time.RFC3339), moduleTokenMinimumLifetime)
 	}
-	return issued.Token, issued.ExpiresAt, nil
+	// Renew ahead of expiry, but never by more than half the credential's own
+	// life: a lead longer than the lifetime would reject the token outright, and
+	// the issuer's chosen lifetime is not this process's to veto.
+	lead := moduleTokenRenewal
+	if half := lifetime / 2; half < lead {
+		lead = half
+		if !c.warnedShortLifetime {
+			c.warnedShortLifetime = true
+			// Honoured, but say so once: at this lifetime the token cannot be
+			// held across many beats, so the mint rate is the issuer's setting
+			// and not a defect here.
+			log.Printf("registration token for %q is issued with a %s lifetime, shorter than the %s renewal lead: it will be re-obtained roughly every %s",
+				c.prefix, lifetime.Round(time.Second), moduleTokenRenewal, lead.Round(time.Second))
+		}
+	}
+	return issued.Token, issued.ExpiresAt.Add(-lead), nil
 }
 
 // Gateway is a client bound to the caller's bearer. It exposes an HTTP client
@@ -805,16 +967,32 @@ func setCORS(w http.ResponseWriter) {
 	w.Header().Set("access-control-allow-methods", "GET, POST, OPTIONS")
 }
 
-// siblingURL returns path on the same scheme/host as base. It is how a derived
-// federation endpoint follows an explicitly overridden one: both endpoints of
-// the registration exchange must address the same gateway.
-func siblingURL(base, path string) string {
-	u, err := url.Parse(base)
-	if err != nil || !u.IsAbs() || u.Host == "" {
+// siblingURL swaps the trailing `replacing` of base for path. It is how a
+// derived federation endpoint follows an explicitly overridden one: both
+// endpoints of the registration exchange must address the same gateway.
+//
+// It replaces a suffix rather than rebuilding from scheme+host, because a
+// gateway is not always mounted at the root. Rebuilding dropped everything
+// between the host and the endpoint, so a gateway served under a path prefix
+// (GATEWAY_URL=http://gateway:8080/gw) registered at /gw/modules/_register while
+// exchanging at /modules/_registration-token — an absolute URL, so validate()
+// passed it, and a 404 on every beat thereafter.
+func siblingURL(base, replacing, path string) string {
+	if u, err := url.Parse(base); err != nil || !u.IsAbs() || u.Host == "" {
 		// Unparseable or relative: hand the value straight back so config
 		// validation reports the one broken URL the operator actually set,
 		// rather than a second one synthesized from it.
 		return base
 	}
-	return (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path}).String()
+	prefix, ok := strings.CutSuffix(base, replacing)
+	if !ok {
+		// The override does not end in the endpoint we know how to pair, so its
+		// sibling is not derivable — a query string, a trailing slash, or a
+		// wholly custom path. Returning "" makes validate() refuse to boot and
+		// name the module token URL, which is the one the operator must set
+		// explicitly; synthesizing a plausible-looking guess would instead 404
+		// on every beat.
+		return ""
+	}
+	return prefix + path
 }
