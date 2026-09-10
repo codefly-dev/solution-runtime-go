@@ -912,10 +912,10 @@ type Gateway struct {
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
-	// workContext is the capability this gateway presents alongside the bearer.
-	// Empty on the gateway a handler is given, set on one derived by ForModule.
-	workContext codefly.WorkContextToken
-	contexts    *workContextCache
+	// delegation is the ask this gateway acts under, nil on the one a handler
+	// is given. It holds the ask rather than a capability: see delegation.
+	delegation *delegation
+	contexts   *workContextCache
 }
 
 func newGateway(baseURL, bearer, orgID string) *Gateway {
@@ -923,7 +923,7 @@ func newGateway(baseURL, bearer, orgID string) *Gateway {
 		baseURL:  baseURL,
 		bearer:   bearer,
 		orgID:    orgID,
-		contexts: &workContextCache{minted: map[string]issuedWorkContext{}},
+		contexts: newWorkContextCache(),
 	}
 }
 
@@ -933,8 +933,35 @@ func (g *Gateway) BaseURL() string { return g.baseURL }
 // a gateway derived by ForModule, the viewer's Work Context — on every request.
 // Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
 func (g *Gateway) HTTPClient() *http.Client {
-	return &http.Client{Transport: bearerTransport{bearer: g.bearer, workContext: g.workContext, base: http.DefaultTransport}}
+	transport := bearerTransport{bearer: g.bearer, base: gatewayTransport}
+	if g.delegation != nil {
+		transport.acting = g
+	}
+	return &http.Client{Transport: transport}
 }
+
+// bearerClient carries the viewer's bearer and nothing else. The mint runs on
+// it rather than on HTTPClient: a capability minted for one module would
+// otherwise ride along on the request that mints another's, and the edge
+// verifies every presented context, so once the first lapsed it would 401 the
+// very call meant to replace it.
+func (g *Gateway) bearerClient() *http.Client {
+	return &http.Client{Transport: bearerTransport{bearer: g.bearer, base: gatewayTransport}}
+}
+
+// gatewayTransport carries every request a solution makes through the gateway:
+// the module reads a handler issues, and the mint that authenticates them. It
+// is NOT http.DefaultTransport.
+//
+// That transport carries Proxy: ProxyFromEnvironment, so with HTTP(S)_PROXY set
+// and a NO_PROXY that does not cover the host's in-cluster names, these requests
+// would be dialled to an arbitrary egress host — carrying, in headers, the
+// viewer's bearer and the signed capability minted on their behalf. The gateway
+// is composition-local (its address is resolved from the SDK's endpoint map),
+// exactly like every registration target, so none of this may be proxied
+// either. It shares the registration transport's constructor because it needs
+// the identical thing: the default transport with proxying dropped.
+var gatewayTransport = newRegistrationTransport()
 
 // --- Work Context ---
 //
@@ -957,18 +984,54 @@ const orgHeader = "x-org-id"
 // failed handler rather than holding the viewer's request open indefinitely.
 const workContextMintTimeout = 10 * time.Second
 
-// workContextRenewal is the remaining validity below which a cached capability
-// is minted afresh instead of reused, so one never lapses between here and the
-// module's check.
+// workContextRenewal is the most lead time the cache takes before a capability
+// expires, so a request never presents one that lapses between here and the
+// edge's check. It is a ceiling, not a requirement on the issuer: a capability
+// whose whole life is shorter is reused until half its lifetime is gone (see
+// mint). Conflating the two would make every short-lived capability uncacheable
+// and turn the cache into a mint per read, silently.
 const workContextRenewal = 10 * time.Second
+
+// workContextMinimumLifetime is the least remaining validity a minted
+// capability must carry to be worth presenting at all. Below this it would
+// lapse mid-flight, so it is a boundary error rather than a credential.
+const workContextMinimumLifetime = 5 * time.Second
+
+// warnedShortWorkContextLifetime carries the one-time notice that this issuer
+// mints capabilities too short-lived to hold across a request. It is
+// process-wide rather than per-request because that is a property of the
+// issuer's configuration, not of any one viewer's call.
+var warnedShortWorkContextLifetime sync.Once
 
 // Scope is one slice of authority requested for a Work Context: what the module
 // may be asked to do, on which resources, on the viewer's behalf. Empty
 // ResourceIDs grants the actions across the whole ResourceKind.
 type Scope struct {
+	ResourceKind string
+	Actions      []string
+	ResourceIDs  []string
+}
+
+// workContextScope is saas.accounts.v1.WorkContextScope on the wire. Scope is
+// this package's own type and carries no tags, so the accounts field spellings
+// live here: a rename over there is a change to this file rather than to a
+// public API this package's consumers can see.
+type workContextScope struct {
 	ResourceKind string   `json:"resourceKind"`
 	Actions      []string `json:"actions,omitempty"`
 	ResourceIDs  []string `json:"resourceIds,omitempty"`
+}
+
+func workContextScopes(scopes []Scope) []workContextScope {
+	wire := make([]workContextScope, len(scopes))
+	for i, scope := range scopes {
+		wire[i] = workContextScope{
+			ResourceKind: scope.ResourceKind,
+			Actions:      scope.Actions,
+			ResourceIDs:  scope.ResourceIDs,
+		}
+	}
+	return wire
 }
 
 // ForModule returns a Gateway that acts for the viewer against one composed
@@ -982,34 +1045,60 @@ type Scope struct {
 // module verifies as its own audience. A solution declares the consumption
 // once and names it here.
 //
-// One ask mints once. The capability is cached per (org, audience, scopes) and
-// shared with every gateway derived from the one the handler was given, so a
-// handler reading a module repeatedly does not re-mint — minting is an audited
+// One ask mints once, however many gateways are derived for it and from however
+// many goroutines: the capability is cached per (org, audience, scopes) and
+// shared with every gateway derived from the one the handler was given, and
+// concurrent asks for it wait on the one mint in flight. Minting is an audited
 // event on accounts, not a free call.
+//
+// The returned gateway holds the ask, not the capability — it resolves one per
+// request — so a handler may keep it for as long as it keeps the viewer's
+// request. Minting here as well means an ask accounts refuses fails at this
+// call rather than inside some later round trip.
 func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scope) (*Gateway, error) {
 	if g.orgID == "" {
-		return nil, fmt.Errorf("cannot mint a work context for %q: the request carries no %s, so the viewer's organization is unknown", audience, orgHeader)
+		// The gateway injects orgHeader from the caller's active org, so it is
+		// present but empty for a viewer with no organization selected and for
+		// an org-less API key. Naming only the absent case would send whoever
+		// reads this to inspect a header the gateway demonstrably did set.
+		return nil, fmt.Errorf(
+			"cannot mint a work context for %q: no viewer organization (%s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected or an org-less API key)",
+			audience, orgHeader)
 	}
-	ask := startTaskRequest{OrgID: g.orgID, Audience: audience, AuthorityScopes: scopes}
-	// The ask is the cache identity. The task and session ids below name one
-	// mint rather than what was asked for, so they are filled in after.
+	ask := startTaskRequest{OrgID: g.orgID, Audience: audience, AuthorityScopes: workContextScopes(scopes)}
+	// The ask is the cache identity. The task and session ids name one mint
+	// rather than what was asked for, so they are filled in per mint, below.
 	key, err := json.Marshal(ask)
 	if err != nil {
 		return nil, err
 	}
-	token, cached := g.contexts.lookup(string(key))
-	if !cached {
-		ask.TaskID, ask.SessionID = uuid.NewString(), uuid.NewString()
-		minted, expiresAt, err := g.mint(ctx, ask)
-		if err != nil {
-			return nil, err
-		}
-		g.contexts.store(string(key), minted, expiresAt)
-		token = minted
+	acting := *g
+	acting.delegation = &delegation{key: string(key), ask: ask}
+	if _, err := acting.workContext(ctx); err != nil {
+		return nil, err
 	}
-	presenting := *g
-	presenting.workContext = token
-	return &presenting, nil
+	return &acting, nil
+}
+
+// delegation is the ask a derived gateway acts under. It holds the ask and not
+// the capability so that every request resolves a live one: a capability
+// snapshotted when the gateway was derived lapses while the handler still holds
+// it, and the edge verifies freshness on any presented context before routing,
+// so the call would 401 there rather than reach the module at all — worse than
+// the bearer-only gateway this replaced.
+type delegation struct {
+	key string
+	ask startTaskRequest
+}
+
+// workContext resolves the capability this gateway acts under, minting one if
+// the cache holds none that will outlive the call.
+func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, error) {
+	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (codefly.WorkContextToken, time.Time, error) {
+		ask := g.delegation.ask
+		ask.TaskID, ask.SessionID = uuid.NewString(), uuid.NewString()
+		return g.mint(ctx, ask)
+	})
 }
 
 // startTaskRequest is saas.accounts.v1.StartTaskWorkContextRequest on the wire.
@@ -1017,11 +1106,11 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 // a solution's host is not this package's dependency. Leaving actorPrincipalId
 // unset is what makes the viewer both owner and actor of the Task.
 type startTaskRequest struct {
-	OrgID           string  `json:"orgId"`
-	TaskID          string  `json:"taskId"`
-	SessionID       string  `json:"sessionId"`
-	Audience        string  `json:"audience"`
-	AuthorityScopes []Scope `json:"authorityScopes"`
+	OrgID           string             `json:"orgId"`
+	TaskID          string             `json:"taskId"`
+	SessionID       string             `json:"sessionId"`
+	Audience        string             `json:"audience"`
+	AuthorityScopes []workContextScope `json:"authorityScopes"`
 }
 
 func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkContextToken, time.Time, error) {
@@ -1036,7 +1125,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 		return codefly.WorkContextToken{}, time.Time{}, err
 	}
 	post.Header.Set("content-type", "application/json")
-	resp, err := g.HTTPClient().Do(post)
+	resp, err := g.bearerClient().Do(post)
 	if err != nil {
 		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
 	}
@@ -1065,7 +1154,39 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 	if err != nil {
 		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned an unusable token: %w", ask.Audience, err)
 	}
-	return token, issued.ExpiresAt, nil
+	// An expiry this process cannot use is a boundary error, not a capability to
+	// cache. Treated as "already lapsed" it would look like success while
+	// re-running an audited mint on every single read — correct answers, no
+	// error, no log. The two unusable shapes have different causes and different
+	// fixes, so they get different messages.
+	now := time.Now()
+	lifetime := issued.ExpiresAt.Sub(now)
+	switch {
+	case issued.ExpiresAt.IsZero():
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf(
+			"work context mint for %q returned no expiry: the issuer omitted expiresAt, or spelled it differently (protobuf JSON spells it expires_at, which does not decode into this field)",
+			ask.Audience)
+	case lifetime < workContextMinimumLifetime:
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf(
+			"work context mint for %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
+			ask.Audience, issued.ExpiresAt.UTC().Format(time.RFC3339), workContextMinimumLifetime)
+	}
+	// Renew ahead of expiry, but never by more than half the capability's own
+	// life: a lead longer than the lifetime would make every capability
+	// uncacheable, and the issuer's chosen lifetime is not this process's to
+	// veto.
+	lead := workContextRenewal
+	if half := lifetime / 2; half < lead {
+		lead = half
+		warnedShortWorkContextLifetime.Do(func() {
+			// Honoured, but say so once: at this lifetime a capability cannot be
+			// held across a whole request, so the mint rate is the issuer's
+			// setting and not a defect here.
+			log.Printf("work contexts are issued with a %s lifetime, shorter than the %s renewal lead: one will be re-minted roughly every %s",
+				lifetime.Round(time.Second), workContextRenewal, lead.Round(time.Second))
+		})
+	}
+	return token, issued.ExpiresAt.Add(-lead), nil
 }
 
 // workContextCache holds the capabilities minted while serving one request. The
@@ -1074,27 +1195,74 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 type workContextCache struct {
 	mu     sync.Mutex
 	minted map[string]issuedWorkContext
+	// minting holds the mint in flight for an ask, so concurrent asks for the
+	// same one wait on it instead of each running their own. A handler that
+	// fans out would otherwise spend one audited mint per goroutine for a
+	// capability they all share.
+	minting map[string]*pendingMint
+}
+
+func newWorkContextCache() *workContextCache {
+	return &workContextCache{
+		minted:  map[string]issuedWorkContext{},
+		minting: map[string]*pendingMint{},
+	}
 }
 
 type issuedWorkContext struct {
-	token     codefly.WorkContextToken
-	expiresAt time.Time
+	token codefly.WorkContextToken
+	// reuseUntil is when this capability stops being worth presenting — its
+	// expiry less the renewal lead mint already applied.
+	reuseUntil time.Time
 }
 
-func (c *workContextCache) lookup(key string) (codefly.WorkContextToken, bool) {
+// pendingMint is one mint in flight. Its result fields are written before done
+// is closed and read only after, so the close/receive pair orders them.
+type pendingMint struct {
+	done  chan struct{}
+	token codefly.WorkContextToken
+	err   error
+}
+
+// resolve returns the capability for one ask, running mint only when the cache
+// holds none that will outlive the call and no other caller is already minting
+// it.
+func (c *workContextCache) resolve(
+	ctx context.Context,
+	key string,
+	mint func(context.Context) (codefly.WorkContextToken, time.Time, error),
+) (codefly.WorkContextToken, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	issued, ok := c.minted[key]
-	if !ok || time.Now().After(issued.expiresAt.Add(-workContextRenewal)) {
-		return codefly.WorkContextToken{}, false
+	if issued, ok := c.minted[key]; ok && time.Now().Before(issued.reuseUntil) {
+		c.mu.Unlock()
+		return issued.token, nil
 	}
-	return issued.token, true
-}
+	if inflight, ok := c.minting[key]; ok {
+		c.mu.Unlock()
+		select {
+		case <-inflight.done:
+			// The leader's outcome is this caller's outcome. Retrying its
+			// failure here would turn one refusal into one mint per waiter.
+			return inflight.token, inflight.err
+		case <-ctx.Done():
+			return codefly.WorkContextToken{}, ctx.Err()
+		}
+	}
+	inflight := &pendingMint{done: make(chan struct{})}
+	c.minting[key] = inflight
+	c.mu.Unlock()
 
-func (c *workContextCache) store(key string, token codefly.WorkContextToken, expiresAt time.Time) {
+	token, reuseUntil, err := mint(ctx)
+	inflight.token, inflight.err = token, err
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.minted[key] = issuedWorkContext{token: token, expiresAt: expiresAt}
+	delete(c.minting, key)
+	if err == nil {
+		c.minted[key] = issuedWorkContext{token: token, reuseUntil: reuseUntil}
+	}
+	c.mu.Unlock()
+	close(inflight.done)
+	return token, err
 }
 
 // Unary makes a typed Connect call to a fully-qualified procedure through the
@@ -1111,15 +1279,23 @@ func Unary[Req, Resp any](ctx context.Context, gw *Gateway, procedure string, re
 }
 
 type bearerTransport struct {
-	bearer      string
-	workContext codefly.WorkContextToken
-	base        http.RoundTripper
+	bearer string
+	// acting, when set, is the delegated gateway this transport presents a
+	// capability for. It is resolved per round trip rather than captured here:
+	// a capability captured once lapses while the handler still holds the
+	// gateway, and the edge rejects a stale context before routing.
+	acting *Gateway
+	base   http.RoundTripper
 }
 
 func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r.Header.Set("authorization", t.bearer)
-	if t.workContext.Encoded() != "" {
-		if err := codefly.AttachWorkContext(r, t.workContext); err != nil {
+	if t.acting != nil {
+		token, err := t.acting.workContext(r.Context())
+		if err != nil {
+			return nil, err
+		}
+		if err := codefly.AttachWorkContext(r, token); err != nil {
 			return nil, err
 		}
 	}

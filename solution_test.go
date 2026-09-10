@@ -1548,15 +1548,16 @@ func TestParseModuleRegistrationSecrets(t *testing.T) {
 // --- Work Context ---
 
 // mintRequest is what the accounts StartTask RPC received: the ask itself, plus
-// the bearer it was presented with — the credential that decides whose Task is
-// minted.
+// the credentials it was presented with — the bearer, which decides whose Task
+// is minted, and any capability that rode along, which none should.
 type mintRequest struct {
-	OrgID           string  `json:"orgId"`
-	TaskID          string  `json:"taskId"`
-	SessionID       string  `json:"sessionId"`
-	Audience        string  `json:"audience"`
-	AuthorityScopes []Scope `json:"authorityScopes"`
-	Bearer          string  `json:"-"`
+	OrgID           string             `json:"orgId"`
+	TaskID          string             `json:"taskId"`
+	SessionID       string             `json:"sessionId"`
+	Audience        string             `json:"audience"`
+	AuthorityScopes []workContextScope `json:"authorityScopes"`
+	Bearer          string             `json:"-"`
+	WorkContext     string             `json:"-"`
 }
 
 // moduleCall is what a composed module behind the gateway received: the two
@@ -1575,10 +1576,18 @@ type workContextGateway struct {
 	mints chan mintRequest
 	calls chan moduleCall
 
-	// tokenTTL is how long an issued capability is claimed to be valid.
+	// tokenTTL is how long an issued capability is claimed to be valid, on the
+	// issuer's clock. Negative stands in for this host's clock running ahead of
+	// the issuer's, which is indistinguishable here from an expiry gone by.
 	tokenTTL time.Duration
+	// omitExpiry drops expiresAt from the issued capability — the shape an
+	// issuer spelling it expires_at (protobuf JSON) produces on this decoder.
+	omitExpiry bool
 	// mintStatus, when non-zero, is what StartTask answers instead of issuing.
 	mintStatus int
+	// mintDelay holds each mint open, so concurrent asks genuinely overlap
+	// rather than serialising by luck.
+	mintDelay time.Duration
 
 	mu     sync.Mutex
 	minted int
@@ -1588,8 +1597,8 @@ const modulePath = "/v1/documents/collection"
 
 func newWorkContextGateway(t *testing.T, gw *workContextGateway) *workContextGateway {
 	t.Helper()
-	gw.mints = make(chan mintRequest, 8)
-	gw.calls = make(chan moduleCall, 8)
+	gw.mints = make(chan mintRequest, 16)
+	gw.calls = make(chan moduleCall, 16)
 	if gw.tokenTTL == 0 {
 		gw.tokenTTL = 5 * time.Minute
 	}
@@ -1604,6 +1613,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		var mint mintRequest
 		_ = json.NewDecoder(r.Body).Decode(&mint)
 		mint.Bearer = r.Header.Get("authorization")
+		mint.WorkContext = r.Header.Get(codefly.WorkContextHeaderName)
 		send(g.mints, mint)
 		if g.mintStatus != 0 {
 			writeJSON(w, g.mintStatus, map[string]string{
@@ -1617,10 +1627,14 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		// Two segments: the wire shape sdk-go accepts for a signed capability.
 		token := fmt.Sprintf("context-%s.%d", mint.Audience, g.minted)
 		g.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"token":     token,
-			"expiresAt": time.Now().Add(g.tokenTTL).UTC().Format(time.RFC3339Nano),
-		})
+		if g.mintDelay > 0 {
+			time.Sleep(g.mintDelay)
+		}
+		issued := map[string]any{"token": token}
+		if !g.omitExpiry {
+			issued["expiresAt"] = time.Now().Add(g.tokenTTL).UTC().Format(time.RFC3339Nano)
+		}
+		writeJSON(w, http.StatusOK, issued)
 	case modulePath:
 		call := moduleCall{
 			Bearer:      r.Header.Get("authorization"),
@@ -1643,6 +1657,20 @@ func (g *workContextGateway) mintCount() int {
 	return g.minted
 }
 
+// getThrough issues one module read on an already-derived gateway.
+func getThrough(ctx context.Context, gw *Gateway) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gw.BaseURL()+modulePath, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := gw.HTTPClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer drainAndClose(resp)
+	return resp.StatusCode, nil
+}
+
 // readModule drives the composed-module read the way a solution handler does:
 // derive a gateway for the module, then call it through that gateway's client.
 func readModule(ctx context.Context, gw *Gateway, audience string) (int, error) {
@@ -1650,16 +1678,19 @@ func readModule(ctx context.Context, gw *Gateway, audience string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, module.BaseURL()+modulePath, nil)
-	if err != nil {
-		return 0, err
+	return getThrough(ctx, module)
+}
+
+// lapseCachedCapabilities backdates every capability the request has cached,
+// standing in for the issuer's TTL running out while a handler still holds a
+// gateway it derived earlier.
+func lapseCachedCapabilities(gw *Gateway) {
+	gw.contexts.mu.Lock()
+	defer gw.contexts.mu.Unlock()
+	for key, issued := range gw.contexts.minted {
+		issued.reuseUntil = time.Now().Add(-time.Second)
+		gw.contexts.minted[key] = issued
 	}
-	resp, err := module.HTTPClient().Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer drainAndClose(resp)
-	return resp.StatusCode, nil
 }
 
 // serveHandler runs one solution handler behind the runtime's own wrapper, so a
@@ -1674,6 +1705,8 @@ func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Se
 	return server
 }
 
+const viewerOrg = "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11"
+
 // viewerRequest is the request the gateway forwards to a solution: the viewer's
 // bearer, plus the canonical identity headers it injects after authenticating.
 func viewerRequest(t *testing.T, target string) *http.Response {
@@ -1683,7 +1716,7 @@ func viewerRequest(t *testing.T, target string) *http.Response {
 		t.Fatalf("new request: %v", err)
 	}
 	req.Header.Set("authorization", "Bearer viewer-token")
-	req.Header.Set(orgHeader, "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11")
+	req.Header.Set(orgHeader, viewerOrg)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)
@@ -1717,13 +1750,13 @@ func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
 	if mint.Bearer != "Bearer viewer-token" {
 		t.Errorf("mint presented bearer %q, want the viewer's — accounts must resolve the viewer as owner", mint.Bearer)
 	}
-	if mint.OrgID != "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11" {
+	if mint.OrgID != viewerOrg {
 		t.Errorf("mint org = %q, want the org the gateway injected", mint.OrgID)
 	}
 	if mint.Audience != "documents" {
 		t.Errorf("mint audience = %q, want %q", mint.Audience, "documents")
 	}
-	want := []Scope{{ResourceKind: "documents", Actions: []string{"read"}}}
+	want := []workContextScope{{ResourceKind: "documents", Actions: []string{"read"}}}
 	if !reflect.DeepEqual(mint.AuthorityScopes, want) {
 		t.Errorf("mint scopes = %v, want %v", mint.AuthorityScopes, want)
 	}
@@ -1769,13 +1802,47 @@ func TestForModuleMintsOncePerAsk(t *testing.T) {
 	}
 }
 
-// TestForModuleMintsAgainWhenTheCachedContextIsAboutToLapse proves the cache
-// respects the issuer's TTL rather than holding a capability for the life of
-// the request: one that would lapse mid-flight is replaced, not presented.
-func TestForModuleMintsAgainWhenTheCachedContextIsAboutToLapse(t *testing.T) {
-	gw := newWorkContextGateway(t, &workContextGateway{tokenTTL: workContextRenewal / 2})
+// TestForModuleMintsOncePerAskUnderConcurrency covers the fan-out a sequential
+// test cannot see: a handler deriving the same ask from several goroutines must
+// spend one audited mint, not one per goroutine.
+func TestForModuleMintsOncePerAskUnderConcurrency(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{mintDelay: 50 * time.Millisecond})
 	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
-		for range 2 {
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := readModule(ctx, g, "documents"); err != nil {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		return "done", <-errs
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("minted %d capabilities for one ask across 8 goroutines, want 1", got)
+	}
+}
+
+// TestForModuleReusesAShortLivedCapability is the test the silent-flood bug
+// needed. An issuer whose lifetime is shorter than the renewal lead must not
+// make every capability uncacheable: the lead is clamped to half the lifetime,
+// so the cache still holds. Without that clamp this mints once per read while
+// answering every read correctly — no error, no log.
+func TestForModuleReusesAShortLivedCapability(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{tokenTTL: 6 * time.Second})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		for range 3 {
 			if _, err := readModule(ctx, g, "documents"); err != nil {
 				return nil, err
 			}
@@ -1788,8 +1855,169 @@ func TestForModuleMintsAgainWhenTheCachedContextIsAboutToLapse(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
 	}
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("minted %d capabilities across 3 reads, want 1 — a lifetime shorter than the renewal lead must clamp the lead, not defeat the cache", got)
+	}
+}
+
+// TestForModuleRefusesACapabilityWithNoExpiry refuses loudly rather than
+// caching something that can never be reused. Treated as "already lapsed" this
+// mints on every read forever while every read still succeeds, which is the
+// failure mode that never shows up in a log.
+func TestForModuleRefusesACapabilityWithNoExpiry(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{omitExpiry: true})
+	var mintErr error
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		_, mintErr = g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		return nil, mintErr
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if mintErr == nil {
+		t.Fatal("ForModule accepted a capability with no expiry")
+	}
+	// The spelling hint is the whole value of the message: expires_at is what a
+	// protobuf-JSON issuer sends, and it decodes to the zero time in silence.
+	for _, want := range []string{"documents", "no expiry", "expires_at"} {
+		if !strings.Contains(mintErr.Error(), want) {
+			t.Errorf("error %q does not mention %q", mintErr, want)
+		}
+	}
+	select {
+	case call := <-gw.calls:
+		t.Errorf("module was read anyway, with work context %q", call.WorkContext)
+	default:
+	}
+}
+
+// TestForModuleRefusesAnExpiryThisHostCannotUse covers clock skew, which needs
+// no misconfiguration anywhere: accounts would still accept the capability, so
+// left alone every read succeeds and every read mints.
+func TestForModuleRefusesAnExpiryThisHostCannotUse(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{tokenTTL: -time.Minute})
+	var mintErr error
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		_, mintErr = g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		return nil, mintErr
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if mintErr == nil {
+		t.Fatal("ForModule accepted an expiry already gone by")
+	}
+	if !strings.Contains(mintErr.Error(), "clock") {
+		t.Errorf("error %q does not point at the clock, the one thing that explains it", mintErr)
+	}
+}
+
+// TestWorkContextCacheReMintsALapsedCapability pins the cache's own expiry rule
+// without waiting on a real TTL: a capability past its reuse deadline is minted
+// afresh rather than presented.
+func TestWorkContextCacheReMintsALapsedCapability(t *testing.T) {
+	cache := newWorkContextCache()
+	mints := 0
+	lapsed := func(context.Context) (codefly.WorkContextToken, time.Time, error) {
+		mints++
+		token, err := codefly.ParseWorkContextToken(fmt.Sprintf("payload.%d", mints))
+		if err != nil {
+			t.Fatalf("parse token: %v", err)
+		}
+		return token, time.Now().Add(-time.Second), nil
+	}
+	for range 2 {
+		if _, err := cache.resolve(context.Background(), "ask", lapsed); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+	}
+	if mints != 2 {
+		t.Errorf("minted %d times, want 2 — a capability past its reuse deadline must not be handed out", mints)
+	}
+}
+
+// TestDerivedGatewayResolvesTheCapabilityPerRequest is the fix for a gateway
+// that snapshotted its capability at derivation. A handler may hold the derived
+// gateway for as long as it holds the request; when the capability lapses
+// mid-request the next call must carry a fresh one. Snapshotted, it carries the
+// stale one and the edge rejects it before the module is ever reached — worse
+// than the bearer-only gateway this replaced.
+func TestDerivedGatewayResolvesTheCapabilityPerRequest(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := getThrough(ctx, docs); err != nil {
+			return nil, err
+		}
+		lapseCachedCapabilities(g)
+		if _, err := getThrough(ctx, docs); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	first, second := <-gw.calls, <-gw.calls
+	if first.WorkContext != "context-documents.1" {
+		t.Errorf("first read carried %q, want the first capability", first.WorkContext)
+	}
+	if second.WorkContext != "context-documents.2" {
+		t.Errorf("read after the capability lapsed carried %q, want a freshly minted one — the derived gateway is holding a snapshot", second.WorkContext)
+	}
 	if got := gw.mintCount(); got != 2 {
-		t.Errorf("minted %d capabilities, want 2 — a capability this short-lived must not be reused", got)
+		t.Errorf("minted %d capabilities, want 2", got)
+	}
+}
+
+// TestMintCarriesNoOtherModulesCapability keeps the mint on a bearer-only
+// client. Riding a capability minted for one module along on the request that
+// mints another's is harmless only until the first lapses: the edge verifies
+// every presented context, so it would then 401 the call meant to replace it.
+func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		// Chaining off a derived gateway is the natural reach: ForModule is a
+		// method on every Gateway, including one already acting for a module.
+		if _, err := docs.ForModule(ctx, "billing", Scope{ResourceKind: "invoices", Actions: []string{"read"}}); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	for range 2 {
+		mint := <-gw.mints
+		if mint.WorkContext != "" {
+			t.Errorf("mint for %q carried work context %q, want none", mint.Audience, mint.WorkContext)
+		}
+		if mint.Bearer != "Bearer viewer-token" {
+			t.Errorf("mint for %q carried bearer %q, want the viewer's", mint.Audience, mint.Bearer)
+		}
+	}
+}
+
+// TestGatewayTrafficIsNeverProxied keeps the viewer's credentials off an
+// arbitrary egress host. Every gateway target is composition-local, and these
+// requests carry the bearer and the capability minted for it in headers — the
+// same reasoning that already forbids proxying registration traffic.
+func TestGatewayTrafficIsNeverProxied(t *testing.T) {
+	if gatewayTransport.Proxy != nil {
+		t.Error("gatewayTransport carries a proxy: with HTTP(S)_PROXY set and a NO_PROXY that misses the in-cluster gateway, the viewer's bearer and Work Context would be dialled to an arbitrary egress host")
 	}
 }
 
@@ -1826,7 +2054,9 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 
 // TestForModuleRefusesWithoutTheViewersOrg fails on the runtime side rather than
 // sending a mint accounts is certain to refuse: a Task is minted inside exactly
-// one organization, and the bearer alone does not name it.
+// one organization, and the bearer alone does not name it. The message must own
+// the common case — the gateway does inject the header, and injects it empty
+// for a viewer with no organization selected.
 func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
 	_, err := newGateway(gw.URL, "Bearer viewer-token", "").
@@ -1834,8 +2064,10 @@ func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
 	if err == nil {
 		t.Fatal("ForModule minted a work context with no organization")
 	}
-	if !strings.Contains(err.Error(), orgHeader) {
-		t.Errorf("error %q does not name %s, the header that is missing", err, orgHeader)
+	for _, want := range []string{orgHeader, "empty"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q: the header is present-but-empty for a viewer with no org, and naming only the absent case misdirects", err, want)
+		}
 	}
 	if got := gw.mintCount(); got != 0 {
 		t.Errorf("minted %d capabilities, want 0", got)
@@ -1848,16 +2080,7 @@ func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
 func TestGatewayWithoutAModuleCarriesOnlyTheBearer(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
 	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.BaseURL()+modulePath, nil)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := g.HTTPClient().Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer drainAndClose(resp)
-		return resp.StatusCode, nil
+		return getThrough(ctx, g)
 	})
 
 	resp := viewerRequest(t, solution.URL)

@@ -132,6 +132,13 @@ and nothing more. The returned gateway then carries **both** credentials — the
 bearer and the capability — on every request, so a module verifying either one
 is satisfied.
 
+The returned gateway holds the *ask*, not the capability: it resolves one per
+request. A handler may therefore keep it for as long as it keeps the viewer's
+request. A capability captured once at derivation would lapse while the handler
+still held it, and the gateway verifies freshness on any presented context
+*before* routing — so a stale one is rejected at the edge and never reaches the
+module at all, which is worse than the bearer-only client it replaced.
+
 The audience is the module's facade entry-point: the `as` of its `api.consumes`
 target above, which is both what the gateway routes `/v1/<as>/*` to and what the
 module verifies as its own audience. A solution declares the consumption once
@@ -140,14 +147,33 @@ and names it here.
 A mint is scoped to one organization, which the bearer does not carry. It comes
 from `x-org-id`, one of the canonical identity headers the gateway injects after
 authenticating the caller; a request reaching a handler without it is refused
-here rather than sent to accounts to be refused there.
+here rather than sent to accounts to be refused there. The gateway injects that
+header from the caller's *active* org, so it arrives present-but-empty for a
+viewer with no organization selected and for an org-less API key — the refusal
+names both shapes, because pointing only at an absent header sends whoever
+reads it to inspect one the gateway demonstrably did set.
 
 Minting is an audited event on accounts, so capabilities are cached per (org,
 audience, scopes) and shared by every gateway derived from the one a handler was
-given: a handler reading a module repeatedly mints once. The cache honours the
-issuer's expiry — a capability with too little life left to survive the call is
-minted afresh — and lives no longer than the request, since the gateway that
-owns it does not.
+given: a handler reading a module repeatedly mints once, and so does one that
+fans the same ask out across goroutines — concurrent asks wait on the single
+mint in flight rather than each running their own. The cache lives no longer
+than the request, since the gateway that owns it does not.
+
+The cache refuses to accept an expiry it cannot use, rather than caching one it
+can never reuse. An expiry that is absent, or that this host's clock reads as
+already gone by, would otherwise read as "always lapsed" — every call correct,
+no error, no log, and one audited mint per read. Both are reported, separately,
+because an issuer that omitted `expiresAt` (or spelled it `expires_at`, as
+protobuf JSON does) and a host clock skewed past the credential's lifetime have
+different fixes. A capability whose whole life is shorter than the renewal lead
+is not refused: the lead is clamped to half its lifetime, with a one-time log,
+because how long a credential lives is the issuer's call and not this runtime's
+to veto.
+
+This traffic is not proxied, for the same reason registration traffic is not:
+every gateway target is composition-local, and these requests carry the viewer's
+bearer and the capability minted for them in headers.
 
 > **Note:** SDK in-process endpoint resolution for a solution composed on an
 > out-of-repo host depends on codefly-core accepting the composed module path in
