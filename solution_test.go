@@ -1544,3 +1544,333 @@ func TestParseModuleRegistrationSecrets(t *testing.T) {
 		})
 	}
 }
+
+// --- Work Context ---
+
+// mintRequest is what the accounts StartTask RPC received: the ask itself, plus
+// the bearer it was presented with — the credential that decides whose Task is
+// minted.
+type mintRequest struct {
+	OrgID           string  `json:"orgId"`
+	TaskID          string  `json:"taskId"`
+	SessionID       string  `json:"sessionId"`
+	Audience        string  `json:"audience"`
+	AuthorityScopes []Scope `json:"authorityScopes"`
+	Bearer          string  `json:"-"`
+}
+
+// moduleCall is what a composed module behind the gateway received: the two
+// credentials the read is authenticated with.
+type moduleCall struct {
+	Bearer      string
+	WorkContext string
+}
+
+// workContextGateway stands in for the host gateway on the two routes a
+// Work-Context-authenticated read crosses: the accounts mint, and the module
+// itself. A module answers only a request carrying a context minted for it, as
+// the real one does — a bearer alone is Unauthenticated.
+type workContextGateway struct {
+	*httptest.Server
+	mints chan mintRequest
+	calls chan moduleCall
+
+	// tokenTTL is how long an issued capability is claimed to be valid.
+	tokenTTL time.Duration
+	// mintStatus, when non-zero, is what StartTask answers instead of issuing.
+	mintStatus int
+
+	mu     sync.Mutex
+	minted int
+}
+
+const modulePath = "/v1/documents/collection"
+
+func newWorkContextGateway(t *testing.T, gw *workContextGateway) *workContextGateway {
+	t.Helper()
+	gw.mints = make(chan mintRequest, 8)
+	gw.calls = make(chan moduleCall, 8)
+	if gw.tokenTTL == 0 {
+		gw.tokenTTL = 5 * time.Minute
+	}
+	gw.Server = httptest.NewServer(http.HandlerFunc(gw.serve))
+	t.Cleanup(gw.Close)
+	return gw
+}
+
+func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case workContextStartTaskProcedure:
+		var mint mintRequest
+		_ = json.NewDecoder(r.Body).Decode(&mint)
+		mint.Bearer = r.Header.Get("authorization")
+		send(g.mints, mint)
+		if g.mintStatus != 0 {
+			writeJSON(w, g.mintStatus, map[string]string{
+				"code":    "permission_denied",
+				"message": "caller holds no such authority",
+			})
+			return
+		}
+		g.mu.Lock()
+		g.minted++
+		// Two segments: the wire shape sdk-go accepts for a signed capability.
+		token := fmt.Sprintf("context-%s.%d", mint.Audience, g.minted)
+		g.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"token":     token,
+			"expiresAt": time.Now().Add(g.tokenTTL).UTC().Format(time.RFC3339Nano),
+		})
+	case modulePath:
+		call := moduleCall{
+			Bearer:      r.Header.Get("authorization"),
+			WorkContext: r.Header.Get(codefly.WorkContextHeaderName),
+		}
+		send(g.calls, call)
+		if call.WorkContext == "" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"collection": "handbook"})
+	default:
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func (g *workContextGateway) mintCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.minted
+}
+
+// readModule drives the composed-module read the way a solution handler does:
+// derive a gateway for the module, then call it through that gateway's client.
+func readModule(ctx context.Context, gw *Gateway, audience string) (int, error) {
+	module, err := gw.ForModule(ctx, audience, Scope{ResourceKind: "documents", Actions: []string{"read"}})
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, module.BaseURL()+modulePath, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := module.HTTPClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer drainAndClose(resp)
+	return resp.StatusCode, nil
+}
+
+// serveHandler runs one solution handler behind the runtime's own wrapper, so a
+// test exercises the same Gateway a real request produces — including the
+// viewer identity the gateway injects, which wrap is the only place to read.
+func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Server {
+	t.Helper()
+	s := New(Manifest{ID: "wiki", Title: "Wiki"})
+	s.cfg = config{gatewayURL: gatewayURL}
+	server := httptest.NewServer(s.wrap(handler))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// viewerRequest is the request the gateway forwards to a solution: the viewer's
+// bearer, plus the canonical identity headers it injects after authenticating.
+func viewerRequest(t *testing.T, target string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("authorization", "Bearer viewer-token")
+	req.Header.Set(orgHeader, "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("call solution: %v", err)
+	}
+	return resp
+}
+
+// TestForModuleMintsAndPresentsTheViewersWorkContext is the whole point of the
+// feature: a module that authenticates by signed Work Context refuses the
+// bearer the runtime used to forward alone, so the read only succeeds because
+// the runtime minted a capability for the viewer and presented it alongside.
+func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	var status int
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		var err error
+		status, err = readModule(ctx, g, "documents")
+		return status, err
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("module answered %d, want 200 — the read was not authenticated", status)
+	}
+
+	mint := <-gw.mints
+	if mint.Bearer != "Bearer viewer-token" {
+		t.Errorf("mint presented bearer %q, want the viewer's — accounts must resolve the viewer as owner", mint.Bearer)
+	}
+	if mint.OrgID != "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11" {
+		t.Errorf("mint org = %q, want the org the gateway injected", mint.OrgID)
+	}
+	if mint.Audience != "documents" {
+		t.Errorf("mint audience = %q, want %q", mint.Audience, "documents")
+	}
+	want := []Scope{{ResourceKind: "documents", Actions: []string{"read"}}}
+	if !reflect.DeepEqual(mint.AuthorityScopes, want) {
+		t.Errorf("mint scopes = %v, want %v", mint.AuthorityScopes, want)
+	}
+	// A Task and its root Session are named per mint, and accounts requires
+	// both to be UUIDs — an empty or reused id is refused before the handler.
+	if mint.TaskID == "" || mint.SessionID == "" || mint.TaskID == mint.SessionID {
+		t.Errorf("mint task/session = %q/%q, want two distinct ids", mint.TaskID, mint.SessionID)
+	}
+
+	call := <-gw.calls
+	if call.WorkContext != "context-documents.1" {
+		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
+	}
+	if call.Bearer != "Bearer viewer-token" {
+		t.Errorf("module read carried bearer %q, want the viewer's — the context is presented alongside it, not instead", call.Bearer)
+	}
+}
+
+// TestForModuleMintsOncePerAsk pins the cache: minting is an audited event on
+// accounts, so a handler reading the same module repeatedly must not mint per
+// read. A different audience is a different ask and does mint again.
+func TestForModuleMintsOncePerAsk(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		for range 3 {
+			if _, err := readModule(ctx, g, "documents"); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := g.ForModule(ctx, "billing", Scope{ResourceKind: "invoices", Actions: []string{"read"}}); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	if got := gw.mintCount(); got != 2 {
+		t.Errorf("minted %d capabilities, want 2 (one per distinct ask)", got)
+	}
+}
+
+// TestForModuleMintsAgainWhenTheCachedContextIsAboutToLapse proves the cache
+// respects the issuer's TTL rather than holding a capability for the life of
+// the request: one that would lapse mid-flight is replaced, not presented.
+func TestForModuleMintsAgainWhenTheCachedContextIsAboutToLapse(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{tokenTTL: workContextRenewal / 2})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		for range 2 {
+			if _, err := readModule(ctx, g, "documents"); err != nil {
+				return nil, err
+			}
+		}
+		return "done", nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	if got := gw.mintCount(); got != 2 {
+		t.Errorf("minted %d capabilities, want 2 — a capability this short-lived must not be reused", got)
+	}
+}
+
+// TestForModuleSurfacesARefusedMint keeps the Connect code and message the
+// authority gave. Without them a refusal is a bare 502 at the solution, which
+// is exactly the dead end this issue started from.
+func TestForModuleSurfacesARefusedMint(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{mintStatus: http.StatusForbidden})
+	var mintErr error
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		_, mintErr = g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		return nil, mintErr
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("solution answered %d, want 502", resp.StatusCode)
+	}
+	if mintErr == nil {
+		t.Fatal("ForModule succeeded against a refusing authority")
+	}
+	for _, want := range []string{"documents", "403", "permission_denied", "caller holds no such authority"} {
+		if !strings.Contains(mintErr.Error(), want) {
+			t.Errorf("mint error %q does not mention %q", mintErr, want)
+		}
+	}
+	select {
+	case call := <-gw.calls:
+		t.Errorf("module was read anyway, with work context %q", call.WorkContext)
+	default:
+	}
+}
+
+// TestForModuleRefusesWithoutTheViewersOrg fails on the runtime side rather than
+// sending a mint accounts is certain to refuse: a Task is minted inside exactly
+// one organization, and the bearer alone does not name it.
+func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	_, err := newGateway(gw.URL, "Bearer viewer-token", "").
+		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+	if err == nil {
+		t.Fatal("ForModule minted a work context with no organization")
+	}
+	if !strings.Contains(err.Error(), orgHeader) {
+		t.Errorf("error %q does not name %s, the header that is missing", err, orgHeader)
+	}
+	if got := gw.mintCount(); got != 0 {
+		t.Errorf("minted %d capabilities, want 0", got)
+	}
+}
+
+// TestGatewayWithoutAModuleCarriesOnlyTheBearer pins that nothing changed for a
+// solution calling the gateway directly: the Work Context header appears only
+// on a gateway derived for a module.
+func TestGatewayWithoutAModuleCarriesOnlyTheBearer(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.BaseURL()+modulePath, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := g.HTTPClient().Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer drainAndClose(resp)
+		return resp.StatusCode, nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+
+	call := <-gw.calls
+	if call.WorkContext != "" {
+		t.Errorf("undelegated gateway sent work context %q, want none", call.WorkContext)
+	}
+	if call.Bearer != "Bearer viewer-token" {
+		t.Errorf("undelegated gateway sent bearer %q, want the viewer's", call.Bearer)
+	}
+	if got := gw.mintCount(); got != 0 {
+		t.Errorf("minted %d capabilities without ForModule, want 0", got)
+	}
+}

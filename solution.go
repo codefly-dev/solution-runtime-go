@@ -24,12 +24,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/resources"
 	"github.com/codefly-dev/core/solution/manifest"
 	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/google/uuid"
 )
 
 // Manifest is the small, solution-specific description the author provides.
@@ -468,7 +470,7 @@ func (s *Server) wrap(handler Handler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		result, err := handler(r.Context(), &Gateway{baseURL: s.cfg.gatewayURL, bearer: bearer})
+		result, err := handler(r.Context(), newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader)))
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
@@ -901,17 +903,198 @@ func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, err
 // that forwards that bearer and the gateway base URL, so a solution can drive
 // its own generated SDK against the gateway — every call stays authenticated
 // and routed through the gateway.
+//
+// A module that authenticates by signed Work Context refuses a bearer alone;
+// ForModule derives a gateway that carries both.
 type Gateway struct {
 	baseURL string
 	bearer  string
+	// orgID is the viewer's organization, which the bearer alone does not
+	// carry. A Work Context is minted inside exactly one org.
+	orgID string
+	// workContext is the capability this gateway presents alongside the bearer.
+	// Empty on the gateway a handler is given, set on one derived by ForModule.
+	workContext codefly.WorkContextToken
+	contexts    *workContextCache
+}
+
+func newGateway(baseURL, bearer, orgID string) *Gateway {
+	return &Gateway{
+		baseURL:  baseURL,
+		bearer:   bearer,
+		orgID:    orgID,
+		contexts: &workContextCache{minted: map[string]issuedWorkContext{}},
+	}
 }
 
 func (g *Gateway) BaseURL() string { return g.baseURL }
 
-// HTTPClient returns an http.Client that injects the caller's bearer on every
-// request. Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
+// HTTPClient returns an http.Client that injects the caller's bearer — and, on
+// a gateway derived by ForModule, the viewer's Work Context — on every request.
+// Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
 func (g *Gateway) HTTPClient() *http.Client {
-	return &http.Client{Transport: bearerTransport{bearer: g.bearer, base: http.DefaultTransport}}
+	return &http.Client{Transport: bearerTransport{bearer: g.bearer, workContext: g.workContext, base: http.DefaultTransport}}
+}
+
+// --- Work Context ---
+//
+// The platform's module-facing auth model is not the bearer: a module derives
+// tenant and subject from a signed capability naming it as the audience, and
+// answers Unauthenticated to a bearer alone. The gateway only verifies and
+// forwards a context that is already presented — nobody mints one for the
+// viewer — so a solution reading a composed module has to mint it here.
+
+// workContextStartTaskProcedure is the accounts RPC that mints a Task Work
+// Context. The gateway routes it like any other Connect procedure, so it is
+// reached on the same base URL the solution's module calls already use.
+const workContextStartTaskProcedure = "/saas.accounts.v1.WorkContextService/StartTask"
+
+// orgHeader carries the viewer's organization. The gateway injects it after it
+// authenticates the bearer, replacing anything the caller sent.
+const orgHeader = "x-org-id"
+
+// workContextMintTimeout bounds one mint, so a stalled gateway surfaces as a
+// failed handler rather than holding the viewer's request open indefinitely.
+const workContextMintTimeout = 10 * time.Second
+
+// workContextRenewal is the remaining validity below which a cached capability
+// is minted afresh instead of reused, so one never lapses between here and the
+// module's check.
+const workContextRenewal = 10 * time.Second
+
+// Scope is one slice of authority requested for a Work Context: what the module
+// may be asked to do, on which resources, on the viewer's behalf. Empty
+// ResourceIDs grants the actions across the whole ResourceKind.
+type Scope struct {
+	ResourceKind string   `json:"resourceKind"`
+	Actions      []string `json:"actions,omitempty"`
+	ResourceIDs  []string `json:"resourceIds,omitempty"`
+}
+
+// ForModule returns a Gateway that acts for the viewer against one composed
+// module. It mints a Task Work Context owned and actored by the viewer — the
+// bearer is forwarded, so accounts resolves the same subject the module would
+// have seen — naming audience and carrying no more authority than scopes, and
+// presents it alongside the bearer on every request the returned gateway makes.
+//
+// audience is the module's facade entry-point: the `as` of its api.consumes
+// target, which is both what the gateway routes /v1/<as>/* to and what the
+// module verifies as its own audience. A solution declares the consumption
+// once and names it here.
+//
+// One ask mints once. The capability is cached per (org, audience, scopes) and
+// shared with every gateway derived from the one the handler was given, so a
+// handler reading a module repeatedly does not re-mint — minting is an audited
+// event on accounts, not a free call.
+func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scope) (*Gateway, error) {
+	if g.orgID == "" {
+		return nil, fmt.Errorf("cannot mint a work context for %q: the request carries no %s, so the viewer's organization is unknown", audience, orgHeader)
+	}
+	ask := startTaskRequest{OrgID: g.orgID, Audience: audience, AuthorityScopes: scopes}
+	// The ask is the cache identity. The task and session ids below name one
+	// mint rather than what was asked for, so they are filled in after.
+	key, err := json.Marshal(ask)
+	if err != nil {
+		return nil, err
+	}
+	token, cached := g.contexts.lookup(string(key))
+	if !cached {
+		ask.TaskID, ask.SessionID = uuid.NewString(), uuid.NewString()
+		minted, expiresAt, err := g.mint(ctx, ask)
+		if err != nil {
+			return nil, err
+		}
+		g.contexts.store(string(key), minted, expiresAt)
+		token = minted
+	}
+	presenting := *g
+	presenting.workContext = token
+	return &presenting, nil
+}
+
+// startTaskRequest is saas.accounts.v1.StartTaskWorkContextRequest on the wire.
+// The runtime speaks it as Connect JSON rather than linking the accounts client:
+// a solution's host is not this package's dependency. Leaving actorPrincipalId
+// unset is what makes the viewer both owner and actor of the Task.
+type startTaskRequest struct {
+	OrgID           string  `json:"orgId"`
+	TaskID          string  `json:"taskId"`
+	SessionID       string  `json:"sessionId"`
+	Audience        string  `json:"audience"`
+	AuthorityScopes []Scope `json:"authorityScopes"`
+}
+
+func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkContextToken, time.Time, error) {
+	body, err := json.Marshal(ask)
+	if err != nil {
+		return codefly.WorkContextToken{}, time.Time{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, workContextMintTimeout)
+	defer cancel()
+	post, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+workContextStartTaskProcedure, bytes.NewReader(body))
+	if err != nil {
+		return codefly.WorkContextToken{}, time.Time{}, err
+	}
+	post.Header.Set("content-type", "application/json")
+	resp, err := g.HTTPClient().Do(post)
+	if err != nil {
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
+	}
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		// Connect reports a refusal as a code and message under a mapped HTTP
+		// status. Carry it through: an authority the viewer does not hold reads
+		// nothing like a gateway that never routed the mint, and the status
+		// alone cannot tell them apart.
+		var refusal struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q rejected (status %d, %q): %s",
+			ask.Audience, resp.StatusCode, refusal.Code, refusal.Message)
+	}
+	var issued struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
+	}
+	token, err := codefly.ParseWorkContextToken(issued.Token)
+	if err != nil {
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned an unusable token: %w", ask.Audience, err)
+	}
+	return token, issued.ExpiresAt, nil
+}
+
+// workContextCache holds the capabilities minted while serving one request. The
+// gateway a handler receives owns it and every gateway derived from that one
+// shares it, so the cache lives exactly as long as the viewer's request.
+type workContextCache struct {
+	mu     sync.Mutex
+	minted map[string]issuedWorkContext
+}
+
+type issuedWorkContext struct {
+	token     codefly.WorkContextToken
+	expiresAt time.Time
+}
+
+func (c *workContextCache) lookup(key string) (codefly.WorkContextToken, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	issued, ok := c.minted[key]
+	if !ok || time.Now().After(issued.expiresAt.Add(-workContextRenewal)) {
+		return codefly.WorkContextToken{}, false
+	}
+	return issued.token, true
+}
+
+func (c *workContextCache) store(key string, token codefly.WorkContextToken, expiresAt time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.minted[key] = issuedWorkContext{token: token, expiresAt: expiresAt}
 }
 
 // Unary makes a typed Connect call to a fully-qualified procedure through the
@@ -928,12 +1111,18 @@ func Unary[Req, Resp any](ctx context.Context, gw *Gateway, procedure string, re
 }
 
 type bearerTransport struct {
-	bearer string
-	base   http.RoundTripper
+	bearer      string
+	workContext codefly.WorkContextToken
+	base        http.RoundTripper
 }
 
 func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r.Header.Set("authorization", t.bearer)
+	if t.workContext.Encoded() != "" {
+		if err := codefly.AttachWorkContext(r, t.workContext); err != nil {
+			return nil, err
+		}
+	}
 	return t.base.RoundTrip(r)
 }
 

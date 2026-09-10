@@ -3,7 +3,8 @@
 Generic Go runtime for **codefly solutions** — independently deployed modules
 that plug into a host at runtime with no build-time coupling. Owns registration
 (host + gateway, with heartbeat), CORS, Module Federation asset serving, the
-capability handshake, the manifest, and a bearer-forwarding gateway client.
+capability handshake, the manifest, and the gateway client each handler uses
+to read composed modules on the viewer's behalf.
 
 A solution author writes a manifest and one handler:
 
@@ -104,6 +105,49 @@ comma-separated `prefix:secret` entries — the plaintext twin of the
 registered, so the runtime skips it with a log naming this variable rather than
 beating against a guaranteed 401. Provisioning both halves is the composition's
 job (`codefly run solution`).
+
+### Reading a Work-Context-authenticated module
+
+The gateway client a handler receives forwards the viewer's bearer. That is
+enough for the accounts API, but not for a module that authenticates by signed
+**Work Context**: it derives tenant and subject from `x-codefly-work-context`
+and answers `Unauthenticated` to a bearer alone. The gateway only verifies and
+forwards a context that is already presented — nothing mints one for the viewer
+— so `Gateway.ForModule` does:
+
+```go
+docs, err := gw.ForModule(ctx, "documents",
+    solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
+if err != nil {
+    return nil, err
+}
+resp, err := solution.Unary[Req, Resp](ctx, docs, "/docs.v1.Documents/List", &Req{})
+```
+
+`ForModule` mints a Task Work Context through accounts' `StartTask`, presenting
+the viewer's bearer so accounts resolves the same subject the module would have
+seen. It names no actor principal, which makes the viewer both owner and actor
+of the Task; the audience is the module; the authority is the scopes asked for
+and nothing more. The returned gateway then carries **both** credentials — the
+bearer and the capability — on every request, so a module verifying either one
+is satisfied.
+
+The audience is the module's facade entry-point: the `as` of its `api.consumes`
+target above, which is both what the gateway routes `/v1/<as>/*` to and what the
+module verifies as its own audience. A solution declares the consumption once
+and names it here.
+
+A mint is scoped to one organization, which the bearer does not carry. It comes
+from `x-org-id`, one of the canonical identity headers the gateway injects after
+authenticating the caller; a request reaching a handler without it is refused
+here rather than sent to accounts to be refused there.
+
+Minting is an audited event on accounts, so capabilities are cached per (org,
+audience, scopes) and shared by every gateway derived from the one a handler was
+given: a handler reading a module repeatedly mints once. The cache honours the
+issuer's expiry — a capability with too little life left to survive the call is
+minted afresh — and lives no longer than the request, since the gateway that
+owns it does not.
 
 > **Note:** SDK in-process endpoint resolution for a solution composed on an
 > out-of-repo host depends on codefly-core accepting the composed module path in
