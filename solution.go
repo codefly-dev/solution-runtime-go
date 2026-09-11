@@ -53,13 +53,31 @@ type Manifest struct {
 }
 
 // Handler is a solution endpoint. It receives a Gateway bound to the caller's
-// bearer and returns any JSON-serializable value (or an error → 502).
+// bearer and returns any JSON-serializable value. Errors return 502 unless they
+// contain a ClientError specifying a 4xx response.
 type Handler func(ctx context.Context, gw *Gateway) (any, error)
+
+// RequestHandler receives the incoming request and the same caller-bound Gateway
+// as Handler. Implementations must bound and validate request bodies before use.
+// Return a ClientError to reject invalid input with a 4xx status; other errors
+// use the runtime's normal 502 JSON error response.
+type RequestHandler func(r *http.Request, gw *Gateway) (any, error)
+
+// ClientError rejects a request with StatusCode (400–499) and a public Message.
+// Handlers may wrap it with %w; only Message is sent to the caller, so wrapping
+// context stays private. An invalid StatusCode is treated as a handler error
+// and returns 502 instead. Both Handle and HandleRequest support ClientError.
+type ClientError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *ClientError) Error() string { return e.Message }
 
 // Server wires a manifest and handlers into a running solution.
 type Server struct {
 	manifest Manifest
-	handlers map[string]Handler
+	handlers map[string]RequestHandler
 	cfg      config
 	// registrationInterval is how long a registration heartbeat waits between
 	// beats. Zero means defaultRegistrationInterval. Per-server rather than a
@@ -435,11 +453,19 @@ func New(manifest Manifest) *Server {
 	if manifest.Contract == "" {
 		manifest.Contract = "lastlogin"
 	}
-	return &Server{manifest: manifest, handlers: make(map[string]Handler)}
+	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler)}
 }
 
 // Handle registers a solution endpoint. Chainable.
 func (s *Server) Handle(path string, handler Handler) *Server {
+	return s.HandleRequest(path, func(r *http.Request, gw *Gateway) (any, error) {
+		return handler(r.Context(), gw)
+	})
+}
+
+// HandleRequest registers an endpoint that consumes request input. It uses the
+// same bearer forwarding, organisation binding and CORS as Handle.
+func (s *Server) HandleRequest(path string, handler RequestHandler) *Server {
 	s.handlers[path] = handler
 	return s
 }
@@ -479,7 +505,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("/.well-known/capabilities", withCORS(s.handleCapabilities))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	for path, handler := range s.handlers {
-		mux.HandleFunc(path, withCORS(s.wrap(handler)))
+		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
 	}
 	mux.Handle("/assets/", http.StripPrefix("/assets/",
 		withCORSHandler(http.FileServer(http.Dir(s.cfg.assetsDir)))))
@@ -640,15 +666,26 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) wrap(handler Handler) http.HandlerFunc {
+	return s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
+		return handler(r.Context(), gw)
+	})
+}
+
+func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bearer := r.Header.Get("authorization")
 		if bearer == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		result, err := handler(r.Context(), newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader)))
+		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader)))
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			status, message := http.StatusBadGateway, err.Error()
+			var clientErr *ClientError
+			if errors.As(err, &clientErr) && clientErr != nil && clientErr.StatusCode >= 400 && clientErr.StatusCode <= 499 {
+				status, message = clientErr.StatusCode, clientErr.Message
+			}
+			writeJSON(w, status, map[string]string{"error": message})
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
