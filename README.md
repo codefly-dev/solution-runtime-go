@@ -35,12 +35,13 @@ the SDK-resolved value is the default.
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally) | `GATEWAY_URL` |
 | Host frontend URL | resolved by role — the single module owning the `frontend` `http`/`http` endpoint, discovered the same way | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
-| Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
+| Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` (must end in `/solutions/_register`, see below) |
 | Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
 | Gateway module token URL | the module register URL above with `/modules/_register` swapped for `/modules/_registration-token`, so it keeps that gateway's base path | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
 | Gateway solution token URL | the gateway register URL above with `/solutions/_register` swapped for `/solutions/_registration-token`, same reasoning | `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Solution registration secret | `codefly.For(ctx).WorkspaceSecret("solution-registration", "SECRET")` — see [Self-registration](#self-registration) | `CODEFLY__SOLUTION_REGISTRATION_SECRET` |
+| Registration beat interval | `15s` | `CODEFLY__SOLUTION_REGISTRATION_INTERVAL` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
 
@@ -105,7 +106,43 @@ it.
 
 A refusal that carries reasons (the host's `409 incompatible_runtime`, say) is
 logged with them, again whenever the reasons change and not only when the status
-does.
+does — up to a handful of distinct reasons per status, after which the log says
+it is suppressing them. The reasons are text the host chooses, so one that
+varies per attempt (the `jti` of the token it just burned, say) must not be able
+to turn the log into a stream of one line per beat.
+
+Two consequences of deriving the exchange from the registration endpoint are
+worth stating outright, because both turn a working deployment into a failing
+one:
+
+- `GATEWAY_REGISTER_URL`, if you override it, **must end in
+  `/solutions/_register`** — that suffix is what the exchange URL is derived
+  from by swapping it. An override with any other path cannot be paired, and
+  the boot is refused naming both this variable and
+  `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, which you can set explicitly
+  instead. This variable was free-form before the exchange existed.
+- Both self-registrations now mint through the gateway, so a gateway outage
+  fails the **host frontend** registration too, even though the frontend is
+  healthy. A beat that never reached its registration surface minted nothing,
+  so it retries on a much shorter backoff cap (30s) than a beat the surface
+  actually refused (2m) — the long cap exists to bound audited mints, and an
+  unreachable dependency produces none, so paying it there would only keep this
+  solution out of a healthy host's nav for longer than necessary.
+
+Every registration request refuses to follow redirects, for the same reason none
+of them may be proxied: `net/http` strips only `Authorization`, `WWW-Authenticate`
+and `Cookie` when a redirect crosses hosts, so the `X-Codefly-*` headers these
+requests carry — the plaintext registration secret and the cluster-internal
+token — would be handed to whatever a `Location` named.
+
+A beat is not free any more: each self-registration beat runs an exchange whose
+every success is an audited mint on the issuer, so at the 15s default across two
+surfaces a solution mints roughly 11.5k tokens a day. The right period is
+whatever the host's registration TTL allows, which this runtime cannot observe —
+set `CODEFLY__SOLUTION_REGISTRATION_INTERVAL` (a Go duration, minimum `1s`) when
+you know both numbers. An unparseable or too-small value fails the boot rather
+than falling back to the default, so a typo cannot silently restore the fast
+beat you were trying to slow down.
 
 The manifest declares the contract majors it is built against
 (`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving the host
