@@ -298,29 +298,6 @@ func solutionRegistrationSecret(ctx context.Context) string {
 	return secret
 }
 
-// secretProvisioningUnknown refuses the boot when no registration secret
-// resolved *and* the SDK failed to load Codefly's environment — because then
-// "none was provisioned" is a guess, and the runtime is about to act on it.
-//
-// Unchecked, a failed load came up looking healthy — port bound, /health 200,
-// manifest served — registered with the cluster-internal token that a host on
-// module-saas-starter >= v0.0.61 refuses, and told whoever read the log that
-// provisioning was the missing half: the one thing that may well be fine. That
-// is the same come-up-healthy-on-the-wrong-port failure validate() exists to
-// prevent, so it fails loud here for the same reason.
-//
-// It fires only in the genuinely ambiguous case. A secret that resolved proves
-// the load error did not matter, and a clean load proves an absent secret is
-// really absent — so neither the provisioned path nor the documented
-// no-secret compatibility path can be caught by this.
-func secretProvisioningUnknown(secret string, envLoadErr error) error {
-	if secret != "" || envLoadErr == nil {
-		return nil
-	}
-	return fmt.Errorf("cannot tell whether a registration secret was provisioned: loading Codefly's environment failed (%w) and no secret resolved from %s or workspace secret %s/%s, so \"none provisioned\" would be a guess — registering on it would present the cluster-internal token a host on module-saas-starter >= v0.0.61 refuses, while blaming provisioning that may be correct",
-		envLoadErr, SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup, SolutionRegistrationSecretKey)
-}
-
 // validate rejects a config the runtime cannot actually serve or register with.
 // When neither the SDK nor an explicit env override resolves a value, loadConfig
 // leaves it empty; without this check Serve would bind ":"+"" — which the kernel
@@ -339,17 +316,20 @@ func (c config) validate() error {
 		"gateway register URL": c.gatewayRegisterURL,
 		"module register URL":  c.moduleRegisterURL,
 		"module token URL":     c.moduleTokenURL,
-	}
-	if c.solutionSecret != "" {
-		// Only a provisioned secret makes the exchange part of the boot path; a
-		// composition on a host that still admits the cluster-internal token
-		// must not be refused for an endpoint it never calls.
-		required["solution token URL"] = c.solutionTokenURL
+		"solution token URL":   c.solutionTokenURL,
 	}
 	for name, raw := range required {
 		if u, err := url.Parse(raw); err != nil || !u.IsAbs() || u.Host == "" {
 			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
 		}
+	}
+	if c.solutionSecret == "" {
+		// The host admits a registration only against a credential minted from
+		// this secret; without it every beat is a guaranteed refusal, so the
+		// boot fails here, naming the provisioning, rather than coming up
+		// looking healthy while nothing is served.
+		return fmt.Errorf("no solution registration secret provisioned: set %s, or provision the workspace secret %s/%s and declare that group as a workspace-configuration dependency of this backend",
+			SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup, SolutionRegistrationSecretKey)
 	}
 	return nil
 }
@@ -377,17 +357,10 @@ func (s *Server) Serve() error {
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-secret lookups resolve from them (falling back to
 	// the local native workspace map when not running under the runtime).
-	envLoadErr := codefly.LoadEnvironmentVariables()
-	if envLoadErr != nil {
-		log.Printf("codefly: load environment: %v", envLoadErr)
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		log.Printf("codefly: load environment: %v", err)
 	}
 	s.cfg = loadConfig(ctx, s.manifest.ID)
-	// Checked before validate() because it is the same class of fault and the
-	// narrower one: validate() catches an unresolved config, this catches a
-	// config that resolved into the wrong auth mode on a missing signal.
-	if err := secretProvisioningUnknown(s.cfg.solutionSecret, envLoadErr); err != nil {
-		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
-	}
 	if err := s.cfg.validate(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -501,21 +474,11 @@ func (s *Server) registerConsumedAPIs(ctx context.Context) {
 	}
 }
 
-// selfRegistrationCredentials chooses what the host and gateway
-// self-registrations present. With a registration secret provisioned, each
-// heartbeat gets its own solutionCredential: the credential is single-use on
-// both surfaces, so two beats sharing one would race for the same jti. Without
-// one, the cluster-internal token is presented as before — a host that still
-// admits it keeps working, and a host that no longer does refuses every beat,
-// which the heartbeat then reports; the one log line here says which half is
-// missing, because "rejected (status 401)" alone points at the wrong place.
+// selfRegistrationCredentials gives the host and gateway self-registrations a
+// solutionCredential each: the credential is single-use on both surfaces, so
+// two beats sharing one would race for the same jti. validate() has already
+// refused a boot without a secret; there is no other credential to present.
 func (s *Server) selfRegistrationCredentials() (host, gateway registrationAuth) {
-	if s.cfg.solutionSecret == "" {
-		log.Printf("solution %q: no registration secret provisioned (%s, or workspace secret %s/%s): self-registration presents the cluster-internal token alone, which a host on module-saas-starter >= v0.0.61 refuses (publisher-bound solution registration)",
-			s.manifest.ID, SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup, SolutionRegistrationSecretKey)
-		internal := internalTokenAuth(s.cfg.internalToken)
-		return internal, internal
-	}
 	credential := func() *solutionCredential {
 		return &solutionCredential{
 			tokenURL:      s.cfg.solutionTokenURL,
@@ -1143,17 +1106,6 @@ const (
 // deliberately different values.
 const solutionTokenMinimumLifetime = time.Second
 
-// solutionExchangeProbeMaxSkip bounds how many beats the credential waits
-// before probing the exchange again once a host has 404'd it. A host that
-// genuinely predates the contract answers 404 for as long as it runs *and*
-// accepts the beat that follows, so the heartbeat's own backoff — which only
-// widens on a failing beat — never slows the probe: the credential would re-ask
-// a route it knows is absent on every beat, forever, on both heartbeats. At the
-// 15s default this caps the re-probe at 2 minutes, matching
-// registrationBackoffCap, so an upgraded host is still picked up without a
-// restart.
-const solutionExchangeProbeMaxSkip = 8
-
 // solutionMintReportEvery is how many mints pass between one line reporting the
 // running count. Minting one token per beat per surface is the contract's
 // consequence and not a defect, but it is an audited event on the issuer, and
@@ -1171,94 +1123,23 @@ type solutionCredential struct {
 	id            string
 	secret        string
 
-	// refused records that the host refused whatever the beat now in flight
+	// refused records that the host refused the token the beat now in flight
 	// presented. Nothing here is cached, so a refusal can never be staleness;
 	// the flag only bounds the diagnostic to one line per refusal episode.
 	refused bool
-	// fellBack records that the beat now in flight presented the
-	// cluster-internal token because the exchange answered 404. invalidate
-	// needs it: a refused minted token and a refused fallback have opposite
-	// causes, opposite fixes, and opposite things to tell the reader.
-	fellBack bool
-	// exchanged records that this host has answered the exchange at least once.
-	// After that a 404 is a fault and never a host version, so the fallback is
-	// not taken again: a downgrade left available on every beat lets anyone who
-	// can answer 404 at tokenURL turn the publisher-bound credential back into
-	// the shared cluster-internal token.
-	exchanged bool
-	// skipBeats counts down the beats left before the exchange is probed again,
-	// and probeSkip is the current spacing it reloads from (see
-	// solutionExchangeProbeMaxSkip).
-	skipBeats int
-	probeSkip int
 	// minted counts the tokens this credential has obtained, so the cost of
 	// minting one per beat is visible here and not only on the issuer.
 	minted int
 }
 
 func (c *solutionCredential) authorize(ctx context.Context, req *http.Request) error {
-	if c.skipBeats > 0 {
-		// Inside the spacing an earlier 404 bought. This host has never served
-		// the exchange, so re-asking is known-useless; present what it does
-		// admit, silently — the notice was logged when the 404 landed.
-		c.skipBeats--
-		c.fellBack = true
-		return internalTokenAuth(c.internalToken).authorize(ctx, req)
-	}
 	token, err := c.exchange(ctx)
-	if errors.Is(err, errNoSolutionExchange) {
-		if c.exchanged {
-			// This host has minted here before, so it does not predate the
-			// contract and this is no compatibility path — it is a downgrade to
-			// a credential the host refuses. Fail the beat and name the route,
-			// which is the thing that actually broke.
-			c.fellBack = false
-			return fmt.Errorf("the solution registration exchange at %s answered 404, but this host has minted a token there before: the route is gone or the URL is wrong (%s, or the %s it is derived from) — refusing to downgrade to the cluster-internal token this host does not accept",
-				c.tokenURL, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", "GATEWAY_REGISTER_URL")
-		}
-		// A host from before the publisher-bound contract has no exchange to
-		// offer and still admits the cluster-internal token; present that, as
-		// the runtime did before, so one composition boots against either host
-		// version.
-		c.spaceOutProbe()
-		c.fellBack = true
-		return internalTokenAuth(c.internalToken).authorize(ctx, req)
-	}
 	if err != nil {
 		return err
 	}
-	c.fellBack = false
-	c.probeSkip, c.skipBeats = 0, 0
 	req.Header.Set(solutionRegistrationHeader, token)
 	return nil
 }
-
-// spaceOutProbe widens the gap before the exchange is probed again after a 404,
-// and announces the fallback the first time.
-//
-// The notice deliberately stops short of concluding *which* cause it is: a 404
-// alone cannot tell a host from before the contract apart from a wrong exchange
-// URL, and the registration that follows can — it is accepted by the first and
-// refused by the second. Asserting the old-host reading here is what sent a
-// reader chasing a host version while a misderived URL was the fault.
-func (c *solutionCredential) spaceOutProbe() {
-	switch {
-	case c.probeSkip == 0:
-		log.Printf("solution %q: the solution registration exchange at %s answered 404, so this beat presents the cluster-internal token instead: either this host predates the publisher-bound contract (module-saas-starter < v0.0.61) and accepts it, or the exchange URL is wrong and it is refused — the registration's own outcome says which",
-			c.id, c.tokenURL)
-		c.probeSkip = 1
-	case c.probeSkip < solutionExchangeProbeMaxSkip:
-		if c.probeSkip *= 2; c.probeSkip > solutionExchangeProbeMaxSkip {
-			c.probeSkip = solutionExchangeProbeMaxSkip
-		}
-	}
-	c.skipBeats = c.probeSkip
-}
-
-// errNoSolutionExchange reports a host with no /solutions/_registration-token
-// route at all — one from before the publisher-bound contract — as opposed to
-// one that refused the exchange.
-var errNoSolutionExchange = errors.New("solution registration exchange not offered by this host")
 
 // invalidate is what a refusal calls. There is no cached token to drop — every
 // beat presents one minted for it — so the refusal cannot be about staleness,
@@ -1271,16 +1152,6 @@ func (c *solutionCredential) invalidate() {
 		return
 	}
 	c.refused = true
-	if c.fellBack {
-		// The disproof. This host refuses the cluster-internal token, which is
-		// exactly what a host from before the publisher-bound contract accepts
-		// — so whatever the 404 suggested, it is not an old host, and no
-		// credential was minted for this beat either. Neither provisioning nor
-		// publisher ownership is implicated, so do not send the reader there.
-		log.Printf("solution %q: the cluster-internal token was refused, which proves this host is not one from before the publisher-bound contract: the 404 from the exchange at %s is a routing or URL fault (check %s, or the %s it is derived from) and no registration credential was minted for this beat",
-			c.id, c.tokenURL, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", "GATEWAY_REGISTER_URL")
-		return
-	}
 	log.Printf("registration for solution %q was refused while presenting a token minted for that same beat: the exchange accepted this solution's secret, so provisioning is not the cause — check that %q is not registered by another publisher and that the host trusts the issuer that signed the token",
 		c.id, c.id)
 }
@@ -1312,19 +1183,15 @@ func (c *solutionCredential) exchange(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer drainAndClose(resp)
-	if resp.StatusCode != http.StatusNotFound {
-		// Anything but an unrouted path — a mint, or a refusal of this secret —
-		// proves the host serves the exchange. Latched here rather than on
-		// success alone so that a 200 carrying an unusable token still counts:
-		// the route existing is what a later 404 has to be judged against.
-		c.exchanged = true
-	}
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
-		// The gateway routes this path only once it implements the contract;
-		// before that, an unrouted path is a plain 404.
-		return "", errNoSolutionExchange
+		// An unrouted path: a host from before the publisher-bound contract
+		// (module-saas-starter < v0.0.61, not supported), or a wrong URL. There
+		// is no other credential to fall back to — the shared cluster-internal
+		// token proves no publisher — so the beat fails and names the route.
+		return "", fmt.Errorf("the solution registration exchange at %s answered 404: this host does not serve publisher-bound registration (module-saas-starter < v0.0.61 is not supported) or the URL is wrong (%s, or the %s it is derived from)",
+			c.tokenURL, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", "GATEWAY_REGISTER_URL")
 	default:
 		// accounts answers an undeclared id and a wrong secret identically, and
 		// the gateway relays that; naming both here is what the reader needs.

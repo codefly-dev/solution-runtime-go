@@ -95,9 +95,7 @@ func TestServeRegistersOnListenPort(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hostSrv.Close()
-	gatewaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	gatewaySrv := httptest.NewServer(http.HandlerFunc(answeringTheExchange))
 	defer gatewaySrv.Close()
 
 	assets := t.TempDir()
@@ -113,9 +111,10 @@ func TestServeRegistersOnListenPort(t *testing.T) {
 
 	t.Setenv("PORT", port)
 	t.Setenv("HOST_REGISTER_URL", hostSrv.URL)
-	t.Setenv("GATEWAY_REGISTER_URL", gatewaySrv.URL)
+	t.Setenv("GATEWAY_REGISTER_URL", gatewaySrv.URL+solutionRegisterPath)
 	t.Setenv("GATEWAY_URL", gatewaySrv.URL)
 	t.Setenv("ASSETS_DIR", assets)
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
 
 	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"}).
 		Handle("/audit", func(context.Context, *Gateway) (any, error) {
@@ -242,9 +241,7 @@ func TestRegistrationPayloadCarriesDashboardVerbatim(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hostSrv.Close()
-	gatewaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	gatewaySrv := httptest.NewServer(http.HandlerFunc(answeringTheExchange))
 	defer gatewaySrv.Close()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -257,7 +254,9 @@ func TestRegistrationPayloadCarriesDashboardVerbatim(t *testing.T) {
 		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
 		publicURL:          "http://127.0.0.1",
 		hostRegisterURL:    hostSrv.URL,
-		gatewayRegisterURL: gatewaySrv.URL,
+		gatewayRegisterURL: gatewaySrv.URL + solutionRegisterPath,
+		solutionTokenURL:   gatewaySrv.URL + solutionRegistrationTokenPath,
+		solutionSecret:     "s3cret",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -337,6 +336,8 @@ func TestConfigValidate(t *testing.T) {
 		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
 		moduleRegisterURL:  "http://gateway:42152/modules/_register",
 		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
+		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
+		solutionSecret:     "s3cret",
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -354,6 +355,8 @@ func TestConfigValidate(t *testing.T) {
 		{"relative gateway register URL", func(c *config) { c.gatewayRegisterURL = "/solutions/_register" }},
 		{"relative module register URL", func(c *config) { c.moduleRegisterURL = "/modules/_register" }},
 		{"relative module token URL", func(c *config) { c.moduleTokenURL = "/modules/_registration-token" }},
+		{"relative solution token URL", func(c *config) { c.solutionTokenURL = "/solutions/_registration-token" }},
+		{"no solution registration secret", func(c *config) { c.solutionSecret = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1451,6 +1454,7 @@ func TestSiblingURLKeepsTheGatewayBasePath(t *testing.T) {
 	t.Setenv("PORT", "8090")
 	t.Setenv("GATEWAY_URL", "http://gateway:42152/gw")
 	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
 
 	cfg := loadConfig(context.Background(), "lastlogin-go")
 	if want := "http://gateway:42152/gw" + moduleRegisterPath; cfg.moduleRegisterURL != want {
@@ -1472,6 +1476,7 @@ func TestSiblingURLRefusesAnUnpairableOverride(t *testing.T) {
 	t.Setenv("GATEWAY_URL", "http://gateway:42152")
 	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
 	t.Setenv("GATEWAY_MODULE_REGISTER_URL", "https://other-gateway:9999/custom/registration-endpoint")
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
 
 	cfg := loadConfig(context.Background(), "lastlogin-go")
 	if cfg.moduleTokenURL != "" {

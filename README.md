@@ -91,34 +91,17 @@ local `codefly run solution` and a deployed cell:
   the SDK injects it. `CODEFLY__SOLUTION_REGISTRATION_SECRET` is an explicit
   override.
 
-One composition boots against either host version. With no secret provisioned
-the runtime registers the way it did before v0.0.61's contract — presenting the
-cluster-internal token — and the boot log says which half is missing, so
-against a newer host "rejected (status 401)" is not read as a gateway fault.
-(If the SDK could not load Codefly's environment at all, the runtime refuses to
-boot instead of reading an unresolved secret as an unprovisioned one: the two
-are indistinguishable from here, and guessing came up looking healthy while
-registering with a credential the host refuses.)
-
-With a secret provisioned but a host that answers `404` on
-`/solutions/_registration-token`, the beat presents the cluster-internal token
-instead and says so — without asserting *why*, because a `404` alone cannot tell
-a host from before v0.0.61 apart from a wrong exchange URL. The registration
-that follows settles it:
-
-- **accepted** — the host does predate the contract. The exchange keeps being
-  probed so an upgrade is picked up without a restart, at a widening interval
-  (up to 2 minutes) rather than on every beat, since a host that genuinely has
-  no such route also accepts the beat and so never triggers the heartbeat's own
-  backoff;
-- **refused** — the host requires the credential, which disproves the old-host
-  reading, so the log names the exchange route and the two variables it is
-  derived from as the fault rather than sending you to provisioning.
-
-Once a host has answered the exchange even once, the fallback is never taken
-again: a later `404` fails the beat instead, because a downgrade left available
-on every beat would let anything able to answer `404` at that URL turn the
-publisher-bound credential back into the shared cluster-internal token.
+There is no other credential, so there is no fallback. A boot without a
+provisioned secret is refused by `validate()`, naming the two provisioning
+paths, rather than coming up looking healthy while the host serves nothing.
+A `404` on `/solutions/_registration-token` fails the beat and names the route:
+either the host does not serve publisher-bound registration (module-saas-starter
+< v0.0.61, which this runtime does not support) or the exchange URL is wrong
+(`GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, or the `GATEWAY_REGISTER_URL` it is
+derived from). The shared cluster-internal token is never presented on a
+registration: it proves no publisher, and a downgrade path would let anything
+able to answer `404` at that URL turn the publisher-bound credential back into
+it.
 
 A refusal that carries reasons (the host's `409 incompatible_runtime`, say) is
 logged with them, again whenever the reasons change and not only when the status
