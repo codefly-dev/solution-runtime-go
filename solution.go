@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/resources"
@@ -73,8 +75,15 @@ type config struct {
 	gatewayRegisterURL          string
 	moduleRegisterURL           string
 	moduleTokenURL              string
-	selfUpstream, assetsDir     string
-	internalToken               string
+	// solutionTokenURL is the gateway exchange that mints this solution's own
+	// registration credential (see solutionCredential).
+	solutionTokenURL        string
+	selfUpstream, assetsDir string
+	internalToken           string
+	// solutionSecret is the registration secret the composition provisioned for
+	// this solution — the plaintext twin of the digest the host declares for its
+	// id. Empty when the composition provisioned none.
+	solutionSecret string
 	// moduleSecrets maps a consumed module's facade prefix to the registration
 	// secret the composition provisioned for it.
 	moduleSecrets map[string]string
@@ -248,19 +257,68 @@ func loadConfig(ctx context.Context, id string) config {
 		token, _ = codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")
 	}
 
+	// The solution's own registration exchange lives on the same gateway as its
+	// registration, for the reason the module pair does: the token minted by one
+	// gateway is trusted by that gateway's host, not by another's.
+	gatewayRegisterURL := env("GATEWAY_REGISTER_URL", gatewayURL+solutionRegisterPath)
+
 	return config{
 		port:               port,
 		publicURL:          public,
 		gatewayURL:         gatewayURL,
 		hostRegisterURL:    env("HOST_REGISTER_URL", frontendURL+"/api/solutions/register"),
-		gatewayRegisterURL: env("GATEWAY_REGISTER_URL", gatewayURL+"/solutions/_register"),
+		gatewayRegisterURL: gatewayRegisterURL,
 		moduleRegisterURL:  moduleRegisterURL,
 		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", siblingURL(moduleRegisterURL, moduleRegisterPath, moduleRegistrationTokenPath)),
+		solutionTokenURL:   env("GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", siblingURL(gatewayRegisterURL, solutionRegisterPath, solutionRegistrationTokenPath)),
 		selfUpstream:       env("SELF_UPSTREAM", public),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
 		internalToken:      token,
+		solutionSecret:     solutionRegistrationSecret(ctx),
 		moduleSecrets:      parseModuleRegistrationSecrets(env(ModuleRegistrationSecretsEnvironmentVariable, "")),
 	}
+}
+
+// solutionRegistrationSecret resolves the registration secret the composition
+// provisioned for this solution: an explicit environment override first, then
+// the namespaced workspace secret Codefly injects — resolved by name through the
+// SDK, exactly as the cluster-internal token is, so the same declaration serves
+// a local `codefly run` and a deployed cell. Empty means none resolved.
+//
+// The SDK's error is dropped because it carries no information: WorkspaceSecret
+// returns the same "no workspace configuration value" error whether the group
+// was never declared or the carriers it lives in never loaded. Telling those
+// apart is secretProvisioningUnknown's job, from the one signal that does
+// distinguish them — whether loading the environment failed at all.
+func solutionRegistrationSecret(ctx context.Context) string {
+	if secret := env(SolutionRegistrationSecretEnvironmentVariable, ""); secret != "" {
+		return secret
+	}
+	secret, _ := codefly.For(ctx).WorkspaceSecret(SolutionRegistrationSecretGroup, SolutionRegistrationSecretKey)
+	return secret
+}
+
+// secretProvisioningUnknown refuses the boot when no registration secret
+// resolved *and* the SDK failed to load Codefly's environment — because then
+// "none was provisioned" is a guess, and the runtime is about to act on it.
+//
+// Unchecked, a failed load came up looking healthy — port bound, /health 200,
+// manifest served — registered with the cluster-internal token that a host on
+// module-saas-starter >= v0.0.61 refuses, and told whoever read the log that
+// provisioning was the missing half: the one thing that may well be fine. That
+// is the same come-up-healthy-on-the-wrong-port failure validate() exists to
+// prevent, so it fails loud here for the same reason.
+//
+// It fires only in the genuinely ambiguous case. A secret that resolved proves
+// the load error did not matter, and a clean load proves an absent secret is
+// really absent — so neither the provisioned path nor the documented
+// no-secret compatibility path can be caught by this.
+func secretProvisioningUnknown(secret string, envLoadErr error) error {
+	if secret != "" || envLoadErr == nil {
+		return nil
+	}
+	return fmt.Errorf("cannot tell whether a registration secret was provisioned: loading Codefly's environment failed (%w) and no secret resolved from %s or workspace secret %s/%s, so \"none provisioned\" would be a guess — registering on it would present the cluster-internal token a host on module-saas-starter >= v0.0.61 refuses, while blaming provisioning that may be correct",
+		envLoadErr, SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup, SolutionRegistrationSecretKey)
 }
 
 // validate rejects a config the runtime cannot actually serve or register with.
@@ -275,13 +333,20 @@ func (c config) validate() error {
 	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
 	}
-	for name, raw := range map[string]string{
+	required := map[string]string{
 		"gateway URL":          c.gatewayURL,
 		"host register URL":    c.hostRegisterURL,
 		"gateway register URL": c.gatewayRegisterURL,
 		"module register URL":  c.moduleRegisterURL,
 		"module token URL":     c.moduleTokenURL,
-	} {
+	}
+	if c.solutionSecret != "" {
+		// Only a provisioned secret makes the exchange part of the boot path; a
+		// composition on a host that still admits the cluster-internal token
+		// must not be refused for an endpoint it never calls.
+		required["solution token URL"] = c.solutionTokenURL
+	}
+	for name, raw := range required {
 		if u, err := url.Parse(raw); err != nil || !u.IsAbs() || u.Host == "" {
 			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
 		}
@@ -312,10 +377,17 @@ func (s *Server) Serve() error {
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-secret lookups resolve from them (falling back to
 	// the local native workspace map when not running under the runtime).
-	if err := codefly.LoadEnvironmentVariables(); err != nil {
-		log.Printf("codefly: load environment: %v", err)
+	envLoadErr := codefly.LoadEnvironmentVariables()
+	if envLoadErr != nil {
+		log.Printf("codefly: load environment: %v", envLoadErr)
 	}
 	s.cfg = loadConfig(ctx, s.manifest.ID)
+	// Checked before validate() because it is the same class of fault and the
+	// narrower one: validate() catches an unresolved config, this catches a
+	// config that resolved into the wrong auth mode on a missing signal.
+	if err := secretProvisioningUnknown(s.cfg.solutionSecret, envLoadErr); err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	if err := s.cfg.validate(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -343,9 +415,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 
 	manifestBody, _ := json.Marshal(s.manifestMap())
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})
-	internal := internalTokenAuth(s.cfg.internalToken)
-	go s.heartbeat(ctx, s.cfg.hostRegisterURL, manifestBody, "host", internal)
-	go s.heartbeat(ctx, s.cfg.gatewayRegisterURL, upstreamBody, "gateway", internal)
+	hostAuth, gatewayAuth := s.selfRegistrationCredentials()
+	go s.heartbeat(ctx, s.cfg.hostRegisterURL, manifestBody, "host", hostAuth)
+	go s.heartbeat(ctx, s.cfg.gatewayRegisterURL, upstreamBody, "gateway", gatewayAuth)
 	s.registerConsumedAPIs(ctx)
 
 	srv := &http.Server{Handler: mux}
@@ -429,14 +501,52 @@ func (s *Server) registerConsumedAPIs(ctx context.Context) {
 	}
 }
 
+// selfRegistrationCredentials chooses what the host and gateway
+// self-registrations present. With a registration secret provisioned, each
+// heartbeat gets its own solutionCredential: the credential is single-use on
+// both surfaces, so two beats sharing one would race for the same jti. Without
+// one, the cluster-internal token is presented as before — a host that still
+// admits it keeps working, and a host that no longer does refuses every beat,
+// which the heartbeat then reports; the one log line here says which half is
+// missing, because "rejected (status 401)" alone points at the wrong place.
+func (s *Server) selfRegistrationCredentials() (host, gateway registrationAuth) {
+	if s.cfg.solutionSecret == "" {
+		log.Printf("solution %q: no registration secret provisioned (%s, or workspace secret %s/%s): self-registration presents the cluster-internal token alone, which a host on module-saas-starter >= v0.0.61 refuses (publisher-bound solution registration)",
+			s.manifest.ID, SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup, SolutionRegistrationSecretKey)
+		internal := internalTokenAuth(s.cfg.internalToken)
+		return internal, internal
+	}
+	credential := func() *solutionCredential {
+		return &solutionCredential{
+			tokenURL:      s.cfg.solutionTokenURL,
+			internalToken: s.cfg.internalToken,
+			id:            s.manifest.ID,
+			secret:        s.cfg.solutionSecret,
+		}
+	}
+	return credential(), credential()
+}
+
+// solutionManifestSchemaMajor and solutionHostContractMajor are the majors
+// this runtime's manifest and page contract are built against. The host checks
+// both before activating a remote, and treats a silent manifest as 1 — so these
+// say out loud what silence would assert, and become the place to bump when the
+// runtime moves to a newer host contract.
+const (
+	solutionManifestSchemaMajor = 1
+	solutionHostContractMajor   = 1
+)
+
 func (s *Server) manifestMap() map[string]any {
 	m := map[string]any{
-		"id":  s.manifest.ID,
-		"nav": map[string]any{"title": s.manifest.Title, "path": "/s/" + s.manifest.ID, "order": s.manifest.Order},
+		"id":            s.manifest.ID,
+		"schemaVersion": solutionManifestSchemaMajor,
+		"nav":           map[string]any{"title": s.manifest.Title, "path": "/s/" + s.manifest.ID, "order": s.manifest.Order},
 		"frontend": map[string]any{
 			"type":          "module-federation",
 			"manifestUrl":   s.cfg.publicURL + "/assets/mf-manifest.json",
 			"exposedModule": s.manifest.ExposedModule,
+			"hostContract":  solutionHostContractMajor,
 			"reactRange":    "^19",
 		},
 		"backend": map[string]any{"serviceAlias": s.manifest.ID, "capabilityPath": "/.well-known/capabilities"},
@@ -485,10 +595,11 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 		interval = defaultRegistrationInterval
 	}
 	lastStatus := 0
+	lastDetail := ""
 	lastErr := ""
 	failures := 0
 	for {
-		status, err := s.beat(ctx, url, body, auth)
+		status, detail, err := s.beat(ctx, url, body, auth)
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			// The credential we just presented was refused. Offer it for
 			// dropping so the next beat obtains a fresh one instead of replaying
@@ -513,15 +624,27 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 			// line per distinct error so a persistent outage doesn't spam.
 			if msg := err.Error(); msg != lastErr {
 				log.Printf("registration with %s failed for %q: %v", label, s.manifest.ID, err)
-				lastErr, lastStatus = msg, 0
+				lastErr, lastStatus, lastDetail = msg, 0, ""
 			}
-		case status != lastStatus:
-			if status < 300 {
+		// The reason is part of what was last reported, not just the status. A
+		// host that keeps answering 409 while changing why — one incompatibility
+		// resolved, a second one now named — would otherwise say it once and go
+		// silent on every reason after it, which is precisely the information
+		// detail was plumbed through beat to carry.
+		case status != lastStatus || detail != lastDetail:
+			switch {
+			case status < 300:
 				log.Printf("registered with %s as %q", label, s.manifest.ID)
-			} else {
+			case detail != "":
+				// The host says why. A refusal with reasons — an incompatible
+				// runtime contract, an id another publisher owns — is actionable
+				// only with them; the status alone sends whoever reads it to
+				// check provisioning.
+				log.Printf("registration with %s rejected (status %d) for %q: %s", label, status, s.manifest.ID, detail)
+			default:
 				log.Printf("registration with %s rejected (status %d) for %q", label, status, s.manifest.ID)
 			}
-			lastStatus, lastErr = status, ""
+			lastStatus, lastDetail, lastErr = status, detail, ""
 		default:
 			lastErr = ""
 		}
@@ -541,9 +664,29 @@ func (s *Server) heartbeat(ctx context.Context, url string, body []byte, label s
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff(interval, failures)):
+		case <-time.After(jittered(backoff(interval, failures))):
 		}
 	}
+}
+
+// registrationJitter is the fraction of a wait that is randomized. Every
+// heartbeat is started in the same instant by serve and shares one interval, so
+// without it the two self-registration credentials run their exchange in
+// lockstep — two simultaneous mints for the same solution id, every beat, for
+// the life of the process. A per-id rate limit or a coarse jti on the issuer
+// turns that into a registration that flaps for a reason invisible from here,
+// so the beats are spread rather than aligned.
+const registrationJitter = 0.2
+
+// jittered spreads a wait over [d, d+registrationJitter*d]. It only ever waits
+// longer, never shorter: the backoff a failing beat earned is a floor, and
+// shortening it would undo the request-rate bound it exists to impose.
+func jittered(d time.Duration) time.Duration {
+	spread := int64(float64(d) * registrationJitter)
+	if spread <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(spread))
 }
 
 // registrationBackoffCap bounds the retry interval of a failing registration.
@@ -571,23 +714,66 @@ func backoff(interval time.Duration, failures int) time.Duration {
 // between beats when a server names no interval of its own.
 const defaultRegistrationInterval = 15 * time.Second
 
-// beat performs one registration POST and returns the HTTP status, or an error
-// if the request could not be built or the round trip failed.
-func (s *Server) beat(ctx context.Context, url string, body []byte, auth registrationAuth) (int, error) {
+// beat performs one registration POST and returns the HTTP status — with, on a
+// refusal, whatever reason the server gave — or an error if the request could
+// not be built or the round trip failed.
+func (s *Server) beat(ctx context.Context, url string, body []byte, auth registrationAuth) (int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	req.Header.Set("content-type", "application/json")
 	if err := auth.authorize(ctx, req); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	resp, err := registrationClient.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	drainAndClose(resp)
-	return resp.StatusCode, nil
+	defer drainAndClose(resp)
+	return resp.StatusCode, refusalDetail(resp), nil
+}
+
+// refusalDetailMaxBytes bounds how much of a refusal body is read for the log.
+// A host's reasons are a short JSON object; anything larger is not a reason.
+const refusalDetailMaxBytes = 4 << 10
+
+// refusalDetail extracts the reason a registration was refused, when the host
+// gave one: the `reasons` list of an incompatible_runtime refusal, else its
+// `error` code. Empty for an accepted registration or a bodiless refusal.
+func refusalDetail(resp *http.Response) string {
+	if resp.StatusCode < 400 {
+		return ""
+	}
+	var refusal struct {
+		Error   string   `json:"error"`
+		Reasons []string `json:"reasons"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, refusalDetailMaxBytes)).Decode(&refusal); err != nil {
+		return ""
+	}
+	switch {
+	case len(refusal.Reasons) > 0 && refusal.Error != "":
+		return oneLine(refusal.Error + ": " + strings.Join(refusal.Reasons, "; "))
+	case len(refusal.Reasons) > 0:
+		return oneLine(strings.Join(refusal.Reasons, "; "))
+	default:
+		return oneLine(refusal.Error)
+	}
+}
+
+// oneLine flattens the control characters out of text the host chose, so a
+// reason carrying a newline cannot forge a log line of its own. The host is
+// composition-local, but its reasons quote values this runtime never saw — a
+// manifest field, an id another publisher registered — so what reaches the log
+// is the host's text and never the host's framing.
+func oneLine(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // drainAndClose consumes what is left of a response body before closing it, so
@@ -644,10 +830,12 @@ const moduleTokenRenewal = 30 * time.Second
 // mid-flight, so it is a boundary error rather than a credential.
 const moduleTokenMinimumLifetime = 5 * time.Second
 
-// moduleTokenExchangeTimeout bounds one exchange. The registration beat is on a
-// 15s cycle, so a stalled gateway must surface as a failed beat rather than
-// wedge the beat loop for that module.
-const moduleTokenExchangeTimeout = 10 * time.Second
+// registrationExchangeTimeout bounds one credential exchange — the module's and
+// the solution's alike, which need the identical bound rather than one of them
+// reaching into the other's constant. The registration beat is on a 15s cycle,
+// so a stalled gateway must surface as a failed beat rather than wedge the beat
+// loop for that module.
+const registrationExchangeTimeout = 10 * time.Second
 
 // registrationClient carries every registration request: the credential
 // exchange and the three registration heartbeats. It is NOT http.DefaultClient.
@@ -667,7 +855,7 @@ const moduleTokenExchangeTimeout = 10 * time.Second
 // registration and never answers: the beat blocks in Do forever, so that module
 // — or, for the self-registrations, this whole solution — silently stops
 // registering for the lifetime of the process, with no log and no recovery. The
-// exchange bounds itself with moduleTokenExchangeTimeout; this bounds the other
+// exchange bounds itself with registrationExchangeTimeout; this bounds the other
 // three call sites the same way.
 var registrationClient = &http.Client{
 	Timeout:   registrationTimeout,
@@ -675,7 +863,7 @@ var registrationClient = &http.Client{
 }
 
 // registrationTimeout bounds one registration request end to end. It matches
-// moduleTokenExchangeTimeout: a stalled gateway must surface as a failed beat,
+// registrationExchangeTimeout: a stalled gateway must surface as a failed beat,
 // which the heartbeat then backs off, rather than wedge the loop.
 const registrationTimeout = 10 * time.Second
 
@@ -828,7 +1016,7 @@ func (c *moduleCredential) succeeded() {
 // the module secret, which identifies this module to accounts, and the
 // cluster-internal token, which the gateway's own perimeter check requires.
 func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, error) {
-	ctx, cancel := context.WithTimeout(ctx, moduleTokenExchangeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, registrationExchangeTimeout)
 	defer cancel()
 
 	body, _ := json.Marshal(map[string]string{"prefix": c.prefix})
@@ -897,6 +1085,276 @@ func (c *moduleCredential) exchange(ctx context.Context) (string, time.Time, err
 		}
 	}
 	return issued.Token, issued.ExpiresAt.Add(-lead), nil
+}
+
+// --- Solution registration credentials ---
+//
+// The host binds a solution's registration to its publisher: the frontend
+// accepts a manifest, and the gateway an upstream, only against a signed,
+// solution-bound token that accounts mints to a caller presenting the
+// registration secret the composition declared for that id. The shared
+// cluster-internal token attests to no publisher and is refused on both
+// (module-saas-starter#540). A token is minted per attempt and burned on use by
+// each surface, so unlike the module credential there is nothing to cache: the
+// exchange runs before every beat.
+
+const (
+	solutionRegisterPath          = "/solutions/_register"
+	solutionRegistrationTokenPath = "/solutions/_registration-token"
+)
+
+const (
+	// solutionRegistrationHeader carries the signed, solution-bound token both
+	// /solutions/_register and /api/solutions/register require.
+	solutionRegistrationHeader = "X-Codefly-Solution-Registration"
+	// solutionSecretHeader carries this solution's own registration secret on
+	// the exchange that mints that token.
+	solutionSecretHeader = "X-Codefly-Solution-Secret"
+)
+
+// SolutionRegistrationSecretEnvironmentVariable carries the registration
+// secret a composition provisioned for this solution — the plaintext twin of
+// the `<id>:sha256hex` digest the same composition declared to the host in its
+// `SOLUTION_REGISTRATION_SECRETS`. It is an explicit override; the workspace
+// secret below is the declared path.
+const SolutionRegistrationSecretEnvironmentVariable = "CODEFLY__SOLUTION_REGISTRATION_SECRET"
+
+// SolutionRegistrationSecretGroup and SolutionRegistrationSecretKey name the
+// workspace secret the runtime resolves through the SDK when no override is
+// set: a composition declares the `solution-registration` group as a
+// workspace-configuration dependency of the solution's backend and provisions
+// `SECRET` in it (`codefly config generate solution-registration SECRET`
+// locally; the cell's secret store when deployed).
+const (
+	SolutionRegistrationSecretGroup = "solution-registration"
+	SolutionRegistrationSecretKey   = "SECRET"
+)
+
+// solutionTokenMinimumLifetime is the least remaining validity a minted
+// registration token must carry to be worth presenting. This credential is
+// presented on the very next round trip rather than held between beats, so the
+// floor bounds one request: whatever lifetime the issuer chose, a token that
+// outlives the registration POST is usable and must not be refused here.
+//
+// moduleTokenMinimumLifetime is 5s because that token *is* cached across beats,
+// and copying the figure over rejected every genuinely single-use credential an
+// issuer might mint — a 3s token failed every beat forever, with a message
+// blaming this host's clock. The two floors bound different things, so they are
+// deliberately different values.
+const solutionTokenMinimumLifetime = time.Second
+
+// solutionExchangeProbeMaxSkip bounds how many beats the credential waits
+// before probing the exchange again once a host has 404'd it. A host that
+// genuinely predates the contract answers 404 for as long as it runs *and*
+// accepts the beat that follows, so the heartbeat's own backoff — which only
+// widens on a failing beat — never slows the probe: the credential would re-ask
+// a route it knows is absent on every beat, forever, on both heartbeats. At the
+// 15s default this caps the re-probe at 2 minutes, matching
+// registrationBackoffCap, so an upgraded host is still picked up without a
+// restart.
+const solutionExchangeProbeMaxSkip = 8
+
+// solutionMintReportEvery is how many mints pass between one line reporting the
+// running count. Minting one token per beat per surface is the contract's
+// consequence and not a defect, but it is an audited event on the issuer, and
+// the only place its rate could be observed was the issuer's own audit trail.
+// If the burn-per-surface premise this design rests on ever stops holding, this
+// is the number that says what abandoning the cache is costing.
+const solutionMintReportEvery = 100
+
+// solutionCredential mints this solution's registration token and presents it
+// on one registration beat. Each self-registration heartbeat owns one, so it
+// needs no locking.
+type solutionCredential struct {
+	tokenURL      string
+	internalToken string
+	id            string
+	secret        string
+
+	// refused records that the host refused whatever the beat now in flight
+	// presented. Nothing here is cached, so a refusal can never be staleness;
+	// the flag only bounds the diagnostic to one line per refusal episode.
+	refused bool
+	// fellBack records that the beat now in flight presented the
+	// cluster-internal token because the exchange answered 404. invalidate
+	// needs it: a refused minted token and a refused fallback have opposite
+	// causes, opposite fixes, and opposite things to tell the reader.
+	fellBack bool
+	// exchanged records that this host has answered the exchange at least once.
+	// After that a 404 is a fault and never a host version, so the fallback is
+	// not taken again: a downgrade left available on every beat lets anyone who
+	// can answer 404 at tokenURL turn the publisher-bound credential back into
+	// the shared cluster-internal token.
+	exchanged bool
+	// skipBeats counts down the beats left before the exchange is probed again,
+	// and probeSkip is the current spacing it reloads from (see
+	// solutionExchangeProbeMaxSkip).
+	skipBeats int
+	probeSkip int
+	// minted counts the tokens this credential has obtained, so the cost of
+	// minting one per beat is visible here and not only on the issuer.
+	minted int
+}
+
+func (c *solutionCredential) authorize(ctx context.Context, req *http.Request) error {
+	if c.skipBeats > 0 {
+		// Inside the spacing an earlier 404 bought. This host has never served
+		// the exchange, so re-asking is known-useless; present what it does
+		// admit, silently — the notice was logged when the 404 landed.
+		c.skipBeats--
+		c.fellBack = true
+		return internalTokenAuth(c.internalToken).authorize(ctx, req)
+	}
+	token, err := c.exchange(ctx)
+	if errors.Is(err, errNoSolutionExchange) {
+		if c.exchanged {
+			// This host has minted here before, so it does not predate the
+			// contract and this is no compatibility path — it is a downgrade to
+			// a credential the host refuses. Fail the beat and name the route,
+			// which is the thing that actually broke.
+			c.fellBack = false
+			return fmt.Errorf("the solution registration exchange at %s answered 404, but this host has minted a token there before: the route is gone or the URL is wrong (%s, or the %s it is derived from) — refusing to downgrade to the cluster-internal token this host does not accept",
+				c.tokenURL, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", "GATEWAY_REGISTER_URL")
+		}
+		// A host from before the publisher-bound contract has no exchange to
+		// offer and still admits the cluster-internal token; present that, as
+		// the runtime did before, so one composition boots against either host
+		// version.
+		c.spaceOutProbe()
+		c.fellBack = true
+		return internalTokenAuth(c.internalToken).authorize(ctx, req)
+	}
+	if err != nil {
+		return err
+	}
+	c.fellBack = false
+	c.probeSkip, c.skipBeats = 0, 0
+	req.Header.Set(solutionRegistrationHeader, token)
+	return nil
+}
+
+// spaceOutProbe widens the gap before the exchange is probed again after a 404,
+// and announces the fallback the first time.
+//
+// The notice deliberately stops short of concluding *which* cause it is: a 404
+// alone cannot tell a host from before the contract apart from a wrong exchange
+// URL, and the registration that follows can — it is accepted by the first and
+// refused by the second. Asserting the old-host reading here is what sent a
+// reader chasing a host version while a misderived URL was the fault.
+func (c *solutionCredential) spaceOutProbe() {
+	switch {
+	case c.probeSkip == 0:
+		log.Printf("solution %q: the solution registration exchange at %s answered 404, so this beat presents the cluster-internal token instead: either this host predates the publisher-bound contract (module-saas-starter < v0.0.61) and accepts it, or the exchange URL is wrong and it is refused — the registration's own outcome says which",
+			c.id, c.tokenURL)
+		c.probeSkip = 1
+	case c.probeSkip < solutionExchangeProbeMaxSkip:
+		if c.probeSkip *= 2; c.probeSkip > solutionExchangeProbeMaxSkip {
+			c.probeSkip = solutionExchangeProbeMaxSkip
+		}
+	}
+	c.skipBeats = c.probeSkip
+}
+
+// errNoSolutionExchange reports a host with no /solutions/_registration-token
+// route at all — one from before the publisher-bound contract — as opposed to
+// one that refused the exchange.
+var errNoSolutionExchange = errors.New("solution registration exchange not offered by this host")
+
+// invalidate is what a refusal calls. There is no cached token to drop — every
+// beat presents one minted for it — so the refusal cannot be about staleness,
+// and the only useful thing to do is say so, once: the exchange that minted the
+// refused token already proved the secret, so the cause is on the host's side
+// of the credential (an id another publisher owns, a manifest the host finds
+// incompatible, a gateway that does not trust the issuer).
+func (c *solutionCredential) invalidate() {
+	if c.refused {
+		return
+	}
+	c.refused = true
+	if c.fellBack {
+		// The disproof. This host refuses the cluster-internal token, which is
+		// exactly what a host from before the publisher-bound contract accepts
+		// — so whatever the 404 suggested, it is not an old host, and no
+		// credential was minted for this beat either. Neither provisioning nor
+		// publisher ownership is implicated, so do not send the reader there.
+		log.Printf("solution %q: the cluster-internal token was refused, which proves this host is not one from before the publisher-bound contract: the 404 from the exchange at %s is a routing or URL fault (check %s, or the %s it is derived from) and no registration credential was minted for this beat",
+			c.id, c.tokenURL, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", "GATEWAY_REGISTER_URL")
+		return
+	}
+	log.Printf("registration for solution %q was refused while presenting a token minted for that same beat: the exchange accepted this solution's secret, so provisioning is not the cause — check that %q is not registered by another publisher and that the host trusts the issuer that signed the token",
+		c.id, c.id)
+}
+
+func (c *solutionCredential) succeeded() {
+	c.refused = false
+}
+
+// exchange runs the credential exchange against the gateway. It presents both
+// the solution secret, which identifies this solution to accounts, and the
+// cluster-internal token, which the gateway's own perimeter check requires.
+func (c *solutionCredential) exchange(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, registrationExchangeTimeout)
+	defer cancel()
+
+	body, _ := json.Marshal(map[string]string{"id": c.id})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("content-type", "application/json")
+	if c.internalToken != "" {
+		req.Header.Set(internalTokenHeader, c.internalToken)
+	}
+	req.Header.Set(solutionSecretHeader, c.secret)
+
+	resp, err := registrationClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusNotFound {
+		// Anything but an unrouted path — a mint, or a refusal of this secret —
+		// proves the host serves the exchange. Latched here rather than on
+		// success alone so that a 200 carrying an unusable token still counts:
+		// the route existing is what a later 404 has to be judged against.
+		c.exchanged = true
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		// The gateway routes this path only once it implements the contract;
+		// before that, an unrouted path is a plain 404.
+		return "", errNoSolutionExchange
+	default:
+		// accounts answers an undeclared id and a wrong secret identically, and
+		// the gateway relays that; naming both here is what the reader needs.
+		return "", fmt.Errorf("registration token exchange for solution %q rejected (status %d): the host declares no %s entry for this id, or the provisioned secret does not match its digest",
+			c.id, resp.StatusCode, "SOLUTION_REGISTRATION_SECRETS")
+	}
+	var issued struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
+		return "", fmt.Errorf("registration token exchange for solution %q returned invalid json: %w", c.id, err)
+	}
+	if issued.Token == "" {
+		return "", fmt.Errorf("registration token exchange for solution %q returned no token", c.id)
+	}
+	// The token is presented once, right now: an expiry that is absent or
+	// already too close is a boundary error, not a credential.
+	switch lifetime := time.Until(issued.ExpiresAt); {
+	case issued.ExpiresAt.IsZero():
+		return "", fmt.Errorf("registration token exchange for solution %q returned no expiry: the issuer omitted expiresAt, or spelled it differently", c.id)
+	case lifetime < solutionTokenMinimumLifetime:
+		return "", fmt.Errorf("registration token exchange for solution %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
+			c.id, issued.ExpiresAt.UTC().Format(time.RFC3339), solutionTokenMinimumLifetime)
+	}
+	if c.minted++; c.minted%solutionMintReportEvery == 0 {
+		log.Printf("solution %q: %d registration tokens minted on this credential, one per beat — each an audited mint on the issuer. The host burns a token per surface, so none can be cached; this is what that costs",
+			c.id, c.minted)
+	}
+	return issued.Token, nil
 }
 
 // Gateway is a client bound to the caller's bearer. It exposes an HTTP client

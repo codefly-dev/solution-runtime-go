@@ -1269,7 +1269,7 @@ func TestHeartbeatDropsACredentialRefusedWith403(t *testing.T) {
 func statusOfOneBeat(t *testing.T, target string) int {
 	t.Helper()
 	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
-	status, err := s.beat(context.Background(), target, []byte(`{}`), internalTokenAuth("tok"))
+	status, _, err := s.beat(context.Background(), target, []byte(`{}`), internalTokenAuth("tok"))
 	if err != nil {
 		t.Fatal(err)
 	}

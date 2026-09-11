@@ -38,7 +38,9 @@ the SDK-resolved value is the default.
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
 | Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
 | Gateway module token URL | the module register URL above with `/modules/_register` swapped for `/modules/_registration-token`, so it keeps that gateway's base path | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
+| Gateway solution token URL | the gateway register URL above with `/solutions/_register` swapped for `/solutions/_registration-token`, same reasoning | `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
+| Solution registration secret | `codefly.For(ctx).WorkspaceSecret("solution-registration", "SECRET")` — see [Self-registration](#self-registration) | `CODEFLY__SOLUTION_REGISTRATION_SECRET` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
 
@@ -55,9 +57,76 @@ exposes the same role — otherwise an ambiguous match resolves to nothing and t
 runtime fails loud at boot rather than picking a host arbitrarily. Concrete
 addresses always come from the SDK.
 
+### Self-registration
+
 On boot the runtime self-registers on a 15s heartbeat with **both** the host
-frontend (host registration) and the gateway (gateway registration), sending the
-internal token as the `x-codefly-internal-token` header on every beat.
+frontend (host registration: the manifest) and the gateway (gateway
+registration: the upstream).
+
+A host on module-saas-starter ≥ v0.0.61 binds each registration to the
+solution's **publisher** (`module/SOLUTION_REGISTRATION.md` there): both
+surfaces admit a registration only against a short-lived, solution-bound token
+that accounts mints to a caller presenting the registration secret the
+composition declared for that id, and neither accepts the shared
+cluster-internal token any more — it attests to no publisher. The runtime
+obtains that token by presenting its **solution registration secret** (plus the
+internal token, the gateway's perimeter check) to
+`/solutions/_registration-token`, and presents it as
+`X-Codefly-Solution-Registration` on both registrations. Each surface burns a
+token on use, so — unlike the module credential below — nothing is cached: a
+fresh token is minted for every beat, on each surface.
+
+Provisioning both halves is the composition's job, and works the same for a
+local `codefly run solution` and a deployed cell:
+
+- **host side** — declare `<solution-id>:sha256hex` in the saas `federation`
+  group's `SOLUTION_REGISTRATION_SECRETS` (separately from
+  `MODULE_REGISTRATION_SECRETS`: a solution credential additionally publishes
+  host-origin code, so the two are never shared);
+- **solution side** — provision the plaintext as the `SECRET` key of the
+  `solution-registration` workspace secret group
+  (`codefly config generate solution-registration SECRET` locally; the cell's
+  secret store when deployed) and declare that group as a
+  `workspace-configuration-dependencies` entry of the solution's backend, so
+  the SDK injects it. `CODEFLY__SOLUTION_REGISTRATION_SECRET` is an explicit
+  override.
+
+One composition boots against either host version. With no secret provisioned
+the runtime registers the way it did before v0.0.61's contract — presenting the
+cluster-internal token — and the boot log says which half is missing, so
+against a newer host "rejected (status 401)" is not read as a gateway fault.
+(If the SDK could not load Codefly's environment at all, the runtime refuses to
+boot instead of reading an unresolved secret as an unprovisioned one: the two
+are indistinguishable from here, and guessing came up looking healthy while
+registering with a credential the host refuses.)
+
+With a secret provisioned but a host that answers `404` on
+`/solutions/_registration-token`, the beat presents the cluster-internal token
+instead and says so — without asserting *why*, because a `404` alone cannot tell
+a host from before v0.0.61 apart from a wrong exchange URL. The registration
+that follows settles it:
+
+- **accepted** — the host does predate the contract. The exchange keeps being
+  probed so an upgrade is picked up without a restart, at a widening interval
+  (up to 2 minutes) rather than on every beat, since a host that genuinely has
+  no such route also accepts the beat and so never triggers the heartbeat's own
+  backoff;
+- **refused** — the host requires the credential, which disproves the old-host
+  reading, so the log names the exchange route and the two variables it is
+  derived from as the fault rather than sending you to provisioning.
+
+Once a host has answered the exchange even once, the fallback is never taken
+again: a later `404` fails the beat instead, because a downgrade left available
+on every beat would let anything able to answer `404` at that URL turn the
+publisher-bound credential back into the shared cluster-internal token.
+
+A refusal that carries reasons (the host's `409 incompatible_runtime`, say) is
+logged with them, again whenever the reasons change and not only when the status
+does.
+
+The manifest declares the contract majors it is built against
+(`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving the host
+to assume them; a host checks both before activating a remote.
 
 ### Consumed-module federation
 
