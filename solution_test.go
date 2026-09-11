@@ -95,9 +95,7 @@ func TestServeRegistersOnListenPort(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hostSrv.Close()
-	gatewaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	gatewaySrv := httptest.NewServer(http.HandlerFunc(answeringTheExchange))
 	defer gatewaySrv.Close()
 
 	assets := t.TempDir()
@@ -113,9 +111,10 @@ func TestServeRegistersOnListenPort(t *testing.T) {
 
 	t.Setenv("PORT", port)
 	t.Setenv("HOST_REGISTER_URL", hostSrv.URL)
-	t.Setenv("GATEWAY_REGISTER_URL", gatewaySrv.URL)
+	t.Setenv("GATEWAY_REGISTER_URL", gatewaySrv.URL+solutionRegisterPath)
 	t.Setenv("GATEWAY_URL", gatewaySrv.URL)
 	t.Setenv("ASSETS_DIR", assets)
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
 
 	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"}).
 		Handle("/audit", func(context.Context, *Gateway) (any, error) {
@@ -242,9 +241,7 @@ func TestRegistrationPayloadCarriesDashboardVerbatim(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hostSrv.Close()
-	gatewaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	gatewaySrv := httptest.NewServer(http.HandlerFunc(answeringTheExchange))
 	defer gatewaySrv.Close()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -257,7 +254,9 @@ func TestRegistrationPayloadCarriesDashboardVerbatim(t *testing.T) {
 		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
 		publicURL:          "http://127.0.0.1",
 		hostRegisterURL:    hostSrv.URL,
-		gatewayRegisterURL: gatewaySrv.URL,
+		gatewayRegisterURL: gatewaySrv.URL + solutionRegisterPath,
+		solutionTokenURL:   gatewaySrv.URL + solutionRegistrationTokenPath,
+		solutionSecret:     "s3cret",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -337,6 +336,8 @@ func TestConfigValidate(t *testing.T) {
 		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
 		moduleRegisterURL:  "http://gateway:42152/modules/_register",
 		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
+		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
+		solutionSecret:     "s3cret",
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -354,6 +355,8 @@ func TestConfigValidate(t *testing.T) {
 		{"relative gateway register URL", func(c *config) { c.gatewayRegisterURL = "/solutions/_register" }},
 		{"relative module register URL", func(c *config) { c.moduleRegisterURL = "/modules/_register" }},
 		{"relative module token URL", func(c *config) { c.moduleTokenURL = "/modules/_registration-token" }},
+		{"relative solution token URL", func(c *config) { c.solutionTokenURL = "/solutions/_registration-token" }},
+		{"no solution registration secret", func(c *config) { c.solutionSecret = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1017,7 +1020,7 @@ func TestModuleCredentialReusesTokenUntilRenewal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := credential.authorize(context.Background(), req); err != nil {
+		if _, err := credential.authorize(context.Background(), req); err != nil {
 			t.Fatalf("beat %d: authorize: %v", beat, err)
 		}
 		if got := req.Header.Get(moduleRegistrationHeader); got != "minted-documents-1" {
@@ -1047,16 +1050,16 @@ func TestModuleCredentialReExchangesAfterRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := credential.authorize(context.Background(), req); err != nil {
+	if _, err := credential.authorize(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	// A later beat presents the held token; that beat's refusal is the one that
 	// can be blamed on staleness, so it drops the credential.
-	if err := credential.authorize(context.Background(), req); err != nil {
+	if _, err := credential.authorize(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	credential.invalidate()
-	if err := credential.authorize(context.Background(), req); err != nil {
+	if _, err := credential.authorize(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1092,14 +1095,14 @@ func TestModuleCredentialKeepsATokenMintedForThisBeat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := credential.authorize(context.Background(), req); err != nil {
+	if _, err := credential.authorize(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	credential.invalidate() // refused the token this beat just minted
 	if credential.token == "" {
 		t.Fatal("dropped a token minted for this very beat; re-minting cannot fix a refusal that was never about staleness")
 	}
-	if err := credential.authorize(context.Background(), req); err != nil {
+	if _, err := credential.authorize(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	if got := gw.mintCount(); got != 1 {
@@ -1223,7 +1226,7 @@ func TestModuleCredentialRetriesAgainAfterRecovering(t *testing.T) {
 	}
 	authorize := func() {
 		t.Helper()
-		if err := credential.authorize(context.Background(), req); err != nil {
+		if _, err := credential.authorize(context.Background(), req); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1314,11 +1317,11 @@ func TestExchangeRejectsAnUnusableExpiry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := credential.authorize(context.Background(), req); err == nil {
+			if _, err := credential.authorize(context.Background(), req); err == nil {
 				t.Fatal("accepted a token the runtime cannot hold; a beat loop would re-mint forever")
 			}
 			// A second beat must not have cached anything either.
-			_ = credential.authorize(context.Background(), req)
+			_, _ = credential.authorize(context.Background(), req)
 			if exchanges != 2 {
 				t.Errorf("exchanged %d times across 2 beats, want 2 attempts and 0 cached", exchanges)
 			}
@@ -1364,7 +1367,7 @@ func TestExchangeOmitsAnUnconfiguredInternalToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := credential.authorize(context.Background(), req); err != nil {
+	if _, err := credential.authorize(context.Background(), req); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := (<-seen)[http.CanonicalHeaderKey(internalTokenHeader)]; ok {
@@ -1398,7 +1401,7 @@ func TestExchangeAcceptsAShortButUsableExpiry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := credential.authorize(context.Background(), req); err != nil {
+			if _, err := credential.authorize(context.Background(), req); err != nil {
 				t.Fatalf("refused a usable %s credential: %v", ttl, err)
 			}
 			if req.Header.Get(moduleRegistrationHeader) == "" {
@@ -1451,6 +1454,7 @@ func TestSiblingURLKeepsTheGatewayBasePath(t *testing.T) {
 	t.Setenv("PORT", "8090")
 	t.Setenv("GATEWAY_URL", "http://gateway:42152/gw")
 	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
 
 	cfg := loadConfig(context.Background(), "lastlogin-go")
 	if want := "http://gateway:42152/gw" + moduleRegisterPath; cfg.moduleRegisterURL != want {
@@ -1472,6 +1476,7 @@ func TestSiblingURLRefusesAnUnpairableOverride(t *testing.T) {
 	t.Setenv("GATEWAY_URL", "http://gateway:42152")
 	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
 	t.Setenv("GATEWAY_MODULE_REGISTER_URL", "https://other-gateway:9999/custom/registration-endpoint")
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
 
 	cfg := loadConfig(context.Background(), "lastlogin-go")
 	if cfg.moduleTokenURL != "" {
@@ -1503,14 +1508,17 @@ func TestBackoffGrowsWhileBrokenAndResetsWhenHealthy(t *testing.T) {
 		{3, registrationBackoffCap},
 		{50, registrationBackoffCap},
 	} {
-		if got := backoff(interval, tc.failures); got != tc.want {
+		if got := backoff(interval, tc.failures, registrationBackoffCap); got != tc.want {
 			t.Errorf("backoff(%s, %d) = %s, want %s", interval, tc.failures, got, tc.want)
 		}
 	}
 	// An interval longer than the cap is the caller's choice, not something to
-	// shorten.
-	if got := backoff(time.Hour, 0); got != time.Hour {
-		t.Errorf("backoff(1h, 0) = %s, want 1h", got)
+	// shorten — at any number of failures, not only at zero. Shortening it would
+	// have a failing beat retry sooner than a healthy one.
+	for _, failures := range []int{0, 1, 50} {
+		if got := backoff(time.Hour, failures, registrationBackoffCap); got != time.Hour {
+			t.Errorf("backoff(1h, %d, cap) = %s, want 1h", failures, got)
+		}
 	}
 }
 
@@ -2097,3 +2105,24 @@ func TestGatewayWithoutAModuleCarriesOnlyTheBearer(t *testing.T) {
 		t.Errorf("minted %d capabilities without ForModule, want 0", got)
 	}
 }
+
+// internalTokenAuth presents the shared cluster-internal token and nothing else.
+// It is a test stub, not a credential this runtime can present: both
+// registration surfaces refuse the shared token, so no production path builds
+// one (module-saas-starter#540). It lives here so heartbeat's status handling
+// can be exercised without standing up a credential exchange — and so that the
+// fallback this runtime deliberately removed cannot be reinstated by wiring one
+// line, which is what leaving it in the package would have allowed.
+type internalTokenAuth string
+
+func (t internalTokenAuth) authorize(_ context.Context, req *http.Request) (time.Time, error) {
+	if t != "" {
+		req.Header.Set(internalTokenHeader, string(t))
+	}
+	// No expiry: injected configuration, so it cannot lapse mid-request.
+	return time.Time{}, nil
+}
+
+func (internalTokenAuth) invalidate() {}
+
+func (internalTokenAuth) succeeded() {}

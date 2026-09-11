@@ -35,12 +35,13 @@ the SDK-resolved value is the default.
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally) | `GATEWAY_URL` |
 | Host frontend URL | resolved by role — the single module owning the `frontend` `http`/`http` endpoint, discovered the same way | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
-| Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
+| Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` (must end in `/solutions/_register`, see below) |
 | Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
 | Gateway module token URL | the module register URL above with `/modules/_register` swapped for `/modules/_registration-token`, so it keeps that gateway's base path | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
 | Gateway solution token URL | the gateway register URL above with `/solutions/_register` swapped for `/solutions/_registration-token`, same reasoning | `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Solution registration secret | `codefly.For(ctx).WorkspaceSecret("solution-registration", "SECRET")` — see [Self-registration](#self-registration) | `CODEFLY__SOLUTION_REGISTRATION_SECRET` |
+| Registration beat interval | `15s` | `CODEFLY__SOLUTION_REGISTRATION_INTERVAL` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
 
@@ -91,38 +92,57 @@ local `codefly run solution` and a deployed cell:
   the SDK injects it. `CODEFLY__SOLUTION_REGISTRATION_SECRET` is an explicit
   override.
 
-One composition boots against either host version. With no secret provisioned
-the runtime registers the way it did before v0.0.61's contract — presenting the
-cluster-internal token — and the boot log says which half is missing, so
-against a newer host "rejected (status 401)" is not read as a gateway fault.
-(If the SDK could not load Codefly's environment at all, the runtime refuses to
-boot instead of reading an unresolved secret as an unprovisioned one: the two
-are indistinguishable from here, and guessing came up looking healthy while
-registering with a credential the host refuses.)
-
-With a secret provisioned but a host that answers `404` on
-`/solutions/_registration-token`, the beat presents the cluster-internal token
-instead and says so — without asserting *why*, because a `404` alone cannot tell
-a host from before v0.0.61 apart from a wrong exchange URL. The registration
-that follows settles it:
-
-- **accepted** — the host does predate the contract. The exchange keeps being
-  probed so an upgrade is picked up without a restart, at a widening interval
-  (up to 2 minutes) rather than on every beat, since a host that genuinely has
-  no such route also accepts the beat and so never triggers the heartbeat's own
-  backoff;
-- **refused** — the host requires the credential, which disproves the old-host
-  reading, so the log names the exchange route and the two variables it is
-  derived from as the fault rather than sending you to provisioning.
-
-Once a host has answered the exchange even once, the fallback is never taken
-again: a later `404` fails the beat instead, because a downgrade left available
-on every beat would let anything able to answer `404` at that URL turn the
-publisher-bound credential back into the shared cluster-internal token.
+There is no other credential, so there is no fallback. A boot without a
+provisioned secret is refused by `validate()`, naming the two provisioning
+paths, rather than coming up looking healthy while the host serves nothing.
+A `404` on `/solutions/_registration-token` fails the beat and names the route:
+either the host does not serve publisher-bound registration (module-saas-starter
+< v0.0.61, which this runtime does not support) or the exchange URL is wrong
+(`GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, or the `GATEWAY_REGISTER_URL` it is
+derived from). The shared cluster-internal token is never presented on a
+registration: it proves no publisher, and a downgrade path would let anything
+able to answer `404` at that URL turn the publisher-bound credential back into
+it.
 
 A refusal that carries reasons (the host's `409 incompatible_runtime`, say) is
 logged with them, again whenever the reasons change and not only when the status
-does.
+does — up to a handful of distinct reasons per status, after which the log says
+it is suppressing them. The reasons are text the host chooses, so one that
+varies per attempt (the `jti` of the token it just burned, say) must not be able
+to turn the log into a stream of one line per beat.
+
+Two consequences of deriving the exchange from the registration endpoint are
+worth stating outright, because both turn a working deployment into a failing
+one:
+
+- `GATEWAY_REGISTER_URL`, if you override it, **must end in
+  `/solutions/_register`** — that suffix is what the exchange URL is derived
+  from by swapping it. An override with any other path cannot be paired, and
+  the boot is refused naming both this variable and
+  `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, which you can set explicitly
+  instead. This variable was free-form before the exchange existed.
+- Both self-registrations now mint through the gateway, so a gateway outage
+  fails the **host frontend** registration too, even though the frontend is
+  healthy. A beat that never reached its registration surface minted nothing,
+  so it retries on a much shorter backoff cap (30s) than a beat the surface
+  actually refused (2m) — the long cap exists to bound audited mints, and an
+  unreachable dependency produces none, so paying it there would only keep this
+  solution out of a healthy host's nav for longer than necessary.
+
+Every registration request refuses to follow redirects, for the same reason none
+of them may be proxied: `net/http` strips only `Authorization`, `WWW-Authenticate`
+and `Cookie` when a redirect crosses hosts, so the `X-Codefly-*` headers these
+requests carry — the plaintext registration secret and the cluster-internal
+token — would be handed to whatever a `Location` named.
+
+A beat is not free any more: each self-registration beat runs an exchange whose
+every success is an audited mint on the issuer, so at the 15s default across two
+surfaces a solution mints roughly 11.5k tokens a day. The right period is
+whatever the host's registration TTL allows, which this runtime cannot observe —
+set `CODEFLY__SOLUTION_REGISTRATION_INTERVAL` (a Go duration, minimum `1s`) when
+you know both numbers. An unparseable or too-small value fails the boot rather
+than falling back to the default, so a typo cannot silently restore the fast
+beat you were trying to slow down.
 
 The manifest declares the contract majors it is built against
 (`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving the host

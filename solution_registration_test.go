@@ -3,8 +3,8 @@ package solution
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -67,6 +67,8 @@ type fakeHost struct {
 	exchangeGoneAfter int
 	// tokenLifetime is how long a minted token is valid for; zero means 5m.
 	tokenLifetime time.Duration
+	// registerDelay is how long both registration surfaces take to answer.
+	registerDelay time.Duration
 
 	mu     sync.Mutex
 	minted int
@@ -119,6 +121,9 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 			"expiresAt": time.Now().Add(lifetime).UTC().Format(time.RFC3339),
 		})
 	case solutionRegisterPath, "/api/solutions/register":
+		if h.registerDelay > 0 {
+			time.Sleep(h.registerDelay)
+		}
 		surface := "gateway"
 		if r.URL.Path != solutionRegisterPath {
 			surface = "host"
@@ -254,203 +259,6 @@ func TestServeRegistersWithSolutionCredential(t *testing.T) {
 	}
 }
 
-// TestServeFallsBackToInternalTokenWithoutSecret pins the compatibility path: a
-// composition that provisioned no secret still registers as before, presenting
-// the cluster-internal token, and is told in the log which half is missing —
-// because on a host that refuses that token, "rejected (status 401)" alone
-// would send the reader to the wrong place.
-func TestServeFallsBackToInternalTokenWithoutSecret(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	h := newFakeHost(t, "s3cret")
-	stop := bootAgainst(t, h, "")
-	defer stop()
-
-	seen := awaitRegistrations(t, h, 2)
-	for _, r := range seen {
-		if r.Internal != internalTokenTest {
-			t.Errorf("%s registration presented %s = %q, want the cluster-internal token when no secret is provisioned", r.Surface, internalTokenHeader, r.Internal)
-		}
-		if r.Token != "" {
-			t.Errorf("%s registration presented %s = %q, want none without a secret to exchange", r.Surface, solutionRegistrationHeader, r.Token)
-		}
-	}
-	select {
-	case exchange := <-h.exchanges:
-		t.Fatalf("an exchange ran (%+v) although no secret was provisioned", exchange)
-	default:
-	}
-	if out := buf.String(); !strings.Contains(out, "no registration secret provisioned") ||
-		!strings.Contains(out, SolutionRegistrationSecretEnvironmentVariable) ||
-		!strings.Contains(out, SolutionRegistrationSecretGroup+"/"+SolutionRegistrationSecretKey) {
-		t.Fatalf("log does not name the missing provisioning:\n%s", out)
-	}
-}
-
-// TestServeFallsBackWhenTheHostOffersNoExchange proves one composition boots
-// against either host version: with a secret provisioned but a host from
-// before the publisher-bound contract — no exchange route — the runtime
-// presents the cluster-internal token as it always did, says so once, and
-// keeps trying the exchange on every beat so a host upgrade is picked up.
-func TestServeFallsBackWhenTheHostOffersNoExchange(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	h := newFakeHost(t, "s3cret")
-	h.noExchange, h.admitsInternal = true, true
-	stop := bootAgainst(t, h, "s3cret")
-	defer stop()
-
-	seen := awaitRegistrations(t, h, 8)
-	for _, r := range seen {
-		if r.Status != http.StatusOK {
-			t.Errorf("%s registration was refused (status %d) by a host that admits the cluster-internal token", r.Surface, r.Status)
-		}
-		if r.Internal != internalTokenTest {
-			t.Errorf("%s registration presented %s = %q, want the cluster-internal token against a host with no exchange", r.Surface, internalTokenHeader, r.Internal)
-		}
-		if r.Token != "" {
-			t.Errorf("%s registration presented %s = %q, want none: nothing minted it", r.Surface, solutionRegistrationHeader, r.Token)
-		}
-	}
-	attempts := 0
-	for len(h.exchanges) > 0 {
-		<-h.exchanges
-		attempts++
-	}
-	if attempts < 2 {
-		t.Fatalf("exchange attempted %d times; it must keep being retried so an upgraded host is picked up", attempts)
-	}
-	if attempts >= len(seen) {
-		// A host that predates the contract 404s for as long as it runs and
-		// accepts the beat that follows, so the heartbeat's backoff never
-		// widens: without spacing the credential re-asks a route it knows is
-		// absent on every beat, forever, on both heartbeats.
-		t.Fatalf("exchange attempted %d times across %d beats; the probe must space itself out, not run every beat", attempts, len(seen))
-	}
-	if n := strings.Count(buf.String(), "answered 404, so this beat presents the cluster-internal token"); n != 2 {
-		// One line per heartbeat (host and gateway each own a credential),
-		// not one per beat.
-		t.Fatalf("fallback notice logged %d times, want once per surface:\n%s", n, buf.String())
-	}
-	// The 404 alone cannot establish the host's version, and this host's
-	// acceptance is what settles it — so the notice must offer both readings
-	// rather than assert the old-host one.
-	if out := buf.String(); !strings.Contains(out, "or the exchange URL is wrong") {
-		t.Fatalf("fallback notice asserts a cause the 404 cannot establish:\n%s", out)
-	}
-}
-
-// TestFallbackRefusedNamesTheRouteNotTheHostVersion is the case the old
-// `legacy` test flag made unreachable: a host that DOES require the
-// publisher-bound credential, reached at an exchange URL that 404s (a misderived
-// override, ingress or path skew, a mid-rollout pod). The runtime used to report
-// two falsehoods here — that the host predated v0.0.61, which its own refusal of
-// the cluster-internal token disproves, and that "the exchange accepted this
-// solution's secret", when the exchange never answered at all — sending the
-// reader to provisioning and publisher ownership while a URL was the fault.
-func TestFallbackRefusedNamesTheRouteNotTheHostVersion(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	h := newFakeHost(t, "s3cret")
-	h.noExchange = true // ... and admitsInternal stays false: a current host.
-	stop := bootAgainst(t, h, "s3cret")
-	defer stop()
-
-	for _, r := range awaitRegistrations(t, h, 2) {
-		if r.Status != http.StatusUnauthorized {
-			t.Fatalf("%s registration status = %d, want the host to refuse the fallback", r.Surface, r.Status)
-		}
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(buf.String(), "is a routing or URL fault") {
-		if time.Now().After(deadline) {
-			t.Fatalf("the refused fallback was never diagnosed as a route fault:\n%s", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "proves this host is not one from before the publisher-bound contract") {
-		t.Errorf("diagnosis does not say the refusal disproves the old-host reading:\n%s", out)
-	}
-	if !strings.Contains(out, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL") {
-		t.Errorf("diagnosis does not name the URL to check:\n%s", out)
-	}
-	if strings.Contains(out, "the exchange accepted this solution's secret") {
-		t.Errorf("diagnosis claims the exchange accepted the secret, but it answered 404:\n%s", out)
-	}
-	if strings.Contains(out, "is not registered by another publisher") {
-		t.Errorf("diagnosis sends the reader to publisher ownership, which is not implicated:\n%s", out)
-	}
-}
-
-// TestExchangeSeenOnceIsNeverDowngradedAgain pins the latch: once a host has
-// minted here, it demonstrably serves the exchange, so a later 404 is a fault
-// and not a host version. Falling back anyway would hand the shared
-// cluster-internal token to the registration endpoints on nothing more than an
-// unauthenticated 404 — a downgrade left armed on every beat for anyone able to
-// answer at that URL.
-func TestExchangeSeenOnceIsNeverDowngradedAgain(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	h := newFakeHost(t, "s3cret")
-	h.exchangeGoneAfter = 2 // one mint per surface, then the route vanishes
-	stop := bootAgainst(t, h, "s3cret")
-	defer stop()
-
-	for _, r := range awaitRegistrations(t, h, 2) {
-		if r.Token == "" {
-			t.Fatalf("%s registration presented no minted token before the route vanished", r.Surface)
-		}
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(buf.String(), "refusing to downgrade") {
-		if time.Now().After(deadline) {
-			t.Fatalf("a vanished exchange route was not reported as a fault:\n%s", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	// Every further beat must fail rather than register with the shared token.
-	for {
-		select {
-		case r := <-h.registrations:
-			if r.Token == "" {
-				t.Fatalf("%s registration fell back to the cluster-internal token (%q) after the host had proved it serves the exchange", r.Surface, r.Internal)
-			}
-		default:
-			return
-		}
-	}
-}
-
-// TestSolutionExchangeProbeSpacingDecays pins the spacing itself, without
-// timing: a 404 widens the gap before the next probe, up to the cap, and one
-// successful exchange resets it.
-func TestSolutionExchangeProbeSpacingDecays(t *testing.T) {
-	c := &solutionCredential{id: "lastlogin-go"}
-	var spacings []int
-	for range 6 {
-		c.spaceOutProbe()
-		spacings = append(spacings, c.skipBeats)
-	}
-	want := []int{1, 2, 4, 8, 8, 8}
-	if fmt.Sprint(spacings) != fmt.Sprint(want) {
-		t.Fatalf("probe spacing = %v, want %v (doubling, capped at solutionExchangeProbeMaxSkip)", spacings, want)
-	}
-	c.probeSkip, c.skipBeats = 0, 0
-	c.spaceOutProbe()
-	if c.skipBeats != 1 {
-		t.Fatalf("after a reset the spacing starts over at 1, got %d", c.skipBeats)
-	}
-}
-
 // TestShortLivedTokenIsUsedNotRefused pins the floor at what it actually bounds.
 // This credential is presented on the very next round trip, so a token the
 // issuer chose to make short-lived is usable; the 5s floor copied from the
@@ -539,37 +347,6 @@ func TestRefusalDetailCannotForgeALogLine(t *testing.T) {
 	}
 	if !strings.Contains(detail, "registered with host as") {
 		t.Fatalf("the host's text must still reach the log, only flattened: %q", detail)
-	}
-}
-
-// TestSecretProvisioningUnknownRefusesTheAmbiguousBoot proves the runtime does
-// not act on a guess. An empty secret means "none provisioned" only when the
-// SDK actually loaded the environment it would have come from; when that load
-// failed the two are indistinguishable — WorkspaceSecret returns the same error
-// either way — and booting on the wrong one came up healthy while registering
-// with a credential the host refuses, blaming provisioning that may be correct.
-func TestSecretProvisioningUnknownRefusesTheAmbiguousBoot(t *testing.T) {
-	loadFailed := errors.New("cannot read injected carriers")
-	if err := secretProvisioningUnknown("", loadFailed); err == nil {
-		t.Fatal("an empty secret after a failed environment load must refuse the boot, not be read as unprovisioned")
-	} else {
-		if !errors.Is(err, loadFailed) {
-			t.Errorf("the refusal must carry the load failure: %v", err)
-		}
-		for _, want := range []string{SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("the refusal does not name %q: %v", want, err)
-			}
-		}
-	}
-	// Neither unambiguous case may be caught by it: a resolved secret proves the
-	// load error did not matter, and a clean load proves an absent secret is
-	// really absent — which is the documented compatibility path.
-	if err := secretProvisioningUnknown("s3cret", loadFailed); err != nil {
-		t.Errorf("a resolved secret makes the load error moot: %v", err)
-	}
-	if err := secretProvisioningUnknown("", nil); err != nil {
-		t.Errorf("a clean load means an absent secret is genuinely absent: %v", err)
 	}
 }
 
@@ -709,34 +486,6 @@ func TestLoadConfigDerivesSolutionTokenURL(t *testing.T) {
 	}
 }
 
-// TestValidateRequiresSolutionTokenURLOnlyWithASecret proves the exchange
-// endpoint is part of the boot contract exactly when a secret makes the
-// exchange run: a composition on a host that still admits the cluster-internal
-// token is not refused for an endpoint it never calls, and one that will
-// exchange fails loud at boot rather than on every beat.
-func TestValidateRequiresSolutionTokenURLOnlyWithASecret(t *testing.T) {
-	base := config{
-		port:               "1234",
-		gatewayURL:         "http://gateway:42152",
-		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
-		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
-		moduleRegisterURL:  "http://gateway:42152/modules/_register",
-		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
-	}
-	if err := base.validate(); err != nil {
-		t.Fatalf("no secret, no token URL: validate() = %v, want nil", err)
-	}
-	withSecret := base
-	withSecret.solutionSecret = "s3cret"
-	if err := withSecret.validate(); err == nil || !strings.Contains(err.Error(), "solution token URL") {
-		t.Fatalf("secret without a token URL: validate() = %v, want an error naming the solution token URL", err)
-	}
-	withSecret.solutionTokenURL = "http://gateway:42152/solutions/_registration-token"
-	if err := withSecret.validate(); err != nil {
-		t.Fatalf("secret with a token URL: validate() = %v, want nil", err)
-	}
-}
-
 // TestSolutionRegistrationSecretResolvesThroughTheSDK proves the declared
 // provisioning path: the secret arrives as the namespaced workspace secret
 // Codefly injects for the `solution-registration` group, resolved by name
@@ -759,6 +508,72 @@ func TestSolutionRegistrationSecretResolvesThroughTheSDK(t *testing.T) {
 	}
 }
 
+// TestValidateRequiresASolutionSecret proves a boot without a registration
+// secret is refused, naming the provisioning: the host admits a registration
+// only against a credential minted from that secret, and there is no other
+// credential to present, so coming up would serve nothing while looking
+// healthy.
+func TestValidateRequiresASolutionSecret(t *testing.T) {
+	cfg := config{
+		port:               "1234",
+		gatewayURL:         "http://gateway:42152",
+		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
+		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
+		moduleRegisterURL:  "http://gateway:42152/modules/_register",
+		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
+		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
+	}
+	err := cfg.validate()
+	if err == nil || !strings.Contains(err.Error(), SolutionRegistrationSecretEnvironmentVariable) ||
+		!strings.Contains(err.Error(), SolutionRegistrationSecretGroup+"/"+SolutionRegistrationSecretKey) {
+		t.Fatalf("validate() without a secret = %v, want an error naming the provisioning", err)
+	}
+	cfg.solutionSecret = "s3cret"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() with a secret = %v, want nil", err)
+	}
+	cfg.solutionTokenURL = ""
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "solution token URL") {
+		t.Fatalf("validate() without an exchange URL = %v, want an error naming the solution token URL", err)
+	}
+}
+
+// TestServeFailsTheBeatWhenTheHostOffersNoExchange proves there is no
+// downgrade: against a host that answers 404 on the exchange, the beat fails
+// and names the route, and nothing — not the cluster-internal token — is
+// presented to the registration surfaces.
+func TestServeFailsTheBeatWhenTheHostOffersNoExchange(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	h := newFakeHost(t, "s3cret")
+	h.noExchange, h.admitsInternal = true, true
+	stop := bootAgainst(t, h, "s3cret")
+	defer stop()
+
+	select {
+	case <-h.exchanges:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no exchange attempted within timeout")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if out := buf.String(); strings.Contains(out, "registration with host failed") && strings.Contains(out, "answered 404") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the 404 was not reported as a failed beat:\n%s", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case r := <-h.registrations:
+		t.Fatalf("a registration reached the host (%+v) although no credential could be minted; the cluster-internal token must never stand in", r)
+	default:
+	}
+}
+
 // TestManifestDeclaresItsContractMajors proves the manifest says which host
 // contract it is built against instead of relying on the host's default for a
 // silent manifest.
@@ -771,5 +586,311 @@ func TestManifestDeclaresItsContractMajors(t *testing.T) {
 	frontend := m["frontend"].(map[string]any)
 	if got := frontend["hostContract"]; got != solutionHostContractMajor {
 		t.Fatalf("frontend.hostContract = %v, want %d", got, solutionHostContractMajor)
+	}
+}
+
+// answeringTheExchange is the least a fake gateway must do for a solution to
+// register at all: mint a token on the exchange, and accept everything else.
+// Tests that are about something other than the credential use it.
+func answeringTheExchange(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == solutionRegistrationTokenPath {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"token":     "solution-token",
+			"expiresAt": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// TestRegistrationClientNeverFollowsARedirect proves the registration secrets
+// cannot be walked off to another host by a Location header. net/http strips
+// only Authorization, WWW-Authenticate and Cookie across hosts, so before this
+// the X-Codefly-* headers — the plaintext registration secret and the
+// cluster-internal token — were copied to whatever the redirect named, and a
+// 307 re-sent the body with them. Anything able to answer at a registration URL
+// could harvest the credential this publisher binding exists to protect.
+func TestRegistrationClientNeverFollowsARedirect(t *testing.T) {
+	var sinkSaw, sinkInternal string
+	var sinkHits atomic.Int32
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sinkHits.Add(1)
+		sinkSaw, sinkInternal = r.Header.Get(solutionSecretHeader), r.Header.Get(internalTokenHeader)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"token":     "stolen-and-answered",
+			"expiresAt": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+		})
+	}))
+	defer sink.Close()
+	// A different host name, so this is the cross-host case net/http claims to
+	// protect — and does not, for custom headers.
+	target := strings.Replace(sink.URL, "127.0.0.1", "localhost", 1)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	credential := &solutionCredential{
+		tokenURL:      redirector.URL,
+		internalToken: internalTokenTest,
+		id:            "lastlogin-go",
+		secret:        "s3cret",
+	}
+	token, _, err := credential.exchange(context.Background())
+	if err == nil {
+		t.Fatalf("exchange followed the redirect and accepted %q; a redirected registration endpoint must fail, not be trusted", token)
+	}
+	if n := sinkHits.Load(); n != 0 {
+		t.Fatalf("the redirect target was contacted %d times; the request must stop at the 3xx", n)
+	}
+	if sinkSaw != "" || sinkInternal != "" {
+		t.Fatalf("the redirect target received the credentials: %s=%q %s=%q", solutionSecretHeader, sinkSaw, internalTokenHeader, sinkInternal)
+	}
+	if !strings.Contains(err.Error(), "307") {
+		t.Errorf("the 3xx must be reported as the answer it is; got %v", err)
+	}
+}
+
+// TestBeatIsBoundedByTheCredentialsExpiry proves a registration cannot outlive
+// the token it presents. The floor only guarantees a token is worth sending;
+// the POST is allowed registrationTimeout (10s), which is longer than a
+// short-lived token's whole life. Unbounded, such a token arrives expired and
+// the host answers 401 — indistinguishable here from an id owned by another
+// publisher, which is what invalidate() would then report, sending whoever
+// reads it to check publisher ownership for what is a token-lifetime problem.
+func TestBeatIsBoundedByTheCredentialsExpiry(t *testing.T) {
+	h := newFakeHost(t, "s3cret")
+	h.tokenLifetime = 1500 * time.Millisecond
+	h.registerDelay = 5 * time.Second // longer than the token lives
+
+	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	credential := &solutionCredential{
+		tokenURL:      h.URL + solutionRegistrationTokenPath,
+		internalToken: internalTokenTest,
+		id:            "lastlogin-go",
+		secret:        "s3cret",
+	}
+	start := time.Now()
+	status, _, err := s.beat(context.Background(), h.URL+solutionRegisterPath, []byte("{}"), credential)
+	if err == nil {
+		t.Fatalf("beat returned status %d; a POST that outlives its credential must fail as a deadline, not be sent on to be refused", status)
+	}
+	if !strings.Contains(err.Error(), "expired at") {
+		t.Fatalf("the failure must name the credential's expiry, not read as a generic timeout: %v", err)
+	}
+	// Bounded by the token (1.5s), not by registrationTimeout (10s).
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("beat took %s; it must be cut short at the token's expiry, not at the request timeout", elapsed)
+	}
+}
+
+// TestValidateBlamesTheEnvironmentLoadNotTheProvisioning proves a boot whose
+// SDK environment never loaded says so. Every SDK-resolved value is empty in
+// that case, and the message that named the provisioning sent an operator to
+// provision a secret that was already provisioned.
+func TestValidateBlamesTheEnvironmentLoadNotTheProvisioning(t *testing.T) {
+	cfg := config{
+		port:               "1234",
+		gatewayURL:         "http://gateway:42152",
+		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
+		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
+		moduleRegisterURL:  "http://gateway:42152/modules/_register",
+		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
+		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
+		environmentLoadErr: fmt.Errorf("carrier %q is unreadable", "/var/run/codefly/env"),
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() with no secret and a failed environment load = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "carrier") {
+		t.Errorf("the environment-load failure must reach the boot error: %v", err)
+	}
+	if strings.Contains(err.Error(), SolutionRegistrationSecretGroup+"/"+SolutionRegistrationSecretKey) {
+		t.Errorf("with the environment unloaded the secret may well be provisioned; the message must not send the operator to provision it: %v", err)
+	}
+	// Unloaded environments also empty the URLs; same misattribution.
+	cfg.solutionSecret, cfg.moduleTokenURL = "s3cret", ""
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "carrier") {
+		t.Errorf("an unresolved URL under a failed environment load must name the load: %v", err)
+	}
+}
+
+// TestValidateNamesTheUnpairableRegisterOverride proves an override this
+// runtime cannot derive an exchange from names itself. GATEWAY_REGISTER_URL was
+// free-form until the exchange began deriving from it, so a deployment that
+// booted yesterday can refuse to boot today; reported as an unresolved SDK
+// endpoint, that sends the operator to endpoint resolution for a value their
+// own override broke.
+func TestValidateNamesTheUnpairableRegisterOverride(t *testing.T) {
+	t.Setenv("PORT", "8090")
+	t.Setenv("GATEWAY_URL", "http://gateway:42152")
+	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
+	t.Setenv("GATEWAY_REGISTER_URL", "https://gw.example.com/api/solutions/register")
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
+
+	cfg := loadConfig(context.Background(), "lastlogin-go")
+	if cfg.solutionTokenURL != "" {
+		t.Fatalf("solutionTokenURL = %q, want empty: the override cannot be paired", cfg.solutionTokenURL)
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() with an unpairable register override = nil, want an error")
+	}
+	for _, want := range []string{"GATEWAY_REGISTER_URL", "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", solutionRegisterPath} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error must name %q, so the operator sees which variable they must fix: %v", want, err)
+		}
+	}
+}
+
+// TestCapabilitiesAndManifestDeclareTheSameMajors proves the two documents
+// cannot disagree. Hardcoded in the capabilities handler, a bump of either
+// constant left this document announcing the old major while the registration
+// manifest announced the new one — one solution claiming two contracts.
+func TestCapabilitiesAndManifestDeclareTheSameMajors(t *testing.T) {
+	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
+	rec := httptest.NewRecorder()
+	s.handleCapabilities(rec, httptest.NewRequest(http.MethodGet, "/.well-known/capabilities", nil))
+
+	var capabilities map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&capabilities); err != nil {
+		t.Fatal(err)
+	}
+	manifest := s.manifestMap()
+	if got, want := capabilities["schemaVersion"], manifest["schemaVersion"]; got != float64(want.(int)) {
+		t.Errorf("capabilities schemaVersion = %v, manifest says %v", got, want)
+	}
+	frontend := manifest["frontend"].(map[string]any)
+	if got, want := capabilities["contractMajor"], frontend["hostContract"]; got != float64(want.(int)) {
+		t.Errorf("capabilities contractMajor = %v, manifest hostContract says %v", got, want)
+	}
+}
+
+// TestBackoffCapDependsOnWhatTheFailureCost proves the two caps. A refusal cost
+// a mint, so it is bounded by the long cap that exists to bound audited events.
+// A beat that never reached the surface minted nothing, and holding it on the
+// long cap left this solution missing from a host that may be perfectly healthy
+// for minutes after the gateway it could not reach came back.
+func TestBackoffCapDependsOnWhatTheFailureCost(t *testing.T) {
+	const interval = 15 * time.Second
+	if got := backoff(interval, 50, registrationBackoffCap); got != registrationBackoffCap {
+		t.Errorf("a refused beat backs off to %s, want the mint-bounding cap %s", got, registrationBackoffCap)
+	}
+	if got := backoff(interval, 50, registrationUnreachedBackoffCap); got != registrationUnreachedBackoffCap {
+		t.Errorf("an unreached beat backs off to %s, want the short cap %s", got, registrationUnreachedBackoffCap)
+	}
+	if registrationUnreachedBackoffCap >= registrationBackoffCap {
+		t.Fatalf("the unreached cap (%s) must be shorter than the refusal cap (%s): it bounds an outage nobody's mint rate pays for",
+			registrationUnreachedBackoffCap, registrationBackoffCap)
+	}
+}
+
+// TestHeartbeatStopsQuotingAnEndlesslyChangingReason proves the reason is not a
+// dedup key this loop trusts to settle. A refusal quoting something per-attempt
+// — the jti of the single-use token it just burned — differs on every beat by
+// construction, so keyed on it alone the throttle was defeated exactly when the
+// registration was most broken: one line per beat, forever.
+func TestHeartbeatStopsQuotingAnEndlesslyChangingReason(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	var beats atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":   "token_already_used",
+			"reasons": []string{fmt.Sprintf("jti %d was already burned", beats.Add(1))},
+		})
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{manifest: Manifest{ID: "lastlogin-go"}, registrationInterval: time.Millisecond}
+	done := make(chan struct{})
+	go func() { s.heartbeat(ctx, srv.URL, []byte("{}"), "host", internalTokenAuth("t")); close(done) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for beats.Load() < int32(maxRefusalDetailsPerStatus)+20 {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if n := strings.Count(buf.String(), "rejected (status 409)"); n > maxRefusalDetailsPerStatus {
+		t.Fatalf("logged %d refusal lines for one unchanging status after %d beats, want at most %d:\n%s",
+			n, beats.Load(), maxRefusalDetailsPerStatus, buf.String())
+	}
+	if !strings.Contains(buf.String(), "further reasons are suppressed") {
+		t.Errorf("suppression must be announced rather than going silent:\n%s", buf.String())
+	}
+}
+
+// TestSolutionSecretIsTrimmed proves a secret carrying the newline a file-mounted
+// or `echo`-generated value almost always has is usable. net/http refuses to
+// write a header containing one, so the request never left the process: the beat
+// failed with "invalid header field value" forever while validate() saw a
+// non-empty secret and let the boot through — a registration that silently never
+// happened, with correct provisioning.
+func TestSolutionSecretIsTrimmed(t *testing.T) {
+	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret\n")
+	got := solutionRegistrationSecret(context.Background())
+	if got != "s3cret" {
+		t.Fatalf("solutionRegistrationSecret() = %q, want the value without its trailing newline", got)
+	}
+	// The point of trimming: the value must survive being written as a header.
+	req, err := http.NewRequest(http.MethodPost, "http://example.invalid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(solutionSecretHeader, got)
+	if err := req.Write(io.Discard); err != nil {
+		t.Fatalf("the resolved secret cannot be sent as a header: %v", err)
+	}
+}
+
+// TestRegistrationIntervalIsConfigurable proves the beat period has a lever. A
+// beat is no longer free: each self-registration beat mints a token whose every
+// success is an audited event on the issuer, and the right period depends on the
+// host's registration TTL, which this runtime cannot observe.
+func TestRegistrationIntervalIsConfigurable(t *testing.T) {
+	t.Run("honoured", func(t *testing.T) {
+		t.Setenv(RegistrationIntervalEnvironmentVariable, "90s")
+		interval, err := registrationIntervalFromEnv()
+		if err != nil || interval != 90*time.Second {
+			t.Fatalf("registrationIntervalFromEnv() = %s, %v; want 90s, nil", interval, err)
+		}
+	})
+	t.Run("unset means the default", func(t *testing.T) {
+		interval, err := registrationIntervalFromEnv()
+		if err != nil || interval != 0 {
+			t.Fatalf("registrationIntervalFromEnv() = %s, %v; want 0, nil", interval, err)
+		}
+	})
+	// A typo must not silently restore the fast default for an operator who
+	// asked for a slow beat precisely to bound their mint rate.
+	for _, raw := range []string{"ninety", "100", "0s", "-5s"} {
+		t.Run("refuses "+raw, func(t *testing.T) {
+			t.Setenv(RegistrationIntervalEnvironmentVariable, raw)
+			if _, err := registrationIntervalFromEnv(); err == nil {
+				t.Fatalf("registrationIntervalFromEnv() accepted %q; an unusable interval must fail the boot, not fall back", raw)
+			}
+			cfg := config{
+				port:                    "1234",
+				gatewayURL:              "http://gateway:42152",
+				hostRegisterURL:         "http://frontend:21931/api/solutions/register",
+				gatewayRegisterURL:      "http://gateway:42152/solutions/_register",
+				moduleRegisterURL:       "http://gateway:42152/modules/_register",
+				moduleTokenURL:          "http://gateway:42152/modules/_registration-token",
+				solutionTokenURL:        "http://gateway:42152/solutions/_registration-token",
+				solutionSecret:          "s3cret",
+				registrationIntervalErr: fmt.Errorf("unusable"),
+			}
+			if err := cfg.validate(); err == nil {
+				t.Fatal("validate() accepted an unusable registration interval")
+			}
+		})
 	}
 }
