@@ -38,7 +38,9 @@ the SDK-resolved value is the default.
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` |
 | Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
 | Gateway module token URL | the module register URL above with `/modules/_register` swapped for `/modules/_registration-token`, so it keeps that gateway's base path | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
+| Gateway solution token URL | the gateway register URL above with `/solutions/_register` swapped for `/solutions/_registration-token`, same reasoning | `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
+| Solution registration secret | `codefly.For(ctx).WorkspaceSecret("solution-registration", "SECRET")` — see [Self-registration](#self-registration) | `CODEFLY__SOLUTION_REGISTRATION_SECRET` |
 | Self upstream | `<public-url>` | `SELF_UPSTREAM` |
 | MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
 
@@ -55,9 +57,50 @@ exposes the same role — otherwise an ambiguous match resolves to nothing and t
 runtime fails loud at boot rather than picking a host arbitrarily. Concrete
 addresses always come from the SDK.
 
+### Self-registration
+
 On boot the runtime self-registers on a 15s heartbeat with **both** the host
-frontend (host registration) and the gateway (gateway registration), sending the
-internal token as the `x-codefly-internal-token` header on every beat.
+frontend (host registration: the manifest) and the gateway (gateway
+registration: the upstream).
+
+A host on module-saas-starter ≥ v0.0.61 binds each registration to the
+solution's **publisher** (`module/SOLUTION_REGISTRATION.md` there): both
+surfaces admit a registration only against a short-lived, solution-bound token
+that accounts mints to a caller presenting the registration secret the
+composition declared for that id, and neither accepts the shared
+cluster-internal token any more — it attests to no publisher. The runtime
+obtains that token by presenting its **solution registration secret** (plus the
+internal token, the gateway's perimeter check) to
+`/solutions/_registration-token`, and presents it as
+`X-Codefly-Solution-Registration` on both registrations. Each surface burns a
+token on use, so — unlike the module credential below — nothing is cached: a
+fresh token is minted for every beat, on each surface.
+
+Provisioning both halves is the composition's job, and works the same for a
+local `codefly run solution` and a deployed cell:
+
+- **host side** — declare `<solution-id>:sha256hex` in the saas `federation`
+  group's `SOLUTION_REGISTRATION_SECRETS` (separately from
+  `MODULE_REGISTRATION_SECRETS`: a solution credential additionally publishes
+  host-origin code, so the two are never shared);
+- **solution side** — provision the plaintext as the `SECRET` key of the
+  `solution-registration` workspace secret group
+  (`codefly config generate solution-registration SECRET` locally; the cell's
+  secret store when deployed) and declare that group as a
+  `workspace-configuration-dependencies` entry of the solution's backend, so
+  the SDK injects it. `CODEFLY__SOLUTION_REGISTRATION_SECRET` is an explicit
+  override.
+
+With no secret provisioned the runtime still registers the way it did before
+v0.0.61's contract — presenting the cluster-internal token — so a solution keeps
+working against an older host; against a newer one every beat is refused, and
+the boot log says which half is missing rather than leaving "rejected (status
+401)" to be read as a gateway fault. A refusal that carries reasons (the host's
+`409 incompatible_runtime`, say) is logged with them.
+
+The manifest declares the contract majors it is built against
+(`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving the host
+to assume them; a host checks both before activating a remote.
 
 ### Consumed-module federation
 
