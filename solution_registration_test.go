@@ -3,6 +3,7 @@ package solution
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,9 +52,21 @@ type fakeHost struct {
 	// 200, with registerBody as the body.
 	registerStatus int
 	registerBody   string
-	// legacy makes the host one from before the publisher-bound contract: no
-	// exchange route, and both surfaces admit the cluster-internal token.
-	legacy bool
+	// noExchange removes the exchange route, so it answers a plain 404.
+	// admitsInternal makes both surfaces accept the cluster-internal token.
+	//
+	// These are separate knobs, not one "legacy" flag: welding them together
+	// made the host that matters most unreachable by construction — one that
+	// 404s the exchange *and* refuses the internal token, i.e. a current host
+	// reached at a wrong exchange URL.
+	noExchange     bool
+	admitsInternal bool
+	// exchangeGoneAfter, when non-zero, makes the exchange start answering 404
+	// once it has minted that many tokens: a route that disappears under a host
+	// that has already proved it serves one.
+	exchangeGoneAfter int
+	// tokenLifetime is how long a minted token is valid for; zero means 5m.
+	tokenLifetime time.Duration
 
 	mu     sync.Mutex
 	minted int
@@ -75,7 +89,10 @@ func newFakeHost(t *testing.T, secret string) *fakeHost {
 func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case solutionRegistrationTokenPath:
-		if h.legacy {
+		h.mu.Lock()
+		unrouted := h.noExchange || (h.exchangeGoneAfter > 0 && h.minted >= h.exchangeGoneAfter)
+		h.mu.Unlock()
+		if unrouted {
 			send(h.exchanges, solutionExchange{ID: "(unrouted)"})
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -93,9 +110,13 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		h.minted++
 		token := fmt.Sprintf("solution-token-%d", h.minted)
 		h.mu.Unlock()
+		lifetime := h.tokenLifetime
+		if lifetime == 0 {
+			lifetime = 5 * time.Minute
+		}
 		writeJSON(w, http.StatusOK, map[string]string{
 			"token":     token,
-			"expiresAt": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+			"expiresAt": time.Now().Add(lifetime).UTC().Format(time.RFC3339),
 		})
 	case solutionRegisterPath, "/api/solutions/register":
 		surface := "gateway"
@@ -106,18 +127,16 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
 		h.mu.Lock()
 		switch {
-		case h.legacy:
+		case token != "" && !h.burned[surface+":"+token]:
+			// A token is presented once per surface; a replay is refused.
+			h.burned[surface+":"+token] = true
+		case h.admitsInternal && r.Header.Get(internalTokenHeader) == internalTokenTest:
 			// Before the publisher-bound contract the shared token was the
 			// credential.
-			if r.Header.Get(internalTokenHeader) != internalTokenTest {
-				status = http.StatusUnauthorized
-			}
-		case token == "" || h.burned[surface+":"+token]:
-			// The cluster-internal token is not a registration credential, and a
-			// token is presented once per surface.
-			status = http.StatusUnauthorized
 		default:
-			h.burned[surface+":"+token] = true
+			// The cluster-internal token is not a registration credential on a
+			// host that binds registration to the publisher.
+			status = http.StatusUnauthorized
 		}
 		h.mu.Unlock()
 		if status == http.StatusOK && h.registerStatus != 0 {
@@ -281,11 +300,11 @@ func TestServeFallsBackWhenTheHostOffersNoExchange(t *testing.T) {
 	defer log.SetOutput(os.Stderr)
 
 	h := newFakeHost(t, "s3cret")
-	h.legacy = true
+	h.noExchange, h.admitsInternal = true, true
 	stop := bootAgainst(t, h, "s3cret")
 	defer stop()
 
-	seen := awaitRegistrations(t, h, 4)
+	seen := awaitRegistrations(t, h, 8)
 	for _, r := range seen {
 		if r.Status != http.StatusOK {
 			t.Errorf("%s registration was refused (status %d) by a host that admits the cluster-internal token", r.Surface, r.Status)
@@ -303,12 +322,275 @@ func TestServeFallsBackWhenTheHostOffersNoExchange(t *testing.T) {
 		attempts++
 	}
 	if attempts < 2 {
-		t.Fatalf("exchange attempted %d times; every beat must retry it so an upgraded host is picked up", attempts)
+		t.Fatalf("exchange attempted %d times; it must keep being retried so an upgraded host is picked up", attempts)
 	}
-	if n := strings.Count(buf.String(), "has no solution registration exchange"); n != 2 {
+	if attempts >= len(seen) {
+		// A host that predates the contract 404s for as long as it runs and
+		// accepts the beat that follows, so the heartbeat's backoff never
+		// widens: without spacing the credential re-asks a route it knows is
+		// absent on every beat, forever, on both heartbeats.
+		t.Fatalf("exchange attempted %d times across %d beats; the probe must space itself out, not run every beat", attempts, len(seen))
+	}
+	if n := strings.Count(buf.String(), "answered 404, so this beat presents the cluster-internal token"); n != 2 {
 		// One line per heartbeat (host and gateway each own a credential),
 		// not one per beat.
-		t.Fatalf("legacy-host notice logged %d times, want once per surface:\n%s", n, buf.String())
+		t.Fatalf("fallback notice logged %d times, want once per surface:\n%s", n, buf.String())
+	}
+	// The 404 alone cannot establish the host's version, and this host's
+	// acceptance is what settles it — so the notice must offer both readings
+	// rather than assert the old-host one.
+	if out := buf.String(); !strings.Contains(out, "or the exchange URL is wrong") {
+		t.Fatalf("fallback notice asserts a cause the 404 cannot establish:\n%s", out)
+	}
+}
+
+// TestFallbackRefusedNamesTheRouteNotTheHostVersion is the case the old
+// `legacy` test flag made unreachable: a host that DOES require the
+// publisher-bound credential, reached at an exchange URL that 404s (a misderived
+// override, ingress or path skew, a mid-rollout pod). The runtime used to report
+// two falsehoods here — that the host predated v0.0.61, which its own refusal of
+// the cluster-internal token disproves, and that "the exchange accepted this
+// solution's secret", when the exchange never answered at all — sending the
+// reader to provisioning and publisher ownership while a URL was the fault.
+func TestFallbackRefusedNamesTheRouteNotTheHostVersion(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	h := newFakeHost(t, "s3cret")
+	h.noExchange = true // ... and admitsInternal stays false: a current host.
+	stop := bootAgainst(t, h, "s3cret")
+	defer stop()
+
+	for _, r := range awaitRegistrations(t, h, 2) {
+		if r.Status != http.StatusUnauthorized {
+			t.Fatalf("%s registration status = %d, want the host to refuse the fallback", r.Surface, r.Status)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "is a routing or URL fault") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the refused fallback was never diagnosed as a route fault:\n%s", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "proves this host is not one from before the publisher-bound contract") {
+		t.Errorf("diagnosis does not say the refusal disproves the old-host reading:\n%s", out)
+	}
+	if !strings.Contains(out, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL") {
+		t.Errorf("diagnosis does not name the URL to check:\n%s", out)
+	}
+	if strings.Contains(out, "the exchange accepted this solution's secret") {
+		t.Errorf("diagnosis claims the exchange accepted the secret, but it answered 404:\n%s", out)
+	}
+	if strings.Contains(out, "is not registered by another publisher") {
+		t.Errorf("diagnosis sends the reader to publisher ownership, which is not implicated:\n%s", out)
+	}
+}
+
+// TestExchangeSeenOnceIsNeverDowngradedAgain pins the latch: once a host has
+// minted here, it demonstrably serves the exchange, so a later 404 is a fault
+// and not a host version. Falling back anyway would hand the shared
+// cluster-internal token to the registration endpoints on nothing more than an
+// unauthenticated 404 — a downgrade left armed on every beat for anyone able to
+// answer at that URL.
+func TestExchangeSeenOnceIsNeverDowngradedAgain(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	h := newFakeHost(t, "s3cret")
+	h.exchangeGoneAfter = 2 // one mint per surface, then the route vanishes
+	stop := bootAgainst(t, h, "s3cret")
+	defer stop()
+
+	for _, r := range awaitRegistrations(t, h, 2) {
+		if r.Token == "" {
+			t.Fatalf("%s registration presented no minted token before the route vanished", r.Surface)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "refusing to downgrade") {
+		if time.Now().After(deadline) {
+			t.Fatalf("a vanished exchange route was not reported as a fault:\n%s", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Every further beat must fail rather than register with the shared token.
+	for {
+		select {
+		case r := <-h.registrations:
+			if r.Token == "" {
+				t.Fatalf("%s registration fell back to the cluster-internal token (%q) after the host had proved it serves the exchange", r.Surface, r.Internal)
+			}
+		default:
+			return
+		}
+	}
+}
+
+// TestSolutionExchangeProbeSpacingDecays pins the spacing itself, without
+// timing: a 404 widens the gap before the next probe, up to the cap, and one
+// successful exchange resets it.
+func TestSolutionExchangeProbeSpacingDecays(t *testing.T) {
+	c := &solutionCredential{id: "lastlogin-go"}
+	var spacings []int
+	for range 6 {
+		c.spaceOutProbe()
+		spacings = append(spacings, c.skipBeats)
+	}
+	want := []int{1, 2, 4, 8, 8, 8}
+	if fmt.Sprint(spacings) != fmt.Sprint(want) {
+		t.Fatalf("probe spacing = %v, want %v (doubling, capped at solutionExchangeProbeMaxSkip)", spacings, want)
+	}
+	c.probeSkip, c.skipBeats = 0, 0
+	c.spaceOutProbe()
+	if c.skipBeats != 1 {
+		t.Fatalf("after a reset the spacing starts over at 1, got %d", c.skipBeats)
+	}
+}
+
+// TestShortLivedTokenIsUsedNotRefused pins the floor at what it actually bounds.
+// This credential is presented on the very next round trip, so a token the
+// issuer chose to make short-lived is usable; the 5s floor copied from the
+// module credential — which caches its token across beats — refused every one of
+// them, failing every beat forever with a message blaming this host's clock.
+func TestShortLivedTokenIsUsedNotRefused(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	h := newFakeHost(t, "s3cret")
+	h.tokenLifetime = 2 * time.Second // under moduleTokenMinimumLifetime
+	stop := bootAgainst(t, h, "s3cret")
+	defer stop()
+
+	for _, r := range awaitRegistrations(t, h, 2) {
+		if r.Status != http.StatusOK || r.Token == "" {
+			t.Fatalf("%s registration with a %s token: status %d, token %q — a token that outlives the round trip must be presented, not refused",
+				r.Surface, h.tokenLifetime, r.Status, r.Token)
+		}
+	}
+	if out := buf.String(); strings.Contains(out, "check this host's clock") {
+		t.Fatalf("a usable short-lived token was rejected as a clock problem:\n%s", out)
+	}
+}
+
+// TestHeartbeatLogsAChangedRefusalReason proves the reason is part of what was
+// last reported. Keyed on the status alone, a host that keeps answering 409
+// while changing why said it once and then went silent on every later reason —
+// dropping exactly the information detail was plumbed through beat to carry.
+func TestHeartbeatLogsAChangedRefusalReason(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	var beats atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reason := "frontend.hostContract 1 is below the host minimum 2"
+		if beats.Add(1) > 2 {
+			reason = "schemaVersion 1 is no longer accepted"
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "incompatible_runtime", "reasons": []string{reason}})
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{manifest: Manifest{ID: "lastlogin-go"}, registrationInterval: 10 * time.Millisecond}
+	done := make(chan struct{})
+	go func() { s.heartbeat(ctx, srv.URL, []byte("{}"), "host", internalTokenAuth("t")); close(done) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(buf.String(), "schemaVersion 1 is no longer accepted") {
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatalf("the host's changed reason never reached the log:\n%s", buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if n := strings.Count(buf.String(), "frontend.hostContract 1 is below"); n != 1 {
+		t.Errorf("the unchanged reason was logged %d times, want once: a repeated reason must still be deduped", n)
+	}
+}
+
+// TestRefusalDetailCannotForgeALogLine proves a reason the host chose reaches
+// the log as text and never as framing: a newline in it would otherwise write a
+// log line of the runtime's own shape.
+func TestRefusalDetailCannotForgeALogLine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":   "incompatible_runtime",
+			"reasons": []string{"nope\n2026/01/01 00:00:00 registered with host as \"impostor\""},
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL, "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer drainAndClose(resp)
+	detail := refusalDetail(resp)
+	if strings.ContainsAny(detail, "\r\n") {
+		t.Fatalf("refusalDetail kept a line break, so a host reason can forge a log line: %q", detail)
+	}
+	if !strings.Contains(detail, "registered with host as") {
+		t.Fatalf("the host's text must still reach the log, only flattened: %q", detail)
+	}
+}
+
+// TestSecretProvisioningUnknownRefusesTheAmbiguousBoot proves the runtime does
+// not act on a guess. An empty secret means "none provisioned" only when the
+// SDK actually loaded the environment it would have come from; when that load
+// failed the two are indistinguishable — WorkspaceSecret returns the same error
+// either way — and booting on the wrong one came up healthy while registering
+// with a credential the host refuses, blaming provisioning that may be correct.
+func TestSecretProvisioningUnknownRefusesTheAmbiguousBoot(t *testing.T) {
+	loadFailed := errors.New("cannot read injected carriers")
+	if err := secretProvisioningUnknown("", loadFailed); err == nil {
+		t.Fatal("an empty secret after a failed environment load must refuse the boot, not be read as unprovisioned")
+	} else {
+		if !errors.Is(err, loadFailed) {
+			t.Errorf("the refusal must carry the load failure: %v", err)
+		}
+		for _, want := range []string{SolutionRegistrationSecretEnvironmentVariable, SolutionRegistrationSecretGroup} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not name %q: %v", want, err)
+			}
+		}
+	}
+	// Neither unambiguous case may be caught by it: a resolved secret proves the
+	// load error did not matter, and a clean load proves an absent secret is
+	// really absent — which is the documented compatibility path.
+	if err := secretProvisioningUnknown("s3cret", loadFailed); err != nil {
+		t.Errorf("a resolved secret makes the load error moot: %v", err)
+	}
+	if err := secretProvisioningUnknown("", nil); err != nil {
+		t.Errorf("a clean load means an absent secret is genuinely absent: %v", err)
+	}
+}
+
+// TestJitteredOnlyEverWaitsLonger proves the spread cannot shorten a wait: the
+// backoff a failing beat earned is the floor, and cutting into it would undo the
+// request-rate bound it exists to impose.
+func TestJitteredOnlyEverWaitsLonger(t *testing.T) {
+	const base = 15 * time.Second
+	distinct := map[time.Duration]bool{}
+	for range 200 {
+		got := jittered(base)
+		if got < base || got > base+time.Duration(float64(base)*registrationJitter) {
+			t.Fatalf("jittered(%s) = %s, want within [%s, +%.0f%%]", base, got, base, registrationJitter*100)
+		}
+		distinct[got] = true
+	}
+	if len(distinct) < 2 {
+		t.Fatal("jittered returned one value 200 times; heartbeats would stay in lockstep")
+	}
+	if got := jittered(0); got != 0 {
+		t.Errorf("jittered(0) = %s, want 0", got)
 	}
 }
 
