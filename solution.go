@@ -1069,16 +1069,38 @@ type solutionCredential struct {
 	// flight. Nothing here is cached, so a refusal can never be staleness; the
 	// flag only bounds the diagnostic to one line per refusal episode.
 	refused bool
+	// legacyHost records that the host offers no exchange, so the beat fell
+	// back to the cluster-internal token. It bounds that notice to one line.
+	legacyHost bool
 }
 
 func (c *solutionCredential) authorize(ctx context.Context, req *http.Request) error {
 	token, err := c.exchange(ctx)
+	if errors.Is(err, errNoSolutionExchange) {
+		// A host from before the publisher-bound contract has no exchange to
+		// offer and still admits the cluster-internal token; present that, as
+		// the runtime did before, so one composition boots against either
+		// host version. Said once: the day the host upgrades, the exchange
+		// starts answering and this path is never taken again.
+		if !c.legacyHost {
+			c.legacyHost = true
+			log.Printf("solution %q: the host has no solution registration exchange (%s answered 404): presenting the cluster-internal token instead — a host on module-saas-starter < v0.0.61",
+				c.id, c.tokenURL)
+		}
+		return internalTokenAuth(c.internalToken).authorize(ctx, req)
+	}
 	if err != nil {
 		return err
 	}
+	c.legacyHost = false
 	req.Header.Set(solutionRegistrationHeader, token)
 	return nil
 }
+
+// errNoSolutionExchange reports a host with no /solutions/_registration-token
+// route at all — one from before the publisher-bound contract — as opposed to
+// one that refused the exchange.
+var errNoSolutionExchange = errors.New("solution registration exchange not offered by this host")
 
 // invalidate is what a refusal calls. There is no cached token to drop — every
 // beat presents one minted for it — so the refusal cannot be about staleness,
@@ -1122,7 +1144,13 @@ func (c *solutionCredential) exchange(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer drainAndClose(resp)
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		// The gateway routes this path only once it implements the contract;
+		// before that, an unrouted path is a plain 404.
+		return "", errNoSolutionExchange
+	default:
 		// accounts answers an undeclared id and a wrong secret identically, and
 		// the gateway relays that; naming both here is what the reader needs.
 		return "", fmt.Errorf("registration token exchange for solution %q rejected (status %d): the host declares no %s entry for this id, or the provisioned secret does not match its digest",

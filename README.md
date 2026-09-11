@@ -91,12 +91,16 @@ local `codefly run solution` and a deployed cell:
   the SDK injects it. `CODEFLY__SOLUTION_REGISTRATION_SECRET` is an explicit
   override.
 
-With no secret provisioned the runtime still registers the way it did before
-v0.0.61's contract — presenting the cluster-internal token — so a solution keeps
-working against an older host; against a newer one every beat is refused, and
-the boot log says which half is missing rather than leaving "rejected (status
-401)" to be read as a gateway fault. A refusal that carries reasons (the host's
-`409 incompatible_runtime`, say) is logged with them.
+One composition boots against either host version. With no secret provisioned
+the runtime registers the way it did before v0.0.61's contract — presenting the
+cluster-internal token — and the boot log says which half is missing, so
+against a newer host "rejected (status 401)" is not read as a gateway fault.
+With a secret provisioned but a host that offers no exchange (`404` on
+`/solutions/_registration-token`: a host before v0.0.61), the beat presents the
+cluster-internal token instead, says so once, and keeps trying the exchange on
+every beat so a host upgrade is picked up without a restart. A refusal that
+carries reasons (the host's `409 incompatible_runtime`, say) is logged with
+them.
 
 The manifest declares the contract majors it is built against
 (`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving the host

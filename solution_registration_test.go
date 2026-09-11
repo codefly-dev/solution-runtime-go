@@ -50,6 +50,9 @@ type fakeHost struct {
 	// 200, with registerBody as the body.
 	registerStatus int
 	registerBody   string
+	// legacy makes the host one from before the publisher-bound contract: no
+	// exchange route, and both surfaces admit the cluster-internal token.
+	legacy bool
 
 	mu     sync.Mutex
 	minted int
@@ -72,6 +75,11 @@ func newFakeHost(t *testing.T, secret string) *fakeHost {
 func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case solutionRegistrationTokenPath:
+		if h.legacy {
+			send(h.exchanges, solutionExchange{ID: "(unrouted)"})
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		var exchange solutionExchange
 		_ = json.NewDecoder(r.Body).Decode(&exchange)
 		exchange.Secret = r.Header.Get(solutionSecretHeader)
@@ -98,6 +106,12 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
 		h.mu.Lock()
 		switch {
+		case h.legacy:
+			// Before the publisher-bound contract the shared token was the
+			// credential.
+			if r.Header.Get(internalTokenHeader) != internalTokenTest {
+				status = http.StatusUnauthorized
+			}
 		case token == "" || h.burned[surface+":"+token]:
 			// The cluster-internal token is not a registration credential, and a
 			// token is presented once per surface.
@@ -253,6 +267,48 @@ func TestServeFallsBackToInternalTokenWithoutSecret(t *testing.T) {
 		!strings.Contains(out, SolutionRegistrationSecretEnvironmentVariable) ||
 		!strings.Contains(out, SolutionRegistrationSecretGroup+"/"+SolutionRegistrationSecretKey) {
 		t.Fatalf("log does not name the missing provisioning:\n%s", out)
+	}
+}
+
+// TestServeFallsBackWhenTheHostOffersNoExchange proves one composition boots
+// against either host version: with a secret provisioned but a host from
+// before the publisher-bound contract — no exchange route — the runtime
+// presents the cluster-internal token as it always did, says so once, and
+// keeps trying the exchange on every beat so a host upgrade is picked up.
+func TestServeFallsBackWhenTheHostOffersNoExchange(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	h := newFakeHost(t, "s3cret")
+	h.legacy = true
+	stop := bootAgainst(t, h, "s3cret")
+	defer stop()
+
+	seen := awaitRegistrations(t, h, 4)
+	for _, r := range seen {
+		if r.Status != http.StatusOK {
+			t.Errorf("%s registration was refused (status %d) by a host that admits the cluster-internal token", r.Surface, r.Status)
+		}
+		if r.Internal != internalTokenTest {
+			t.Errorf("%s registration presented %s = %q, want the cluster-internal token against a host with no exchange", r.Surface, internalTokenHeader, r.Internal)
+		}
+		if r.Token != "" {
+			t.Errorf("%s registration presented %s = %q, want none: nothing minted it", r.Surface, solutionRegistrationHeader, r.Token)
+		}
+	}
+	attempts := 0
+	for len(h.exchanges) > 0 {
+		<-h.exchanges
+		attempts++
+	}
+	if attempts < 2 {
+		t.Fatalf("exchange attempted %d times; every beat must retry it so an upgraded host is picked up", attempts)
+	}
+	if n := strings.Count(buf.String(), "has no solution registration exchange"); n != 2 {
+		// One line per heartbeat (host and gateway each own a credential),
+		// not one per beat.
+		t.Fatalf("legacy-host notice logged %d times, want once per surface:\n%s", n, buf.String())
 	}
 }
 
