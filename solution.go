@@ -678,7 +678,7 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader)))
+		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader), r.Header.Get(sessionHeader)))
 		if err != nil {
 			status, message := http.StatusBadGateway, err.Error()
 			var clientErr *ClientError
@@ -1490,18 +1490,24 @@ type Gateway struct {
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
+	// sessionID is the viewer's session, which the bearer does not carry
+	// either. Accounts seals the selected organization into that session, so
+	// rooting a Task in it is what makes the capability follow the org the
+	// viewer actually switched into, and lapse with the session itself.
+	sessionID string
 	// delegation is the ask this gateway acts under, nil on the one a handler
 	// is given. It holds the ask rather than a capability: see delegation.
 	delegation *delegation
 	contexts   *workContextCache
 }
 
-func newGateway(baseURL, bearer, orgID string) *Gateway {
+func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 	return &Gateway{
-		baseURL:  baseURL,
-		bearer:   bearer,
-		orgID:    orgID,
-		contexts: newWorkContextCache(),
+		baseURL:   baseURL,
+		bearer:    bearer,
+		orgID:     orgID,
+		sessionID: sessionID,
+		contexts:  newWorkContextCache(),
 	}
 }
 
@@ -1557,6 +1563,15 @@ const workContextStartTaskProcedure = "/saas.accounts.v1.WorkContextService/Star
 // orgHeader carries the viewer's organization. The gateway injects it after it
 // authenticates the bearer, replacing anything the caller sent.
 const orgHeader = "x-org-id"
+
+// sessionHeader carries the viewer's session, stamped from the same verified
+// claims as orgHeader and replacing anything the caller sent. It is the session
+// accounts sealed the selected organization into, which is why a Task is rooted
+// in it rather than in a session id this runtime invents: an invented one is a
+// well-formed UUID naming no session, so nothing about the viewer's session —
+// an organization switch, an impersonation ending, a revocation, its expiry —
+// reaches the capability minted under it.
+const sessionHeader = "x-session-id"
 
 // workContextMintTimeout bounds one mint, so a stalled gateway surfaces as a
 // failed handler rather than holding the viewer's request open indefinitely.
@@ -1623,9 +1638,15 @@ func workContextScopes(scopes []Scope) []workContextScope {
 // module verifies as its own audience. A solution declares the consumption
 // once and names it here.
 //
+// The Task is rooted in the viewer's own session — the one accounts sealed the
+// selected organization into — so the capability names the organization the
+// viewer actually switched into, and no more of the viewer's authority than
+// scopes. Both boundaries come from the identity headers the gateway stamps
+// from verified claims, never from the handler or from anything a browser sent.
+//
 // One ask mints once, however many gateways are derived for it and from however
-// many goroutines: the capability is cached per (org, audience, scopes) and
-// shared with every gateway derived from the one the handler was given, and
+// many goroutines: the capability is cached per (org, session, audience, scopes)
+// and shared with every gateway derived from the one the handler was given, and
 // concurrent asks for it wait on the one mint in flight. Minting is an audited
 // event on accounts, not a free call.
 //
@@ -1643,9 +1664,22 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 			"cannot mint a work context for %q: no viewer organization (%s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected or an org-less API key)",
 			audience, orgHeader)
 	}
-	ask := startTaskRequest{OrgID: g.orgID, Audience: audience, AuthorityScopes: workContextScopes(scopes)}
-	// The ask is the cache identity. The task and session ids name one mint
-	// rather than what was asked for, so they are filled in per mint, below.
+	if g.sessionID == "" {
+		// Same shape as the org above: the gateway stamps this header for every
+		// authenticated caller, empty when the caller has no session to name —
+		// an API key authenticates a principal and no session at all.
+		return nil, fmt.Errorf(
+			"cannot mint a work context for %q: no viewer session (%s is absent or empty — the gateway injects it from the verified session, which an API-key caller does not have)",
+			audience, sessionHeader)
+	}
+	ask := startTaskRequest{
+		OrgID:           g.orgID,
+		SessionID:       g.sessionID,
+		Audience:        audience,
+		AuthorityScopes: workContextScopes(scopes),
+	}
+	// The ask is the cache identity. The task id names one mint rather than
+	// what was asked for, so it is filled in per mint, below.
 	key, err := json.Marshal(ask)
 	if err != nil {
 		return nil, err
@@ -1674,7 +1708,7 @@ type delegation struct {
 func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, error) {
 	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (codefly.WorkContextToken, time.Time, error) {
 		ask := g.delegation.ask
-		ask.TaskID, ask.SessionID = uuid.NewString(), uuid.NewString()
+		ask.TaskID = uuid.NewString()
 		return g.mint(ctx, ask)
 	})
 }

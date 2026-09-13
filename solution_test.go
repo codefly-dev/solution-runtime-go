@@ -1715,6 +1715,10 @@ func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Se
 
 const viewerOrg = "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11"
 
+// viewerSession is the session the gateway stamps from the verified claims —
+// the one accounts sealed viewerOrg into when the viewer selected it.
+const viewerSession = "019240b1-3f5a-7c21-9d4e-8a2b7c1e5f30"
+
 // viewerRequest is the request the gateway forwards to a solution: the viewer's
 // bearer, plus the canonical identity headers it injects after authenticating.
 func viewerRequest(t *testing.T, target string) *http.Response {
@@ -1725,6 +1729,7 @@ func viewerRequest(t *testing.T, target string) *http.Response {
 	}
 	req.Header.Set("authorization", "Bearer viewer-token")
 	req.Header.Set(orgHeader, viewerOrg)
+	req.Header.Set(sessionHeader, viewerSession)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)
@@ -1768,10 +1773,13 @@ func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
 	if !reflect.DeepEqual(mint.AuthorityScopes, want) {
 		t.Errorf("mint scopes = %v, want %v", mint.AuthorityScopes, want)
 	}
-	// A Task and its root Session are named per mint, and accounts requires
-	// both to be UUIDs — an empty or reused id is refused before the handler.
-	if mint.TaskID == "" || mint.SessionID == "" || mint.TaskID == mint.SessionID {
-		t.Errorf("mint task/session = %q/%q, want two distinct ids", mint.TaskID, mint.SessionID)
+	// The Task is named per mint; the session it is rooted in is the viewer's
+	// own, not one this runtime invented.
+	if mint.SessionID != viewerSession {
+		t.Errorf("mint session = %q, want the viewer's %q", mint.SessionID, viewerSession)
+	}
+	if mint.TaskID == "" || mint.TaskID == mint.SessionID {
+		t.Errorf("mint task = %q, want an id of its own", mint.TaskID)
 	}
 
 	call := <-gw.calls
@@ -2067,7 +2075,7 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 // for a viewer with no organization selected.
 func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	_, err := newGateway(gw.URL, "Bearer viewer-token", "").
+	_, err := newGateway(gw.URL, "Bearer viewer-token", "", viewerSession).
 		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 	if err == nil {
 		t.Fatal("ForModule minted a work context with no organization")
@@ -2103,6 +2111,95 @@ func TestGatewayWithoutAModuleCarriesOnlyTheBearer(t *testing.T) {
 	}
 	if got := gw.mintCount(); got != 0 {
 		t.Errorf("minted %d capabilities without ForModule, want 0", got)
+	}
+}
+
+// TestMintRootsTheTaskInTheViewersVerifiedSession pins what the mint is built
+// from. Accounts seals the selected organization into the viewer's session, so
+// a Task rooted in a session id this runtime invented names no session at all:
+// it is a well-formed UUID that passes validation while an organization switch,
+// an ended impersonation, a revocation or the session's own expiry never reach
+// the capability minted under it. One session carries many Tasks, so the Task
+// id — and only it — is named per mint.
+func TestMintRootsTheTaskInTheViewersVerifiedSession(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		if _, err := readModule(ctx, g, "documents"); err != nil {
+			return nil, err
+		}
+		if _, err := g.ForModule(ctx, "billing", Scope{ResourceKind: "invoices", Actions: []string{"read"}}); err != nil {
+			return nil, err
+		}
+		return "done", nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+
+	first, second := <-gw.mints, <-gw.mints
+	for _, mint := range []mintRequest{first, second} {
+		if mint.SessionID != viewerSession {
+			t.Errorf("mint for %q rooted in session %q, want the viewer's %q", mint.Audience, mint.SessionID, viewerSession)
+		}
+	}
+	if first.TaskID == second.TaskID {
+		t.Errorf("both mints named task %q, want one Task per mint under the one session", first.TaskID)
+	}
+}
+
+// TestForModuleRefusesWithoutTheViewersSession is the session twin of the org
+// refusal: a capability accounts cannot tie to a live session is refused here
+// rather than bought with an audited mint. The gateway stamps the header for
+// every authenticated caller, so the common cause is a caller that has no
+// session to name at all — an API key.
+func TestForModuleRefusesWithoutTheViewersSession(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	_, err := newGateway(gw.URL, "Bearer viewer-token", viewerOrg, "").
+		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+	if err == nil {
+		t.Fatal("ForModule minted a work context with no viewer session")
+	}
+	if !strings.Contains(err.Error(), sessionHeader) {
+		t.Errorf("error %q does not name %s, the header whoever reads it must inspect", err, sessionHeader)
+	}
+	if got := gw.mintCount(); got != 0 {
+		t.Errorf("minted %d capabilities, want 0", got)
+	}
+}
+
+// TestBrowserSuppliedWorkContextIsNeverForwarded pins that no capability a
+// caller presents can become the one a module read is authenticated with. The
+// runtime builds its outbound requests rather than relaying the inbound one, so
+// a forged context authenticates neither the mint nor the read — the credential
+// on the wire is the one accounts issued for this viewer's session.
+func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		return readModule(ctx, g, "documents")
+	})
+
+	req, err := http.NewRequest(http.MethodGet, solution.URL, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("authorization", "Bearer viewer-token")
+	req.Header.Set(orgHeader, viewerOrg)
+	req.Header.Set(sessionHeader, viewerSession)
+	req.Header.Set(codefly.WorkContextHeaderName, "forged.capability")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("call solution: %v", err)
+	}
+	defer drainAndClose(resp)
+
+	if mint := <-gw.mints; mint.WorkContext != "" {
+		t.Errorf("mint carried work context %q, want none — a caller-supplied capability must not authenticate the mint", mint.WorkContext)
+	}
+	if call := <-gw.calls; call.WorkContext != "context-documents.1" {
+		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
 	}
 }
 

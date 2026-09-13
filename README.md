@@ -242,10 +242,23 @@ viewer with no organization selected and for an org-less API key — the refusal
 names both shapes, because pointing only at an absent header sends whoever
 reads it to inspect one the gateway demonstrably did set.
 
+The Task is rooted in the viewer's **session**, which arrives the same way:
+`x-session-id`, stamped from the same verified claims and replacing anything the
+caller sent. That session is the one accounts sealed the selected organization
+into, so the capability follows the organization the viewer actually switched
+into and lapses with the session — an organization switch, an ended
+impersonation, a revoked or expired session. A session id the runtime invented
+would be a well-formed UUID naming no session, so none of that would reach the
+capability minted under it. A caller with no session to name — an API key
+authenticates a principal and no session — is refused here, like the org, rather
+than charged an audited mint accounts would refuse. Neither boundary is ever
+taken from the handler or from anything a browser sent: a solution names the
+audience and the scopes, and the runtime names who the viewer is.
+
 Minting is an audited event on accounts, so capabilities are cached per (org,
-audience, scopes) and shared by every gateway derived from the one a handler was
-given: a handler reading a module repeatedly mints once, and so does one that
-fans the same ask out across goroutines — concurrent asks wait on the single
+session, audience, scopes) and shared by every gateway derived from the one a
+handler was given: a handler reading a module repeatedly mints once, and so does
+one that fans the same ask out across goroutines — concurrent asks wait on the single
 mint in flight rather than each running their own. The cache lives no longer
 than the request, since the gateway that owns it does not.
 
