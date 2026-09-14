@@ -678,7 +678,7 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader)))
+		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader), r.Header.Get(sessionHeader)))
 		if err != nil {
 			status, message := http.StatusBadGateway, err.Error()
 			var clientErr *ClientError
@@ -1490,18 +1490,24 @@ type Gateway struct {
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
+	// sessionID is the viewer's session, which the bearer does not carry
+	// either. Accounts seals the selected organization into that session, so
+	// rooting a Task in it is what makes the mint accounts journals name the
+	// session that asked for it.
+	sessionID string
 	// delegation is the ask this gateway acts under, nil on the one a handler
 	// is given. It holds the ask rather than a capability: see delegation.
 	delegation *delegation
 	contexts   *workContextCache
 }
 
-func newGateway(baseURL, bearer, orgID string) *Gateway {
+func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 	return &Gateway{
-		baseURL:  baseURL,
-		bearer:   bearer,
-		orgID:    orgID,
-		contexts: newWorkContextCache(),
+		baseURL:   baseURL,
+		bearer:    bearer,
+		orgID:     orgID,
+		sessionID: sessionID,
+		contexts:  newWorkContextCache(),
 	}
 }
 
@@ -1557,6 +1563,21 @@ const workContextStartTaskProcedure = "/saas.accounts.v1.WorkContextService/Star
 // orgHeader carries the viewer's organization. The gateway injects it after it
 // authenticates the bearer, replacing anything the caller sent.
 const orgHeader = "x-org-id"
+
+// sessionHeader carries the viewer's session, stamped from the same verified
+// claims as orgHeader and replacing anything the caller sent. It is the session
+// accounts sealed the selected organization into, which is why a Task is rooted
+// in it rather than in a session id this runtime invents: an invented one is a
+// well-formed UUID naming no session, so the capability it roots is attributable
+// to nothing — neither the audit of the mint nor any check accounts makes on the
+// Task it journals can tie it back to the session that asked for it.
+//
+// What rooting it here does NOT do is make an issued capability revocable. The
+// edge verifies a presented context's signature and validity window, not the
+// liveness of the session named in it, so revoking a session stops the next
+// request — at the gateway's own revocation check, before any mint — while a
+// capability already minted stands until its own expiry.
+const sessionHeader = "x-session-id"
 
 // workContextMintTimeout bounds one mint, so a stalled gateway surfaces as a
 // failed handler rather than holding the viewer's request open indefinitely.
@@ -1623,11 +1644,24 @@ func workContextScopes(scopes []Scope) []workContextScope {
 // module verifies as its own audience. A solution declares the consumption
 // once and names it here.
 //
+// The Task is rooted in the viewer's own session — the one accounts sealed the
+// selected organization into — so the capability names the organization the
+// viewer actually switched into, and no more of the viewer's authority than
+// scopes. Both boundaries come from the identity headers the gateway stamps
+// from verified claims, never from the handler or from anything a browser sent.
+//
 // One ask mints once, however many gateways are derived for it and from however
-// many goroutines: the capability is cached per (org, audience, scopes) and
-// shared with every gateway derived from the one the handler was given, and
-// concurrent asks for it wait on the one mint in flight. Minting is an audited
-// event on accounts, not a free call.
+// many goroutines: the capability is cached under the ask itself and shared with
+// every gateway derived from the one the handler was given, and concurrent asks
+// for it wait on the one mint in flight. That cache lives for one request, so
+// the org and session in the key are fixed across it and the audience and scopes
+// are what tell two asks apart. Minting is an audited event on accounts, not a
+// free call.
+//
+// A caller the runtime cannot name both boundaries for is refused here rather
+// than charged a mint accounts would refuse: each refusal carries a ClientError,
+// so a handler that returns it answers 409 (no organization selected) or 403 (no
+// session — an API key cannot read a composed module) instead of a generic 502.
 //
 // The returned gateway holds the ask, not the capability — it resolves one per
 // request — so a handler may keep it for as long as it keeps the viewer's
@@ -1639,13 +1673,38 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		// present but empty for a viewer with no organization selected and for
 		// an org-less API key. Naming only the absent case would send whoever
 		// reads this to inspect a header the gateway demonstrably did set.
+		//
+		// Selecting an organization is something the caller can actually do, so
+		// this answers a status that says so. As a bare error it would reach the
+		// browser as the runtime's generic 502, where "pick an organization" is
+		// indistinguishable from "this solution is down".
 		return nil, fmt.Errorf(
-			"cannot mint a work context for %q: no viewer organization (%s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected or an org-less API key)",
-			audience, orgHeader)
+			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected and for an org-less API key: %w",
+			audience, orgHeader, &ClientError{StatusCode: http.StatusConflict, Message: "no organization selected"})
 	}
-	ask := startTaskRequest{OrgID: g.orgID, Audience: audience, AuthorityScopes: workContextScopes(scopes)}
-	// The ask is the cache identity. The task and session ids name one mint
-	// rather than what was asked for, so they are filled in per mint, below.
+	if g.sessionID == "" {
+		// Same shape as the org above: the gateway stamps this header for every
+		// authenticated caller and leaves it empty for one that authenticates
+		// without a session — an API key names a principal and no session.
+		//
+		// Such a caller cannot read a composed module at all: accounts requires
+		// a Task to name a session (session_id is a required UUID on StartTask),
+		// and the only session id this runtime could supply is one it invented,
+		// which is what made the capability attributable to nothing. Unlike the
+		// org above this is not the caller's to fix, so it is forbidden rather
+		// than a conflict.
+		return nil, fmt.Errorf(
+			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the verified session and stamps it empty for any caller that authenticates without one: %w",
+			audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
+	}
+	ask := startTaskRequest{
+		OrgID:           g.orgID,
+		SessionID:       g.sessionID,
+		Audience:        audience,
+		AuthorityScopes: workContextScopes(scopes),
+	}
+	// The ask is the cache identity. The task id names one mint rather than
+	// what was asked for, so it is filled in per mint, below.
 	key, err := json.Marshal(ask)
 	if err != nil {
 		return nil, err
@@ -1674,7 +1733,7 @@ type delegation struct {
 func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, error) {
 	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (codefly.WorkContextToken, time.Time, error) {
 		ask := g.delegation.ask
-		ask.TaskID, ask.SessionID = uuid.NewString(), uuid.NewString()
+		ask.TaskID = uuid.NewString()
 		return g.mint(ctx, ask)
 	})
 }
