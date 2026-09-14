@@ -2170,11 +2170,13 @@ func TestForModuleRefusesWithoutTheViewersSession(t *testing.T) {
 	}
 }
 
-// TestBrowserSuppliedWorkContextIsNeverForwarded pins that no capability a
-// caller presents can become the one a module read is authenticated with. The
-// runtime builds its outbound requests rather than relaying the inbound one, so
-// a forged context authenticates neither the mint nor the read — the credential
-// on the wire is the one accounts issued for this viewer's session.
+// TestBrowserSuppliedWorkContextIsNeverForwarded guards a property that holds
+// structurally today: the runtime builds its outbound requests instead of
+// relaying the inbound one, so there is no path by which a caller-presented
+// capability could authenticate the mint or the read. It cannot fail as the code
+// stands — it is here to fail the day someone relays inbound headers onto a
+// gateway request, which is the change that would quietly let a browser pick the
+// credential a module read is authenticated with.
 func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
 	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
@@ -2200,6 +2202,68 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	}
 	if call := <-gw.calls; call.WorkContext != "context-documents.1" {
 		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
+	}
+}
+
+// TestRefusedBoundariesAnswerAStatusTheCallerCanAct pins how a refusal reaches
+// the browser. Both boundaries fail before any mint, but as bare errors they
+// arrive as the runtime's generic 502, where "select an organization" — which
+// the viewer fixes in one click — is indistinguishable from "this solution is
+// down". The diagnostic naming internal headers stays out of the response body:
+// that separation is the other half of what ClientError is for.
+func TestRefusedBoundariesAnswerAStatusTheCallerCanAct(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		if _, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}}); err != nil {
+			return nil, err
+		}
+		return "minted", nil
+	})
+
+	for _, tt := range []struct {
+		name    string
+		org     string
+		session string
+		status  int
+		message string
+		header  string
+	}{
+		{"no organization selected", "", viewerSession, http.StatusConflict, "no organization selected", orgHeader},
+		{"no session", viewerOrg, "", http.StatusForbidden, "a user session is required to read composed modules", sessionHeader},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, solution.URL, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("authorization", "Bearer viewer-token")
+			req.Header.Set(orgHeader, tt.org)
+			req.Header.Set(sessionHeader, tt.session)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("call solution: %v", err)
+			}
+			defer drainAndClose(resp)
+
+			if resp.StatusCode != tt.status {
+				t.Errorf("solution answered %d, want %d — a bare error answers 502, which reads as an outage", resp.StatusCode, tt.status)
+			}
+			var body struct {
+				Error string `json:"error"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			if body.Error != tt.message {
+				t.Errorf("body error = %q, want %q", body.Error, tt.message)
+			}
+			if strings.Contains(body.Error, tt.header) {
+				t.Errorf("body %q names the internal header %q: the diagnostic belongs in the handler's error, not the caller's response", body.Error, tt.header)
+			}
+			if got := gw.mintCount(); got != 0 {
+				t.Errorf("minted %d capabilities, want 0", got)
+			}
+		})
 	}
 }
 

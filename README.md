@@ -245,18 +245,36 @@ reads it to inspect one the gateway demonstrably did set.
 The Task is rooted in the viewer's **session**, which arrives the same way:
 `x-session-id`, stamped from the same verified claims and replacing anything the
 caller sent. That session is the one accounts sealed the selected organization
-into, so the capability follows the organization the viewer actually switched
-into and lapses with the session — an organization switch, an ended
-impersonation, a revoked or expired session. A session id the runtime invented
-would be a well-formed UUID naming no session, so none of that would reach the
-capability minted under it. A caller with no session to name — an API key
-authenticates a principal and no session — is refused here, like the org, rather
-than charged an audited mint accounts would refuse. Neither boundary is ever
-taken from the handler or from anything a browser sent: a solution names the
-audience and the scopes, and the runtime names who the viewer is.
+into, so the Task it roots is attributable — the mint accounts journals names the
+session that asked for it. A session id the runtime invented would be a
+well-formed UUID naming no session, attributable to nothing.
 
-Minting is an audited event on accounts, so capabilities are cached per (org,
-session, audience, scopes) and shared by every gateway derived from the one a
+Rooting the Task there does **not** make the capability revocable, and nothing
+here should be read as saying it does. The edge verifies a presented context's
+signature and validity window, not the liveness of the session named in it, so
+revoking a session stops the *next* request — at the gateway's own revocation
+check, before any mint — while a capability already minted stands until its own
+expiry. That expiry, not the session's, is what bounds one; accounts caps a
+Task's requested TTL at 15 minutes.
+
+Each boundary is refused rather than guessed, and each refusal carries a
+`ClientError`, so a handler that returns it answers a status the caller can act
+on instead of the generic 502: no active organization is `409`, no session is
+`403`. The second has a consequence worth stating outright — **an API key cannot
+read a composed module**. It authenticates a principal and no session, so the
+gateway stamps `x-session-id` empty, and accounts requires a Task to name one
+(`session_id` is a required UUID on `StartTask`). A solution could previously
+mint for such a caller only because this runtime invented a session id, which is
+exactly what made the capability attributable to nothing. The user-absent path
+accounts does provide is the headless installation mint, which this runtime does
+not implement.
+
+Neither boundary is ever taken from the handler or from anything a browser sent:
+a solution names the audience and the scopes, and the runtime names who the
+viewer is.
+
+Minting is an audited event on accounts, so capabilities are cached under the
+ask they were minted for and shared by every gateway derived from the one a
 handler was given: a handler reading a module repeatedly mints once, and so does
 one that fans the same ask out across goroutines — concurrent asks wait on the single
 mint in flight rather than each running their own. The cache lives no longer

@@ -1492,8 +1492,8 @@ type Gateway struct {
 	orgID string
 	// sessionID is the viewer's session, which the bearer does not carry
 	// either. Accounts seals the selected organization into that session, so
-	// rooting a Task in it is what makes the capability follow the org the
-	// viewer actually switched into, and lapse with the session itself.
+	// rooting a Task in it is what makes the mint accounts journals name the
+	// session that asked for it.
 	sessionID string
 	// delegation is the ask this gateway acts under, nil on the one a handler
 	// is given. It holds the ask rather than a capability: see delegation.
@@ -1568,9 +1568,15 @@ const orgHeader = "x-org-id"
 // claims as orgHeader and replacing anything the caller sent. It is the session
 // accounts sealed the selected organization into, which is why a Task is rooted
 // in it rather than in a session id this runtime invents: an invented one is a
-// well-formed UUID naming no session, so nothing about the viewer's session —
-// an organization switch, an impersonation ending, a revocation, its expiry —
-// reaches the capability minted under it.
+// well-formed UUID naming no session, so the capability it roots is attributable
+// to nothing — neither the audit of the mint nor any check accounts makes on the
+// Task it journals can tie it back to the session that asked for it.
+//
+// What rooting it here does NOT do is make an issued capability revocable. The
+// edge verifies a presented context's signature and validity window, not the
+// liveness of the session named in it, so revoking a session stops the next
+// request — at the gateway's own revocation check, before any mint — while a
+// capability already minted stands until its own expiry.
 const sessionHeader = "x-session-id"
 
 // workContextMintTimeout bounds one mint, so a stalled gateway surfaces as a
@@ -1645,10 +1651,17 @@ func workContextScopes(scopes []Scope) []workContextScope {
 // from verified claims, never from the handler or from anything a browser sent.
 //
 // One ask mints once, however many gateways are derived for it and from however
-// many goroutines: the capability is cached per (org, session, audience, scopes)
-// and shared with every gateway derived from the one the handler was given, and
-// concurrent asks for it wait on the one mint in flight. Minting is an audited
-// event on accounts, not a free call.
+// many goroutines: the capability is cached under the ask itself and shared with
+// every gateway derived from the one the handler was given, and concurrent asks
+// for it wait on the one mint in flight. That cache lives for one request, so
+// the org and session in the key are fixed across it and the audience and scopes
+// are what tell two asks apart. Minting is an audited event on accounts, not a
+// free call.
+//
+// A caller the runtime cannot name both boundaries for is refused here rather
+// than charged a mint accounts would refuse: each refusal carries a ClientError,
+// so a handler that returns it answers 409 (no organization selected) or 403 (no
+// session — an API key cannot read a composed module) instead of a generic 502.
 //
 // The returned gateway holds the ask, not the capability — it resolves one per
 // request — so a handler may keep it for as long as it keeps the viewer's
@@ -1660,17 +1673,29 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		// present but empty for a viewer with no organization selected and for
 		// an org-less API key. Naming only the absent case would send whoever
 		// reads this to inspect a header the gateway demonstrably did set.
+		//
+		// Selecting an organization is something the caller can actually do, so
+		// this answers a status that says so. As a bare error it would reach the
+		// browser as the runtime's generic 502, where "pick an organization" is
+		// indistinguishable from "this solution is down".
 		return nil, fmt.Errorf(
-			"cannot mint a work context for %q: no viewer organization (%s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected or an org-less API key)",
-			audience, orgHeader)
+			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected and for an org-less API key: %w",
+			audience, orgHeader, &ClientError{StatusCode: http.StatusConflict, Message: "no organization selected"})
 	}
 	if g.sessionID == "" {
 		// Same shape as the org above: the gateway stamps this header for every
-		// authenticated caller, empty when the caller has no session to name —
-		// an API key authenticates a principal and no session at all.
+		// authenticated caller and leaves it empty for one that authenticates
+		// without a session — an API key names a principal and no session.
+		//
+		// Such a caller cannot read a composed module at all: accounts requires
+		// a Task to name a session (session_id is a required UUID on StartTask),
+		// and the only session id this runtime could supply is one it invented,
+		// which is what made the capability attributable to nothing. Unlike the
+		// org above this is not the caller's to fix, so it is forbidden rather
+		// than a conflict.
 		return nil, fmt.Errorf(
-			"cannot mint a work context for %q: no viewer session (%s is absent or empty — the gateway injects it from the verified session, which an API-key caller does not have)",
-			audience, sessionHeader)
+			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the verified session and stamps it empty for any caller that authenticates without one: %w",
+			audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
 	}
 	ask := startTaskRequest{
 		OrgID:           g.orgID,
