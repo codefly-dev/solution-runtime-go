@@ -2037,9 +2037,8 @@ func TestGatewayTrafficIsNeverProxied(t *testing.T) {
 	}
 }
 
-// TestForModuleSurfacesARefusedMint keeps the Connect code and message the
-// authority gave. Without them a refusal is a bare 502 at the solution, which
-// is exactly the dead end this issue started from.
+// A refused mint retains diagnostics for the handler but returns an actionable
+// status, without disclosing upstream details, to the browser.
 func TestForModuleSurfacesARefusedMint(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{mintStatus: http.StatusForbidden})
 	var mintErr error
@@ -2050,8 +2049,8 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 
 	resp := viewerRequest(t, solution.URL)
 	defer drainAndClose(resp)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("solution answered %d, want 502", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("solution answered %d, want 403", resp.StatusCode)
 	}
 	if mintErr == nil {
 		t.Fatal("ForModule succeeded against a refusing authority")
@@ -2060,6 +2059,13 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 		if !strings.Contains(mintErr.Error(), want) {
 			t.Errorf("mint error %q does not mention %q", mintErr, want)
 		}
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "caller holds no such authority") || strings.Contains(string(body), "documents") {
+		t.Fatalf("upstream diagnostic disclosed: %s", body)
 	}
 	select {
 	case call := <-gw.calls:

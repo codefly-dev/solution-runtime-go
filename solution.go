@@ -53,14 +53,14 @@ type Manifest struct {
 }
 
 // Handler is a solution endpoint. It receives a Gateway bound to the caller's
-// bearer and returns any JSON-serializable value. Errors return 502 unless they
-// contain a ClientError specifying a 4xx response.
+// bearer and returns any JSON-serializable value. ClientError, GatewayError and
+// Connect errors retain actionable statuses; untyped errors return 502.
 type Handler func(ctx context.Context, gw *Gateway) (any, error)
 
 // RequestHandler receives the incoming request and the same caller-bound Gateway
 // as Handler. Implementations must bound and validate request bodies before use.
-// Return a ClientError to reject invalid input with a 4xx status; other errors
-// use the runtime's normal 502 JSON error response.
+// Return a ClientError to reject invalid input with a 4xx status. GatewayError
+// and Connect errors retain actionable statuses; untyped errors return 502.
 type RequestHandler func(r *http.Request, gw *Gateway) (any, error)
 
 // ClientError rejects a request with StatusCode (400–499) and a public Message.
@@ -680,11 +680,7 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 		}
 		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader), r.Header.Get(sessionHeader)))
 		if err != nil {
-			status, message := http.StatusBadGateway, err.Error()
-			var clientErr *ClientError
-			if errors.As(err, &clientErr) && clientErr != nil && clientErr.StatusCode >= 400 && clientErr.StatusCode <= 499 {
-				status, message = clientErr.StatusCode, clientErr.Message
-			}
+			status, message := handlerErrorResponse(err)
 			writeJSON(w, status, map[string]string{"error": message})
 			return
 		}
@@ -1777,8 +1773,8 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 			Message string `json:"message"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q rejected (status %d, %q): %s",
-			ask.Audience, resp.StatusCode, refusal.Code, refusal.Message)
+		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q rejected (status %d, %q): %s: %w",
+			ask.Audience, resp.StatusCode, refusal.Code, refusal.Message, &GatewayError{StatusCode: resp.StatusCode})
 	}
 	var issued struct {
 		Token     string    `json:"token"`

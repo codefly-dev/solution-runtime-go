@@ -117,8 +117,10 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 			lifetime = 5 * time.Minute
 		}
 		writeJSON(w, http.StatusOK, map[string]string{
-			"token":     token,
-			"expiresAt": time.Now().Add(lifetime).UTC().Format(time.RFC3339),
+			"token": token,
+			// Preserve the requested lifetime: truncating to seconds can put
+			// a 1.5s token below the 1s admission floor before the beat starts.
+			"expiresAt": time.Now().Add(lifetime).UTC().Format(time.RFC3339Nano),
 		})
 	case solutionRegisterPath, "/api/solutions/register":
 		if h.registerDelay > 0 {

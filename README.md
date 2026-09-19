@@ -19,6 +19,23 @@ solution.New(solution.Manifest{ID: "my-solution", Title: "My Solution"}).
 
 The gateway URL, the caller's bearer, and the wire protocol are hidden.
 
+## Handler errors
+
+Return `ClientError` for an explicitly public validation message. Connect errors
+returned by `Unary` retain actionable statuses: authentication 401, permission
+403, missing resource 404, invalid input 400, conflict 409, precondition 412,
+quota 429, unavailable 503 and deadline 504. Other RPC failures return 502.
+Only generic status text reaches the browser; wrapped/upstream details remain
+available to the handler. No request is retried or replayed.
+
+REST adapters can return `&solution.GatewayError{StatusCode: resp.StatusCode}`
+after a non-success response through the gateway. The runtime preserves 4xx,
+503 and 504; unexpected statuses and other server failures become 502. This
+error carries no raw body, URL or headers. Work Context mint refusals use this
+same path. Untyped errors retain the existing 502/public-error-string behavior,
+so handlers must not put private details in them. Consumers using an older runtime
+or flattening failures into strings must adopt these typed errors to benefit.
+
 ## Configuration
 
 The runtime hardcodes nothing. On boot `Serve` calls
