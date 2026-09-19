@@ -21,4 +21,4 @@ jobs:
       - run: go mod download && go mod verify
       - run: go test -race ./... -count=1 -timeout=5m
       - run: go vet ./...
-      - run: test -z "$(gofmt -l *.go)"
+      - run: test -z "$(gofmt -l ./*.go)"
