@@ -288,22 +288,32 @@ func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
 	}
 }
 
-// A solution that offers nothing inside a client must not gain the key, and one
-// that declares no selector or namespaces must not gain those slots: the host
-// defaults what a solution left unsaid, and a null says something else.
-func TestManifestOmitsUndeclaredSurfaceSlots(t *testing.T) {
+// A solution that offers nothing inside a client must not gain the key at all.
+func TestManifestOmitsAbsentSurfaces(t *testing.T) {
 	bare := &Server{manifest: Manifest{ID: "lastlogin-go"}}
 	if _, ok := bare.manifestMap()["surfaces"]; ok {
 		t.Errorf("emitted a surfaces key with no surface declared")
 	}
+}
 
+// A surface is in the manifest whether or not it declares a selector, so an
+// absent applies is not the absence of the surface — it is the default the
+// contract names, and every client would otherwise have to invent it alike.
+// Nothing to show and nothing to reconcile on are different: those slots say
+// what they mean by being absent.
+func TestManifestDefaultsAppliesAndOmitsEmptySurfaceSlots(t *testing.T) {
 	surface := wordFootnote()
 	surface.Applies = nil
 	surface.Events = nil
+	surface.Description = ""
 	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+
 	entry := s.manifestMap()["surfaces"].([]any)[0].(map[string]any)
-	if _, ok := entry["applies"]; ok {
-		t.Errorf("emitted an applies key with no selector declared")
+	if got := entry["applies"]; got != "always" {
+		t.Errorf("applies with no selector declared = %#v, want %q", got, "always")
+	}
+	if _, ok := entry["description"]; ok {
+		t.Errorf("emitted a description key with no description declared")
 	}
 	if _, ok := entry["events"]; ok {
 		t.Errorf("emitted an events key with no namespaces declared")
@@ -321,9 +331,15 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 		{"no id", []Surface{func() Surface { s := wordFootnote(); s.ID = ""; return s }()}, "no id"},
 		{"id with uppercase", []Surface{func() Surface { s := wordFootnote(); s.ID = "Footnote"; return s }()}, "id must be"},
 		{"id with a slash", []Surface{func() Surface { s := wordFootnote(); s.ID = "word/footnote"; return s }()}, "id must be"},
-		{"duplicate id", []Surface{wordFootnote(), wordFootnote()}, "declared twice"},
+		{"id with a leading dash", []Surface{func() Surface { s := wordFootnote(); s.ID = "-footnote"; return s }()}, "id must be"},
+		{"id with a trailing dash", []Surface{func() Surface { s := wordFootnote(); s.ID = "footnote-"; return s }()}, "id must be"},
+		{"id of one dash", []Surface{func() Surface { s := wordFootnote(); s.ID = "-"; return s }()}, "id must be"},
+		{"duplicate id in one client", []Surface{wordFootnote(), wordFootnote()}, "declared twice"},
+		{"no title", []Surface{func() Surface { s := wordFootnote(); s.Title = ""; return s }()}, "no title"},
 		{"unknown client", []Surface{func() Surface { s := wordFootnote(); s.Client = "notion"; return s }()}, "unknown client kind"},
 		{"no client", []Surface{func() Surface { s := wordFootnote(); s.Client = ""; return s }()}, "unknown client kind"},
+		{"undeclared contract", []Surface{func() Surface { s := wordFootnote(); s.Contract = 0; return s }()}, "contract"},
+		{"negative contract", []Surface{func() Surface { s := wordFootnote(); s.Contract = -1; return s }()}, "contract"},
 		{"absolute module URL", []Surface{func() Surface {
 			s := wordFootnote()
 			s.Module = "https://evil.example/footnote.js"
@@ -332,6 +348,29 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 		{"protocol-relative module", []Surface{func() Surface {
 			s := wordFootnote()
 			s.Module = "//evil.example/footnote.js"
+			return s
+		}()}, "own origin"},
+		// A browser reads the backslash beside the leading slash as a slash and
+		// what follows as a host, so each of these loads third-party code even
+		// though net/url reports no host in any of them.
+		{"backslash authority module", []Surface{func() Surface {
+			s := wordFootnote()
+			s.Module = `/\evil.example/footnote.js`
+			return s
+		}()}, "own origin"},
+		{"backslash-slash authority module", []Surface{func() Surface {
+			s := wordFootnote()
+			s.Module = `/\/evil.example/footnote.js`
+			return s
+		}()}, "own origin"},
+		{"tab-smuggled authority module", []Surface{func() Surface {
+			s := wordFootnote()
+			s.Module = "/\t/evil.example/footnote.js"
+			return s
+		}()}, "own origin"},
+		{"newline-smuggled authority module", []Surface{func() Surface {
+			s := wordFootnote()
+			s.Module = "/\n//evil.example/footnote.js"
 			return s
 		}()}, "own origin"},
 		{"relative module", []Surface{func() Surface { s := wordFootnote(); s.Module = "surfaces/footnote.js"; return s }()}, "own origin"},
@@ -350,15 +389,26 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 	}
 }
 
-// Two surfaces for two clients are the normal case — the wiki offers one inside
-// Word and one inside Slack — and must not read as a duplicate.
-func TestSurfaceValidationAcceptsSeveralClients(t *testing.T) {
-	slack := wordFootnote()
-	slack.ID = "ask"
-	slack.Client = "slack"
-	slack.Module = "/surfaces/slack/ask.js"
-	if err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), slack}}).validateSurfaces(); err != nil {
-		t.Errorf("validateSurfaces refused a valid pair: %v", err)
+// The same offering in two clients carries the same id — the wiki's footnote is
+// "footnote" in Word and in PowerPoint — and neither client can see the other's,
+// so that is not a collision. Only two surfaces of one client are ambiguous.
+func TestSurfaceIDsAreUniquePerClientNotPerSolution(t *testing.T) {
+	powerpoint := wordFootnote()
+	powerpoint.Client = "powerpoint"
+	powerpoint.Module = "/surfaces/powerpoint/footnote.js"
+	if err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), powerpoint}}).validateSurfaces(); err != nil {
+		t.Errorf("validateSurfaces refused one id shared across two clients: %v", err)
+	}
+
+	second := wordFootnote()
+	second.Title = "Footnote, again"
+	second.Module = "/surfaces/word/footnote-2.js"
+	err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), second}}).validateSurfaces()
+	if err == nil {
+		t.Fatal("validateSurfaces accepted two surfaces sharing an id within one client")
+	}
+	if !strings.Contains(err.Error(), "declared twice") {
+		t.Errorf("error %q does not say the id was declared twice", err)
 	}
 }
 
@@ -367,7 +417,7 @@ func TestSurfaceValidationAcceptsSeveralClients(t *testing.T) {
 // every environment, so it must not wait on the environment resolving first.
 func TestServeRejectsUnusableSurface(t *testing.T) {
 	surface := wordFootnote()
-	surface.Module = "https://evil.example/footnote.js"
+	surface.Module = `/\evil.example/footnote.js`
 
 	s := New(Manifest{ID: "wiki", Title: "Wiki", Surfaces: []Surface{surface}})
 	err := s.Serve()
