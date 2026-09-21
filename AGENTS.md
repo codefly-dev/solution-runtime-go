@@ -13,7 +13,7 @@ their admission rules belong to the host (`codefly-dev/module-saas-starter`) and
 the gateway; endpoint, port and secret resolution to `codefly-dev/sdk-go`;
 workspace and manifest types to `codefly-dev/core`; running a composition and
 provisioning its secrets to `codefly-dev/cli`. Everything here is a library —
-one Go package at the repository root, consumed by solution repos as
+one Go package at the repository root, consumed as the Go module
 `github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag.
 
 ## Boundaries
@@ -22,14 +22,21 @@ one Go package at the repository root, consumed by solution repos as
   consumers and it is kept current with the code, down to the env-override
   table. A behaviour change the README describes is unfinished until the README
   describes the new one.
-- The exported surface (`New`, `Handle`, `HandleRequest`, `Serve`, `Unary`,
-  `Gateway`, `Scope`, `ClientError`, `GatewayError`) is pinned at a tag by repos
-  you cannot see from here. A change that breaks a consumer carries a `!` in the
-  commit type and says so in the PR body.
-- Configuration is resolved in one place, `loadConfig`, and checked in one
-  place, `validate()`. New configuration follows both: resolved through the SDK,
-  with an explicit env override, refused loudly at boot when unresolved. Do not
-  read the environment from the interior.
+- Everything `go doc -short .` prints is pinned at a tag by repos you cannot see
+  from here — the types a solution author writes (`Manifest`, `Handler`,
+  `RequestHandler`) as much as the calls it makes. Read that list before you
+  change a signature, a struct field or an exported constant; a change that
+  breaks a consumer carries a `!` in the commit type and says so in the PR body.
+- Boot configuration is resolved in one place, `loadConfig`, and checked in one
+  place, `validate()`: resolved through the SDK, with an explicit env override,
+  refused loudly when unresolved. New configuration follows both rather than
+  reading the environment where it is used.
+- The exception is the consumed-API projection, read at serve time in
+  `registerConsumedAPIs` and never seen by `validate()`. A malformed one is not
+  refused: the runtime logs that the federation is disabled and serves on, so
+  every consumed facade 404s at the gateway while the solution looks healthy.
+  Anything you add on that path inherits that property — it degrades silently
+  unless you make it loud, and a log line is the only signal there is.
 - Validate at the boundary — boot, and the headers a request arrives with — not
   between internal callers. `validate()` is the model: each refusal names the
   variable or the provisioning path that fixes it.
@@ -114,7 +121,7 @@ Go comes from `go.mod` (1.27). Nothing else is needed: no Docker, no
 credentials, no running composition.
 
 - The suite takes ~20s, most of it two heartbeat tests that wait on real wall
-  time (10s and 5s). That is not a hang — hence the 5m timeout.
+  time (10s and 5s). That is not a hang.
 - The formatting gate globs `./*.go`, so it covers the root package and only
   the root package. A package added in a subdirectory is vetted and tested by
   the commands above but not format-checked; widen the glob in the same PR.
@@ -123,8 +130,10 @@ credentials, no running composition.
   commands above. `go mod tidy` is a no-op on a clean tree, so a diff it
   produces is part of your change. Say in the commit *why* the pin moves and
   reference the owning issue — "bump" is not a reason.
-- Releases are plain `vX.Y.Z` tags on `main`; there is no release workflow. The
-  tag is what consumers pin, so it is cut from a commit whose gate is green.
+- Releases are plain `vX.Y.Z` tags on `main`; there is no release workflow, and
+  the one GitHub Release object (v0.0.2) was not kept up — it names no current
+  version and nothing reads it. The tag is what consumers pin, so it is cut
+  from a commit whose gate is green.
 
 ## Where the depth is
 
