@@ -36,7 +36,9 @@ one Go package at the repository root, consumed as the Go module
   refused: the runtime logs that the federation is disabled and serves on, so
   every consumed facade 404s at the gateway while the solution looks healthy.
   Anything you add on that path inherits that property — it degrades silently
-  unless you make it loud, and a log line is the only signal there is.
+  unless you make it loud, and a log line is the only signal there is. Both
+  halves of this bullet are pinned by `environment_boundary_test.go`, so a
+  second exception fails the suite until this file describes it.
 - Validate at the boundary — boot, and the headers a request arrives with — not
   between internal callers. `validate()` is the model: each refusal names the
   variable or the provisioning path that fixes it.
