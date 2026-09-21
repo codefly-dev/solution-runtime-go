@@ -50,6 +50,85 @@ type Manifest struct {
 	// validation are owned by the host, so this stays an opaque declaration to
 	// keep the runtime host-agnostic.
 	Dashboard any
+	// Surfaces are what this solution offers inside a client application — a
+	// Word add-in, a Slack app — rather than as a page the host renders. The
+	// host's registry projects them so a client can discover, without a table
+	// of its own, which solutions offer it something.
+	Surfaces []Surface
+}
+
+// Surface is one offering a solution makes inside a client application.
+type Surface struct {
+	ID          string // unique within the solution, e.g. "footnote"
+	Client      string // client kind: word, powerpoint, excel, slack
+	Title       string
+	Description string
+	// Module is the path, on this solution's own origin, of a self-contained ES
+	// module the client loads. Same-origin: the client resolves it against the
+	// solution it is loading, so a full URL here would let a manifest point a
+	// client's module loader at a third party.
+	Module string
+	// Contract is the surface contract major this module is built against
+	// (obin-ai/obin-word docs/SURFACE.md), so a client refuses a surface it
+	// cannot run rather than loading it and failing inside.
+	Contract int
+	// Applies is "always" or a {"tagged": [...]} selector, and Events are the
+	// journal namespaces the surface reconciles on. Both are carried verbatim:
+	// what a tag selects and what a namespace names are the client's to
+	// interpret, not this runtime's.
+	Applies any
+	Events  []string
+}
+
+// surfaceClients are the client kinds a surface may declare. A client loads
+// only what names it, so an unknown kind is a surface nothing will ever load —
+// caught at boot rather than showing up as a solution that simply never
+// appears in the add-in.
+var surfaceClients = map[string]bool{"word": true, "powerpoint": true, "excel": true, "slack": true}
+
+// validateSurfaces refuses a surface declaration no client could use. The
+// author writes these in code, so every failure here is a mistake a boot should
+// name rather than a condition the runtime can recover from.
+func (m Manifest) validateSurfaces() error {
+	seen := make(map[string]bool, len(m.Surfaces))
+	for i, surface := range m.Surfaces {
+		switch {
+		case surface.ID == "":
+			return fmt.Errorf("surface %d has no id", i)
+		case !isSurfaceID(surface.ID):
+			return fmt.Errorf("surface %q: id must be lowercase letters, digits and dashes", surface.ID)
+		case seen[surface.ID]:
+			return fmt.Errorf("surface %q declared twice: a client addresses a surface by id, so two cannot share one", surface.ID)
+		case !surfaceClients[surface.Client]:
+			return fmt.Errorf("surface %q: unknown client kind %q", surface.ID, surface.Client)
+		case !isSameOriginPath(surface.Module):
+			return fmt.Errorf("surface %q: module %q must be a path on this solution's own origin, e.g. %q",
+				surface.ID, surface.Module, "/surfaces/"+surface.Client+"/"+surface.ID+".js")
+		}
+		seen[surface.ID] = true
+	}
+	return nil
+}
+
+func isSurfaceID(id string) bool {
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// isSameOriginPath reports whether p addresses this solution's own origin: a
+// rooted path and nothing else. "//host/x.js" is rejected explicitly — it is a
+// rooted path to read but a protocol-relative URL to a browser, which is the
+// one form that looks same-origin here and is not one once loaded.
+func isSameOriginPath(p string) bool {
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return false
+	}
+	u, err := url.Parse(p)
+	return err == nil && u.Scheme == "" && u.Host == ""
 }
 
 // Handler is a solution endpoint. It receives a Gateway bound to the caller's
@@ -473,6 +552,12 @@ func (s *Server) HandleRequest(path string, handler RequestHandler) *Server {
 // Serve reads env config, self-registers, and blocks serving the solution.
 func (s *Server) Serve() error {
 	ctx := context.Background()
+	// Before anything the environment owns: a surface the author declared wrong
+	// is wrong in every environment, and saying so first keeps that mistake from
+	// reading as one more unresolved address.
+	if err := s.manifest.validateSurfaces(); err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-secret lookups resolve from them (falling back to
 	// the local native workspace map when not running under the runtime).
@@ -643,6 +728,30 @@ func (s *Server) manifestMap() map[string]any {
 	// the wire byte-identical for solutions that declare no dashboard.
 	if s.manifest.Dashboard != nil {
 		m["dashboard"] = s.manifest.Dashboard
+	}
+	if len(s.manifest.Surfaces) > 0 {
+		surfaces := make([]any, 0, len(s.manifest.Surfaces))
+		for _, surface := range s.manifest.Surfaces {
+			entry := map[string]any{
+				"id":          surface.ID,
+				"client":      surface.Client,
+				"title":       surface.Title,
+				"description": surface.Description,
+				"module":      surface.Module,
+				"contract":    surface.Contract,
+			}
+			// Same reasoning as the dashboard slot above: the host defaults what
+			// the solution left unsaid, and an explicit null would instead be a
+			// declaration that no selector and no namespace apply.
+			if surface.Applies != nil {
+				entry["applies"] = surface.Applies
+			}
+			if len(surface.Events) > 0 {
+				entry["events"] = surface.Events
+			}
+			surfaces = append(surfaces, entry)
+		}
+		m["surfaces"] = surfaces
 	}
 	return m
 }

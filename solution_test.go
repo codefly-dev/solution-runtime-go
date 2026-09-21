@@ -225,6 +225,160 @@ func TestManifestOmitsAbsentDashboard(t *testing.T) {
 	}
 }
 
+// wordFootnote is the surface shape the wiki declares for a Word document: the
+// whole set of slots a client reads, so a test can assert on all of them.
+func wordFootnote() Surface {
+	return Surface{
+		ID:          "footnote",
+		Client:      "word",
+		Title:       "Footnote",
+		Description: "Cite a claim from the wiki.",
+		Module:      "/surfaces/word/footnote.js",
+		Contract:    1,
+		Applies:     "always",
+		Events:      []string{"documents.entry.*"},
+	}
+}
+
+// A client discovers what a solution offers it from the served manifest alone,
+// so every declared slot must survive the trip through JSON — including the
+// applies selector, which the runtime carries without interpreting.
+func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
+	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote()}}}
+
+	var got map[string]any
+	body, err := json.Marshal(s.manifestMap())
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	want := []any{map[string]any{
+		"id":          "footnote",
+		"client":      "word",
+		"title":       "Footnote",
+		"description": "Cite a claim from the wiki.",
+		"module":      "/surfaces/word/footnote.js",
+		"contract":    float64(1),
+		"applies":     "always",
+		"events":      []any{"documents.entry.*"},
+	}}
+	if !reflect.DeepEqual(got["surfaces"], want) {
+		t.Errorf("served surfaces = %#v, want %#v", got["surfaces"], want)
+	}
+}
+
+// A tagged selector is a structure, not a keyword, and the runtime must hand it
+// to the client exactly as declared rather than flattening it.
+func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
+	applies := map[string]any{"tagged": []any{"legal", "finance"}}
+	surface := wordFootnote()
+	surface.Applies = applies
+	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+
+	var got map[string]any
+	body, _ := json.Marshal(s.manifestMap())
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal manifest: %v", err)
+	}
+	entry := got["surfaces"].([]any)[0].(map[string]any)
+	if !reflect.DeepEqual(entry["applies"], applies) {
+		t.Errorf("served applies = %#v, want %#v", entry["applies"], applies)
+	}
+}
+
+// A solution that offers nothing inside a client must not gain the key, and one
+// that declares no selector or namespaces must not gain those slots: the host
+// defaults what a solution left unsaid, and a null says something else.
+func TestManifestOmitsUndeclaredSurfaceSlots(t *testing.T) {
+	bare := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	if _, ok := bare.manifestMap()["surfaces"]; ok {
+		t.Errorf("emitted a surfaces key with no surface declared")
+	}
+
+	surface := wordFootnote()
+	surface.Applies = nil
+	surface.Events = nil
+	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+	entry := s.manifestMap()["surfaces"].([]any)[0].(map[string]any)
+	if _, ok := entry["applies"]; ok {
+		t.Errorf("emitted an applies key with no selector declared")
+	}
+	if _, ok := entry["events"]; ok {
+		t.Errorf("emitted an events key with no namespaces declared")
+	}
+}
+
+// A surface no client could load must fail the boot, not register quietly and
+// show up as a solution that simply never appears in the add-in.
+func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
+	cases := []struct {
+		name     string
+		surfaces []Surface
+		want     string
+	}{
+		{"no id", []Surface{func() Surface { s := wordFootnote(); s.ID = ""; return s }()}, "no id"},
+		{"id with uppercase", []Surface{func() Surface { s := wordFootnote(); s.ID = "Footnote"; return s }()}, "id must be"},
+		{"id with a slash", []Surface{func() Surface { s := wordFootnote(); s.ID = "word/footnote"; return s }()}, "id must be"},
+		{"duplicate id", []Surface{wordFootnote(), wordFootnote()}, "declared twice"},
+		{"unknown client", []Surface{func() Surface { s := wordFootnote(); s.Client = "notion"; return s }()}, "unknown client kind"},
+		{"no client", []Surface{func() Surface { s := wordFootnote(); s.Client = ""; return s }()}, "unknown client kind"},
+		{"absolute module URL", []Surface{func() Surface {
+			s := wordFootnote()
+			s.Module = "https://evil.example/footnote.js"
+			return s
+		}()}, "own origin"},
+		{"protocol-relative module", []Surface{func() Surface {
+			s := wordFootnote()
+			s.Module = "//evil.example/footnote.js"
+			return s
+		}()}, "own origin"},
+		{"relative module", []Surface{func() Surface { s := wordFootnote(); s.Module = "surfaces/footnote.js"; return s }()}, "own origin"},
+		{"no module", []Surface{func() Surface { s := wordFootnote(); s.Module = ""; return s }()}, "own origin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Manifest{ID: "wiki", Surfaces: tc.surfaces}.validateSurfaces()
+			if err == nil {
+				t.Fatalf("validateSurfaces accepted %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Two surfaces for two clients are the normal case — the wiki offers one inside
+// Word and one inside Slack — and must not read as a duplicate.
+func TestSurfaceValidationAcceptsSeveralClients(t *testing.T) {
+	slack := wordFootnote()
+	slack.ID = "ask"
+	slack.Client = "slack"
+	slack.Module = "/surfaces/slack/ask.js"
+	if err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), slack}}).validateSurfaces(); err != nil {
+		t.Errorf("validateSurfaces refused a valid pair: %v", err)
+	}
+}
+
+// Serve must refuse a manifest whose surface no client could load, and name the
+// surface — the mistake is in the author's code, and it is the same mistake in
+// every environment, so it must not wait on the environment resolving first.
+func TestServeRejectsUnusableSurface(t *testing.T) {
+	surface := wordFootnote()
+	surface.Module = "https://evil.example/footnote.js"
+
+	s := New(Manifest{ID: "wiki", Title: "Wiki", Surfaces: []Surface{surface}})
+	err := s.Serve()
+	if err == nil {
+		t.Fatal("Serve returned nil for an off-origin surface module; expected a boot error and no bind")
+	}
+	if !strings.Contains(err.Error(), "footnote") {
+		t.Errorf("boot error should name the surface, got: %v", err)
+	}
+}
+
 // The host registration payload (the heartbeat body) must carry the declared
 // data-graph verbatim, not just the GET manifest — that is the surface the host
 // self-registration path reads.
