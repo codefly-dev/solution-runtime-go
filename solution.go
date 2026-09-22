@@ -50,6 +50,134 @@ type Manifest struct {
 	// validation are owned by the host, so this stays an opaque declaration to
 	// keep the runtime host-agnostic.
 	Dashboard any
+	// Surfaces are what this solution offers inside a client application — a
+	// Word add-in, a Slack app — rather than as a page the host renders. The
+	// host's registry projects them so a client can discover, without a table
+	// of its own, which solutions offer it something.
+	Surfaces []Surface
+}
+
+// Surface is one offering a solution makes inside a client application.
+type Surface struct {
+	ID     string // unique per client, e.g. "footnote"
+	Client string // client kind: word, powerpoint, excel, slack
+	Title  string // what the client labels the surface with
+	// Description is the longer explanation a client may show beside the title.
+	// Optional, and omitted from the manifest when empty so a client renders no
+	// description rather than an empty one.
+	Description string
+	// Module is the path, on this solution's own origin, of a self-contained ES
+	// module the client loads, resolved against the origin the client loaded
+	// this solution from. The check on it catches an author reaching off that
+	// origin by mistake; it is not what keeps a hostile solution from doing so
+	// deliberately, since a solution serves its own manifest and need not use
+	// this runtime at all. The host's registry and the client's loader own that
+	// boundary and have to enforce it themselves.
+	Module string
+	// Contract is the surface contract major this module is built against
+	// (obin-ai/obin-word docs/SURFACE.md), so a client refuses a surface it
+	// cannot run rather than loading it and failing inside.
+	Contract int
+	// Applies is "always" or a {"tagged": [...]} selector, and Events are the
+	// journal namespaces the surface reconciles on. Both are carried verbatim:
+	// what a tag selects and what a namespace names are the client's to
+	// interpret, not this runtime's.
+	Applies any
+	Events  []string
+}
+
+// surfaceAppliesAlways is what an undeclared Applies is served as. A surface is
+// present in the manifest either way, so leaving the slot out would not say
+// "no surface" the way an absent dashboard does — it would ask every client to
+// invent the same default for a surface that is otherwise fully declared.
+const surfaceAppliesAlways = "always"
+
+// surfaceClients are the client kinds a surface may declare. A client loads
+// only what names it, so an unknown kind is a surface nothing will ever load —
+// caught at boot rather than showing up as a solution that simply never
+// appears in the add-in.
+var surfaceClients = map[string]bool{"word": true, "powerpoint": true, "excel": true, "slack": true}
+
+// validateSurfaces refuses a surface declaration no client could use. The
+// author writes these in code, so every failure here is a mistake a boot should
+// name rather than a condition the runtime can recover from.
+func (m Manifest) validateSurfaces() error {
+	// Keyed by client and id together: two clients never see each other's
+	// surfaces, so the same offering carries the same id in Word and in
+	// PowerPoint, and only a collision within one client is ambiguous. The id
+	// and client checks below run first, so neither half of the key can contain
+	// the separator and no two distinct pairs can collide into one string.
+	seen := make(map[string]bool, len(m.Surfaces))
+	for i, surface := range m.Surfaces {
+		switch {
+		case surface.ID == "":
+			return fmt.Errorf("surface %d has no id", i)
+		case !isSurfaceID(surface.ID):
+			return fmt.Errorf("surface %q: id must be lowercase letters and digits, separated by dashes", surface.ID)
+		case surface.Title == "":
+			return fmt.Errorf("surface %q has no title: a client labels the surface with it, and renders a blank control without one", surface.ID)
+		case !surfaceClients[surface.Client]:
+			return fmt.Errorf("surface %q: unknown client kind %q", surface.ID, surface.Client)
+		case seen[surface.Client+"/"+surface.ID]:
+			return fmt.Errorf("surface %q declared twice for client %q: a client addresses a surface by id, so two of its own cannot share one",
+				surface.ID, surface.Client)
+		case surface.Contract < 1:
+			// A client runs a surface only when it recognises the contract
+			// major it declares, so the zero an author leaves behind is not a
+			// lenient default: it is a surface every client refuses, in a boot
+			// that otherwise looks entirely healthy.
+			return fmt.Errorf("surface %q: contract %d is not a surface contract major; declare the major this module is built against (>= 1)",
+				surface.ID, surface.Contract)
+		case !isSameOriginPath(surface.Module):
+			return fmt.Errorf("surface %q: module %q must be a path on this solution's own origin, e.g. %q",
+				surface.ID, surface.Module, "/surfaces/"+surface.Client+"/"+surface.ID+".js")
+		}
+		seen[surface.Client+"/"+surface.ID] = true
+	}
+	return nil
+}
+
+// isSurfaceID accepts lowercase letters and digits separated by dashes. A
+// leading or trailing dash is refused so that an id is never a prefix game, and
+// so the empty string cannot pass by having no characters to object to.
+func isSurfaceID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i, r := range id {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			continue
+		}
+		if r != '-' || i == 0 || i == len(id)-1 {
+			return false
+		}
+	}
+	return true
+}
+
+// isSameOriginPath reports whether p addresses this solution's own origin: a
+// rooted path and nothing else.
+//
+// Whether a path is rooted is decided by the parser that will resolve it — the
+// client's, not Go's — and the two disagree on three inputs. A browser follows
+// WHATWG URL, where a backslash beside the leading slash is read as a slash and
+// what follows it as an authority, so "/\host/x.js" resolves to https://host/x.js
+// while net/url reads that backslash as an ordinary path byte and reports no
+// host at all; and where ASCII tab and newline are removed from the input before
+// it is parsed, so "/<tab>/host/x.js" becomes protocol-relative on arrival. None
+// of the three can be seen in net/url's answer, so they are refused here by
+// inspecting the bytes rather than by asking net/url what it made of them.
+func isSameOriginPath(p string) bool {
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return false
+	}
+	for _, r := range p {
+		if r == '\\' || unicode.IsControl(r) {
+			return false
+		}
+	}
+	u, err := url.Parse(p)
+	return err == nil && u.Scheme == "" && u.Host == ""
 }
 
 // Handler is a solution endpoint. It receives a Gateway bound to the caller's
@@ -473,6 +601,12 @@ func (s *Server) HandleRequest(path string, handler RequestHandler) *Server {
 // Serve reads env config, self-registers, and blocks serving the solution.
 func (s *Server) Serve() error {
 	ctx := context.Background()
+	// Before anything the environment owns: a surface the author declared wrong
+	// is wrong in every environment, and saying so first keeps that mistake from
+	// reading as one more unresolved address.
+	if err := s.manifest.validateSurfaces(); err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-secret lookups resolve from them (falling back to
 	// the local native workspace map when not running under the runtime).
@@ -643,6 +777,33 @@ func (s *Server) manifestMap() map[string]any {
 	// the wire byte-identical for solutions that declare no dashboard.
 	if s.manifest.Dashboard != nil {
 		m["dashboard"] = s.manifest.Dashboard
+	}
+	if len(s.manifest.Surfaces) > 0 {
+		surfaces := make([]any, 0, len(s.manifest.Surfaces))
+		for _, surface := range s.manifest.Surfaces {
+			entry := map[string]any{
+				"id":       surface.ID,
+				"client":   surface.Client,
+				"title":    surface.Title,
+				"module":   surface.Module,
+				"contract": surface.Contract,
+				"applies":  surface.Applies,
+			}
+			if surface.Applies == nil {
+				entry["applies"] = surfaceAppliesAlways
+			}
+			// Absent, these two say something a client can act on — no
+			// description to show, nothing to reconcile on — where a null would
+			// only be a slot the client still has to interpret.
+			if surface.Description != "" {
+				entry["description"] = surface.Description
+			}
+			if len(surface.Events) > 0 {
+				entry["events"] = surface.Events
+			}
+			surfaces = append(surfaces, entry)
+		}
+		m["surfaces"] = surfaces
 	}
 	return m
 }
