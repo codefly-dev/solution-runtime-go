@@ -256,6 +256,24 @@ func env(key, fallback string) string {
 // could not resolve it. Using the SDK keeps addresses and ports out of the
 // runtime: they come from Codefly's runtime-injected endpoint map (or, in a
 // local run, its deterministic native workspace map) — never a hardcoded port.
+// listenPort is the port of this service's own endpoint address. Codefly hands a
+// service its own endpoint as a bare "host:port" (a rendered cell writes
+// "localhost:8080"), and other endpoints as URLs; url.Parse reads the bare form
+// as scheme "localhost" with no port, which left every rendered solution
+// refusing to boot with an empty listen port. Both forms resolve here.
+func listenPort(self string) string {
+	if strings.Contains(self, "://") {
+		if u, err := url.Parse(self); err == nil {
+			return u.Port()
+		}
+		return ""
+	}
+	if _, port, err := net.SplitHostPort(self); err == nil {
+		return port
+	}
+	return ""
+}
+
 func address(ctx context.Context, module, service, endpoint, api string) string {
 	q := codefly.For(ctx).Endpoint(endpoint)
 	if module != "" {
@@ -386,9 +404,7 @@ func loadConfig(ctx context.Context, id string) config {
 	port := env("PORT", "")
 	if port == "" {
 		if self := address(ctx, "", "", "http", "http"); self != "" {
-			if u, err := url.Parse(self); err == nil {
-				port = u.Port()
-			}
+			port = listenPort(self)
 		}
 	}
 	public := env("PUBLIC_URL", "")
