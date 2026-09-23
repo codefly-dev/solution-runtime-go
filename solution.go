@@ -17,12 +17,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +58,15 @@ type Manifest struct {
 	// host's registry projects them so a client can discover, without a table
 	// of its own, which solutions offer it something.
 	Surfaces []Surface
+	// Assets, when set, is what /assets/ serves: the built Module Federation
+	// remote (mf-manifest.json at its root, and every chunk it names), usually
+	// embedded in the binary with go:embed and narrowed with fs.Sub to the
+	// build's output directory. A solution that ships its frontend this way
+	// reads nothing from disk to serve it, so it runs with a read-only root
+	// filesystem and cannot drift from the binary it was built with.
+	//
+	// When nil, /assets/ serves the ASSETS_DIR directory, as before.
+	Assets fs.FS
 }
 
 // Surface is one offering a solution makes inside a client application.
@@ -238,6 +250,10 @@ type config struct {
 	// one was not usable.
 	registrationInterval    time.Duration
 	registrationIntervalErr error
+	// runtimeContext is the kind of runtime Codefly says this process runs
+	// under (CODEFLY__RUNTIME_CONTEXT), the explicit signal validate() uses to
+	// tell a deployed process from a local one. Empty when nothing injected it.
+	runtimeContext string
 	// environmentLoadErr is the failure, if any, of loading Codefly's injected
 	// carriers. Every SDK-resolved value below is empty when that load failed,
 	// so validate() must say so rather than report each empty value as
@@ -407,10 +423,10 @@ func loadConfig(ctx context.Context, id string) config {
 			port = listenPort(self)
 		}
 	}
-	public := env("PUBLIC_URL", "")
-	if public == "" {
-		public = "http://localhost:" + port
-	}
+	// Empty unless an operator set one: the manifest is then registered
+	// root-relative (see frontendManifestURL), never on this process's own
+	// loopback listen address.
+	public := strings.TrimRight(env("PUBLIC_URL", ""), "/")
 
 	// Host endpoints, resolved via the SDK (no localhost:port literals).
 	gatewayURL := strings.TrimRight(env("GATEWAY_URL", resolveGateway(ctx, hostModule, hostGateway)), "/")
@@ -443,14 +459,98 @@ func loadConfig(ctx context.Context, id string) config {
 		moduleRegisterURL:  moduleRegisterURL,
 		moduleTokenURL:     env("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", siblingURL(moduleRegisterURL, moduleRegisterPath, moduleRegistrationTokenPath)),
 		solutionTokenURL:   env("GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", siblingURL(gatewayRegisterURL, solutionRegisterPath, solutionRegistrationTokenPath)),
-		selfUpstream:       env("SELF_UPSTREAM", public),
+		selfUpstream:       strings.TrimRight(env("SELF_UPSTREAM", selfUpstream(port)), "/"),
 		assetsDir:          env("ASSETS_DIR", "../fe-remote/dist"),
 		internalToken:      token,
 		solutionSecret:     solutionRegistrationSecret(ctx),
 		moduleSecrets:      parseModuleRegistrationSecrets(env(ModuleRegistrationSecretsEnvironmentVariable, "")),
+		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
 	}
 	cfg.registrationInterval, cfg.registrationIntervalErr = registrationIntervalFromEnv()
 	return cfg
+}
+
+// selfEndpointCarrierPrefix names the carrier Codefly injects with this
+// service's own endpoint as the rest of the deployment reaches it — its
+// in-cluster address, e.g. "http://backend.<namespace>.svc.cluster.local:8080".
+// It sits beside the CODEFLY__ENDPOINT__ carrier for the same endpoint, which
+// stays what it is: the address this process listens on ("localhost:8080" in a
+// rendered cell), right for binding and wrong for anyone else to dial.
+//
+// PENDING codefly-dev/core v0.5.6, which adds this carrier. It is read here by
+// name, in this one helper, only until core/sdk-go release an accessor for it;
+// switch selfEndpoint to that accessor when they do.
+const selfEndpointCarrierPrefix = "CODEFLY__SELF_ENDPOINT"
+
+// selfEndpoint is this service's reachable http endpoint from the carrier
+// above, or "" when none was injected (a local run, or a render from before
+// core v0.5.6). The key is normalised exactly as the CODEFLY__ENDPOINT__
+// carriers are.
+func selfEndpoint() string {
+	module, service := os.Getenv(resources.ModulePrefix), os.Getenv(resources.ServicePrefix)
+	if module == "" || service == "" {
+		return ""
+	}
+	key := selfEndpointCarrierPrefix + "__" + resources.EndpointAsEnvironmentVariableKeyBase(&resources.EndpointInformation{
+		Module: module, Service: service, Name: "http", API: "http",
+	})
+	return strings.TrimSpace(os.Getenv(key))
+}
+
+// selfUpstream is the upstream this solution registers with the gateway: the
+// address the gateway dials to proxy to it. It is the reachable self endpoint
+// when Codefly injected one, and otherwise this process's own listen address —
+// correct only when the gateway runs on the same machine, which is why
+// validate() refuses a loopback upstream in a deployed runtime context rather
+// than letting the gateway proxy the solution to itself.
+//
+// It used to be the public URL, which defaulted to that same loopback listen
+// address, so every deployed solution registered "http://localhost:8080" and
+// the gateway, dialling its own localhost, proxied the solution to itself.
+func selfUpstream(port string) string {
+	if self := selfEndpoint(); self != "" {
+		return self
+	}
+	if port == "" {
+		return ""
+	}
+	return "http://localhost:" + port
+}
+
+// deployedRuntimeContext reports whether Codefly says this process runs in a
+// deployment rather than on a developer machine. The signal is explicit —
+// CODEFLY__RUNTIME_CONTEXT, which core's GitOps render injects (e.g.
+// "kubernetes") — and never the environment name: an environment called
+// "local-dogfood" or "staging" says nothing about where the process runs.
+// Every runtime context `codefly run` uses on a developer machine is local;
+// any other declared context is a deployment, so a new deployed kind is
+// covered without a change here. Nothing declared means not deployed.
+//
+// PENDING codefly-dev/core v0.5.6, which injects the signal into renders:
+// until a cell is rendered with it, this reports false there too.
+func deployedRuntimeContext(kind string) bool {
+	switch strings.ToLower(kind) {
+	case "", resources.RuntimeContextNative, resources.RuntimeContextNix,
+		resources.RuntimeContextContainer, resources.RuntimeContextFree:
+		return false
+	}
+	return true
+}
+
+// loopbackURL reports whether raw names this machine: localhost (or a name
+// under .localhost), a loopback IP, or the unspecified address. Such a URL is
+// reachable only from the process's own host.
+func loopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
 // RegistrationIntervalEnvironmentVariable sets how long a registration
@@ -543,6 +643,7 @@ func (c config) validate() error {
 		"module register URL":  c.moduleRegisterURL,
 		"module token URL":     c.moduleTokenURL,
 		"solution token URL":   c.solutionTokenURL,
+		"self upstream":        c.selfUpstream,
 	}
 	// A token URL is not resolved from the SDK at all: it is derived from its
 	// register URL by siblingURL, which yields "" for a base it cannot pair.
@@ -564,7 +665,26 @@ func (c config) validate() error {
 			if hint, ok := unpairable[name]; ok && raw == "" {
 				return fmt.Errorf("unresolved %s: %s", name, hint)
 			}
+			if name == "self upstream" {
+				// Not a host endpoint: it is this solution's own address, from
+				// its own endpoint carriers or an explicit SELF_UPSTREAM.
+				return fmt.Errorf("unresolved self upstream %q: SELF_UPSTREAM must be an absolute URL the gateway can dial, or unset so the address Codefly injects for this service is used", raw)
+			}
 			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
+		}
+	}
+	if deployedRuntimeContext(c.runtimeContext) {
+		// A loopback address registered from a deployment is reachable by no
+		// one: the gateway dialling "localhost" proxies the solution to
+		// itself, and a browser loading a manifest from "localhost" loads it
+		// from the viewer's own machine. Both used to boot and look healthy.
+		if loopbackURL(c.selfUpstream) {
+			return fmt.Errorf("self upstream %q is a loopback address in the deployed runtime context %q: the gateway would proxy this solution to itself. Codefly injects the reachable address as %s__<MODULE>__<SERVICE>__HTTP__HTTP (core >= v0.5.6); set SELF_UPSTREAM only for a deployment the resolver cannot see",
+				c.selfUpstream, c.runtimeContext, selfEndpointCarrierPrefix)
+		}
+		if c.publicURL != "" && loopbackURL(c.publicURL) {
+			return fmt.Errorf("PUBLIC_URL %q is a loopback address in the deployed runtime context %q: no browser but this machine's could load the manifest from it. Unset it to register the manifest relative to this backend, or set the origin browsers actually reach",
+				c.publicURL, c.runtimeContext)
 		}
 	}
 	if c.registrationIntervalErr != nil {
@@ -657,8 +777,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	for path, handler := range s.handlers {
 		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
 	}
-	mux.Handle("/assets/", http.StripPrefix("/assets/",
-		withCORSHandler(http.FileServer(http.Dir(s.cfg.assetsDir)))))
+	mux.Handle("/assets/", http.StripPrefix("/assets/", withCORSHandler(s.assetsHandler())))
 
 	manifestBody, _ := json.Marshal(s.manifestMap())
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})
@@ -781,7 +900,7 @@ func (s *Server) manifestMap() map[string]any {
 		"nav":           map[string]any{"title": s.manifest.Title, "path": "/s/" + s.manifest.ID, "order": s.manifest.Order},
 		"frontend": map[string]any{
 			"type":          "module-federation",
-			"manifestUrl":   s.cfg.publicURL + "/assets/mf-manifest.json",
+			"manifestUrl":   s.frontendManifestURL(),
 			"exposedModule": s.manifest.ExposedModule,
 			"hostContract":  solutionHostContractMajor,
 			"reactRange":    "^19",
@@ -822,6 +941,92 @@ func (s *Server) manifestMap() map[string]any {
 		m["surfaces"] = surfaces
 	}
 	return m
+}
+
+// assetsHandler serves the frontend build under /assets/ (the prefix already
+// stripped): from Manifest.Assets when the solution ships one, else from the
+// ASSETS_DIR directory. Both go through the standard file server, so content
+// types and range/conditional handling are the same whichever source serves.
+func (s *Server) assetsHandler() http.Handler {
+	var files http.Handler
+	if s.manifest.Assets != nil {
+		files = http.FileServerFS(s.manifest.Assets)
+	} else {
+		files = http.FileServer(http.Dir(s.cfg.assetsDir))
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		files.ServeHTTP(&assetCacheWriter{ResponseWriter: w, cacheControl: assetCacheControl(r.URL.Path)}, r)
+	})
+}
+
+// assetCacheWriter stamps an asset's cache policy on the response, but only on
+// one that delivers or confirms the asset. A 404 for a hashed chunk — asked of
+// an old replica mid-rollout — must not be cached for a year under the name
+// the new build will serve it at.
+type assetCacheWriter struct {
+	http.ResponseWriter
+	cacheControl string
+	wrote        bool
+}
+
+func (w *assetCacheWriter) WriteHeader(status int) {
+	if !w.wrote {
+		w.wrote = true
+		policy := w.cacheControl
+		if status >= 300 && status != http.StatusNotModified {
+			policy = "no-cache"
+		}
+		w.Header().Set("cache-control", policy)
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *assetCacheWriter) Write(b []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// contentHashedAsset matches a file name carrying a build content hash — a
+// run of at least eight hex digits between separators, as the bundlers emit
+// ("123.3f9a1c2b.js", "index-3f9a1c2b0d.css").
+var contentHashedAsset = regexp.MustCompile(`[.-][0-9a-f]{8,}\.[A-Za-z0-9]+$`)
+
+// assetCacheControl is the caching a served asset may have. A content-hashed
+// file never changes under its name, so it is cached for good. Everything
+// else — above all mf-manifest.json and the remote entry, whose names are
+// fixed so the host can find them — must be revalidated on every load, or a
+// browser keeps a manifest naming chunks the redeployed solution no longer
+// serves.
+func assetCacheControl(name string) string {
+	if contentHashedAsset.MatchString(path.Base(name)) {
+		return "public, max-age=31536000, immutable"
+	}
+	return "no-cache"
+}
+
+// federationManifestPath is where this runtime serves its Module Federation
+// manifest, relative to its own backend: the /assets/ file server in serve.
+const federationManifestPath = "/assets/mf-manifest.json"
+
+// frontendManifestURL is the manifestUrl this solution registers. With an
+// explicit PUBLIC_URL it is absolute on that origin — an operator who exposes
+// the solution's assets directly said where. Without one it is the path on the
+// solution's own backend, root-relative, and the host resolves it against the
+// route by which it reaches this solution.
+//
+// It used to be absolute on "http://localhost:<port>", which is this process's
+// own listen address: true in a browser on the developer's machine and in no
+// other browser anywhere, so every deployed solution registered a manifest the
+// product could not load. The runtime cannot build a better absolute URL,
+// because the origin a browser reaches this solution through is the host's —
+// and naming the host's route layout here would couple every solution to it.
+func (s *Server) frontendManifestURL() string {
+	if s.cfg.publicURL != "" {
+		return strings.TrimRight(s.cfg.publicURL, "/") + federationManifestPath
+	}
+	return federationManifestPath
 }
 
 func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request) {
@@ -1137,6 +1342,17 @@ func oneLine(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// exchangeFailureBody is what the gateway said alongside a failed exchange,
+// bounded and flattened to one log line: the host's own words are the only
+// clue to which of its dependencies is down. "no body" when it said nothing.
+func exchangeFailureBody(resp *http.Response) string {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, refusalDetailMaxBytes))
+	if body := strings.TrimSpace(oneLine(string(raw))); body != "" {
+		return body
+	}
+	return "no body"
 }
 
 // drainAndClose consumes what is left of a response body before closing it, so
@@ -1614,11 +1830,26 @@ func (c *solutionCredential) exchange(ctx context.Context) (string, time.Time, e
 		// token proves no publisher — so the beat fails and names the route.
 		return "", time.Time{}, fmt.Errorf("the solution registration exchange at %s answered 404: this host does not serve publisher-bound registration (module-saas-starter < v0.0.61 is not supported) or the URL is wrong (%s, or the %s it is derived from)",
 			c.tokenURL, "GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL", "GATEWAY_REGISTER_URL")
-	default:
+	case http.StatusUnauthorized, http.StatusForbidden:
 		// accounts answers an undeclared id and a wrong secret identically, and
 		// the gateway relays that; naming both here is what the reader needs.
+		// Only these two statuses are a verdict on the credential: they are the
+		// ones accounts answers after reading the secret.
 		return "", time.Time{}, fmt.Errorf("registration token exchange for solution %q rejected (status %d): the host declares no %s entry for this id, or the provisioned secret does not match its digest",
 			c.id, resp.StatusCode, "SOLUTION_REGISTRATION_SECRETS")
+	default:
+		// Anything else was never a judgement of the secret. Blaming the
+		// provisioning for it sent an operator to re-provision a secret that
+		// was correct while the gateway could not reach accounts (a 502 relayed
+		// as "the provisioned secret does not match its digest"). A 5xx is the
+		// host being unavailable; the heartbeat retries it on its short cap, so
+		// say that, with what the gateway said.
+		if resp.StatusCode >= 500 {
+			return "", time.Time{}, fmt.Errorf("registration token exchange for solution %q: host unavailable (status %d), retrying: %s",
+				c.id, resp.StatusCode, exchangeFailureBody(resp))
+		}
+		return "", time.Time{}, fmt.Errorf("registration token exchange for solution %q failed (status %d), retrying: %s",
+			c.id, resp.StatusCode, exchangeFailureBody(resp))
 	}
 	var issued struct {
 		Token     string    `json:"token"`

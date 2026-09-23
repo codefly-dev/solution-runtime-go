@@ -524,6 +524,7 @@ func TestValidateRequiresASolutionSecret(t *testing.T) {
 		moduleRegisterURL:  "http://gateway:42152/modules/_register",
 		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
 		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
+		selfUpstream:       "http://backend:8080",
 	}
 	err := cfg.validate()
 	if err == nil || !strings.Contains(err.Error(), SolutionRegistrationSecretEnvironmentVariable) ||
@@ -894,5 +895,105 @@ func TestRegistrationIntervalIsConfigurable(t *testing.T) {
 				t.Fatal("validate() accepted an unusable registration interval")
 			}
 		})
+	}
+}
+
+// TestSolutionExchangeBlamesTheCredentialOnlyWhenItWasJudged proves only a
+// 401/403 from the exchange names the provisioning. A 5xx is the host being
+// unavailable — reported with the gateway's own words — and before this every
+// status fell through to "no SOLUTION_REGISTRATION_SECRETS entry / digest
+// mismatch", sending an operator to re-provision a secret that was correct
+// while the gateway could not reach accounts.
+func TestSolutionExchangeBlamesTheCredentialOnlyWhenItWasJudged(t *testing.T) {
+	for _, tc := range []struct {
+		status     int
+		body       string
+		want       []string
+		credential bool
+	}{
+		{status: http.StatusUnauthorized, credential: true},
+		{status: http.StatusForbidden, credential: true},
+		{status: http.StatusInternalServerError, body: `{"error":"accounts unavailable"}`,
+			want: []string{"host unavailable (status 500), retrying", `{"error":"accounts unavailable"}`}},
+		{status: http.StatusBadGateway, body: "upstream connect error\nor disconnect",
+			want: []string{"host unavailable (status 502), retrying", "upstream connect error or disconnect"}},
+		{status: http.StatusServiceUnavailable,
+			want: []string{"host unavailable (status 503), retrying: no body"}},
+		{status: http.StatusTooManyRequests, body: "slow down",
+			want: []string{"failed (status 429), retrying: slow down"}},
+	} {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			credential := &solutionCredential{tokenURL: srv.URL, id: "lastlogin-go", secret: "s3cret"}
+			_, _, err := credential.exchange(context.Background())
+			if err == nil {
+				t.Fatalf("status %d: exchange succeeded", tc.status)
+			}
+			blames := strings.Contains(err.Error(), "SOLUTION_REGISTRATION_SECRETS")
+			if blames != tc.credential {
+				t.Fatalf("status %d: blames the credential = %v, want %v: %v", tc.status, blames, tc.credential, err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("status %d: error %q does not contain %q", tc.status, err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestSolutionRegistrationKeepsRetryingAnUnavailableHost proves a host whose
+// exchange answers 5xx is retried, not given up on, and that the log says the
+// host is unavailable rather than that the secret is wrong.
+func TestSolutionRegistrationKeepsRetryingAnUnavailableHost(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	var exchanges atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == solutionRegistrationTokenPath {
+			exchanges.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "accounts unreachable")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
+	s.registrationInterval = 10 * time.Millisecond
+	s.cfg = config{
+		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
+		hostRegisterURL:    srv.URL + "/api/solutions/register",
+		gatewayRegisterURL: srv.URL + solutionRegisterPath,
+		moduleRegisterURL:  srv.URL + moduleRegisterPath,
+		moduleTokenURL:     srv.URL + moduleRegistrationTokenPath,
+		solutionTokenURL:   srv.URL + solutionRegistrationTokenPath,
+		internalToken:      internalTokenTest,
+		solutionSecret:     "s3cret",
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = s.serve(ctx, ln); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	// Two surfaces, each beating: six exchanges is at least two retries each.
+	waitFor(t, "exchange retries", func() bool { return exchanges.Load() >= 6 })
+	out := buf.String()
+	if !strings.Contains(out, "host unavailable (status 502), retrying: accounts unreachable") {
+		t.Fatalf("an unavailable host was not reported as such:\n%s", out)
+	}
+	if strings.Contains(out, "SOLUTION_REGISTRATION_SECRETS") {
+		t.Fatalf("a 502 was reported as a provisioning fault:\n%s", out)
 	}
 }

@@ -133,14 +133,16 @@ func TestServeRegistersOnListenPort(t *testing.T) {
 	base := "http://127.0.0.1:" + port
 	waitFor(t, "health", func() bool { return getStatus(t, base+"/health") == http.StatusOK })
 
-	// The advertised manifest port must equal the port the runtime actually binds.
+	// With no PUBLIC_URL the manifest is registered as a path on this backend —
+	// never on its own loopback listen address, which no browser but the
+	// developer's can reach — and that path is one this backend serves.
 	manifestURL := frontendManifestURL(t, base)
 	u, err := url.Parse(manifestURL)
 	if err != nil {
 		t.Fatalf("parse manifestUrl %q: %v", manifestURL, err)
 	}
-	if u.Port() != port {
-		t.Errorf("manifestUrl port = %q, want listen port %q", u.Port(), port)
+	if u.IsAbs() || u.Host != "" || manifestURL != federationManifestPath {
+		t.Errorf("manifestUrl = %q, want the root-relative path %q", manifestURL, federationManifestPath)
 	}
 	if code := getStatus(t, base+u.Path); code != http.StatusOK {
 		t.Errorf("GET manifestUrl = %d, want 200", code)
@@ -542,6 +544,7 @@ func TestConfigValidate(t *testing.T) {
 		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
 		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
 		solutionSecret:     "s3cret",
+		selfUpstream:       "http://backend:8080",
 	}
 	if err := valid.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -2497,3 +2500,29 @@ func (t internalTokenAuth) authorize(_ context.Context, req *http.Request) (time
 func (internalTokenAuth) invalidate() {}
 
 func (internalTokenAuth) succeeded() {}
+
+// TestManifestURLIsNeverTheListenAddress pins where the registered manifestUrl
+// points. Unset PUBLIC_URL used to yield "http://localhost:<port>/assets/...",
+// this process's own loopback address, so every deployed solution registered a
+// manifest no browser could load and the product showed it as failed to load.
+// Without an explicit origin the URL is now the path on this backend, which the
+// host resolves against the route by which it reaches the solution.
+func TestManifestURLIsNeverTheListenAddress(t *testing.T) {
+	for _, tc := range []struct {
+		public string
+		want   string
+	}{
+		{public: "", want: "/assets/mf-manifest.json"},
+		{public: "https://solutions.example.com/lastlogin", want: "https://solutions.example.com/lastlogin/assets/mf-manifest.json"},
+		{public: "https://solutions.example.com/", want: "https://solutions.example.com/assets/mf-manifest.json"},
+	} {
+		t.Setenv("PUBLIC_URL", tc.public)
+		t.Setenv("PORT", "8080")
+		s := New(Manifest{ID: "lastlogin-go"})
+		s.cfg = loadConfig(context.Background(), s.manifest.ID)
+		frontend, _ := s.manifestMap()["frontend"].(map[string]any)
+		if got := frontend["manifestUrl"]; got != tc.want {
+			t.Errorf("PUBLIC_URL=%q: manifestUrl = %v, want %q", tc.public, got, tc.want)
+		}
+	}
+}

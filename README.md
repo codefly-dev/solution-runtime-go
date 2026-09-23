@@ -48,7 +48,7 @@ the SDK-resolved value is the default.
 | What | SDK resolution | Env override (default) |
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
-| Public URL | `http://localhost:<port>` | `PUBLIC_URL` |
+| Public URL | none — the manifest is then registered as the root-relative path `/assets/mf-manifest.json` on this backend (see [Where the host reaches the solution](#where-the-host-reaches-the-solution)) | `PUBLIC_URL` |
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally) | `GATEWAY_URL` |
 | Host frontend URL | resolved by role — the single module owning the `frontend` `http`/`http` endpoint, discovered the same way | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
@@ -59,8 +59,9 @@ the SDK-resolved value is the default.
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Solution registration secret | `codefly.For(ctx).WorkspaceSecret("solution-registration", "SECRET")` — see [Self-registration](#self-registration) | `CODEFLY__SOLUTION_REGISTRATION_SECRET` |
 | Registration beat interval | `15s` | `CODEFLY__SOLUTION_REGISTRATION_INTERVAL` |
-| Self upstream | `<public-url>` | `SELF_UPSTREAM` |
-| MF assets dir | `../fe-remote/dist` | `ASSETS_DIR` |
+| Self upstream | the reachable self endpoint Codefly injects as `CODEFLY__SELF_ENDPOINT__<MODULE>__<SERVICE>__HTTP__HTTP` (core ≥ v0.5.6); without it, the listen address `http://localhost:<port>` | `SELF_UPSTREAM` |
+| Deployed or local | `CODEFLY__RUNTIME_CONTEXT`, injected by Codefly: `native`/`nix`/`container`/`free` (or unset) is a local run, anything else (a GitOps render's `kubernetes`, core ≥ v0.5.6) a deployment | — |
+| MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 
 The host it plugs into is named by Codefly-convention **service roles**, not by
 its workspace module name: the runtime discovers the single module that owns each
@@ -74,6 +75,49 @@ only needs setting to disambiguate a composition where **more than one** module
 exposes the same role — otherwise an ambiguous match resolves to nothing and the
 runtime fails loud at boot rather than picking a host arbitrarily. Concrete
 addresses always come from the SDK.
+
+### Where the host reaches the solution
+
+The two registrations carry two different addresses, for two different
+callers, and neither is this process's listen address:
+
+- **`manifestUrl`** (host registration) is loaded by the **viewer's browser**.
+  With no `PUBLIC_URL` it is the root-relative path `/assets/mf-manifest.json`
+  on this backend, and the host resolves it against the route by which it
+  reaches the solution — the runtime does not know, and does not encode, the
+  host's route layout. `PUBLIC_URL` makes it absolute on that origin instead,
+  for an operator who exposes the solution's assets directly.
+- **`upstream`** (gateway registration) is dialled by the **gateway**. It is
+  the address Codefly injects for reaching this service
+  (`CODEFLY__SELF_ENDPOINT__…`, beside the `CODEFLY__ENDPOINT__…` carrier that
+  stays the listen address), and `SELF_UPSTREAM` overrides it. `PUBLIC_URL` no
+  longer feeds it: the browser's origin is not the gateway's route.
+
+In a **deployed** runtime context (`CODEFLY__RUNTIME_CONTEXT` outside the local
+kinds above) `validate()` refuses to boot when either address is loopback
+(`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`, the unspecified address): a
+deployed solution that registered its listen address booted, looked healthy, and
+was proxied by the gateway to the gateway itself, while the product reported it
+as failed to load. The environment's *name* is never consulted — an environment
+called `local-dogfood` may well be deployed.
+
+Until core v0.5.6 is released, the self endpoint is read from that carrier by
+name in one helper (`selfEndpoint`), and a cell rendered by an older core has
+neither the carrier nor the runtime-context signal: it falls back to the listen
+address and is not refused. Both switch to the core/SDK accessors when released.
+
+### Serving the frontend
+
+`/assets/` serves the built Module Federation remote, with CORS, from
+`Manifest.Assets` when the solution sets it — typically an `embed.FS` narrowed
+with `fs.Sub` to the build's output directory — and otherwise from the
+`ASSETS_DIR` directory. A solution serving from `Manifest.Assets` reads nothing
+from disk, so it runs with a read-only root filesystem. Either way a file whose
+name carries a content hash (`123.3f9a1c2b.js`) is served
+`public, max-age=31536000, immutable`, and everything else — `mf-manifest.json`
+and the remote entry above all, whose names never change — `no-cache`, as is
+any response that is not the file (a `404` for a hashed name must not be cached
+under the name the next build will serve).
 
 ### Self-registration
 
@@ -120,6 +164,13 @@ derived from). The shared cluster-internal token is never presented on a
 registration: it proves no publisher, and a downgrade path would let anything
 able to answer `404` at that URL turn the publisher-bound credential back into
 it.
+
+Only a `401`/`403` from the exchange is reported as a credential fault (no
+`SOLUTION_REGISTRATION_SECRETS` entry for this id, or a secret that does not
+match its digest) — those are the statuses accounts answers after judging the
+secret. A `5xx` is reported as `host unavailable (status N), retrying` with the
+gateway's own error body, and any other status as a failure with its body; none
+of them names the provisioning, and the heartbeat keeps retrying all of them.
 
 A refusal that carries reasons (the host's `409 incompatible_runtime`, say) is
 logged with them, again whenever the reasons change and not only when the status
