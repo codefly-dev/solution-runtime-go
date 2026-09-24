@@ -1119,15 +1119,15 @@ func TestServeSkipsConsumedAPIWithoutSecret(t *testing.T) {
 // registration — it just retries on its own heartbeat.
 func TestServeIsolatesFailedModuleRegistration(t *testing.T) {
 	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
-	setEndpoint(t, "CODEFLY__ENDPOINT__BILLING__INVOICES__REST__REST", "http://billing-upstream:9200")
+	setEndpoint(t, "CODEFLY__ENDPOINT__ALPHA__ITEMS__REST__REST", "http://alpha-upstream:9200")
 	t.Setenv("CODEFLY__API_CONSUMES", `[`+
-		`{"id":"billing.invoices","module":"billing","service":"invoices","endpoint":"rest","protocol":"rest","as":"billing"},`+
+		`{"id":"alpha.items","module":"alpha","service":"items","endpoint":"rest","protocol":"rest","as":"alpha"},`+
 		`{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`)
-	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret,billing:stale")
+	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret,alpha:stale")
 
 	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{
 		"documents": "s3cret",
-		"billing":   "rotated",
+		"alpha":     "rotated",
 	}})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1739,8 +1739,8 @@ func TestParseModuleRegistrationSecrets(t *testing.T) {
 		{name: "one", raw: "documents:s3cret", want: map[string]string{"documents": "s3cret"}},
 		{
 			name: "several, spaced",
-			raw:  "documents:s3cret, billing:other",
-			want: map[string]string{"documents": "s3cret", "billing": "other"},
+			raw:  "documents:s3cret, alpha:other",
+			want: map[string]string{"documents": "s3cret", "alpha": "other"},
 		},
 		// A secret is opaque and base64 may contain "=" and "+"; only the first
 		// ":" separates it from the prefix.
@@ -2012,7 +2012,7 @@ func TestForModuleMintsOncePerAsk(t *testing.T) {
 				return nil, err
 			}
 		}
-		if _, err := g.ForModule(ctx, "billing", Scope{ResourceKind: "invoices", Actions: []string{"read"}}); err != nil {
+		if _, err := g.ForModule(ctx, "alpha", Scope{ResourceKind: "items", Actions: []string{"read"}}); err != nil {
 			return nil, err
 		}
 		return "done", nil
@@ -2215,7 +2215,7 @@ func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
 		}
 		// Chaining off a derived gateway is the natural reach: ForModule is a
 		// method on every Gateway, including one already acting for a module.
-		if _, err := docs.ForModule(ctx, "billing", Scope{ResourceKind: "invoices", Actions: []string{"read"}}); err != nil {
+		if _, err := docs.ForModule(ctx, "alpha", Scope{ResourceKind: "items", Actions: []string{"read"}}); err != nil {
 			return nil, err
 		}
 		return "done", nil
@@ -2343,7 +2343,7 @@ func TestMintRootsTheTaskInTheViewersVerifiedSession(t *testing.T) {
 		if _, err := readModule(ctx, g, "documents"); err != nil {
 			return nil, err
 		}
-		if _, err := g.ForModule(ctx, "billing", Scope{ResourceKind: "invoices", Actions: []string{"read"}}); err != nil {
+		if _, err := g.ForModule(ctx, "alpha", Scope{ResourceKind: "items", Actions: []string{"read"}}); err != nil {
 			return nil, err
 		}
 		return "done", nil
