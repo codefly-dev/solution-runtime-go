@@ -84,7 +84,8 @@ repository is the runtime that cost was measured against.
    to core, the SDK or the host.
 4. **Never hardcode what the system resolves.** This package resolves every
    address, port and secret through the SDK; the single `localhost` literal in
-   it is the public URL built from the *resolved* port. Both token-exchange URLs
+   it is the self upstream's listen-address fallback, built from the *resolved*
+   port and refused by `validate()` in a deployed runtime context. Both token-exchange URLs
    are derived from their register URLs by swapping the path suffix, which is
    why an override that drops the documented suffix cannot be paired and is
    refused at boot rather than guessed at. If you are typing an address, a port
