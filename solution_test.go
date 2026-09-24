@@ -1771,8 +1771,11 @@ type mintRequest struct {
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
-	Bearer          string             `json:"-"`
-	WorkContext     string             `json:"-"`
+	// TTLSeconds is nil when the ask carried no ttlSeconds at all, which is
+	// how "the issuer's default" must reach accounts — not as an explicit 0.
+	TTLSeconds  *int32 `json:"ttlSeconds"`
+	Bearer      string `json:"-"`
+	WorkContext string `json:"-"`
 }
 
 // moduleCall is what a composed module behind the gateway received: the two

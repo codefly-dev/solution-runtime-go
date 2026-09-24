@@ -2067,11 +2067,59 @@ func workContextScopes(scopes []Scope) []workContextScope {
 // so a handler that returns it answers 409 (no organization selected) or 403 (no
 // session — an API key cannot read a composed module) instead of a generic 502.
 //
+// Every mint names a fresh Task — a re-mint within one request as much as
+// another request's mint — so no two capabilities share one. A module that
+// fences what a caller may read by the Task it was minted under (a durable task
+// runtime does) then refuses a later request's read of what an earlier one
+// started; name the Task with ForTask instead.
+//
 // The returned gateway holds the ask, not the capability — it resolves one per
 // request — so a handler may keep it for as long as it keeps the viewer's
 // request. Minting here as well means an ask accounts refuses fails at this
 // call rather than inside some later round trip.
 func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scope) (*Gateway, error) {
+	return g.forAsk(ctx, startTaskRequest{Audience: audience, AuthorityScopes: workContextScopes(scopes)})
+}
+
+// Task names the host Task a Work Context is minted under, and asks how long
+// the capability should live.
+type Task struct {
+	// ID is sent to accounts verbatim as the Task id, which accounts signs into
+	// the capability as its boundary. It must be a UUID in the hyphenated form
+	// accounts validates; any other shape is refused before a request is made.
+	ID string
+	// TTLSeconds is the lifetime asked of the issuer. Zero leaves it to the
+	// issuer's default; the issuer bounds it and refuses a value outside them.
+	TTLSeconds int32
+}
+
+// taskIDShape is the form accounts' StartTask admits for a Task id
+// (buf.validate string.uuid): hyphenated, any version, either case.
+var taskIDShape = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ForTask is ForModule under a Task the solution names. Every mint for the same
+// task.ID — within one request or across many, now or later — carries the same
+// Task boundary, so a module that fences reads by that boundary lets a later
+// request read what an earlier one under the same Task started. Accounts signs
+// the id as given and keeps no registry of it: naming the Task grants nothing,
+// since each capability still carries only the viewer's own authority.
+//
+// The cache identity includes the Task and the lifetime asked for, so two
+// Tasks never share a capability. The org and session are the viewer's, exactly
+// as for ForModule.
+func (g *Gateway) ForTask(ctx context.Context, task Task, audience string, scopes ...Scope) (*Gateway, error) {
+	if !taskIDShape.MatchString(task.ID) {
+		return nil, fmt.Errorf("cannot mint a work context for %q under task %q: a task id must be a hyphenated UUID, which is all accounts admits", audience, task.ID)
+	}
+	return g.forAsk(ctx, startTaskRequest{
+		TaskID:          task.ID,
+		TTLSeconds:      task.TTLSeconds,
+		Audience:        audience,
+		AuthorityScopes: workContextScopes(scopes),
+	})
+}
+
+func (g *Gateway) forAsk(ctx context.Context, ask startTaskRequest) (*Gateway, error) {
 	if g.orgID == "" {
 		// The gateway injects orgHeader from the caller's active org, so it is
 		// present but empty for a viewer with no organization selected and for
@@ -2084,7 +2132,7 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		// indistinguishable from "this solution is down".
 		return nil, fmt.Errorf(
 			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the caller's active org, which is empty for a viewer with no organization selected and for an org-less API key: %w",
-			audience, orgHeader, &ClientError{StatusCode: http.StatusConflict, Message: "no organization selected"})
+			ask.Audience, orgHeader, &ClientError{StatusCode: http.StatusConflict, Message: "no organization selected"})
 	}
 	if g.sessionID == "" {
 		// Same shape as the org above: the gateway stamps this header for every
@@ -2099,16 +2147,12 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		// than a conflict.
 		return nil, fmt.Errorf(
 			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the verified session and stamps it empty for any caller that authenticates without one: %w",
-			audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
+			ask.Audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
 	}
-	ask := startTaskRequest{
-		OrgID:           g.orgID,
-		SessionID:       g.sessionID,
-		Audience:        audience,
-		AuthorityScopes: workContextScopes(scopes),
-	}
-	// The ask is the cache identity. The task id names one mint rather than
-	// what was asked for, so it is filled in per mint, below.
+	ask.OrgID, ask.SessionID = g.orgID, g.sessionID
+	// The ask is the cache identity, a named Task included. A task id that was
+	// not named identifies one mint rather than what was asked for, so it is
+	// filled in per mint, below.
 	key, err := json.Marshal(ask)
 	if err != nil {
 		return nil, err
@@ -2137,7 +2181,9 @@ type delegation struct {
 func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, error) {
 	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (codefly.WorkContextToken, time.Time, error) {
 		ask := g.delegation.ask
-		ask.TaskID = uuid.NewString()
+		if ask.TaskID == "" {
+			ask.TaskID = uuid.NewString()
+		}
 		return g.mint(ctx, ask)
 	})
 }
@@ -2152,6 +2198,7 @@ type startTaskRequest struct {
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
+	TTLSeconds      int32              `json:"ttlSeconds,omitempty"`
 }
 
 func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkContextToken, time.Time, error) {
