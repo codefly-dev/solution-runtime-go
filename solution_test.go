@@ -1845,7 +1845,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		if g.mintDelay > 0 {
 			time.Sleep(g.mintDelay)
 		}
-		issued := map[string]any{"token": token}
+		issued := map[string]any{"token": token, "orgId": mint.OrgID, "ownerPrincipalId": "viewer-principal", "currentActorPrincipalId": "viewer-principal"}
 		if !g.omitExpiry {
 			issued["expiresAt"] = time.Now().Add(g.tokenTTL).UTC().Format(time.RFC3339Nano)
 		}
@@ -2524,5 +2524,38 @@ func TestManifestURLIsNeverTheListenAddress(t *testing.T) {
 		if got := frontend["manifestUrl"]; got != tc.want {
 			t.Errorf("PUBLIC_URL=%q: manifestUrl = %v, want %q", tc.public, got, tc.want)
 		}
+	}
+}
+
+// TestWorkContextPrincipalsReportsWhomAccountsIssuedFor: a handler comparing a
+// claimed owner against the capability reads accounts' own answer to the mint,
+// and a gateway acting under no capability has none to report.
+func TestWorkContextPrincipalsReportsWhomAccountsIssuedFor(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	var got WorkContextPrincipals
+	var bare error
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		_, bare = g.WorkContextPrincipals(ctx)
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		got, err = docs.WorkContextPrincipals(ctx)
+		return "done", err
+	})
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
+	}
+	want := WorkContextPrincipals{OrgID: viewerOrg, OwnerPrincipalID: "viewer-principal", CurrentActorPrincipalID: "viewer-principal"}
+	if got != want {
+		t.Fatalf("principals = %+v, want %+v", got, want)
+	}
+	if bare == nil {
+		t.Fatal("a gateway acting under no work context reported principals")
+	}
+	if n := gw.mintCount(); n != 1 {
+		t.Fatalf("minted %d capabilities, want 1: reading the principals reuses the capability", n)
 	}
 }

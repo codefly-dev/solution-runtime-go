@@ -396,6 +396,12 @@ non-2xx answer is a `*GatewayError` carrying the status.
 `Gateway.OrgID` is the viewer's active organization, the same one `ForModule`
 mints in. A handler scoping a module read to a tenant names this one.
 
+`Gateway.WorkContextPrincipals` reports whom a `ForModule` capability was
+issued for — the organization, the Task's owner and its current actor, as
+accounts answered the mint — so a handler compares a claimed owner against
+accounts' own resolution instead of trusting it. It reuses the cached
+capability rather than minting again.
+
 ### Generated messages in a response
 
 A handler's value is encoded with `encoding/json`, which reads a generated
