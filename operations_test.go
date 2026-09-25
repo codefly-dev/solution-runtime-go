@@ -12,10 +12,11 @@ import (
 )
 
 type documentedTree struct {
-	ID       string                         `json:"id"`
-	Rule     Message[*annotations.HttpRule] `json:"rule"`
-	Children []*documentedTree              `json:"children"`
-	Facets   map[string]any                 `json:"facets"`
+	ID       string                          `json:"id"`
+	Rule     Message[*annotations.HttpRule]  `json:"rule"`
+	Optional *Message[*annotations.HttpRule] `json:"optional,omitempty"`
+	Children []*documentedTree               `json:"children"`
+	Facets   map[string]any                  `json:"facets"`
 }
 
 type documentedResponse struct {
@@ -66,8 +67,12 @@ func TestInterfaceDocumentDescribesGeneratedMessagesFromTheirDescriptor(t *testi
 	if items := rule.Properties["additionalBindings"]["items"].(map[string]any); items["$ref"] != "#/definitions/GoogleApiHttpRule" {
 		t.Fatalf("a self-referencing message does not terminate in a $ref: %v", items)
 	}
-	if _, ok := doc.Definitions["DocumentedTree"]; !ok {
+	tree, ok := doc.Definitions["DocumentedTree"]
+	if !ok {
 		t.Fatalf("struct definitions are missing: %v", doc.Definitions)
+	}
+	if tree.Properties["optional"]["$ref"] != "#/definitions/GoogleApiHttpRule" {
+		t.Fatalf("a pointer to a generated message is not described by it: %v", tree.Properties["optional"])
 	}
 }
 

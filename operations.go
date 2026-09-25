@@ -235,12 +235,16 @@ func schemaFor(t reflect.Type, definitions map[string]any) map[string]any {
 	if t == rawMessageType {
 		return map[string]any{"type": "object"}
 	}
+	// A pointer is described by what it points to. It is unwrapped first:
+	// *Message[T] also has Message[T]'s methods, and its zero value is a nil
+	// pointer no method can be called on.
+	if t.Kind() == reflect.Pointer {
+		return schemaFor(t.Elem(), definitions)
+	}
 	if t.Implements(messageDescribedType) {
 		return messageSchema(reflect.Zero(t).Interface().(messageDescribed).messageDescriptor(), definitions)
 	}
 	switch t.Kind() {
-	case reflect.Pointer:
-		return schemaFor(t.Elem(), definitions)
 	case reflect.Struct:
 		name := title(t.Name())
 		// An unnamed struct has no definition to be referenced by: keyed on ""
