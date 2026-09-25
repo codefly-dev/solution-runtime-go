@@ -1917,6 +1917,13 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 
 func (g *Gateway) BaseURL() string { return g.baseURL }
 
+// OrgID is the viewer's active organization: the x-org-id identity header the
+// gateway stamped from the verified bearer, never anything the browser sent.
+// It is empty for a viewer with no organization selected and for an org-less
+// API key. It is the organization ForModule mints in, so a handler that scopes
+// a module read to a tenant names this one rather than resolving another.
+func (g *Gateway) OrgID() string { return g.orgID }
+
 // HTTPClient returns an http.Client that injects the caller's bearer — and, on
 // a gateway derived by ForModule, the viewer's Work Context — on every request.
 // Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
@@ -2187,6 +2194,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 	var issued struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expiresAt"`
+		WorkContextPrincipals
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
 		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
@@ -2227,7 +2235,38 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 				lifetime.Round(time.Second), workContextRenewal, lead.Round(time.Second))
 		})
 	}
+	g.contexts.remember(token, issued.WorkContextPrincipals)
 	return token, issued.ExpiresAt.Add(-lead), nil
+}
+
+// WorkContextPrincipals is who accounts says a minted capability acts for, as
+// it answered the mint: the organization, the Task's owner, and its current
+// actor. They are accounts' own resolution of the forwarded bearer, never
+// anything the handler or the browser supplied.
+type WorkContextPrincipals struct {
+	OrgID                   string `json:"orgId"`
+	OwnerPrincipalID        string `json:"ownerPrincipalId"`
+	CurrentActorPrincipalID string `json:"currentActorPrincipalId"`
+}
+
+// WorkContextPrincipals reports whom the capability this gateway acts under was
+// issued for — on a gateway derived by ForModule, resolving (and if need be
+// minting) the capability exactly as a request would. A handler compares them
+// against an identity it was handed rather than trusting that identity. On a
+// gateway that acts under no capability it is an error.
+func (g *Gateway) WorkContextPrincipals(ctx context.Context) (WorkContextPrincipals, error) {
+	if g.delegation == nil {
+		return WorkContextPrincipals{}, errors.New("this gateway acts under no work context; derive one with ForModule")
+	}
+	token, err := g.workContext(ctx)
+	if err != nil {
+		return WorkContextPrincipals{}, err
+	}
+	principals, ok := g.contexts.principals(token)
+	if !ok || principals.OwnerPrincipalID == "" || principals.CurrentActorPrincipalID == "" || principals.OrgID == "" {
+		return WorkContextPrincipals{}, errors.New("the work context issuance named no organization, owner or actor")
+	}
+	return principals, nil
 }
 
 // workContextCache holds the capabilities minted while serving one request. The
@@ -2241,12 +2280,28 @@ type workContextCache struct {
 	// fans out would otherwise spend one audited mint per goroutine for a
 	// capability they all share.
 	minting map[string]*pendingMint
+	// issuedFor holds, per issued capability, whom accounts said it acts for.
+	issuedFor map[string]WorkContextPrincipals
+}
+
+func (c *workContextCache) remember(token codefly.WorkContextToken, principals WorkContextPrincipals) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.issuedFor[token.Encoded()] = principals
+}
+
+func (c *workContextCache) principals(token codefly.WorkContextToken) (WorkContextPrincipals, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	principals, ok := c.issuedFor[token.Encoded()]
+	return principals, ok
 }
 
 func newWorkContextCache() *workContextCache {
 	return &workContextCache{
-		minted:  map[string]issuedWorkContext{},
-		minting: map[string]*pendingMint{},
+		minted:    map[string]issuedWorkContext{},
+		minting:   map[string]*pendingMint{},
+		issuedFor: map[string]WorkContextPrincipals{},
 	}
 }
 

@@ -363,6 +363,65 @@ This traffic is not proxied, for the same reason registration traffic is not:
 every gateway target is composition-local, and these requests carry the viewer's
 bearer and the capability minted for them in headers.
 
+### Calling a composed module over its REST binding
+
+The gateway reaches a composed module only under the REST prefix the solution
+federates for it (`/v1/<as>/*`), so the module's generated gRPC or Connect
+client cannot be pointed at it: its procedure paths are not under that prefix.
+What the module does publish is each RPC's `google.api.http` binding, in its
+generated descriptor. `Gateway.Transcoded` speaks that binding with the
+module's own generated messages:
+
+```go
+docs, err := gw.ForModule(ctx, "documents",
+    solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
+if err != nil {
+    return nil, err
+}
+var page documentsv1.ListCollectionResponse
+err = docs.Transcoded(ctx, "/v1/documents", documentsv1.DocumentsService_ListCollection_FullMethodName,
+    &documentsv1.ListCollectionRequest{PageSize: 500}, &page)
+```
+
+The call uses the method's first binding — the primary rule, then its
+additional bindings in order — whose path lies under the prefix. The URL, the
+HTTP method, and which request fields go into the path, the query or the body
+all come from the descriptor. The caller can name no path of its own, and a
+method with no binding under the prefix is refused before anything is sent, as
+is a multi-segment path variable, an empty or dot-segment path value, and a
+request or response of the wrong type. The response is decoded with unknown
+fields discarded and is bounded (`MaxResponseBytes`, 8 MiB by default). A
+non-2xx answer is a `*GatewayError` carrying the status.
+
+`Gateway.OrgID` is the viewer's active organization, the same one `ForModule`
+mints in. A handler scoping a module read to a tenant names this one.
+
+`Gateway.WorkContextPrincipals` reports whom a `ForModule` capability was
+issued for — the organization, the Task's owner and its current actor, as
+accounts answered the mint — so a handler compares a claimed owner against
+accounts' own resolution instead of trusting it. It reuses the cached
+capability rather than minting again.
+
+### Generated messages in a response
+
+A handler's value is encoded with `encoding/json`, which reads a generated
+message's Go struct tags rather than producing protobuf JSON. Wrap an owner's
+message in `solution.MessageOf(m)` (`solution.Message[T]`) wherever it sits in
+the response, and it encodes as protobuf JSON. To pass on only part of an
+owner's message, declare a `FieldMask` once from the paths allowed and
+`solution.Apply` it. A field the owner adds later reaches nobody until it is
+named, and a path naming no field fails at declaration.
+
+### Documented operations
+
+`Server.Operations` registers a list of `solution.Operation`s — each a route,
+its handler, and the documentation a reader needs (summary, callers, behaviour,
+query parameters, request and response types). `solution.InterfaceDocument`
+renders the same list as a Swagger 2.0 artifact, so one declaration is the
+source of what is served and what is published, and an operation missing its
+documentation is refused. A `Message[T]` field is described from its
+descriptor, with protobuf JSON names.
+
 > **Note:** SDK in-process endpoint resolution for a solution composed on an
 > out-of-repo host depends on codefly-core accepting the composed module path in
 > its workspace loader (codefly-dev/core#365, merged); the `core`/`sdk-go` pins
