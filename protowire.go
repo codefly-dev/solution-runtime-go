@@ -3,6 +3,7 @@ package solution
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -147,4 +148,29 @@ func prune(msg protoreflect.Message, node *maskNode) {
 	for _, fd := range disallowed {
 		msg.Clear(fd)
 	}
+}
+
+// paths lists the allowed field paths, sorted: each leaf of the tree, the way
+// the declaration named it. Documentation reads it; Apply does not.
+func (mask FieldMask) paths() []string {
+	var out []string
+	var walk func(prefix string, node *maskNode)
+	walk = func(prefix string, node *maskNode) {
+		if node.all {
+			out = append(out, prefix)
+			return
+		}
+		for name, child := range node.children {
+			path := string(name)
+			if prefix != "" {
+				path = prefix + "." + path
+			}
+			walk(path, child)
+		}
+	}
+	if mask.root != nil {
+		walk("", mask.root)
+	}
+	sort.Strings(out)
+	return out
 }

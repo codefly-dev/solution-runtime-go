@@ -10,11 +10,19 @@ import (
 
 // GatewayError carries a non-success HTTP status received through the host
 // gateway. REST adapters should return this rather than flattening the status
-// into a string. It never carries response bodies, credentials or headers.
-// Handlers may wrap it; only a generic status message reaches the browser.
+// into a string. It exposes no response body, credential or header. Handlers
+// may wrap it; only a generic status message reaches the browser.
 type GatewayError struct {
 	StatusCode int
+	// detail is the head of a module's refusal body (Transcoded keeps at most
+	// gatewayErrorDetailLimit bytes). Only the consumed-module passthrough reads
+	// it, to relay the module's own refusal to the page that made the call; a
+	// handler's error never exposes it.
+	detail []byte
 }
+
+// gatewayErrorDetailLimit bounds the refusal body a GatewayError keeps.
+const gatewayErrorDetailLimit = 4 << 10
 
 func (e *GatewayError) Error() string {
 	return fmt.Sprintf("gateway returned HTTP %d", e.StatusCode)
