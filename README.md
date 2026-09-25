@@ -437,6 +437,10 @@ boot, `Serve` refuses a module whose `as` is not in the solution's api.consumes,
 a method missing from the registry or with no binding under `/v1/<as>`, a
 streaming method, and a method with no declared response fields. `Response`
 names the fields returned to the page; `WholeResponse` must be said explicitly.
+`Pin` fixes part of every request server-side (merged with `proto.Merge`): a
+pinned scalar replaces the page's value and a pinned repeated value is added to
+the page's, so a filter clause the module ANDs stays in force whatever the page
+sends.
 A module's refusal reaches the page in the Connect error: a `google.rpc.Status`
 body keeps its code and message, any other small JSON refusal is the message
 verbatim under the code its HTTP status maps to, and anything else is reported

@@ -12,6 +12,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/solution/manifest"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
@@ -77,6 +79,13 @@ type ConsumedMethod struct {
 	// WholeResponse passes every response field, and must be said explicitly:
 	// the zero value of a declaration returns nothing it did not name.
 	WholeResponse bool
+	// Pin, when set, is merged into every request the page sends before it is
+	// forwarded (proto.Merge): a scalar it sets replaces the page's value, a
+	// message merges, and a repeated field is appended. It is how a solution
+	// fixes part of a request server-side — a filter clause the module ANDs
+	// with the page's own, say — so the page can narrow the call but not undo
+	// the pin. It must be the method's request type.
+	Pin proto.Message
 	// MaxRequestBytes bounds the request message the page sends; zero is
 	// DefaultPassthroughRequestLimit.
 	MaxRequestBytes int
@@ -158,6 +167,9 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 				return nil, fmt.Errorf("consumed module %q: %s declares no response fields; name them in Response, or pass WholeResponse explicitly", module.As, md.FullName())
 			case method.Response.desc != nil && method.Response.desc.FullName() != md.Output().FullName():
 				return nil, fmt.Errorf("consumed module %q: %s answers %s, but its response mask is over %s", module.As, md.FullName(), md.Output().FullName(), method.Response.desc.FullName())
+			}
+			if method.Pin != nil && method.Pin.ProtoReflect().Descriptor().FullName() != md.Input().FullName() {
+				return nil, fmt.Errorf("consumed module %q: %s reads %s, but its pin is a %s", module.As, md.FullName(), md.Input().FullName(), method.Pin.ProtoReflect().Descriptor().FullName())
 			}
 			path := PassthroughPathPrefix + module.As + "/" + string(md.Parent().FullName()) + "/" + string(md.Name())
 			if _, dup := routes[path]; dup {
@@ -277,6 +289,17 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 		}
 		gw = acting
 	}
+	if route.method.Pin != nil {
+		// Merged through the wire form: the pin is the generated type, the
+		// request a dynamic message over the same descriptor.
+		pinned, err := proto.Marshal(route.method.Pin)
+		if err != nil {
+			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
+		}
+		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, req.Msg); err != nil {
+			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
+		}
+	}
 	out := dynamicpb.NewMessage(route.md.Output())
 	var opts []TranscodeOption
 	if route.method.MaxResponseBytes > 0 {
@@ -389,6 +412,10 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			callers = fmt.Sprintf("Signed-in viewers. The %s module authenticates the viewer's bearer and authorizes every call itself.", route.module.As)
 		}
 		behavior := fmt.Sprintf("A Connect unary call, forwarded to the module's %s %s binding. ", route.verb, route.template)
+		if route.method.Pin != nil {
+			pin, _ := protojson.Marshal(route.method.Pin)
+			behavior += fmt.Sprintf("Every request is merged with the declared pin %s first. ", pin)
+		}
 		if route.method.WholeResponse {
 			behavior += "The module's whole response is returned."
 		} else {

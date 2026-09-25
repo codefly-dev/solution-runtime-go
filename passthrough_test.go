@@ -12,6 +12,7 @@ import (
 
 	"github.com/codefly-dev/core/solution/manifest"
 	codefly "github.com/codefly-dev/sdk-go"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // passthroughModule is the "things" module of transcodeTestFile as a solution
@@ -293,5 +294,38 @@ func TestPassthroughOperationsDocumentTheDeclaration(t *testing.T) {
 	}
 	if parsed.Definitions["ThingsV1Thing"] == nil || parsed.Definitions["ThingsV1GetThingRequest"] == nil {
 		t.Fatalf("definitions = %v", parsed.Definitions)
+	}
+}
+
+func TestPassthroughMergesTheDeclaredPinIntoEveryRequest(t *testing.T) {
+	gw := newModuleGateway(t, http.StatusOK, `{}`)
+	pin := thingMessage("GetThingRequest")
+	setField(pin, "tenant", protoreflect.ValueOfString("pinned-tenant"))
+	ids := pin.NewField(pin.Descriptor().Fields().ByName("ids"))
+	ids.List().Append(protoreflect.ValueOfString("pinned-id"))
+	pin.Set(pin.Descriptor().Fields().ByName("ids"), ids)
+	module := passthroughModule()
+	module.Methods[0].Pin = pin
+	s := passthroughServer(gw.URL, module)
+
+	if status, body := call(t, s, searchPath, "Bearer viewer", `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
+		t.Fatalf("status %d %v", status, body)
+	}
+	var sent struct {
+		Tenant string   `json:"tenant"`
+		IDs    []string `json:"ids"`
+	}
+	if err := json.Unmarshal([]byte(gw.bodys[0]), &sent); err != nil {
+		t.Fatal(err)
+	}
+	// A pinned scalar replaces the page's; a pinned repeated value is added to
+	// the page's, so a module that ANDs them keeps the pin whatever the page sends.
+	if sent.Tenant != "pinned-tenant" || len(sent.IDs) != 2 || sent.IDs[0] != "page-id" || sent.IDs[1] != "pinned-id" {
+		t.Fatalf("module received %q", gw.bodys[0])
+	}
+
+	module.Methods[0].Pin = thingMessage("Thing")
+	if _, err := resolvePassthrough([]ConsumedModule{module}); err == nil {
+		t.Fatal("a pin of another type was accepted")
 	}
 }
