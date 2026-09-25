@@ -1917,6 +1917,13 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 
 func (g *Gateway) BaseURL() string { return g.baseURL }
 
+// OrgID is the viewer's active organization: the x-org-id identity header the
+// gateway stamped from the verified bearer, never anything the browser sent.
+// It is empty for a viewer with no organization selected and for an org-less
+// API key. It is the organization ForModule mints in, so a handler that scopes
+// a module read to a tenant names this one rather than resolving another.
+func (g *Gateway) OrgID() string { return g.orgID }
+
 // HTTPClient returns an http.Client that injects the caller's bearer — and, on
 // a gateway derived by ForModule, the viewer's Work Context — on every request.
 // Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
