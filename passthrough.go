@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
+	"gopkg.in/yaml.v3"
 )
 
 // --- Consumed-module passthrough ---
@@ -451,3 +454,42 @@ type describedMessage struct {
 }
 
 func (d describedMessage) messageDescriptor() protoreflect.MessageDescriptor { return d.md }
+
+// InterfaceArtifact renders the interface artifact of the solution backend
+// rooted at dir: its own operations and the consumed-module operations its
+// page may call, at the version its service.codefly.yaml declares. The
+// artifact carries the version the platform ships, never a second number kept
+// in step by hand. An empty info.Version is read from the manifest.
+func InterfaceArtifact(dir string, info InterfaceInfo, ops []Operation, modules ...ConsumedModule) ([]byte, error) {
+	if info.Version == "" {
+		version, err := ServiceVersion(dir)
+		if err != nil {
+			return nil, err
+		}
+		info.Version = version
+	}
+	consumed, err := PassthroughOperations(modules...)
+	if err != nil {
+		return nil, err
+	}
+	return InterfaceDocument(info, append(append([]Operation{}, ops...), consumed...))
+}
+
+// ServiceVersion is the version the service manifest (service.codefly.yaml)
+// in dir declares.
+func ServiceVersion(dir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "service.codefly.yaml"))
+	if err != nil {
+		return "", err
+	}
+	var svc struct {
+		Version string `yaml:"version"`
+	}
+	if err := yaml.Unmarshal(data, &svc); err != nil {
+		return "", fmt.Errorf("service.codefly.yaml: %w", err)
+	}
+	if svc.Version == "" {
+		return "", fmt.Errorf("service.codefly.yaml declares no version")
+	}
+	return svc.Version, nil
+}

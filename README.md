@@ -445,7 +445,9 @@ A module's refusal reaches the page in the Connect error: a `google.rpc.Status`
 body keeps its code and message, any other small JSON refusal is the message
 verbatim under the code its HTTP status maps to, and anything else is reported
 by kind only. `PassthroughOperations` renders the declaration for the interface
-artifact.
+artifact, and `InterfaceArtifact(dir, info, ops, modules...)` renders a
+backend's whole artifact — its own operations and the passthrough — at the
+version its `service.codefly.yaml` declares.
 
 ### Generated messages in a response
 

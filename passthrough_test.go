@@ -1,10 +1,13 @@
 package solution
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -327,5 +330,31 @@ func TestPassthroughMergesTheDeclaredPinIntoEveryRequest(t *testing.T) {
 	module.Methods[0].Pin = thingMessage("Thing")
 	if _, err := resolvePassthrough([]ConsumedModule{module}); err == nil {
 		t.Fatal("a pin of another type was accepted")
+	}
+}
+
+func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "service.codefly.yaml"), []byte("kind: service\nname: backend\nversion: 1.2.3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	own := Operation{Path: "/own", Summary: "s", Callers: "c", Behavior: "b", Response: map[string]string{},
+		Handler: func(context.Context, *Gateway) (any, error) { return nil, nil }}
+	doc, err := InterfaceArtifact(dir, InterfaceInfo{Title: "t", BasePath: "/solutions/test", OperationPrefix: "Test", Tag: "test"}, []Operation{own}, passthroughModule())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Info  struct{ Version string } `json:"info"`
+		Paths map[string]any           `json:"paths"`
+	}
+	if err := json.Unmarshal(doc, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Info.Version != "1.2.3" || parsed.Paths["/own"] == nil || parsed.Paths[searchPath] == nil {
+		t.Fatalf("artifact: version %q, paths %v", parsed.Info.Version, parsed.Paths)
+	}
+	if _, err := InterfaceArtifact(t.TempDir(), InterfaceInfo{}, nil); err == nil {
+		t.Fatal("a backend with no service manifest rendered a version")
 	}
 }
