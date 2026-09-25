@@ -402,6 +402,53 @@ accounts answered the mint — so a handler compares a claimed owner against
 accounts' own resolution instead of trusting it. It reuses the cached
 capability rather than minting again.
 
+### Letting the page call a consumed module: the passthrough
+
+The host proxy forwards a solution's page only to the solution's own backend,
+so a page cannot reach a composed module's `/v1/<as>/*` prefix, and a module
+that authenticates by Work Context would refuse its bearer anyway. Instead of a
+handler per module operation, a solution declares which operations its page
+may call:
+
+```go
+solution.New(manifest).Consumes(solution.ConsumedModule{
+    As:     "documents", // the `as` of its api.consumes entry
+    Scopes: []solution.Scope{{ResourceKind: "documents", Actions: []string{"read"}}},
+    Methods: []solution.ConsumedMethod{{
+        Name:     documentsv1.DocumentsService_GetDocument_FullMethodName,
+        Response: solution.MustFieldMask(&documentsv1.GetDocumentResponse{}, "document.entry"),
+    }},
+})
+```
+
+Each declared method is served as a Connect unary procedure at
+`/modules/<as>/<package.Service>/<Method>`, so the page uses the module's own
+generated client (connect-es) unmodified, with the base URL
+`<apiBase>/modules/<as>`. A call is answered by the module as the viewer: the
+runtime mints the viewer's Work Context with the declared scopes (`ForModule`),
+or, with `ViewerBearer`, forwards only the bearer to a module that
+authenticates the viewer itself, and forwards the request over the method's
+binding (`Transcoded`). The page names a procedure and a request message,
+never a path, a prefix, an audience or an authority, and authorization stays at
+the module.
+
+Least privilege by default. A method that is not declared is `not_found`. At
+boot, `Serve` refuses a module whose `as` is not in the solution's api.consumes,
+a method missing from the registry or with no binding under `/v1/<as>`, a
+streaming method, and a method with no declared response fields. `Response`
+names the fields returned to the page; `WholeResponse` must be said explicitly.
+`Pin` fixes part of every request server-side (merged with `proto.Merge`): a
+pinned scalar replaces the page's value and a pinned repeated value is added to
+the page's, so a filter clause the module ANDs stays in force whatever the page
+sends.
+A module's refusal reaches the page in the Connect error: a `google.rpc.Status`
+body keeps its code and message, any other small JSON refusal is the message
+verbatim under the code its HTTP status maps to, and anything else is reported
+by kind only. `PassthroughOperations` renders the declaration for the interface
+artifact, and `InterfaceArtifact(dir, info, ops, modules...)` renders a
+backend's whole artifact — its own operations and the passthrough — at the
+version its `service.codefly.yaml` declares.
+
 ### Generated messages in a response
 
 A handler's value is encoded with `encoding/json`, which reads a generated

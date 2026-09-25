@@ -218,7 +218,11 @@ func (e *ClientError) Error() string { return e.Message }
 type Server struct {
 	manifest Manifest
 	handlers map[string]RequestHandler
-	cfg      config
+	// consumed is the passthrough declaration (Consumes); passthrough is its
+	// resolved routes, checked by Serve before it listens.
+	consumed    []ConsumedModule
+	passthrough map[string]passthroughRoute
+	cfg         config
 	// registrationInterval is how long a registration heartbeat waits between
 	// beats. Zero means defaultRegistrationInterval. Per-server rather than a
 	// package value so a test can drive several beats without every other
@@ -259,6 +263,9 @@ type config struct {
 	// so validate() must say so rather than report each empty value as
 	// something the composition forgot to provision.
 	environmentLoadErr error
+	// apiConsumes is the api.consumes projection Codefly injected, which the
+	// passthrough declaration is checked against before the boot listens.
+	apiConsumes string
 }
 
 func env(key, fallback string) string {
@@ -465,6 +472,7 @@ func loadConfig(ctx context.Context, id string) config {
 		solutionSecret:     solutionRegistrationSecret(ctx),
 		moduleSecrets:      parseModuleRegistrationSecrets(env(ModuleRegistrationSecretsEnvironmentVariable, "")),
 		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
+		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 	}
 	cfg.registrationInterval, cfg.registrationIntervalErr = registrationIntervalFromEnv()
 	return cfg
@@ -758,6 +766,13 @@ func (s *Server) Serve() error {
 	if err := s.cfg.validate(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
+	// After the environment is loaded: the declaration is checked against the
+	// api.consumes projection Codefly injected.
+	routes, err := s.validatePassthrough()
+	if err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	s.passthrough = routes
 	ln, err := net.Listen("tcp", ":"+s.cfg.port)
 	if err != nil {
 		return err
@@ -778,6 +793,16 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
 	}
 	mux.Handle("/assets/", http.StripPrefix("/assets/", withCORSHandler(s.assetsHandler())))
+	if len(s.consumed) > 0 {
+		routes := s.passthrough
+		if routes == nil {
+			var err error
+			if routes, err = resolvePassthrough(s.consumed); err != nil {
+				return err
+			}
+		}
+		mux.Handle(PassthroughPathPrefix, s.passthroughHandler(routes))
+	}
 
 	manifestBody, _ := json.Marshal(s.manifestMap())
 	upstreamBody, _ := json.Marshal(map[string]string{"id": s.manifest.ID, "upstream": s.cfg.selfUpstream})

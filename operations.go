@@ -129,7 +129,7 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		}
 		parameters := []any{}
 		if op.Request != nil {
-			parameters = append(parameters, map[string]any{"name": "body", "in": "body", "required": true, "schema": schemaFor(reflect.TypeOf(op.Request), definitions)})
+			parameters = append(parameters, map[string]any{"name": "body", "in": "body", "required": true, "schema": valueSchema(op.Request, definitions)})
 		}
 		for _, query := range op.Query {
 			parameters = append(parameters, map[string]any{"name": query.Name, "in": "query", "required": query.Required, "type": "string"})
@@ -171,7 +171,7 @@ func operationResponses(op Operation, definitions map[string]any) map[string]any
 	return map[string]any{
 		"200": map[string]any{
 			"description": "A successful response.",
-			"schema":      schemaFor(reflect.TypeOf(op.Response), definitions),
+			"schema":      valueSchema(op.Response, definitions),
 		},
 		"401": map[string]any{
 			"description": "The request carried no bearer token.",
@@ -227,6 +227,16 @@ var (
 	messageDescribedType = reflect.TypeOf((*messageDescribed)(nil)).Elem()
 	rawMessageType       = reflect.TypeOf(json.RawMessage{})
 )
+
+// valueSchema describes a declared request or response value: a message known
+// only by its descriptor (a passthrough operation's) from that descriptor, and
+// anything else from its type.
+func valueSchema(v any, definitions map[string]any) map[string]any {
+	if described, ok := v.(describedMessage); ok {
+		return messageSchema(described.md, definitions)
+	}
+	return schemaFor(reflect.TypeOf(v), definitions)
+}
 
 // schemaFor derives a JSON schema from a response type, registering a
 // definition for every struct it reaches so a self-referencing shape
