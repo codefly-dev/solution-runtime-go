@@ -2174,6 +2174,25 @@ func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, er
 	})
 }
 
+// WorkContextRefusal is the issuer's refusal to mint a Work Context: most
+// often an authority the viewer does not hold ("owner is not allowed
+// kind:action at requested scope"). It keeps the issuer's Connect code and
+// message, so a caller can tell "you lack this permission" from "the gateway
+// never routed the mint", and unwraps to the GatewayError it has always been.
+type WorkContextRefusal struct {
+	Audience   string
+	StatusCode int
+	// Code is the issuer's Connect code ("permission_denied"), when it sent one.
+	Code    string
+	Message string
+}
+
+func (e *WorkContextRefusal) Error() string {
+	return fmt.Sprintf("work context mint for %q rejected (status %d, %q): %s", e.Audience, e.StatusCode, e.Code, e.Message)
+}
+
+func (e *WorkContextRefusal) Unwrap() error { return &GatewayError{StatusCode: e.StatusCode} }
+
 // startTaskRequest is saas.accounts.v1.StartTaskWorkContextRequest on the wire.
 // The runtime speaks it as Connect JSON rather than linking the accounts client:
 // a solution's host is not this package's dependency. Leaving actorPrincipalId
@@ -2213,8 +2232,9 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 			Message string `json:"message"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q rejected (status %d, %q): %s: %w",
-			ask.Audience, resp.StatusCode, refusal.Code, refusal.Message, &GatewayError{StatusCode: resp.StatusCode})
+		return codefly.WorkContextToken{}, time.Time{}, &WorkContextRefusal{
+			Audience: ask.Audience, StatusCode: resp.StatusCode, Code: refusal.Code, Message: refusal.Message,
+		}
 	}
 	var issued struct {
 		Token     string    `json:"token"`

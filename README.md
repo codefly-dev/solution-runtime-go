@@ -432,10 +432,34 @@ binding (`Transcoded`). The page names a procedure and a request message,
 never a path, a prefix, an audience or an authority, and authorization stays at
 the module.
 
+Authority is minted per method. A method may declare its own `Scopes`, which
+replace the module's for a call to that method — never add to them — so one
+module's methods that need different authority are declared under one `as`:
+
+```go
+solution.ConsumedModule{
+    As: "tasks",
+    Methods: []solution.ConsumedMethod{
+        {Name: ownListMethod, Scopes: []solution.Scope{{ResourceKind: "tasks", Actions: []string{"list"}}}, WholeResponse: true},
+        {Name: orgListMethod, Scopes: []solution.Scope{{ResourceKind: "tasks", Actions: []string{"inspect"}}}, WholeResponse: true},
+    },
+}
+```
+
+Each call mints only its own method's authority. A viewer who lacks one
+method's authority is refused that method as `permission_denied`, with the
+issuer's reason (which names the missing permission), and is still served
+every other method; the mint is never widened or retried with less. Every
+method of a module that is not `ViewerBearer` needs scopes, its own or the
+module's, and `ViewerBearer` takes none at either level.
+
 Least privilege by default. A method that is not declared is `not_found`. At
 boot, `Serve` refuses a module whose `as` is not in the solution's api.consumes,
 a method missing from the registry or with no binding under `/v1/<as>`, a
-streaming method, and a method with no declared response fields. `Response`
+streaming method, a method with no declared response fields, a method with no
+scopes of its own or its module's (unless the module is `ViewerBearer`), scopes
+on a `ViewerBearer` module or method, and a scope with no resource kind, no
+action, or a blank or repeated action. `Response`
 names the fields returned to the page; `WholeResponse` must be said explicitly.
 `Pin` fixes part of every request server-side (merged with `proto.Merge`): a
 pinned scalar replaces the page's value and a pinned repeated value is added to

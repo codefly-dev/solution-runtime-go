@@ -58,9 +58,10 @@ type ConsumedModule struct {
 	// for it is minted for. A module the solution does not consume under this
 	// name is refused at boot.
 	As string
-	// Scopes is the authority minted for the viewer on every call (ForModule),
-	// no more than the declared operations need. Exactly one of Scopes and
-	// ViewerBearer is set.
+	// Scopes is the authority minted for the viewer on every call (ForModule)
+	// of a method that declares none of its own, no more than those methods
+	// need. A module that is not ViewerBearer sets Scopes, or sets Scopes on
+	// every one of its methods.
 	Scopes []Scope
 	// ViewerBearer forwards only the viewer's bearer: for a module that
 	// authenticates the viewer and mints its own authority from that bearer,
@@ -76,6 +77,14 @@ type ConsumedMethod struct {
 	// "/package.Service/Method" constant a gRPC or Connect stub exports. The
 	// module's generated package must be linked into the solution.
 	Name string
+	// Scopes, when set, is the authority minted for the viewer on a call to
+	// this method, instead of the module's Scopes — never in addition to them.
+	// It is how one module's methods that need different authority are
+	// declared under one `as`: each call mints only what its own method needs,
+	// so a viewer who lacks one method's authority is refused that method
+	// (permission_denied) and is still served every other. Not allowed on a
+	// ViewerBearer module, which mints nothing.
+	Scopes []Scope
 	// Response is the allowlist of response fields returned to the page. A
 	// field the module adds later is dropped until someone names it here.
 	Response FieldMask
@@ -145,10 +154,13 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 			return nil, fmt.Errorf("consumed module %q: as must be one path segment, the `as` of its api.consumes entry", module.As)
 		case seen[module.As]:
 			return nil, fmt.Errorf("consumed module %q is declared twice", module.As)
-		case module.ViewerBearer == (len(module.Scopes) > 0):
+		case module.ViewerBearer && len(module.Scopes) > 0:
 			return nil, fmt.Errorf("consumed module %q: declare exactly one of Scopes (the authority minted for the viewer) and ViewerBearer (the module authenticates the viewer itself)", module.As)
 		case len(module.Methods) == 0:
 			return nil, fmt.Errorf("consumed module %q declares no methods", module.As)
+		}
+		if err := checkScopes(module.Scopes); err != nil {
+			return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
 		}
 		seen[module.As] = true
 		for _, method := range module.Methods {
@@ -171,6 +183,15 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 			case method.Response.desc != nil && method.Response.desc.FullName() != md.Output().FullName():
 				return nil, fmt.Errorf("consumed module %q: %s answers %s, but its response mask is over %s", module.As, md.FullName(), md.Output().FullName(), method.Response.desc.FullName())
 			}
+			switch {
+			case module.ViewerBearer && len(method.Scopes) > 0:
+				return nil, fmt.Errorf("consumed module %q: %s declares Scopes, but the module is ViewerBearer: it mints nothing, so the scopes would never be asked for", module.As, md.FullName())
+			case !module.ViewerBearer && len(module.Scopes) == 0 && len(method.Scopes) == 0:
+				return nil, fmt.Errorf("consumed module %q: %s declares no Scopes and the module declares none either; name the authority minted for the viewer, or declare the module ViewerBearer", module.As, md.FullName())
+			}
+			if err := checkScopes(method.Scopes); err != nil {
+				return nil, fmt.Errorf("consumed module %q: %s: %w", module.As, md.FullName(), err)
+			}
 			if method.Pin != nil && method.Pin.ProtoReflect().Descriptor().FullName() != md.Input().FullName() {
 				return nil, fmt.Errorf("consumed module %q: %s reads %s, but its pin is a %s", module.As, md.FullName(), md.Input().FullName(), method.Pin.ProtoReflect().Descriptor().FullName())
 			}
@@ -182,6 +203,39 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 		}
 	}
 	return routes, nil
+}
+
+// checkScopes refuses a scope that could not name an authority: one with no
+// resource kind, no action, or a blank or duplicated action.
+func checkScopes(scopes []Scope) error {
+	for _, scope := range scopes {
+		if strings.TrimSpace(scope.ResourceKind) == "" || scope.ResourceKind != strings.TrimSpace(scope.ResourceKind) {
+			return fmt.Errorf("a scope names no resource kind (or pads it with spaces)")
+		}
+		if len(scope.Actions) == 0 {
+			return fmt.Errorf("scope %q names no action", scope.ResourceKind)
+		}
+		seen := map[string]bool{}
+		for _, action := range scope.Actions {
+			if strings.TrimSpace(action) == "" || action != strings.TrimSpace(action) {
+				return fmt.Errorf("scope %q names a blank action (or pads one with spaces)", scope.ResourceKind)
+			}
+			if seen[action] {
+				return fmt.Errorf("scope %q names the action %q twice", scope.ResourceKind, action)
+			}
+			seen[action] = true
+		}
+	}
+	return nil
+}
+
+// scopes is the authority a call to this route mints for the viewer: the
+// method's own, else the module's. Never the union.
+func (r passthroughRoute) scopes() []Scope {
+	if len(r.method.Scopes) > 0 {
+		return r.method.Scopes
+	}
+	return r.module.Scopes
 }
 
 // checkConsumed refuses a declaration for a module the solution does not
@@ -286,7 +340,7 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 	defer cancel()
 	gw := newGateway(s.cfg.gatewayURL, bearer, req.Header().Get(orgHeader), req.Header().Get(sessionHeader))
 	if !route.module.ViewerBearer {
-		acting, err := gw.ForModule(ctx, route.module.As, route.module.Scopes...)
+		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)
 		if err != nil {
 			return nil, relayedError(err)
 		}
@@ -324,6 +378,23 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 // answer to the page's own request. Anything else (a transport failure, an
 // undecodable answer) is reported by kind only, never by its internal detail.
 func relayedError(err error) error {
+	var refusal *WorkContextRefusal
+	if errors.As(err, &refusal) && refusal != nil && refusal.StatusCode >= 400 && refusal.StatusCode < 500 {
+		// The issuer refused the viewer's authority for this call: say so, in
+		// its own code and words (they name the missing permission), rather
+		// than as a failed module call. It is the viewer's own authorization,
+		// so nothing of another principal is disclosed.
+		code := codeForStatus(refusal.StatusCode)
+		var parsed connect.Code
+		if refusal.Code != "" && parsed.UnmarshalText([]byte(refusal.Code)) == nil && parsed != connect.CodeUnknown {
+			code = parsed
+		}
+		message := "the viewer's authority for the " + refusal.Audience + " module was refused"
+		if refusal.Message != "" {
+			message += ": " + truncated(refusal.Message)
+		}
+		return connect.NewError(code, errors.New(message))
+	}
 	var clientErr *ClientError
 	if errors.As(err, &clientErr) && clientErr != nil {
 		return connect.NewError(codeForStatus(clientErr.StatusCode), errors.New(clientErr.Message))
@@ -410,7 +481,7 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 	for _, path := range paths {
 		route := routes[path]
 		callers := fmt.Sprintf("Signed-in viewers. The %s module authorizes every call itself, under a Work Context minted for the viewer (audience %q, %s).",
-			route.module.As, route.module.As, scopeText(route.module.Scopes))
+			route.module.As, route.module.As, scopeText(route.scopes()))
 		if route.module.ViewerBearer {
 			callers = fmt.Sprintf("Signed-in viewers. The %s module authenticates the viewer's bearer and authorizes every call itself.", route.module.As)
 		}

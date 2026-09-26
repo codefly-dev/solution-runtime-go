@@ -37,6 +37,9 @@ type moduleGateway struct {
 	*httptest.Server
 	status int
 	reply  string
+	// deny, when set, is an action the viewer does not hold: a mint asking for
+	// it is refused the way accounts refuses one.
+	deny string
 
 	mu    sync.Mutex
 	mints []mintRequest
@@ -56,6 +59,17 @@ func newModuleGateway(t *testing.T, status int, reply string) *moduleGateway {
 			_ = json.Unmarshal(body, &mint)
 			mint.Bearer = r.Header.Get("authorization")
 			g.mints = append(g.mints, mint)
+			for _, scope := range mint.AuthorityScopes {
+				for _, action := range scope.Actions {
+					if g.deny != "" && action == g.deny {
+						writeJSON(w, http.StatusForbidden, map[string]any{
+							"code":    "permission_denied",
+							"message": "owner is not allowed " + scope.ResourceKind + ":" + action + " at requested scope",
+						})
+						return
+					}
+				}
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"token": "context-" + mint.Audience + ".1", "orgId": mint.OrgID,
 				"ownerPrincipalId": "viewer", "currentActorPrincipalId": "viewer",
