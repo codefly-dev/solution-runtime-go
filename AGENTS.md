@@ -14,7 +14,10 @@ the gateway; endpoint, port and secret resolution to `codefly-dev/sdk-go`;
 workspace and manifest types to `codefly-dev/core`; running a composition and
 provisioning its secrets to `codefly-dev/cli`. Everything here is a library —
 one Go package at the repository root, consumed as the Go module
-`github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag.
+`github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag, plus
+`passthroughtest`, the test seam a consumer runs the root package's
+passthrough under against a fake host. It holds no runtime behaviour of its
+own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
 
 ## Boundaries
 
@@ -117,7 +120,7 @@ gate. It is four commands, and they are the whole local loop:
 go mod download && go mod verify
 go test -race ./... -count=1 -timeout=5m
 go vet ./...
-test -z "$(gofmt -l ./*.go)"
+test -z "$(gofmt -l .)"
 ```
 
 Go comes from `go.mod` (1.27). Nothing else is needed: no Docker, no
@@ -125,9 +128,8 @@ credentials, no running composition.
 
 - The suite takes ~20s, most of it two heartbeat tests that wait on real wall
   time (10s and 5s). That is not a hang.
-- The formatting gate globs `./*.go`, so it covers the root package and only
-  the root package. A package added in a subdirectory is vetted and tested by
-  the commands above but not format-checked; widen the glob in the same PR.
+- The formatting gate runs over the whole tree (`gofmt -l .`), so a package
+  added in a subdirectory is format-checked as well as vetted and tested.
 - Dependency pins are how fixes from `core` and `sdk-go` reach consumers:
   `go get github.com/codefly-dev/core@vX.Y.Z && go mod tidy`, then the four
   commands above. `go mod tidy` is a no-op on a clean tree, so a diff it

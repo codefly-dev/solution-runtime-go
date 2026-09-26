@@ -286,6 +286,67 @@ func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
 	return routes, checkConsumed(s.consumed, consumed)
 }
 
+// mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix,
+// as serve does and as PassthroughHandler does: the one place the passthrough
+// is wired, so a test through PassthroughHandler serves what Serve serves.
+// Serve has already resolved and checked the routes; a test that calls serve
+// directly has not, and resolves them here.
+func (s *Server) mountPassthrough(mux *http.ServeMux) error {
+	if len(s.consumed) == 0 {
+		return nil
+	}
+	routes := s.passthrough
+	if routes == nil {
+		var err error
+		if routes, err = resolvePassthrough(s.consumed); err != nil {
+			return err
+		}
+	}
+	mux.Handle(PassthroughPathPrefix, s.passthroughHandler(routes))
+	return nil
+}
+
+// PassthroughEnvironment is what Serve resolves from the composition for the
+// passthrough, supplied instead by a caller of PassthroughHandler.
+type PassthroughEnvironment struct {
+	// GatewayURL is the host gateway every call goes through: the Work Context
+	// mint and the consumed modules' /v1/<as> prefixes.
+	GatewayURL string
+	// Consumes is the solution's api.consumes projection, which Serve reads
+	// from CODEFLY__API_CONSUMES. Every declared module must be in it.
+	Consumes []manifest.ConsumedAPI
+}
+
+// PassthroughHandler is the consumed-module passthrough exactly as Serve
+// serves it — the declaration checked by the same boot check, mounted by the
+// same code at PassthroughPathPrefix — against an environment the caller
+// supplies instead of the one Serve resolves. Nothing else of the solution is
+// served, and nothing registers anywhere.
+//
+// It exists for tests: package passthroughtest builds on it, with a fake host
+// standing in for the gateway. A solution serves with Serve, which overwrites
+// the environment set here when it resolves its own.
+func (s *Server) PassthroughHandler(env PassthroughEnvironment) (http.Handler, error) {
+	if len(s.consumed) == 0 {
+		return nil, fmt.Errorf("solution %q declares no consumed modules (Consumes)", s.manifest.ID)
+	}
+	projection, err := json.Marshal(env.Consumes)
+	if err != nil {
+		return nil, err
+	}
+	s.cfg.gatewayURL, s.cfg.apiConsumes = env.GatewayURL, string(projection)
+	routes, err := s.validatePassthrough()
+	if err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	s.passthrough = routes
+	mux := http.NewServeMux()
+	if err := s.mountPassthrough(mux); err != nil {
+		return nil, err
+	}
+	return mux, nil
+}
+
 // passthroughHandler serves every route under PassthroughPathPrefix. Each
 // route is a Connect unary handler over the method's own descriptor, so every
 // protocol the module's generated clients speak is accepted and every refusal

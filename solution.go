@@ -793,15 +793,8 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
 	}
 	mux.Handle("/assets/", http.StripPrefix("/assets/", withCORSHandler(s.assetsHandler())))
-	if len(s.consumed) > 0 {
-		routes := s.passthrough
-		if routes == nil {
-			var err error
-			if routes, err = resolvePassthrough(s.consumed); err != nil {
-				return err
-			}
-		}
-		mux.Handle(PassthroughPathPrefix, s.passthroughHandler(routes))
+	if err := s.mountPassthrough(mux); err != nil {
+		return err
 	}
 
 	manifestBody, _ := json.Marshal(s.manifestMap())

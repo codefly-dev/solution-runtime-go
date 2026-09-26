@@ -515,6 +515,37 @@ In the interface artifact a streamed operation says so in its behaviour and
 carries `x-streaming: server` (Swagger 2 has no stream; its 200 schema is one
 message of it).
 
+#### Testing the passthrough: `passthroughtest`
+
+`Serve` resolves the gateway and api.consumes from the composition and
+registers with the host, so a solution cannot run its own passthrough in a
+test through it. Package
+`github.com/codefly-dev/solution-runtime-go/passthroughtest` serves the real
+passthrough — `Server.PassthroughHandler`, the handler `Serve` mounts, behind
+the same boot check — over an `httptest` server, against a fake host:
+
+```go
+upstream := httptest.NewServer(fakeWidgets) // the test's stand-in for the module's binding
+host := passthroughtest.NewHost(t).Module("widgets", upstream.URL)
+page := passthroughtest.Start(t, host, declaration...) // the solution's Consumes
+client := widgetsv1connect.NewWidgetsClient(page.Client(), page.BaseURL("widgets"))
+```
+
+| API | What it is |
+| --- | --- |
+| `NewHost(t)` | The fake host gateway: it mints the viewer's Work Context (the accounts `StartTask` procedure) and forwards `/v1/<as>/*` to each routed module, streams included, flushed as they arrive. |
+| `Host.Module(as, upstream)` | Routes a consumed module to the test's own server, path unchanged. Every routed module is also in the solution's api.consumes; one the declaration names but the host does not route is refused as `Serve` refuses it. |
+| `Host.RefuseMints(func(Mint) *Refusal)` | Decides each mint: a non-nil `Refusal` refuses it as accounts would (default status 403), so the page sees `permission_denied` with its message. |
+| `Host.Mints()`, `Host.Calls()` | Every mint asked for (audience, scopes, org, session, bearer, the token answered), and every call forwarded to a module, each with the `Mint` whose capability it presented — how a test asserts the authority each method was called under. |
+| `Start(t, host, consumes...)` / `Handler(host, consumes...)` | The passthrough served for the declaration, or the bare handler and the error `Serve` would refuse the declaration with. |
+| `Solution.Client()`, `ClientAs(Viewer)`, `BaseURL(as)` | A client that calls as `DefaultViewer` (or the viewer given), setting the bearer and the `x-org-id` / `x-session-id` headers the gateway stamps; and the base URL a module's generated client takes. |
+
+What a green test there proves is the solution's side: the declaration, the
+authority each method mints, the fields that reach the page, stream bounds and
+cancellation. It never proves that a real host admits the solution, that
+accounts grants the scopes, or that the real module answers its binding the way
+the test's stand-in does.
+
 ### Generated messages in a response
 
 A handler's value is encoded with `encoding/json`, which reads a generated
