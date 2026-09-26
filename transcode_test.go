@@ -76,6 +76,12 @@ var transcodeTestFile = func() protoreflect.FileDescriptor {
 				{Name: proto.String("Unbound"), InputType: proto.String(".things.v1.GetThingRequest"), OutputType: proto.String(".things.v1.Thing")},
 				{Name: proto.String("Wide"), InputType: proto.String(".things.v1.GetThingRequest"), OutputType: proto.String(".things.v1.Thing"),
 					Options: http(&annotations.HttpRule{Pattern: &annotations.HttpRule_Get{Get: "/v1/things/{entry_id=**}"}})},
+				{Name: proto.String("Watch"), InputType: proto.String(".things.v1.GetThingRequest"), OutputType: proto.String(".things.v1.Thing"),
+					ServerStreaming: proto.Bool(true),
+					Options:         http(&annotations.HttpRule{Pattern: &annotations.HttpRule_Get{Get: "/v1/things/{entry_id}/watch"}})},
+				{Name: proto.String("Upload"), InputType: proto.String(".things.v1.GetThingRequest"), OutputType: proto.String(".things.v1.Thing"),
+					ClientStreaming: proto.Bool(true),
+					Options:         http(&annotations.HttpRule{Pattern: &annotations.HttpRule_Post{Post: "/v1/things/upload"}, Body: "*"})},
 			},
 		}},
 	}

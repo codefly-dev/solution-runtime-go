@@ -37,7 +37,9 @@ import (
 //	/modules/<as>/<package.Service>/<Method>
 //
 // so the module's own generated client (connect-es, connect-go) is used
-// unmodified with the base URL `<apiBase>/modules/<as>`. Each call is answered
+// unmodified with the base URL `<apiBase>/modules/<as>`. A server-streaming
+// method is served the same way as a Connect server-streaming procedure; see
+// "Streamed methods" in stream.go for the wire a module answers it with. Each call is answered
 // by the module, as the viewer: the runtime mints the viewer's Work Context for
 // the module (Gateway.ForModule) — or forwards only the bearer, for a module
 // that authenticates the viewer itself — and forwards the request over the
@@ -105,8 +107,22 @@ type ConsumedMethod struct {
 	// DefaultTranscodedResponseLimit.
 	MaxResponseBytes int64
 	// Timeout bounds one call, the mint included; zero is
-	// DefaultPassthroughTimeout.
+	// DefaultPassthroughTimeout. For a server-streaming method it bounds the
+	// mint and the module's first answer (its status line and headers); the
+	// stream itself is bounded by MaxStreamDuration.
 	Timeout time.Duration
+	// MaxStreamDuration bounds how long one stream of a server-streaming
+	// method stays open, from the call to its last message; zero is
+	// DefaultStreamDuration, and no stream may be declared longer than
+	// MaxStreamDurationLimit. A stream that reaches it ends with
+	// deadline_exceeded. Only for a server-streaming method.
+	MaxStreamDuration time.Duration
+	// MaxStreamMessageBytes bounds each message of a server-streaming method's
+	// stream, as the module sends it (one line of its answer); zero is
+	// DefaultStreamMessageLimit. A larger message ends the stream with
+	// resource_exhausted: it is never truncated. Only for a server-streaming
+	// method.
+	MaxStreamMessageBytes int64
 }
 
 const (
@@ -168,8 +184,11 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 			if err != nil {
 				return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
 			}
-			if md.IsStreamingClient() || md.IsStreamingServer() {
-				return nil, fmt.Errorf("consumed module %q: %s streams; only unary methods pass through", module.As, md.FullName())
+			if md.IsStreamingClient() {
+				return nil, fmt.Errorf("consumed module %q: %s streams its requests; only unary and server-streaming methods pass through", module.As, md.FullName())
+			}
+			if err := checkStreamBounds(md, method); err != nil {
+				return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
 			}
 			_, verb, template, err := bindingUnder(md, prefix)
 			if err != nil {
@@ -310,6 +329,16 @@ func (s *Server) passthroughRoute(route passthroughRoute) http.Handler {
 		limit = DefaultPassthroughRequestLimit
 	}
 	procedure := "/" + string(md.Parent().FullName()) + "/" + string(md.Name())
+	if md.IsStreamingServer() {
+		handler := connect.NewServerStreamHandler(procedure, func(ctx context.Context, req *connect.Request[dynamicpb.Message], stream *connect.ServerStream[dynamicpb.Message]) error {
+			return s.forwardStream(ctx, route, req, stream)
+		},
+			connect.WithSchema(md),
+			connect.WithRequestInitializer(initialize),
+			connect.WithReadMaxBytes(limit),
+		)
+		return http.StripPrefix(PassthroughPathPrefix+route.module.As, handler)
+	}
 	handler := connect.NewUnaryHandler(procedure, func(ctx context.Context, req *connect.Request[dynamicpb.Message]) (*connect.Response[dynamicpb.Message], error) {
 		resp, err := s.forward(ctx, route, req)
 		if err != nil {
@@ -338,7 +367,29 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	gw := newGateway(s.cfg.gatewayURL, bearer, req.Header().Get(orgHeader), req.Header().Get(sessionHeader))
+	gw, err := s.authorize(ctx, route, req.Header(), req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	out := dynamicpb.NewMessage(route.md.Output())
+	var opts []TranscodeOption
+	if route.method.MaxResponseBytes > 0 {
+		opts = append(opts, MaxResponseBytes(route.method.MaxResponseBytes))
+	}
+	if err := gw.Transcoded(ctx, "/v1/"+route.module.As, route.method.Name, req.Msg, out, opts...); err != nil {
+		return nil, relayedError(err)
+	}
+	if !route.method.WholeResponse {
+		out = Apply(route.method.Response, out)
+	}
+	return out, nil
+}
+
+// authorize prepares one call as the viewer: the declared authority minted for
+// this method (or the bearer alone, for a ViewerBearer module), and the
+// declared pin merged into the request.
+func (s *Server) authorize(ctx context.Context, route passthroughRoute, header http.Header, msg *dynamicpb.Message) (*Gateway, error) {
+	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
 	if !route.module.ViewerBearer {
 		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)
 		if err != nil {
@@ -353,22 +404,11 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 		if err != nil {
 			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
 		}
-		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, req.Msg); err != nil {
+		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, msg); err != nil {
 			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
 		}
 	}
-	out := dynamicpb.NewMessage(route.md.Output())
-	var opts []TranscodeOption
-	if route.method.MaxResponseBytes > 0 {
-		opts = append(opts, MaxResponseBytes(route.method.MaxResponseBytes))
-	}
-	if err := gw.Transcoded(ctx, "/v1/"+route.module.As, route.method.Name, req.Msg, out, opts...); err != nil {
-		return nil, relayedError(err)
-	}
-	if !route.method.WholeResponse {
-		out = Apply(route.method.Response, out)
-	}
-	return out, nil
+	return gw, nil
 }
 
 // relayedError turns a failed call into the Connect error the page receives.
@@ -394,6 +434,17 @@ func relayedError(err error) error {
 			message += ": " + truncated(refusal.Message)
 		}
 		return connect.NewError(code, errors.New(message))
+	}
+	var streamErr *StreamError
+	if errors.As(err, &streamErr) && streamErr != nil {
+		code := connect.CodeUnknown
+		if streamErr.Code > 0 && streamErr.Code <= 16 {
+			code = connect.Code(streamErr.Code)
+		}
+		return connect.NewError(code, errors.New(truncated(streamErr.Message)))
+	}
+	if errors.Is(err, ErrStreamMessageTooLarge) {
+		return connect.NewError(connect.CodeResourceExhausted, errors.New("a message of the module's stream exceeds its declared bound"))
 	}
 	var clientErr *ClientError
 	if errors.As(err, &clientErr) && clientErr != nil {
@@ -486,6 +537,10 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			callers = fmt.Sprintf("Signed-in viewers. The %s module authenticates the viewer's bearer and authorizes every call itself.", route.module.As)
 		}
 		behavior := fmt.Sprintf("A Connect unary call, forwarded to the module's %s %s binding. ", route.verb, route.template)
+		if route.md.IsStreamingServer() {
+			behavior = fmt.Sprintf("A Connect server-streaming call, forwarded to the module's %s %s binding, which answers as newline-delimited JSON. "+
+				"The stream stays open at most %s and each message is at most %d bytes. ", route.verb, route.template, route.streamDuration(), route.streamMessageLimit())
+		}
 		if route.method.Pin != nil {
 			pin, _ := protojson.Marshal(route.method.Pin)
 			behavior += fmt.Sprintf("Every request is merged with the declared pin %s first. ", pin)
@@ -495,14 +550,18 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 		} else {
 			behavior += "Only these response fields are returned: " + strings.Join(route.method.Response.paths(), ", ") + "."
 		}
+		if route.md.IsStreamingServer() {
+			behavior += " The response fields apply to every streamed message."
+		}
 		ops = append(ops, Operation{
-			Path:     path,
-			Method:   "post",
-			Summary:  fmt.Sprintf("Call %s on the %s module as the viewer", route.md.FullName(), route.module.As),
-			Callers:  callers,
-			Behavior: behavior,
-			Request:  describedMessage{route.md.Input()},
-			Response: describedMessage{route.md.Output()},
+			Path:      path,
+			Method:    "post",
+			Summary:   fmt.Sprintf("Call %s on the %s module as the viewer", route.md.FullName(), route.module.As),
+			Streaming: route.md.IsStreamingServer(),
+			Callers:   callers,
+			Behavior:  behavior,
+			Request:   describedMessage{route.md.Input()},
+			Response:  describedMessage{route.md.Output()},
 			// Documentation only: InterfaceDocument requires a handler, and the
 			// passthrough, not Operations, serves these routes.
 			Handler: func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the passthrough") },

@@ -48,6 +48,9 @@ type Operation struct {
 	// the artifact's schema is derived from its type. A generated protobuf
 	// message is carried as Message[T] and described from its descriptor.
 	Response any
+	// Streaming marks an operation answered as a stream of Response messages
+	// (a Connect server-streaming procedure) rather than one of them.
+	Streaming bool
 	// Exactly one of Handler and RequestHandler answers the route.
 	Handler        Handler
 	RequestHandler RequestHandler
@@ -126,6 +129,10 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 			"description": op.Callers + "\n\n" + op.Behavior,
 			"tags":        []string{info.Tag},
 			"responses":   operationResponses(op, definitions),
+		}
+		if op.Streaming {
+			// Swagger 2 has no stream: the 200 schema is one message of it.
+			endpoint["x-streaming"] = "server"
 		}
 		parameters := []any{}
 		if op.Request != nil {

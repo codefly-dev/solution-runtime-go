@@ -456,7 +456,7 @@ module's, and `ViewerBearer` takes none at either level.
 Least privilege by default. A method that is not declared is `not_found`. At
 boot, `Serve` refuses a module whose `as` is not in the solution's api.consumes,
 a method missing from the registry or with no binding under `/v1/<as>`, a
-streaming method, a method with no declared response fields, a method with no
+client-streaming method, stream bounds on a unary method or out of range, a method with no declared response fields, a method with no
 scopes of its own or its module's (unless the module is `ViewerBearer`), scopes
 on a `ViewerBearer` module or method, and a scope with no resource kind, no
 action, or a blank or repeated action. `Response`
@@ -472,6 +472,48 @@ by kind only. `PassthroughOperations` renders the declaration for the interface
 artifact, and `InterfaceArtifact(dir, info, ops, modules...)` renders a
 backend's whole artifact — its own operations and the passthrough — at the
 version its `service.codefly.yaml` declares.
+
+#### Streamed methods
+
+A server-streaming method passes through too, as a Connect server-streaming
+procedure at the same path, so connect-es's generated client consumes it
+unmodified. It takes the same authority as a unary call — the viewer's Work
+Context minted for that method, or the bearer alone for a `ViewerBearer`
+module — and the declared response fields (`Response`, or `WholeResponse`)
+apply to **every** message of the stream.
+
+Every stream is bounded, and both bounds are declared per method:
+
+| Field | Default | Refused at boot |
+| --- | --- | --- |
+| `MaxStreamDuration` | `DefaultStreamDuration` (5 min) | negative, or over `MaxStreamDurationLimit` (30 min) |
+| `MaxStreamMessageBytes` | `DefaultStreamMessageLimit` (1 MiB) | negative |
+
+A stream that reaches its duration ends with `deadline_exceeded`; a message
+over its bound ends it with `resource_exhausted` and is never truncated. For a
+streaming method `Timeout` bounds only the mint and the module's first answer
+(status line and headers), and `MaxResponseBytes` is refused (bound each
+message instead). The page disconnecting cancels the module request at once.
+
+**The wire a module answers a streamed method with** is grpc-gateway's for a
+server-streaming method, over the method's `google.api.http` binding: a 2xx
+response with content type `application/x-ndjson` (`application/json` is
+accepted too), one JSON object per line, each flushed as it is ready:
+
+```
+{"result": <the message, in protobuf JSON>}
+{"error": {"code": <google.rpc.Code number>, "message": "<text>"}}
+```
+
+Blank lines are ignored, so a module may send them to keep an idle connection
+open. An error line ends the stream with that code and message; the end of the
+body ends it normally. A non-2xx answer before the stream starts is the
+module's refusal, relayed like a unary one. `Gateway.TranscodedStream` is the
+same call for a handler of the solution's own.
+
+In the interface artifact a streamed operation says so in its behaviour and
+carries `x-streaming: server` (Swagger 2 has no stream; its 200 schema is one
+message of it).
 
 ### Generated messages in a response
 
