@@ -359,6 +359,39 @@ is not refused: the lead is clamped to half its lifetime, with a one-time log,
 because how long a credential lives is the issuer's call and not this runtime's
 to veto.
 
+#### Naming the Task: `ForTask`
+
+`ForModule` names a fresh Task on every mint, so no two capabilities — and no
+two viewer requests — share one. A module that fences what a caller may read by
+the Task its capability was minted under (a durable task runtime does: it
+lists and reads only the tasks admitted under the caller's own Task) then
+refuses a later request's read of what an earlier request started. When the
+unit of work outlives a request, name its Task:
+
+```go
+docs, err := gw.ForTask(ctx, solution.Task{ID: askID}, "documents",
+    solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
+```
+
+`Task.ID` is sent to accounts' `StartTask` verbatim as `taskId`, and accounts
+signs it into the capability as given, so every mint for that id — in this
+request or any later one — carries the same Task boundary. It must be a
+hyphenated UUID, the only form accounts admits; anything else (including an
+empty id, or the brace, URN and unhyphenated forms a general UUID parser
+accepts) is refused here, before any request. A solution usually derives it
+deterministically from what the work is over, e.g. a UUIDv5 of its content.
+Naming a Task grants nothing: accounts still mints under the viewer's own
+bearer, so a capability carries only the viewer's authority whatever id it
+names. The org and session are the viewer's, exactly as for `ForModule`.
+
+`Task.TTLSeconds`, when non-zero, is sent as `ttlSeconds` — the lifetime asked
+of the issuer, which bounds it and refuses a value outside those bounds. Zero
+sends nothing and leaves the issuer's default.
+
+The cache identity of a `ForTask` ask includes the Task id and the lifetime, so
+two Tasks never share a capability; within one request one Task's ask mints
+once, exactly as a `ForModule` ask does.
+
 This traffic is not proxied, for the same reason registration traffic is not:
 every gateway target is composition-local, and these requests carry the viewer's
 bearer and the capability minted for them in headers.
