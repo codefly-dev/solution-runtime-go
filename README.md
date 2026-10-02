@@ -236,6 +236,42 @@ A consumer whose issuer is reached another way supplies its own source:
 solution.New(manifest).Credential(mySource).Serve() // Credential(ctx) (workcontext.Credential, error)
 ```
 
+### This runtime neither signs, parses nor verifies a capability
+
+There is **one** implementation of a Work Context — Core's (`core/workcontext`:
+deterministic proto, Ed25519) — and this runtime is not it. It obtains a
+credential through the SDK's client, carries it as the string it travels as,
+and lets whoever consumes it decide. It declares none of a capability's fields
+and reads none of them: the capability a handler's gateway presents to a module
+is a string this package never decoded, and the one check that must happen
+before a call rather than at the far end — that a capability is sealed at all —
+is the carrier's (`workcontext.Attach`).
+
+It also does not **verify**, and that is a position rather than an omission.
+Core's verifier requires four live sources — the authorization revision,
+replay, grants and seals — and refuses everything without them, deliberately,
+so the strongest check in the model cannot become the easiest to skip. A
+solution runtime holds none of those: it is the party presenting a capability,
+not the party deciding on one. So there is no verifier here to configure and no
+conformance kit for this package to run; a change that adds one has to answer
+where those four sources come from.
+
+Both halves are pinned by `work_context_boundary_test.go`, which fails on a
+signing primitive, on a `WorkContext`-named type or function of this package's
+own, and on a call to a verifier. The duplication it prevents already happened
+once, in a module whose only job was to carry these things, and 3,532 lines had
+to be deleted to get back to one implementation. Every step of that was locally
+reasonable, which is why the first step fails a test here.
+
+A module's refusal of a presented capability reaches a handler by kind:
+`ErrRevoked` — the capability was sound when minted and the state moved under
+it (an installation revision, a principal's epoch, a build incarnation, a
+binding) — is reported as `aborted`, because the answer to every one of those
+is to mint again rather than to retry or to tell the viewer their authorization
+failed. `ErrInvalid`, `ErrUnsealed` and `ErrNotACoreToken` are reported as
+`internal`: a credential this solution could not present is this solution's
+problem, not a module that is briefly unreachable.
+
 ## The published contract
 
 The renderer derives this solution's **authority document** from the contract it
@@ -675,13 +711,15 @@ descriptor, with protobuf JSON names.
 
 > **Note on pins.** SDK in-process endpoint resolution for a solution composed
 > on an out-of-repo host depends on codefly-core accepting the composed module
-> path in its workspace loader (codefly-dev/core#365, merged), and this runtime
-> needs core v0.7.1 for the configuration-profile rule and sdk-go for the
-> certificate reloader, the authority reader and the mint client. The `core` and
-> `sdk-go` pins in `go.mod` carry all of it.
+> path in its workspace loader (codefly-dev/core#365, merged); the
+> configuration-profile rule and `core/workcontext` come from core; and the
+> certificate reloader, the authority reader and the mint client come from
+> sdk-go. The `core` and `sdk-go` pins in `go.mod` carry all of it, and there is
+> **no `replace` directive** — both are ordinary pseudo-version `require`s, so
+> this module builds from its own tag for anyone.
 >
-> This branch additionally carries a `replace` to an unreleased `sdk-go`, for
-> the mint-once client and the authority reader (codefly-dev/sdk-go#47). It is a
-> labelled stopgap and must be swapped for a released pin before merge: a
-> `replace` pointing at a path on one machine makes this module unbuildable from
-> its own tag for everyone else.
+> Those two pins are currently unreleased branches (core#692 and
+> codefly-dev/sdk-go#48, the Work Context single-implementation fix) and must
+> move to the releases at merge, core first. Every capability's format changes
+> in that cutover, so verifiers upgrade before minters or calls fail closed in
+> the window.

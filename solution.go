@@ -1339,8 +1339,8 @@ type delegation struct {
 
 // workContext resolves the capability this gateway acts under, minting one if
 // the cache holds none that will outlive the call.
-func (g *Gateway) workContext(ctx context.Context) (workcontext.WorkContextToken, error) {
-	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (workcontext.WorkContextToken, time.Time, error) {
+func (g *Gateway) workContext(ctx context.Context) (string, error) {
+	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (string, time.Time, error) {
 		ask := g.delegation.ask
 		ask.TaskID = uuid.NewString()
 		return g.mint(ctx, ask)
@@ -1378,16 +1378,16 @@ type startTaskRequest struct {
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
 }
 
-func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (workcontext.WorkContextToken, time.Time, error) {
+func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.Time, error) {
 	body, err := json.Marshal(ask)
 	if err != nil {
-		return workcontext.WorkContextToken{}, time.Time{}, err
+		return "", time.Time{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, workContextMintTimeout)
 	defer cancel()
 	post, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+workContextStartTaskProcedure, bytes.NewReader(body))
 	if err != nil {
-		return workcontext.WorkContextToken{}, time.Time{}, err
+		return "", time.Time{}, err
 	}
 	post.Header.Set("content-type", "application/json")
 	// The viewer's bearer says on whose behalf; this execution's credential
@@ -1398,7 +1398,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (workcontext.W
 	attestWorkload(ctx, g.workload, post, g.id)
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
-		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
+		return "", time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
 	}
 	defer drainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
@@ -1411,7 +1411,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (workcontext.W
 			Message string `json:"message"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
-		return workcontext.WorkContextToken{}, time.Time{}, &WorkContextRefusal{
+		return "", time.Time{}, &WorkContextRefusal{
 			Audience: ask.Audience, StatusCode: resp.StatusCode, Code: refusal.Code, Message: refusal.Message,
 		}
 	}
@@ -1421,11 +1421,20 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (workcontext.W
 		WorkContextPrincipals
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
-		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
+		return "", time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
 	}
-	token, err := workcontext.ParseWorkContextToken(issued.Token)
-	if err != nil {
-		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned an unusable token: %w", ask.Audience, err)
+	// The capability travels as a string and is not parsed here. There is one
+	// implementation of a Work Context — core's — and this runtime is not it:
+	// a token this process decoded to inspect would be a second reading of a
+	// format whose only authoritative reader is the verifier at the far end.
+	// What this runtime checks is what it is responsible for: that a usable
+	// expiry came back, so a capability is not cached under one it can never
+	// reuse. The carrier refuses an unsealed capability when it is attached
+	// (workcontext.Attach), which is the one check that has to happen before a
+	// call rather than at the far end.
+	token := issued.Token
+	if strings.TrimSpace(token) == "" {
+		return "", time.Time{}, fmt.Errorf("work context mint for %q returned no capability", ask.Audience)
 	}
 	// An expiry this process cannot use is a boundary error, not a capability to
 	// cache. Treated as "already lapsed" it would look like success while
@@ -1436,11 +1445,11 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (workcontext.W
 	lifetime := issued.ExpiresAt.Sub(now)
 	switch {
 	case issued.ExpiresAt.IsZero():
-		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf(
+		return "", time.Time{}, fmt.Errorf(
 			"work context mint for %q returned no expiry: the issuer omitted expiresAt, or spelled it differently (protobuf JSON spells it expires_at, which does not decode into this field)",
 			ask.Audience)
 	case lifetime < workContextMinimumLifetime:
-		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf(
+		return "", time.Time{}, fmt.Errorf(
 			"work context mint for %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
 			ask.Audience, issued.ExpiresAt.UTC().Format(time.RFC3339), workContextMinimumLifetime)
 	}
@@ -1498,7 +1507,7 @@ func (g *Gateway) WorkContextPrincipals(ctx context.Context) (WorkContextPrincip
 // shares it, so the cache lives exactly as long as the viewer's request.
 type workContextCache struct {
 	mu     sync.Mutex
-	minted map[string]issuedWorkContext
+	minted map[string]cachedCapability
 	// minting holds the mint in flight for an ask, so concurrent asks for the
 	// same one wait on it instead of each running their own. A handler that
 	// fans out would otherwise spend one audited mint per goroutine for a
@@ -1508,29 +1517,34 @@ type workContextCache struct {
 	issuedFor map[string]WorkContextPrincipals
 }
 
-func (c *workContextCache) remember(token workcontext.WorkContextToken, principals WorkContextPrincipals) {
+func (c *workContextCache) remember(token string, principals WorkContextPrincipals) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.issuedFor[token.Encoded()] = principals
+	c.issuedFor[token] = principals
 }
 
-func (c *workContextCache) principals(token workcontext.WorkContextToken) (WorkContextPrincipals, bool) {
+func (c *workContextCache) principals(token string) (WorkContextPrincipals, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	principals, ok := c.issuedFor[token.Encoded()]
+	principals, ok := c.issuedFor[token]
 	return principals, ok
 }
 
 func newWorkContextCache() *workContextCache {
 	return &workContextCache{
-		minted:    map[string]issuedWorkContext{},
+		minted:    map[string]cachedCapability{},
 		minting:   map[string]*pendingMint{},
 		issuedFor: map[string]WorkContextPrincipals{},
 	}
 }
 
-type issuedWorkContext struct {
-	token workcontext.WorkContextToken
+// cachedCapability is one capability this gateway holds for the life of a
+// request: the carrier as it travels, and when it stops being worth
+// presenting. Not a Work Context — this runtime declares none of a
+// capability's fields and reads none of them (see
+// work_context_boundary_test.go); it holds the string and a deadline.
+type cachedCapability struct {
+	token string
 	// reuseUntil is when this capability stops being worth presenting — its
 	// expiry less the renewal lead mint already applied.
 	reuseUntil time.Time
@@ -1540,7 +1554,7 @@ type issuedWorkContext struct {
 // is closed and read only after, so the close/receive pair orders them.
 type pendingMint struct {
 	done  chan struct{}
-	token workcontext.WorkContextToken
+	token string
 	err   error
 }
 
@@ -1550,8 +1564,8 @@ type pendingMint struct {
 func (c *workContextCache) resolve(
 	ctx context.Context,
 	key string,
-	mint func(context.Context) (workcontext.WorkContextToken, time.Time, error),
-) (workcontext.WorkContextToken, error) {
+	mint func(context.Context) (string, time.Time, error),
+) (string, error) {
 	c.mu.Lock()
 	if issued, ok := c.minted[key]; ok && time.Now().Before(issued.reuseUntil) {
 		c.mu.Unlock()
@@ -1565,7 +1579,7 @@ func (c *workContextCache) resolve(
 			// failure here would turn one refusal into one mint per waiter.
 			return inflight.token, inflight.err
 		case <-ctx.Done():
-			return workcontext.WorkContextToken{}, ctx.Err()
+			return "", ctx.Err()
 		}
 	}
 	inflight := &pendingMint{done: make(chan struct{})}
@@ -1578,7 +1592,7 @@ func (c *workContextCache) resolve(
 	c.mu.Lock()
 	delete(c.minting, key)
 	if err == nil {
-		c.minted[key] = issuedWorkContext{token: token, reuseUntil: reuseUntil}
+		c.minted[key] = cachedCapability{token: token, reuseUntil: reuseUntil}
 	}
 	c.mu.Unlock()
 	close(inflight.done)
@@ -1615,7 +1629,7 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := workcontext.AttachWorkContext(r, token); err != nil {
+		if err := workcontext.Attach(r, token); err != nil {
 			return nil, err
 		}
 	}

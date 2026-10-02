@@ -533,13 +533,29 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
-	case errors.Is(err, workcontext.ErrWorkContextInvalid):
+	case errors.Is(err, workcontext.ErrRevoked):
+		// The capability was sound when it was minted and the state moved under
+		// it — an installation revision, a principal's epoch, a build
+		// incarnation, a binding. The holder's answer to every one of those is
+		// the same and it is not "retry": it is to mint again. Reported as the
+		// unavailable fallthrough below, a page or a client policy would retry
+		// against a credential guaranteed to keep failing; reported as a plain
+		// denial, a condition one mint fixes would reach the viewer as their
+		// own authorization failing. Aborted is neither, and a caller that
+		// re-asks gets a fresh mint because the cache no longer holds a current
+		// one.
+		return connect.NewError(connect.CodeAborted, errors.New("the authority this solution presented has been superseded; the call was not made"))
+	case errors.Is(err, workcontext.ErrUnsealed), errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
 		// A capability this solution could not present is this solution's
-		// problem, not a module that is briefly unreachable. Reported as the
-		// unavailable fallthrough below it would be retried — by the page, by a
-		// client's own policy — against a credential that will be exactly as
-		// invalid next time, and the one signal that the issuer handed back
-		// something unusable would be spent on a retry loop.
+		// problem, not a module that is briefly unreachable, and not the
+		// viewer's authorization. Reported as the unavailable fallthrough it
+		// would be retried against a credential that will be exactly as
+		// unusable next time, and the one signal that the issuer handed back
+		// something this runtime cannot carry would be spent on a retry loop.
+		// The three are kept apart from each other at the point they are
+		// logged, not here: "another format", "no seal" and "bad capability"
+		// have different owners, and core deliberately does not let one
+		// errors.Is branch reach all three.
 		return connect.NewError(connect.CodeInternal, errors.New("this solution could not present a usable credential for the module"))
 	}
 	return connect.NewError(connect.CodeUnavailable, errors.New("the module call failed"))

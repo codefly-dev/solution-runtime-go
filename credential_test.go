@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -109,6 +110,73 @@ func TestTheProjectedTokenIsReadAtEveryMintNotCachedAtBoot(t *testing.T) {
 	}
 }
 
+// TestEveryCallerOfOneExecutionSharesOneCarrier is the mint-once assertion that
+// a client minting per request would fail.
+//
+// Comparing what a credential *describes* does not catch that defect: a client
+// that mints per request answers the same audience and the same seal every
+// time, because the host issues both again. So this compares the credential
+// **material** — the carrier itself — across every caller of a concurrent
+// burst, and counts what the host was asked. The runtime resolves a credential
+// per use (the passthrough calls it on every request, from whatever goroutine
+// the server hands it), so the burst is the shape production actually takes.
+//
+// It matters more than it looks: the saving this whole change buys is one mint
+// plus a handful of renewals an hour against the heartbeat's 240. A client that
+// silently minted per request would be *worse* than the heartbeat it replaced,
+// and every functional test would still pass, because every token it issued
+// would be valid.
+func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	source := mintClientFor(t, mint.URL, tokenFile)
+
+	const callers = 32
+	carriers := make([]string, callers)
+	seals := make([]workcontext.Seal, callers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			credential, err := source.Credential(context.Background())
+			if err != nil {
+				t.Errorf("caller %d: %v", i, err)
+				return
+			}
+			carriers[i], seals[i] = credential.Token(), credential.Seal()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, carrier := range carriers {
+		switch {
+		case carrier == "":
+			t.Fatalf("caller %d obtained no credential", i)
+		case carrier != carriers[0]:
+			// Naming which part moved rather than printing both carriers: two
+			// different capabilities render alike at a glance, so "X vs X" is
+			// what a reader would otherwise be left with.
+			t.Fatalf("caller %d holds a different carrier from caller 0 (same length: %t, same seal: %t) — one execution holds one credential",
+				i, len(carrier) == len(carriers[0]), seals[i] == seals[0])
+		}
+	}
+	if got := mint.count(); got != 1 {
+		t.Errorf("the host was asked %d times by %d concurrent callers, want exactly 1", got, callers)
+	}
+	// The client's own accounting, which is the only place a source that
+	// re-dialled the host for the same bytes would be visible at all.
+	if client, ok := source.(*workcontext.MintClient); ok {
+		if mints, renewals := client.Counts(); mints != 1 || renewals != 0 {
+			t.Errorf("the client reports %d mints and %d renewals, want 1 and 0", mints, renewals)
+		}
+	}
+}
+
 // TestAMintingRuntimePresentsNoRegistrationCredential is the deletion, pinned:
 // the shared cluster-internal token and the per-solution registration secret
 // are gone from this package, so no boot can present either and no
@@ -159,8 +227,8 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	if mints[0].Bearer != "Bearer viewer" {
 		t.Errorf("the mint presented bearer %q, want the viewer's", mints[0].Bearer)
 	}
-	if mints[0].WorkContext != credential.Token().Encoded() {
-		t.Errorf("the mint presented work context %q, want this workload's own credential %q", mints[0].WorkContext, credential.Token().Encoded())
+	if mints[0].WorkContext != credential.Token() {
+		t.Errorf("the mint presented work context %q, want this workload's own credential %q", mints[0].WorkContext, credential.Token())
 	}
 }
 

@@ -20,10 +20,10 @@
 package passthroughtest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
+	"context"
 	"encoding/json"
 	"fmt"
+	corework "github.com/codefly-dev/core/workcontext"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -195,7 +195,7 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	call := Call{Module: as, Method: r.Method, Path: r.URL.Path, Bearer: r.Header.Get("authorization")}
-	if presented := r.Header.Get(workcontext.WorkContextHeaderName); presented != "" {
+	if presented := r.Header.Get(workcontext.HeaderName); presented != "" {
 		for i := range h.mints {
 			if h.mints[i].Token == presented {
 				mint := h.mints[i]
@@ -336,63 +336,59 @@ func (t viewerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(r)
 }
 
-// capability is a Work-Context-shaped capability a stand-in issuer hands out.
-// It is genuinely signed and genuinely sealed, because the SDK reads the seal
-// out of the token before it will attach one to a request — a capability with
-// no readable installation is refused, so no transport can carry one. The key
-// is this process's, not a real issuer's, and nothing here verifies the
-// signature: what the fixture has to be is well-formed, not trusted.
+// capability is a stand-in issuer's capability, minted per seed.
+//
+// It is minted by **core's** authority, from core's own conformance fixture
+// identities and key — the one implementation of a Work Context, which this
+// runtime neither signs nor parses. The private key is public by design (core
+// derives it from a seed in its own source), so this is a real sealed
+// capability that a conforming verifier accepts, without a signer or a payload
+// struct living here. That matters beyond convenience: a fixture issuer with
+// its own encoding is how two implementations of a capability format start.
 //
 // Memoised by seed so a test can recompute the capability it expects to have
-// been presented: the signer stamps a fresh nonce on every token, so signing
-// the same seed twice would otherwise produce two different strings.
+// been presented: every mint carries a fresh nonce, so minting the same seed
+// twice would otherwise produce two different strings.
 func capability(seed string) string {
 	capabilityMu.Lock()
 	defer capabilityMu.Unlock()
 	if issued, ok := issuedCapabilities[seed]; ok {
 		return issued
 	}
-	token, _, err := capabilitySigner().StartTask(workcontext.StartTaskInput{
-		Audience:           "stand-in",
-		TenantID:           "tenant",
-		OwnerPrincipalID:   "viewer-principal",
-		OwnerPrincipalKind: "user",
+	token, _, err := standInAuthority().Start(context.Background(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
 		TaskID:             seed,
-		SessionID:          "session-1",
-		Seal: workcontext.Seal{
-			PrincipalEpoch:       1,
-			InstallationID:       "inst-stand-in",
-			InstallationRevision: 1,
-			BuildIncarnation:     "stand-in-build",
-		},
-		TTL: 10 * time.Minute,
+		Audience:           corework.FixtureAudience,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     corework.FixtureInstallation,
+		TTL:                10 * time.Minute,
 	})
 	if err != nil {
 		panic("stand-in capability: " + err.Error())
 	}
-	issuedCapabilities[seed] = token.Encoded()
-	return token.Encoded()
+	issuedCapabilities[seed] = token
+	return token
 }
 
 var (
 	capabilityMu       sync.Mutex
 	issuedCapabilities = map[string]string{}
-	capabilitySignerV  *workcontext.WorkContextSigner
+	standInAuthorityV  *corework.Authority
 )
 
-func capabilitySigner() *workcontext.WorkContextSigner {
-	if capabilitySignerV != nil {
-		return capabilitySignerV
+// standInAuthority is core's minter, configured from core's fixture identities.
+func standInAuthority() *corework.Authority {
+	if standInAuthorityV == nil {
+		_, key := corework.FixtureKeyPair()
+		standInAuthorityV = &corework.Authority{
+			Issuer:    corework.FixtureIssuer,
+			KeyID:     corework.FixtureKeyID,
+			Key:       key,
+			Revisions: corework.FixtureRevisions(),
+			Seals:     corework.FixtureSeals(),
+		}
 	}
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	capabilitySignerV, err = workcontext.NewWorkContextSigner(workcontext.WorkContextSignerOptions{
-		Issuer: "stand-in-issuer", KeyID: "stand-in-key", PrivateKey: key,
-	})
-	if err != nil {
-		panic(err)
-	}
-	return capabilitySignerV
+	return standInAuthorityV
 }

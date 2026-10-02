@@ -54,6 +54,17 @@ on `Server.PassthroughHandler`, the handler `Serve` mounts.
   registrations. Every environment read now sits in `loadConfig`'s call tree,
   which `environment_boundary_test.go` pins: a new read outside it fails the
   suite until this file describes the exception.
+- **Never sign, parse or verify a Work Context here.** There is one
+  implementation, Core's; this runtime obtains a credential through the SDK's
+  mint client, carries it as the string it travels as, and lets the far end
+  decide. It declares none of a capability's fields and holds no verifier —
+  core's needs the issuer's live revision, replay, grant and seal sources, which
+  a solution does not have. `work_context_boundary_test.go` fails on a signing
+  primitive, on a `WorkContext`-named declaration of this package's own, and on
+  a call to a verifier. This is not a style rule: a second signed encoding grew
+  inside an SDK beside core's once, with its own payload struct, signer,
+  verifier and error taxonomy, and 3,532 lines had to be deleted to get back to
+  one. Every step of that was locally reasonable.
 - The authority-bearing values are a narrower case still: the principal, the
   mint audience and the projected token's own audience are read **once**, through
   the SDK's authority reader, and frozen. The credential this process holds is
@@ -162,8 +173,10 @@ Go comes from `go.mod` (1.27). Nothing else is needed: no Docker, no
 credentials, no running composition.
 
 - The suite is fast (a few seconds) and hermetic: the host's mint, its gateway
-  and accounts are all `httptest` servers on `127.0.0.1`, and the workload
-  identity is a key pair the test generates into a temp directory. The two
+  and accounts are all `httptest` servers on `127.0.0.1`, the workload identity
+  is a key pair the test generates into a temp directory, and a stand-in
+  capability is minted by **core's** authority from core's published fixture
+  identities — never by a signer of this repo's own. The two
   heartbeat tests that waited on 10s and 5s of real wall time are gone with the
   heartbeat.
 - The formatting gate runs over the whole tree (`gofmt -l .`), so a package

@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/solution/manifest"
+	corework "github.com/codefly-dev/core/workcontext"
 	codefly "github.com/codefly-dev/sdk-go"
-	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
 // The authority-bearing values every test in this package boots under. They are
@@ -34,8 +34,15 @@ const (
 	testPrincipal          = "spiffe://test/ns/solutions/sa/lastlogin"
 	testAudience           = "lastlogin-go"
 	testProjectionAudience = "accounts"
-	testInstallation       = "inst-7"
-	testBuildIncarnation   = "sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+
+// The sealed values the stand-in host issues against are core's own conformance
+// values: the credential is minted by core's authority from core's fixture
+// identities, so the seal this runtime logs and a test asserts is the live one
+// that authority holds rather than a number invented here.
+const (
+	testInstallation     = corework.FixtureInstallation
+	testBuildIncarnation = uint64(corework.FixtureBuildIncarnation)
 )
 
 // authorityValues provisions the module-authority group the way the platform
@@ -61,7 +68,7 @@ func authorityValues(t *testing.T) {
 // reads the seal out of the signature and not out of the response body.
 type hostMint struct {
 	*httptest.Server
-	signer *workcontext.WorkContextSigner
+	authority *corework.Authority
 
 	// status, when non-zero, is answered instead of a credential: 403 for a
 	// workload the host refuses, 503 for an issuer that has nothing to mint
@@ -87,19 +94,12 @@ type hostMint struct {
 
 func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 	t.Helper()
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mint.signer, err = workcontext.NewWorkContextSigner(workcontext.WorkContextSignerOptions{
-		Issuer: "test-host", KeyID: "test-key", PrivateKey: key,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	mint.authority = standInAuthority()
 	if mint.ttl == 0 {
-		// The signer caps a Work Context's lifetime at 15 minutes, so a
-		// credential is short-lived by construction and renewal is ordinary.
+		// Core imposes no maximum lifetime — how long a credential lives is the
+		// issuing host's decision, and this runtime's renewal arithmetic simply
+		// follows whatever it is handed. Ten minutes keeps a test's renewal
+		// behaviour ordinary rather than asserting a cap that does not exist.
 		mint.ttl = 10 * time.Minute
 	}
 	mint.Server = httptest.NewServer(http.HandlerFunc(mint.serve))
@@ -117,27 +117,22 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(m.status)
 		return
 	}
-	token, _, err := m.signer.StartTask(workcontext.StartTaskInput{
+	token, _, err := m.authority.Start(r.Context(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
+		TaskID:             fmt.Sprintf("workload-execution-%d", atomic.LoadInt64(&m.mints)),
 		Audience:           testAudience,
-		TenantID:           "tenant",
-		OwnerPrincipalID:   testPrincipal,
-		OwnerPrincipalKind: "service",
-		TaskID:             fmt.Sprintf("task-%d", atomic.LoadInt64(&m.mints)),
-		SessionID:          "session-workload",
-		Seal: workcontext.Seal{
-			PrincipalEpoch:       1,
-			InstallationID:       testInstallation,
-			InstallationRevision: 3,
-			BuildIncarnation:     testBuildIncarnation,
-		},
-		TTL: m.ttl,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     testInstallation,
+		TTL:                m.ttl,
 	})
 	if err != nil {
 		m.signErr = err
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"work_context": token.Encoded()})
+	writeJSON(w, http.StatusOK, map[string]string{"work_context": token})
 }
 
 func (m *hostMint) count() int64 { return atomic.LoadInt64(&m.mints) }

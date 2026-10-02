@@ -4,9 +4,9 @@ go 1.27.0
 
 require (
 	connectrpc.com/connect v1.21.0
-	github.com/codefly-dev/core v0.7.1
-	github.com/codefly-dev/sdk-go v0.2.0
-	github.com/codefly-dev/sdk-go/workcontext v0.0.0-20260928181007-c1fc359f112f
+	github.com/codefly-dev/core v0.7.2-0.20261002174635-56a98dd580f8
+	github.com/codefly-dev/sdk-go v0.2.1-0.20261002175130-75e99cc7928a
+	github.com/codefly-dev/sdk-go/workcontext v0.0.0-20261002175130-75e99cc7928a
 	github.com/google/uuid v1.6.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688
 	google.golang.org/protobuf v1.36.12
@@ -55,11 +55,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260825221802-da73d73af1c5 // indirect
 	google.golang.org/grpc v1.83.2 // indirect
 )
-
-// STOPGAP, not a fix: build against the unreleased mint-once client of
-// codefly-dev/sdk-go#47 (workcontext.MintClient, codefly.Authority). Swap both
-// lines for a released sdk-go pin before merge — a replace to a path on one
-// machine makes this module unbuildable from its own tag for everyone else.
-replace github.com/codefly-dev/sdk-go => /Users/antoine/.lazybox/v2/github-codefly-dev-sdk-go/issue-47-workcontext-mint-once-per-execution-seal-the-credential
-
-replace github.com/codefly-dev/sdk-go/workcontext => /Users/antoine/.lazybox/v2/github-codefly-dev-sdk-go/issue-47-workcontext-mint-once-per-execution-seal-the-credential/workcontext

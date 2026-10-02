@@ -215,7 +215,7 @@ func TestAUnaryCallIsAnsweredByTheModuleAsTheViewer(t *testing.T) {
 		t.Fatalf("mint = %+v, want the module's audience in the viewer's org and session", mint)
 	}
 	upstream.mu.Lock()
-	presented := upstream.headers[0].Get(workcontext.WorkContextHeaderName)
+	presented := upstream.headers[0].Get(workcontext.HeaderName)
 	upstream.mu.Unlock()
 	if got := presented; got != mint.Token {
 		t.Fatalf("the module was presented %q, want the minted %q", got, mint.Token)

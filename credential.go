@@ -167,7 +167,7 @@ func (s *Server) openCredential(ctx context.Context) error {
 		switch {
 		case err == nil:
 			seal := credential.Seal()
-			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %s, valid until %s",
+			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
 				s.manifest.ID, seal.InstallationID, seal.InstallationRevision, seal.BuildIncarnation,
 				credential.ExpiresAt().UTC().Format(time.RFC3339))
 			return nil

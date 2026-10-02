@@ -3,10 +3,9 @@ package solution
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	corework "github.com/codefly-dev/core/workcontext"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,65 +21,61 @@ import (
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
-// capability is a Work-Context-shaped capability a stand-in issuer hands out.
-// It is genuinely signed and genuinely sealed, because the SDK reads the seal
-// out of the token before it will attach one to a request — a capability with
-// no readable installation is refused, so no transport can carry one. The key
-// is this process's, not a real issuer's, and nothing here verifies the
-// signature: what the fixture has to be is well-formed, not trusted.
+// capability is a stand-in issuer's capability, minted per seed.
+//
+// It is minted by **core's** authority, from core's own conformance fixture
+// identities and key — the one implementation of a Work Context, which this
+// runtime neither signs nor parses. The private key is public by design (core
+// derives it from a seed in its own source), so this is a real sealed
+// capability that a conforming verifier accepts, without a signer or a payload
+// struct living here. That matters beyond convenience: a fixture issuer with
+// its own encoding is how two implementations of a capability format start.
 //
 // Memoised by seed so a test can recompute the capability it expects to have
-// been presented: the signer stamps a fresh nonce on every token, so signing
-// the same seed twice would otherwise produce two different strings.
+// been presented: every mint carries a fresh nonce, so minting the same seed
+// twice would otherwise produce two different strings.
 func capability(seed string) string {
 	capabilityMu.Lock()
 	defer capabilityMu.Unlock()
 	if issued, ok := issuedCapabilities[seed]; ok {
 		return issued
 	}
-	token, _, err := capabilitySigner().StartTask(workcontext.StartTaskInput{
-		Audience:           "stand-in",
-		TenantID:           "tenant",
-		OwnerPrincipalID:   "viewer-principal",
-		OwnerPrincipalKind: "user",
+	token, _, err := standInAuthority().Start(context.Background(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
 		TaskID:             seed,
-		SessionID:          "session-1",
-		Seal: workcontext.Seal{
-			PrincipalEpoch:       1,
-			InstallationID:       "inst-stand-in",
-			InstallationRevision: 1,
-			BuildIncarnation:     "stand-in-build",
-		},
-		TTL: 10 * time.Minute,
+		Audience:           corework.FixtureAudience,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     corework.FixtureInstallation,
+		TTL:                10 * time.Minute,
 	})
 	if err != nil {
 		panic("stand-in capability: " + err.Error())
 	}
-	issuedCapabilities[seed] = token.Encoded()
-	return token.Encoded()
+	issuedCapabilities[seed] = token
+	return token
 }
 
 var (
 	capabilityMu       sync.Mutex
 	issuedCapabilities = map[string]string{}
-	capabilitySignerV  *workcontext.WorkContextSigner
+	standInAuthorityV  *corework.Authority
 )
 
-func capabilitySigner() *workcontext.WorkContextSigner {
-	if capabilitySignerV != nil {
-		return capabilitySignerV
+// standInAuthority is core's minter, configured from core's fixture identities.
+func standInAuthority() *corework.Authority {
+	if standInAuthorityV == nil {
+		_, key := corework.FixtureKeyPair()
+		standInAuthorityV = &corework.Authority{
+			Issuer:    corework.FixtureIssuer,
+			KeyID:     corework.FixtureKeyID,
+			Key:       key,
+			Revisions: corework.FixtureRevisions(),
+			Seals:     corework.FixtureSeals(),
+		}
 	}
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	capabilitySignerV, err = workcontext.NewWorkContextSigner(workcontext.WorkContextSignerOptions{
-		Issuer: "stand-in-issuer", KeyID: "stand-in-key", PrivateKey: key,
-	})
-	if err != nil {
-		panic(err)
-	}
-	return capabilitySignerV
+	return standInAuthorityV
 }
 
 type syncBuffer struct {
@@ -613,7 +608,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		var mint mintRequest
 		_ = json.NewDecoder(r.Body).Decode(&mint)
 		mint.Bearer = r.Header.Get("authorization")
-		mint.WorkContext = r.Header.Get(workcontext.WorkContextHeaderName)
+		mint.WorkContext = r.Header.Get(workcontext.HeaderName)
 		send(g.mints, mint)
 		if g.mintStatus != 0 {
 			writeJSON(w, g.mintStatus, map[string]string{
@@ -638,7 +633,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 	case modulePath:
 		call := moduleCall{
 			Bearer:      r.Header.Get("authorization"),
-			WorkContext: r.Header.Get(workcontext.WorkContextHeaderName),
+			WorkContext: r.Header.Get(workcontext.HeaderName),
 		}
 		send(g.calls, call)
 		if call.WorkContext == "" {
@@ -926,13 +921,9 @@ func TestForModuleRefusesAnExpiryThisHostCannotUse(t *testing.T) {
 func TestWorkContextCacheReMintsALapsedCapability(t *testing.T) {
 	cache := newWorkContextCache()
 	mints := 0
-	lapsed := func(context.Context) (workcontext.WorkContextToken, time.Time, error) {
+	lapsed := func(context.Context) (string, time.Time, error) {
 		mints++
-		token, err := workcontext.ParseWorkContextToken(capability(fmt.Sprintf("payload.%d", mints)))
-		if err != nil {
-			t.Fatalf("parse token: %v", err)
-		}
-		return token, time.Now().Add(-time.Second), nil
+		return capability(fmt.Sprintf("lapsed-%d", mints)), time.Now().Add(-time.Second), nil
 	}
 	for range 2 {
 		if _, err := cache.resolve(context.Background(), "ask", lapsed); err != nil {
@@ -1188,7 +1179,7 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	req.Header.Set("authorization", "Bearer viewer-token")
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
-	req.Header.Set(workcontext.WorkContextHeaderName, capability("forged"))
+	req.Header.Set(workcontext.HeaderName, capability("forged"))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)
