@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -97,6 +98,10 @@ type hostMint struct {
 	ttl time.Duration
 
 	mints int64
+	// mu guards what serve records. The viewer's mint and this workload's
+	// arrive on the same host, and a test that drives concurrent requests
+	// reaches it from several goroutines.
+	mu sync.Mutex
 	// signErr is the fake host failing to produce a credential, which is a
 	// defect in the test and not an outcome the runtime should see.
 	signErr error
@@ -141,11 +146,27 @@ func (m *hostMint) serveTLS(t *testing.T, c *cell) {
 }
 
 func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
-	atomic.AddInt64(&m.mints, 1)
+	m.mu.Lock()
 	m.presented = append(m.presented, r.Header.Get("authorization"))
 	m.headers = append(m.headers, r.Header.Clone())
 	m.callers = append(m.callers, callerIdentity(r))
 	m.paths = append(m.paths, r.URL.Path)
+	m.mu.Unlock()
+	// The gateway this harness stands in for routes the viewer's mint as well
+	// as this workload's, on the same base URL. They are counted apart: one per
+	// process start is the claim about the workload credential, and a test about
+	// what a handler mints needs to see only the viewer's.
+	if r.URL.Path == workContextStartTaskProcedure {
+		var mint mintRequest
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &mint)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"token": capability("context-" + mint.Audience + ".1"), "orgId": mint.OrgID,
+			"expiresAt": time.Now().Add(m.ttl).UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	atomic.AddInt64(&m.mints, 1)
 	// recoverAfter 0 means this host never issues; a positive one means it
 	// issues once that many asks have been answered with status.
 	if m.status != 0 && (m.recoverAfter == 0 || atomic.LoadInt64(&m.mints) <= m.recoverAfter) {
@@ -171,6 +192,20 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *hostMint) count() int64 { return atomic.LoadInt64(&m.mints) }
+
+// observedStartTasks is the viewer mints this host was asked for, which is not
+// the same question as count(): that one is this workload's own credential.
+func (m *hostMint) observedStartTasks() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var asked []string
+	for _, path := range m.paths {
+		if path == workContextStartTaskProcedure {
+			asked = append(asked, path)
+		}
+	}
+	return asked
+}
 
 // callerIdentity is the SPIFFE ID the caller's own certificate named, or "" on
 // a plain connection.
@@ -328,8 +363,19 @@ type booted struct {
 // or the test is asserting the first missing value instead.
 func bootEnvironment(t *testing.T, mint *hostMint) (caller *tls.Certificate, roots *x509.CertPool) {
 	t.Helper()
+	certFile, keyFile, bundleFile, caller, roots := bootIdentity(t, mint, testPrincipal)
+	_, _, _ = certFile, keyFile, bundleFile
+	return caller, roots
+}
+
+// bootIdentity is bootEnvironment with the projected material exposed, for a
+// test that supplies its own IdentitySource and must do so under the *same*
+// anchor the fake host is served with — otherwise the boot fails verifying the
+// host rather than on the property under test.
+func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, keyFile, bundleFile string, caller *tls.Certificate, roots *x509.CertPool) {
+	t.Helper()
 	cell := newCell(t)
-	certFile, keyFile, bundleFile, caller, roots := cell.workload(t, testPrincipal)
+	certFile, keyFile, bundleFile, caller, roots = cell.workload(t, principal)
 	mint.serveTLS(t, cell)
 	authorityValues(t)
 	tokenFile := filepath.Join(t.TempDir(), "token")
@@ -351,7 +397,7 @@ func bootEnvironment(t *testing.T, mint *hostMint) (caller *tls.Certificate, roo
 	if os.Getenv("ASSETS_DIR") == "" {
 		t.Setenv("ASSETS_DIR", t.TempDir())
 	}
-	return caller, roots
+	return certFile, keyFile, bundleFile, caller, roots
 }
 
 // boot runs the whole boot a deployed solution runs — configuration, the

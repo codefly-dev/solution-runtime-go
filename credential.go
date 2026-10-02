@@ -294,6 +294,32 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // is this process's and one renewal fixes it — and no capability is minted
 // under an attribution nobody can check.
 func attestWorkload(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string) error {
+	return attestWorkloadReporting(ctx, source, report, request, id, nil)
+}
+
+// attestWorkloadReporting is attestWorkload with somewhere to report a
+// *terminal* failure, which is the half the first round got wrong.
+//
+// The boot already separates the issuer's two answers and must: a refusal is a
+// judgement on this build — the installation moved, the build is not the one
+// the presence document approved, the principal's epoch advanced — and no
+// number of attempts changes it, while an unavailable mint is a transient
+// condition worth waiting out. At *renewal* both were collapsed into
+// ErrNotAttested, which relayedError maps to unavailable with the note that one
+// renewal fixes it. For a refusal that is false: nothing fixes it, so the
+// process answered 503 to every request, forever, while reporting itself
+// healthy — the one shape this cutover was supposed to end, because a solution
+// that serves nothing while looking alive is exactly what the delivered-presence
+// model replaced the heartbeat to avoid.
+//
+// A terminal refusal therefore ends the process. Health starts failing so the
+// host's own probe takes the binding out, and serve returns non-zero so the
+// orchestrator restarts it against the delivery as it now stands — which is
+// where a build the host no longer approves gets resolved, and it is not here.
+func attestWorkloadReporting(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string, terminal func(error)) error {
+	if source == nil && terminal == nil {
+		return fmt.Errorf("%w: this solution holds no credential source, so it cannot attest which module is asking", ErrNotAttested)
+	}
 	if source == nil {
 		// No source at all is a programming error on a path that mints: every
 		// boot opens one, and a consumer that supplied its own supplied a
@@ -303,6 +329,9 @@ func attestWorkload(ctx context.Context, source CredentialSource, report *attest
 	credential, err := source.Credential(ctx)
 	if err != nil {
 		report.say(id, "refusing to mint for a viewer: this execution's credential could not be obtained: "+err.Error())
+		if terminal != nil && terminalCredentialFailure(err) {
+			terminal(err)
+		}
 		return fmt.Errorf("%w: %w", ErrNotAttested, err)
 	}
 	if err := credential.Attach(request); err != nil {
@@ -358,4 +387,21 @@ func (r *attestationReport) recovered(id string) {
 	if had != "" {
 		log.Printf("solution %q: presenting this workload's credential again", id)
 	}
+}
+
+// terminalCredentialFailure reports whether the issuer's answer is a judgement
+// no retry can change.
+//
+// ErrMintRefused is the host saying this build is not the one its presence
+// document approved. ErrRevoked is live state having moved under a credential
+// that was sound when it was minted — an installation revision, a principal's
+// epoch, a build incarnation. Both are decisions about *this* execution, and
+// the only thing that resolves either is a new delivery and a new process.
+//
+// Everything else, ErrMintUnavailable above all, is transient by construction
+// and must not end the process: an issuer that cannot reach its own policy log
+// is an issuer behaving correctly, and exiting on it would turn a dependency
+// blip into a crash loop.
+func terminalCredentialFailure(err error) bool {
+	return errors.Is(err, workcontext.ErrMintRefused) || errors.Is(err, workcontext.ErrRevoked)
 }

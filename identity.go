@@ -136,6 +136,32 @@ func peerAnchor(bundleFile string) (*x509.CertPool, error) {
 // that cannot produce an identity is refused here, naming the material that is
 // missing.
 func (s *Server) listen() (net.Listener, error) {
+	config, err := s.serverIdentity()
+	if err != nil {
+		return nil, err
+	}
+	ln, err := net.Listen("tcp", ":"+s.cfg.port)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, config), nil
+}
+
+// serverIdentity resolves this workload's identity once and holds it to every
+// posture rule, memoised so the boot and the listener are the same identity
+// rather than two resolutions that could differ.
+//
+// It is called *before* the first outbound act, which is the ordering half of a
+// real bug: the credential mint used to run before listen(), so a leaf issued
+// for a neighbouring workload had already been presented to the host — along
+// with this workload's projected token — by the time the principal check
+// refused the listener. The check that says "this is the workload the platform
+// provisioned" is worth nothing if the mint has already happened under the
+// wrong one.
+func (s *Server) serverIdentity() (*tls.Config, error) {
+	if s.identityConfig != nil {
+		return s.identityConfig, nil
+	}
 	source := s.identity
 	if source == nil {
 		source = projectedIdentity{
@@ -155,11 +181,59 @@ func (s *Server) listen() (net.Listener, error) {
 		return nil, err
 	}
 	holdPerConnectionPosture(config, s.principal)
-	ln, err := net.Listen("tcp", ":"+s.cfg.port)
+	s.identityConfig = config
+	return config, nil
+}
+
+// peerAnchorOf is the pool a resolved server configuration verifies its callers
+// against — the same pool this runtime verifies the *platform* against when it
+// dials out, which is what makes one identity object serve both directions.
+//
+// A source may carry it on the configuration or resolve it per handshake (the
+// projected one does the latter, so a removed root takes effect without a
+// restart), so both are read here. usableServerIdentity has already refused a
+// configuration that has neither.
+func peerAnchorOf(config *tls.Config) (*x509.CertPool, error) {
+	if config.ClientCAs != nil {
+		return config.ClientCAs, nil
+	}
+	if config.GetConfigForClient != nil {
+		answer, err := config.GetConfigForClient(&tls.ClientHelloInfo{ServerName: "localhost"})
+		if err != nil {
+			return nil, fmt.Errorf("resolve the trust anchor this workload verifies the platform against: %w", err)
+		}
+		if answer != nil && answer.ClientCAs != nil {
+			return answer.ClientCAs, nil
+		}
+	}
+	return nil, fmt.Errorf("the identity source names no trust anchor, so there is nothing to verify the platform against when this runtime dials it: an https URL alone is checked against this host's system roots, which cannot tell the platform from anything holding a public certificate")
+}
+
+// clientTLSFrom derives the configuration this runtime dials the platform with
+// from the one its listener serves: the same certificate, the same anchor.
+//
+// The certificate is taken through the source's own callback rather than copied,
+// so a rotated leaf is presented outbound as well — snapshotting it here would
+// mean the listener served a fresh leaf while the mint presented an expired one,
+// and the failure would name neither.
+func clientTLSFrom(config *tls.Config) (*tls.Config, error) {
+	anchor, err := peerAnchorOf(config)
 	if err != nil {
 		return nil, err
 	}
-	return tls.NewListener(ln, config), nil
+	client := &tls.Config{RootCAs: anchor, MinVersion: tls.VersionTLS13}
+	switch {
+	case config.GetCertificate != nil:
+		get := config.GetCertificate
+		client.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return get(&tls.ClientHelloInfo{ServerName: "localhost"})
+		}
+	case len(config.Certificates) > 0:
+		client.Certificates = config.Certificates
+	default:
+		return nil, fmt.Errorf("the identity source produces no certificate this runtime can present to the platform: it would dial the mint and the gateway as an anonymous client, which cannot be held to this installation")
+	}
+	return client, nil
 }
 
 // usableServerIdentity refuses a configuration this listener must not serve
@@ -192,6 +266,22 @@ func usableServerIdentity(config *tls.Config) error {
 	if config.ClientAuth < tls.RequireAndVerifyClientCert {
 		return fmt.Errorf("the identity source returned a TLS configuration that does not require and verify a caller's certificate (ClientAuth %v): a listener that authenticates no peer accepts anything that can route to it, bypassing the admission its host decides on its routes",
 			config.ClientAuth)
+	}
+	// And it has to say *which* anchor a caller is verified against. This is
+	// not pedantry about a field: with RequireAndVerifyClientCert and a nil
+	// ClientCAs, Go verifies client certificates against the host's system
+	// roots, so the listener demands a certificate and then accepts one from
+	// any public CA — a posture that reads as mutual TLS in every log line and
+	// admits the internet. Requiring a certificate and not saying whose is
+	// strictly worse than requiring none, because it looks like the strong
+	// thing.
+	//
+	// A source may resolve the anchor per handshake instead, which is what the
+	// projected one does so that a removed root takes effect without a restart;
+	// then the callback's answer is where the pool must appear, and
+	// holdPerConnectionPosture checks it there.
+	if config.ClientCAs == nil && config.GetConfigForClient == nil {
+		return fmt.Errorf("the identity source returned a TLS configuration that requires a caller's certificate but names no trust anchor to verify it against (ClientCAs is nil): Go would fall back to this host's system roots, so the listener would accept a client certificate from any public CA. Set ClientCAs, or resolve it per handshake in GetConfigForClient")
 	}
 	return nil
 }
@@ -232,6 +322,12 @@ func holdPerConnectionPosture(config *tls.Config, principal string) {
 		}
 		if err := usableServerIdentity(answer); err != nil {
 			return nil, fmt.Errorf("the identity source answered this handshake with a configuration below the posture its boot configuration was held to: %w", err)
+		}
+		// On a per-connection answer the pool is not optional: this *is* the
+		// configuration the handshake runs under, so "resolved per handshake"
+		// has to mean resolved, not deferred again to system roots.
+		if answer.ClientCAs == nil {
+			return nil, fmt.Errorf("the identity source answered this handshake with a configuration that requires a caller's certificate but names no trust anchor (ClientCAs is nil): Go would verify it against this host's system roots, accepting a client certificate from any public CA")
 		}
 		if err := presentsThisWorkload(answer, principal); err != nil {
 			return nil, err

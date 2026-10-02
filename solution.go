@@ -38,6 +38,7 @@ package solution
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +54,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -257,6 +259,10 @@ type Server struct {
 	// the one the platform projects, read from the configured files; a consumer
 	// whose platform issues an identity another way supplies it with Identity.
 	identity IdentitySource
+	// identityConfig is the resolved, posture-checked configuration from that
+	// source: one resolution serving the listener and the outbound client, so
+	// the two cannot be different identities.
+	identityConfig *tls.Config
 	// credential is where this execution's credential comes from. Nil until
 	// the boot opens the platform's mint endpoint; a test or a consumer on
 	// another issuer supplies its own with Credential.
@@ -264,6 +270,13 @@ type Server struct {
 	// authority is the frozen set of authority-bearing values this process runs
 	// under, read once at boot and rechecked before every credential renewal.
 	authority *codefly.Authority
+	// terminal is closed the first time the issuer answers a renewal with a
+	// judgement no retry can change. It makes health fail and serve return,
+	// because a process holding a credential the host has stopped honouring
+	// cannot act for anyone and nothing it does locally changes that.
+	terminal     chan struct{}
+	terminalOnce sync.Once
+	terminalErr  atomic.Pointer[error]
 	// attestation throttles what a failed attestation says (see attestWorkload).
 	attestation attestationReport
 	// outbound is the authenticated client this boot makes platform requests
@@ -714,7 +727,7 @@ func New(manifest Manifest) *Server {
 		// unset announced that product's capability contract to the host.
 		manifest.Contract = manifest.ID
 	}
-	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler)}
+	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler), terminal: make(chan struct{})}
 }
 
 // Handle registers a solution endpoint. Chainable.
@@ -789,16 +802,32 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if err := s.openAuthority(ctx); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
-	// The client this process calls the platform with, presenting the same
-	// identity its listener presents. Built before the mint, because the mint
-	// is the first thing it carries.
-	if s.credential == nil || s.identity == nil {
-		outbound, err := s.outboundClient()
-		if err != nil {
-			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
-		}
-		s.outbound = outbound
+	// This workload's identity, resolved and held to every posture rule —
+	// including that the leaf is the principal the platform provisioned —
+	// before the first outbound act. Two bugs lived in the four lines this
+	// replaces.
+	//
+	// It was conditional: `if s.credential == nil || s.identity == nil`. With
+	// *both* sources supplied the client was never built, so s.outbound stayed
+	// nil and every gateway call fell through to the unauthenticated transport
+	// — system roots, no client certificate — which is the one posture this
+	// cutover exists to remove, reached by supplying more configuration rather
+	// than less. And with only Identity() supplied, the condition was true, so
+	// the client read the projected files validateSources had just declared
+	// unnecessary for that boot: the README's own example could not start.
+	//
+	// It also ran after the mint. A leaf issued for a neighbouring workload had
+	// therefore already been presented to the host, with this workload's
+	// projected token, by the time listen() refused it.
+	identityConfig, err := s.serverIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
+	outbound, err := s.outboundClient(identityConfig)
+	if err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	s.outbound = outbound
 	// The contract this solution publishes is resolved from the same
 	// declaration, under the profile this process runs in, and every value it
 	// requires is named in the refusal when it is absent.
@@ -835,7 +864,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	// Health is answered, never pushed. The host probes the destination its own
 	// presence document names; this process does not report its liveness
 	// anywhere, and has no way to make itself present by answering.
-	mux.HandleFunc(HealthPath, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc(HealthPath, s.handleHealth)
 	for path, handler := range s.handlers {
 		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
 	}
@@ -846,7 +875,10 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 
 	srv := &http.Server{Handler: mux}
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-s.credentialRefusedC():
+		}
 		srv.Close()
 	}()
 
@@ -854,8 +886,46 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	if serveErr := srv.Serve(ln); !errors.Is(serveErr, http.ErrServerClosed) {
 		return serveErr
 	}
+	// A terminal credential failure is reported as the reason this process
+	// ended, so the orchestrator's restart is against a judgement rather than
+	// an unexplained exit.
+	if err := s.terminalErr.Load(); err != nil && ctx.Err() == nil {
+		return fmt.Errorf("solution %q stopped serving: %w", s.manifest.ID, *err)
+	}
 	return nil
 }
+
+// handleHealth answers the host's probe with what this process can actually do.
+//
+// It was an unconditional 200, which is only right while the one thing this
+// runtime needs is still true. Once the issuer has refused this execution's
+// credential for good, the process can serve no module call for any viewer: a
+// 200 then invites the host to keep routing to a binding that answers 503 to
+// everything, and the probe is the only channel this runtime has to say
+// otherwise — it does not push liveness, so it has to answer honestly.
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	if err := s.terminalErr.Load(); err != nil {
+		// Named, not detailed: a probe is not a place to put the issuer's text.
+		http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// credentialRefused records a judgement the issuer will not reverse.
+func (s *Server) credentialRefused(err error) {
+	s.terminalOnce.Do(func() {
+		s.terminalErr.Store(&err)
+		log.Printf("solution %q: this execution's credential was refused and will not be renewed, so this process is ending for the orchestrator to restart against the delivery as it stands: %v",
+			s.manifest.ID, err)
+		close(s.terminal)
+	})
+}
+
+// credentialRefusedC is the channel serve waits on. Created in New, never
+// lazily: a request goroutine reporting a refusal and serve reading it would
+// otherwise race on the field itself.
+func (s *Server) credentialRefusedC() <-chan struct{} { return s.terminal }
 
 // HealthPath is where this runtime answers a health probe. It is a plain 200 on
 // the listener the presence document names, which is the whole of this
@@ -1093,6 +1163,14 @@ type Gateway struct {
 	// transport is what this gateway dials with: the boot's authenticated
 	// client, or nil on a gateway built outside a boot.
 	transport http.RoundTripper
+	// terminal reports a credential failure the issuer will not reverse, so the
+	// process can stop claiming to be healthy. Nil outside a boot.
+	terminal func(error)
+	// ceilings is the published contract's ceiling per audience, which every
+	// ForModule ask is held to. Non-nil exactly when a contract was resolved,
+	// which only a boot does; a derived gateway inherits it, so chaining
+	// ForModule off one cannot escape it.
+	ceilings map[string][]Scope
 }
 
 func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
@@ -1111,7 +1189,24 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
 	gw.workload, gw.id, gw.report = s.credential, s.manifest.ID, &s.attestation
+	gw.terminal = s.credentialRefused
+	// The ceiling this process published, carried onto the gateway a handler
+	// gets, so what it mints is held to what the contract claims. Resolved
+	// contracts only: s.contract.Solution is set by resolveContract and by
+	// nothing else, so an unbooted gateway is distinguishable from a booted one
+	// that declared nothing.
+	if s.contract.Solution != "" {
+		gw.ceilings = make(map[string][]Scope, len(s.contract.Bindings))
+		for _, binding := range s.contract.Bindings {
+			gw.ceilings[binding.Audience] = binding.Ceiling
+		}
+	}
 	if s.outbound != nil {
+		// The transport, not the client: the client's redirect policy and
+		// timeout are re-applied by platformClient below, which every client
+		// this gateway builds goes through. Taking .Transport alone was the
+		// bug — it dropped exactly the CheckRedirect that kept credentials
+		// from being re-sent to a Location.
 		gw.transport = s.outbound.Transport
 	}
 	return gw
@@ -1134,7 +1229,10 @@ func (g *Gateway) HTTPClient() *http.Client {
 	if g.delegation != nil {
 		transport.acting = g
 	}
-	return &http.Client{Transport: transport}
+	// No timeout: this client carries streams, whose bound is the method's
+	// declared MaxStreamDuration on the request context, and a client timeout
+	// would cut a conforming stream off mid-flight.
+	return g.platformClient(transport, 0)
 }
 
 // bearerClient carries the viewer's bearer and nothing else. The mint runs on
@@ -1143,7 +1241,42 @@ func (g *Gateway) HTTPClient() *http.Client {
 // verifies every presented context, so once the first lapsed it would 401 the
 // very call meant to replace it.
 func (g *Gateway) bearerClient() *http.Client {
-	return &http.Client{Transport: bearerTransport{bearer: g.bearer, base: g.roundTripper()}}
+	return g.platformClient(bearerTransport{bearer: g.bearer, base: g.roundTripper()}, platformRequestTimeout)
+}
+
+// platformClient is every client this gateway dials with, and it exists so
+// there is one place the two properties below cannot be forgotten.
+//
+// **A redirect is never followed.** This was a blocker, and the shape of it is
+// worth keeping written down because every piece of it looked right on its own.
+// The boot's outbound client did set CheckRedirect; gatewayFor copied only its
+// .Transport, so every gateway client was an http.Client literal with Go's
+// default policy, which follows up to ten hops. Go copies the original
+// request's headers onto a redirected one and strips only Authorization,
+// WWW-Authenticate and Cookie — so the viewer's capability and the installation
+// headers went along, and on the mint, this workload's own credential in
+// x-codefly-work-context went with them. Worse, bearerTransport sets the bearer
+// on *every* round trip, so the one header Go does strip was put straight back;
+// and a 307 re-sends the body. A single `307 Location: http://elsewhere/` from
+// the gateway, from accounts, or from any module the gateway relays therefore
+// handed over the viewer's unscoped bearer, their capability and this
+// workload's credential — in cleartext, since nothing about an http:// hop
+// involves the TLS configuration that protects the first one. ErrUseLastResponse
+// returns the 3xx to the caller instead: no hop, nothing re-sent.
+//
+// **And the request may only go to the origin this gateway was built for.**
+// That is the belt to the braces: a client built anywhere without the policy
+// above is still refused by the transport, which is where a property this
+// serious belongs. It is also stricter than "must be https" and needs no
+// special case for a test, because an http:// fake gateway is simply its own
+// origin: every destination this gateway has is one host, and validate()
+// already refuses a gateway URL that is not https in a real boot.
+func (g *Gateway) platformClient(transport http.RoundTripper, timeout time.Duration) *http.Client {
+	return &http.Client{
+		Transport:     transport,
+		Timeout:       timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // roundTripper carries every request this gateway makes: the module reads a
@@ -1163,10 +1296,51 @@ func (g *Gateway) bearerClient() *http.Client {
 // that is the only place it is used: there is no path on which a *booted*
 // runtime dials the platform without presenting its identity.
 func (g *Gateway) roundTripper() http.RoundTripper {
+	var base http.RoundTripper = unauthenticatedTransport
 	if g.transport != nil {
-		return g.transport
+		base = g.transport
 	}
-	return unauthenticatedTransport
+	return originPinned{base: base, origin: requestOrigin(g.baseURL)}
+}
+
+// originPinned refuses a credential-bearing request to anywhere but the one
+// origin its gateway addresses.
+//
+// Every destination a gateway has — a module read, a transcoded call, a stream,
+// the viewer's mint — is a path on the gateway it was built for, so "same
+// origin as the base URL" is not a restriction on anything this runtime does.
+// What it stops is a request that was *redirected* somewhere else, or built by
+// a future client that forgot the policy: the credentials on these requests are
+// the viewer's bearer, the capability minted for them and this workload's own,
+// and the check costs a string comparison.
+//
+// It refuses rather than rewrites, and it refuses an unparseable or empty base
+// too, since a gateway that cannot say where it dials cannot be allowed to
+// carry these headers anywhere.
+type originPinned struct {
+	base   http.RoundTripper
+	origin string
+}
+
+func (t originPinned) RoundTrip(r *http.Request) (*http.Response, error) {
+	if t.origin == "" {
+		return nil, fmt.Errorf("refusing to send a credential-bearing request to %q: this gateway has no resolved origin to dial, so there is nothing to hold the destination to", r.URL.Redacted())
+	}
+	if got := requestOrigin(r.URL.String()); got != t.origin {
+		return nil, fmt.Errorf("refusing to send a credential-bearing request to %s: this gateway dials %s, and these headers carry the viewer's bearer, the capability minted for them and this workload's own credential — a destination that is not the gateway is a redirect or a misbuilt client, never a call this runtime makes",
+			got, t.origin)
+	}
+	return t.base.RoundTrip(r)
+}
+
+// requestOrigin is scheme://host, the unit the pin compares. A URL that does
+// not parse, or names no host, has no origin and is refused by the caller.
+func requestOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // unauthenticatedTransport is the non-proxied default for a gateway built
@@ -1199,15 +1373,28 @@ func newPlatformTransport() *http.Transport {
 // So anything able to answer with a Location would be handed the credentials
 // that prove who this workload is, and the theft would look like an ordinary
 // successful request.
-func (s *Server) outboundClient() (*http.Client, error) {
-	anchor, err := peerAnchor(s.cfg.trustBundleFile)
-	if err != nil {
-		return nil, fmt.Errorf("configure this workload's outbound trust: %w", err)
-	}
-	config, err := codefly.ClientTLSConfig(s.cfg.identityCertFile, s.cfg.identityKeyFile, anchor)
-	if err != nil {
-		return nil, fmt.Errorf("configure this workload's outbound identity from %q/%q: %w — the same pair the listener presents is what names this workload to the platform it calls",
-			s.cfg.identityCertFile, s.cfg.identityKeyFile, err)
+func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error) {
+	var config *tls.Config
+	if s.identity == nil {
+		// The projected pair, through the SDK's reloader, which is what keeps a
+		// rotated leaf presented outbound as well as inbound.
+		anchor, err := peerAnchor(s.cfg.trustBundleFile)
+		if err != nil {
+			return nil, fmt.Errorf("configure this workload's outbound trust: %w", err)
+		}
+		config, err = codefly.ClientTLSConfig(s.cfg.identityCertFile, s.cfg.identityKeyFile, anchor)
+		if err != nil {
+			return nil, fmt.Errorf("configure this workload's outbound identity from %q/%q: %w — the same pair the listener presents is what names this workload to the platform it calls",
+				s.cfg.identityCertFile, s.cfg.identityKeyFile, err)
+		}
+	} else {
+		// A consumer's source: the identity it returned, in both directions,
+		// rather than projected files it never said it uses.
+		derived, err := clientTLSFrom(identityConfig)
+		if err != nil {
+			return nil, fmt.Errorf("configure this workload's outbound identity from the supplied identity source: %w", err)
+		}
+		config = derived
 	}
 	transport := newPlatformTransport()
 	transport.TLSClientConfig = config
@@ -1344,6 +1531,13 @@ func workContextScopes(scopes []Scope) []workContextScope {
 // request. Minting here as well means an ask accounts refuses fails at this
 // call rather than inside some later round trip.
 func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scope) (*Gateway, error) {
+	// The contract first, before anything about the caller: asking for
+	// authority this solution never published is this solution's defect, true
+	// of every caller, and it should not be reported only to the ones who
+	// happen to arrive with a complete set of identity headers.
+	if err := g.withinPublishedCeiling(audience, scopes); err != nil {
+		return nil, err
+	}
 	if g.orgID == "" {
 		// The gateway injects orgHeader from the caller's active org, so it is
 		// present but empty for a viewer with no organization selected and for
@@ -1391,6 +1585,48 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		return nil, err
 	}
 	return &acting, nil
+}
+
+// withinPublishedCeiling holds a mint to the contract this process published.
+//
+// The contract claims, in the document an operator and a renderer read, "the
+// most authority this solution may ever ask for". Until this existed that was
+// true of the *declaration* and nothing else: checkContract governs the
+// Consumes entries, while ForModule is public, takes any audience and any
+// scopes, and went straight to the mint. A solution whose handlers only call
+// ForModule consumed nothing, so mintsAuthority was false, so it needed no
+// profile and published an empty contract — and minted arbitrary authority
+// behind it. A ceiling that governs the declaration and not the asks is a
+// ceiling that governs nothing a reviewer cares about.
+//
+// Enforcing it here also closes the gap the other way: a solution that mints
+// through ForModule now has to declare the audience and its ceiling, because an
+// audience the contract does not name is refused. That is the same answer the
+// boot gives for an undeclared consumed module, at the moment the authority is
+// actually asked for.
+//
+// A gateway with no resolved contract carries no ceilings and is not held to
+// one. That is a gateway built outside a boot — a unit test, the passthrough
+// seam — reachable only through this package's unexported constructors, never
+// by a deployed runtime: start() resolves the contract before it serves, so
+// every gateway a handler is handed carries it.
+func (g *Gateway) withinPublishedCeiling(audience string, scopes []Scope) error {
+	if g.ceilings == nil {
+		return nil
+	}
+	ceiling, declared := g.ceilings[audience]
+	if !declared {
+		return fmt.Errorf("this solution asked %q for authority, and its published contract names no binding for that audience: declare it — the contract is what the host derives this solution's authority from, so an audience missing from it is authority nobody approved: %w",
+			audience, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution holds no binding for that module"})
+	}
+	for _, scope := range scopes {
+		if err := withinCeiling(scope, ceiling); err != nil {
+			return fmt.Errorf("this solution asked %q for %s outside the ceiling its contract publishes: %w: %w",
+				audience, scopeText([]Scope{scope}), err,
+				&ClientError{StatusCode: http.StatusForbidden, Message: "this solution asked for more authority than its contract allows"})
+		}
+	}
+	return nil
 }
 
 // delegation is the ask a derived gateway acts under. It holds the ask and not
@@ -1462,7 +1698,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	// request — the capability being minted is what the answer carries, and the
 	// viewer has none yet — so attesting here collides with nothing the module
 	// call later presents.
-	if err := attestWorkload(ctx, g.workload, g.report, post, g.id); err != nil {
+	if err := attestWorkloadReporting(ctx, g.workload, g.report, post, g.id, g.terminal); err != nil {
 		return "", time.Time{}, err
 	}
 	resp, err := g.bearerClient().Do(post)

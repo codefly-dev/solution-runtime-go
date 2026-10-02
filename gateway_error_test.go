@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +75,46 @@ func TestGatewayErrorStatusValidation(t *testing.T) {
 			got, message := handlerErrorResponse(err)
 			if got != want || message != http.StatusText(want) {
 				t.Fatalf("got %d %q, want %d", got, message, want)
+			}
+		})
+	}
+}
+
+// TestAHandlerPathCredentialFailureDisclosesNothing is the disclosure a second
+// reviewer found behind the "a page sees unavailable" answer, which was only
+// ever true of the passthrough.
+//
+// A Handle or HandleRequest handler returns whatever ForModule gave it. Those
+// errors are produced inside this package and deliberately name the mint URL,
+// the gateway URL and the issuer's own text, because that is what a boot
+// refusal has to say. handlerErrorResponse ended in `err.Error()`, so the
+// browser got a 502 carrying all of it — and 502 is the wrong answer anyway:
+// the condition is this process's and one renewal fixes it, which is what the
+// passthrough path has always reported.
+func TestAHandlerPathCredentialFailureDisclosesNothing(t *testing.T) {
+	const secretish = "https://mint.internal.example/platform/_credential"
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"a workload this solution cannot attest for", fmt.Errorf("obtain this execution's credential from %s: 403 forbidden: build 11 is not approved: %w", secretish, ErrNotAttested), http.StatusServiceUnavailable},
+		{"a superseded authority", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrRevoked), http.StatusConflict},
+		{"a capability this solution cannot carry", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrUnsealed), http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, message := handlerErrorResponse(tc.err)
+			if status != tc.status {
+				t.Errorf("status = %d, want %d: the handler path must answer what the passthrough path answers for the same condition", status, tc.status)
+			}
+			if strings.Contains(message, secretish) {
+				t.Errorf("the message handed to the browser names an internal destination:\n%s", message)
+			}
+			if strings.Contains(message, "403") || strings.Contains(message, "not approved") {
+				t.Errorf("the message handed to the browser carries the issuer's own text:\n%s", message)
+			}
+			if message == "" {
+				t.Error("the message says nothing at all: a page still needs to know whose problem it is")
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -516,4 +517,116 @@ func mintClientFor(t *testing.T, mintURL, tokenFile string) CredentialSource {
 		t.Fatal(err)
 	}
 	return client
+}
+
+// mintClientVia is mintClientFor with the caller's own HTTP client, for a test
+// whose fake host is served over TLS: a credential source is consumer code and
+// brings its own transport, so nothing in the runtime hands it one.
+func mintClientVia(t *testing.T, mintURL, tokenFile string, client *http.Client) CredentialSource {
+	t.Helper()
+	source, err := workcontext.NewMintClient(workcontext.MintOptions{
+		URL:                mintURL,
+		Audience:           testAudience,
+		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
+		ProjectionAudience: testProjectionAudience,
+		HTTPClient:         client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return source
+}
+
+// refusingSource is a credential source whose renewal the issuer has started
+// refusing for good: the shape the boot already treats as terminal, happening
+// after a successful boot instead of during it.
+type refusingSource struct{ err error }
+
+func (r refusingSource) Credential(context.Context) (workcontext.Credential, error) {
+	return workcontext.Credential{}, r.err
+}
+
+// TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever is the
+// asymmetry a second reviewer found between the boot and the run.
+//
+// The boot separates the issuer's two answers and must: a refusal is a
+// judgement on this build that no number of attempts changes, an unavailable
+// mint is transient. At renewal both were collapsed into ErrNotAttested, which
+// reaches a page as unavailable with the note that one renewal fixes it. For a
+// refusal nothing fixes it — so the process answered 503 to every request
+// forever while /health returned 200, which is the exact shape the
+// delivered-presence model replaced the heartbeat to avoid: a solution that
+// serves nothing and looks alive.
+func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		terminal bool
+	}{
+		{"the host refuses this build", fmt.Errorf("mint: %w", workcontext.ErrMintRefused), true},
+		{"the state the credential is sealed to has moved", fmt.Errorf("mint: %w", workcontext.ErrRevoked), true},
+		// The control, and the reason this is not just "exit on any error": an
+		// issuer that cannot reach its own policy log is behaving correctly,
+		// and exiting on it turns a dependency blip into a crash loop.
+		{"the issuer is briefly unavailable", fmt.Errorf("mint: %w", workcontext.ErrMintUnavailable), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+			server := New(Manifest{ID: testSolutionID}).Credential(refusingSource{err: tc.err})
+			server.cfg.gatewayURL = gw.URL
+
+			// Health is honest before anything has failed.
+			if status, _ := healthStatus(t, server); status != http.StatusOK {
+				t.Fatalf("health = %d before any failure, want 200", status)
+			}
+
+			header := http.Header{}
+			header.Set("authorization", "Bearer viewer")
+			header.Set(orgHeader, "org-1")
+			header.Set(sessionHeader, "session-1")
+			_, err := server.gatewayFor(header).ForModule(context.Background(), "things",
+				Scope{ResourceKind: "things", Actions: []string{"read"}})
+			if !errors.Is(err, ErrNotAttested) {
+				t.Fatalf("ForModule error = %v, want ErrNotAttested", err)
+			}
+			if got := len(gw.observedMints()); got != 0 {
+				t.Errorf("observed %d viewer mints, want 0", got)
+			}
+
+			status, body := healthStatus(t, server)
+			if tc.terminal {
+				if status != http.StatusServiceUnavailable {
+					t.Errorf("health = %d after a refusal the issuer will not reverse, want 503: a 200 invites the host to keep routing to a binding that answers nothing", status)
+				}
+				if !strings.Contains(body, "refused") {
+					t.Errorf("the probe says %q, want it to name the condition", body)
+				}
+				select {
+				case <-server.credentialRefusedC():
+				default:
+					t.Error("the process was not asked to end: a credential the host has stopped honouring cannot be waited out")
+				}
+				if stored := server.terminalErr.Load(); stored == nil || !errors.Is(*stored, tc.err) {
+					t.Error("the reason this process is ending was not recorded, so its exit would say nothing")
+				}
+			} else {
+				if status != http.StatusOK {
+					t.Errorf("health = %d while the issuer is merely unavailable, want 200: this is transient and exiting on it is a crash loop", status)
+				}
+				select {
+				case <-server.credentialRefusedC():
+					t.Error("the process was ended on a transient condition")
+				default:
+				}
+			}
+		})
+	}
+}
+
+// healthStatus asks the health route what this process reports.
+func healthStatus(t *testing.T, server *Server) (int, string) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	server.handleHealth(recorder, httptest.NewRequest(http.MethodGet, HealthPath, nil))
+	return recorder.Code, recorder.Body.String()
 }

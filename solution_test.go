@@ -1101,7 +1101,7 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
-	client, err := server.outboundClient()
+	client, err := server.outboundClient(nil)
 	if err != nil {
 		t.Fatalf("outboundClient: %v", err)
 	}
@@ -1127,7 +1127,7 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	// A boot with no trust anchor cannot build one at all, which is the same
 	// refusal the listener makes.
 	server.cfg.trustBundleFile = ""
-	if _, err := server.outboundClient(); err == nil {
+	if _, err := server.outboundClient(nil); err == nil {
 		t.Error("an outbound client was built with no projected anchor to verify the platform against")
 	}
 }

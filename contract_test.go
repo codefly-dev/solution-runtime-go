@@ -1,7 +1,10 @@
 package solution
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -336,5 +339,101 @@ func TestThisRuntimesContractDoesNotClaimTheRenderersSchema(t *testing.T) {
 	}
 	if effective.Schema != ContractSchema {
 		t.Errorf("the served contract names schema %q, want %q", effective.Schema, ContractSchema)
+	}
+}
+
+// TestABootedRuntimeHoldsForModuleToThePublishedCeiling is the authority bypass
+// a second reviewer found, and it defeats the point of publishing a ceiling at
+// all.
+//
+// checkContract governs the Consumes *declaration*. ForModule is public, takes
+// any audience and any scopes, and went straight to the mint — so the document
+// saying "the most authority this solution may ever ask for" was a statement
+// about a declaration the handlers did not have to use. Worse at the other end:
+// a solution whose handlers only call ForModule consumes nothing, so
+// mintsAuthority was false, so it needed no profile and published an empty
+// contract while minting whatever it liked.
+//
+// This boots a real runtime with a declared ceiling and drives all three cases
+// through its handler, counting what the host was asked — a refusal that still
+// minted would be no refusal.
+func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
+	type ask struct {
+		audience string
+		scope    Scope
+	}
+	for _, tc := range []struct {
+		name     string
+		ask      ask
+		wantMint bool
+		says     string
+	}{
+		{
+			"inside the ceiling", ask{"things", Scope{ResourceKind: "things", Actions: []string{"read"}}},
+			true, "",
+		},
+		{
+			"an action the ceiling does not allow", ask{"things", Scope{ResourceKind: "things", Actions: []string{"delete"}}},
+			false, "outside the ceiling its contract publishes",
+		},
+		{
+			"an audience the contract names no binding for", ask{"ghost", Scope{ResourceKind: "things", Actions: []string{"read"}}},
+			false, "names no binding for that audience",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
+			mint := newHostMint(t, &hostMint{})
+			var mintErr error
+			solution := boot(t, New(Manifest{ID: testSolutionID}).
+				Consumes(passthroughModule()).
+				Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+					localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+				}}).
+				Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
+					_, mintErr = gw.ForModule(ctx, tc.ask.audience, tc.ask.scope)
+					return map[string]string{"ok": "yes"}, nil
+				}), mint)
+
+			request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("authorization", "Bearer viewer")
+			request.Header.Set(orgHeader, "org-1")
+			request.Header.Set(sessionHeader, "session-1")
+			resp, err := solution.client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+
+			// The mint the boot itself ran is request-independent; what matters
+			// is whether the viewer's mint was attempted on top of it.
+			viewerMints := len(mint.observedStartTasks())
+			switch {
+			case tc.wantMint && mintErr != nil:
+				t.Fatalf("an ask inside the published ceiling was refused: %v", mintErr)
+			case tc.wantMint && viewerMints != 1:
+				t.Errorf("an ask inside the ceiling produced %d viewer mints, want 1", viewerMints)
+			case !tc.wantMint:
+				if mintErr == nil {
+					t.Fatalf("ForModule minted %s for %q, which the published contract does not allow",
+						scopeText([]Scope{tc.ask.scope}), tc.ask.audience)
+				}
+				if !strings.Contains(mintErr.Error(), tc.says) {
+					t.Errorf("refusal %q does not say %q", mintErr, tc.says)
+				}
+				if viewerMints != 0 {
+					t.Errorf("the host was asked for %d viewer mint(s) on an ask outside the contract, want 0: a refusal that still mints is not a refusal", viewerMints)
+				}
+				// The viewer sees their own 403-shaped answer, not this
+				// solution's 502.
+				var clientErr *ClientError
+				if !errors.As(mintErr, &clientErr) || clientErr.StatusCode != http.StatusForbidden {
+					t.Errorf("refusal carries %T, want a ClientError with 403 so the page is told the solution asked for too much", mintErr)
+				}
+			}
+		})
 	}
 }

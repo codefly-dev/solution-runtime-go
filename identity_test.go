@@ -1,6 +1,7 @@
 package solution
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,6 +153,12 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 		{"a floor below TLS 1.3", withFloor(usable, tls.VersionTLS12), "TLS 1.3"},
 		{"no peer authentication", withClientAuth(usable, tls.NoClientCert), "authenticates no peer"},
 		{"a peer it verifies but does not require", withClientAuth(usable, tls.VerifyClientCertIfGiven), "authenticates no peer"},
+		// Requiring a certificate and naming no anchor is strictly worse than
+		// requiring none, because it reads as mutual TLS in every log line:
+		// with ClientCAs nil, Go verifies the caller against this host's
+		// system roots, so the listener demands a certificate and then accepts
+		// one from any public CA.
+		{"a required certificate with no anchor to verify it against", withoutAnchor(usable), "system roots"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: tc.config})
@@ -315,6 +323,16 @@ type staticIdentity struct{ config *tls.Config }
 
 func (s staticIdentity) ServerTLSConfig() (*tls.Config, error) { return s.config, nil }
 
+// withoutAnchor is a source that requires a caller's certificate and names
+// nothing to verify it against, with no per-connection callback to resolve one
+// later either.
+func withoutAnchor(base *tls.Config) *tls.Config {
+	changed := base.Clone()
+	changed.ClientCAs = nil
+	changed.GetConfigForClient = nil
+	return changed
+}
+
 func withFloor(base *tls.Config, floor uint16) *tls.Config {
 	changed := base.Clone()
 	changed.MinVersion = floor
@@ -442,6 +460,32 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 			},
 		},
 		{
+			// Resolving the anchor per handshake has to mean resolved: a
+			// callback that answers with no pool defers to the system roots
+			// for that connection, which is the same hole one layer along.
+			"no trust anchor per connection",
+			func(cfg *tls.Config) { cfg.ClientCAs = nil },
+			func() *tls.Config {
+				return &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13, ServerName: "localhost"}
+			},
+		},
+		{
+			// And the same with the answer carrying a further callback. Go
+			// calls GetConfigForClient once, on the base configuration, so a
+			// callback *on the answer* is never called and cannot be where the
+			// pool arrives — the connection runs on this configuration, with
+			// system roots. It is the one shape the boot-time check reads as
+			// "resolved later".
+			"no trust anchor per connection, deferred to a callback Go never calls",
+			func(cfg *tls.Config) {
+				cfg.ClientCAs = nil
+				cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil }
+			},
+			func() *tls.Config {
+				return &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13, ServerName: "localhost"}
+			},
+		},
+		{
 			// Nothing extra is admitted here; what changes is whose identity
 			// the listener presents, so the authenticated caller is the one
 			// that reads the defect.
@@ -539,4 +583,138 @@ func serve(t *testing.T, ln net.Listener) {
 		}
 	}()
 	t.Cleanup(func() { <-done })
+}
+
+// suppliedIdentity is a consumer's IdentitySource that happens to produce a
+// conforming configuration — the shape the README's example implies, built over
+// the same anchor the fake host is served under so the boot fails on the
+// property under test and not on verifying the host.
+type suppliedIdentity struct{ certFile, keyFile, bundleFile string }
+
+func (c suppliedIdentity) ServerTLSConfig() (*tls.Config, error) {
+	return projectedIdentity{certFile: c.certFile, keyFile: c.keyFile, trustBundleFile: c.bundleFile}.ServerTLSConfig()
+}
+
+// TestASuppliedSourceBootsAndStaysAuthenticatedOutbound drives the two bugs a
+// second reviewer found behind the "custom sources work through the boot
+// contract" answer. The test that answered it before stopped at
+// validateSources, so neither was reachable by it.
+//
+// The outbound client was built `if s.credential == nil || s.identity == nil`:
+//
+//   - supply **both** sources and it was never built, so s.outbound stayed nil
+//     and every gateway call fell through to the unauthenticated transport —
+//     system roots, no client certificate. The one posture this cutover exists
+//     to remove, reached by configuring more rather than less.
+//   - supply **only Identity** and the condition was true, so the client read
+//     the projected files validateSources had just declared unnecessary for
+//     that boot. The README's own example could not start.
+func TestASuppliedSourceBootsAndStaysAuthenticatedOutbound(t *testing.T) {
+	// No projected identity files at all, so a boot that reads them fails and a
+	// boot that honours the supplied source does not.
+	withoutProjectedIdentity := func(t *testing.T) {
+		t.Helper()
+		t.Setenv(IdentityCertFileEnvironmentVariable, "")
+		t.Setenv(IdentityKeyFileEnvironmentVariable, "")
+		t.Setenv(IdentityTrustBundleFileEnvironmentVariable, "")
+	}
+
+	t.Run("identity only, the README's own example", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{})
+		certFile, keyFile, bundleFile, _, _ := bootIdentity(t, mint, testPrincipal)
+		withoutProjectedIdentity(t)
+
+		server := New(Manifest{ID: testSolutionID}).
+			Identity(suppliedIdentity{certFile: certFile, keyFile: keyFile, bundleFile: bundleFile})
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ln, err := server.start(ctx)
+		if err != nil {
+			t.Fatalf("a boot supplying only Identity(...) was refused: %v\nthe supplied source says where the identity comes from, so the projected files are provisioning this boot does not read", err)
+		}
+		defer func() { _ = ln.Close() }()
+		if server.outbound == nil {
+			t.Fatal("the boot came up with no outbound client at all")
+		}
+		if got := mint.count(); got != 1 {
+			t.Errorf("the host was asked %d times, want the one mint: the supplied-identity boot must still obtain its credential", got)
+		}
+	})
+
+	t.Run("both sources supplied: outbound still presents this workload", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{})
+		certFile, keyFile, bundleFile, caller, roots := bootIdentity(t, mint, testPrincipal)
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected-token")
+		withoutProjectedIdentity(t)
+
+		// The fake host is served over TLS under the cell's anchor, and a
+		// supplied credential source brings its own transport — the runtime
+		// hands it none, which is the point of supplying one.
+		viaCell := &http.Client{Timeout: platformRequestTimeout, Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			RootCAs: roots, Certificates: []tls.Certificate{*caller}, MinVersion: tls.VersionTLS13,
+		}}}
+		server := New(Manifest{ID: testSolutionID}).
+			Identity(suppliedIdentity{certFile: certFile, keyFile: keyFile, bundleFile: bundleFile}).
+			Credential(mintClientVia(t, mint.URL+credentialMintPath, tokenFile, viaCell))
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ln, err := server.start(ctx)
+		if err != nil {
+			t.Fatalf("a boot supplying both sources was refused: %v", err)
+		}
+		defer func() { _ = ln.Close() }()
+
+		if server.outbound == nil {
+			t.Fatal("s.outbound is nil with both sources supplied, so every gateway call falls through to the unauthenticated transport: system roots, no client certificate")
+		}
+		transport, ok := server.outbound.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("outbound transport is %T, want *http.Transport", server.outbound.Transport)
+		}
+		switch {
+		case transport.TLSClientConfig == nil:
+			t.Fatal("the outbound client has no TLS configuration")
+		case transport.TLSClientConfig.RootCAs == nil:
+			t.Error("the outbound client verifies the platform against system roots, not the anchor the supplied source named")
+		case transport.TLSClientConfig.GetClientCertificate == nil && len(transport.TLSClientConfig.Certificates) == 0:
+			t.Error("the outbound client presents no identity, so the platform cannot tell this workload from anything else that reached it")
+		case transport.TLSClientConfig.MinVersion != tls.VersionTLS13:
+			t.Errorf("the outbound floor is 0x%04x, want TLS 1.3", transport.TLSClientConfig.MinVersion)
+		}
+		// And the gateway a handler is handed carries it, rather than the
+		// unauthenticated fallback.
+		if server.gatewayFor(http.Header{}).transport == nil {
+			t.Error("a handler's gateway carries no transport, so it dials the platform unauthenticated")
+		}
+	})
+}
+
+// TestAMismatchedLeafIsRefusedBeforeTheMint is the ordering half of the same
+// finding: the principal check is worth nothing after the fact.
+//
+// openCredential used to run before listen(), so a leaf issued for a
+// neighbouring workload — the wrong Secret mounted, a Certificate issued for
+// another service — had already been presented to the host, together with this
+// workload's projected service-account token, by the time the listener refused
+// it. The refusal was real and the disclosure had already happened.
+func TestAMismatchedLeafIsRefusedBeforeTheMint(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	bootIdentity(t, mint, "spiffe://codefly.test/ns/solutions/sa/another-workload")
+
+	// Not bootFails: that helper re-provisions the environment, which would
+	// replace the mismatched leaf with a matching one and assert nothing.
+	ln, err := New(Manifest{ID: testSolutionID}).start(context.Background())
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if err == nil {
+		t.Fatal("the boot came up serving a leaf issued for another workload")
+	}
+	if !strings.Contains(err.Error(), "another-workload") {
+		t.Errorf("the boot was refused with %v, want a refusal naming the identity actually served", err)
+	}
+	if got := mint.count(); got != 0 {
+		t.Errorf("the host was asked %d time(s) before the leaf was checked: a mismatched identity must reach nothing, and the projected token travels on that request", got)
+	}
 }
