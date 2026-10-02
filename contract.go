@@ -14,7 +14,31 @@ import (
 // ContractSchema is the version of the contract document this runtime
 // publishes. A reader branches on it rather than on the presence of a field, so
 // a later shape is a new version and never a stricter reading of these bytes.
-const ContractSchema = "codefly/module-contract/v1"
+//
+// It is deliberately *not* `codefly/module-contract/v1`. That string belongs to
+// the document the renderer reads — `module.contract.codefly.yaml`, YAML,
+// strict-decoded, at the module directory the composition resolved, carrying
+// slots rather than literals (codefly-dev/cli#855). This runtime's document is
+// JSON, has a different shape, and answers a different question: what a process
+// holds *itself* to, resolved for the one profile it runs under.
+//
+// Sharing the string was worse than a mismatch. Strict decoding refuses the
+// unknown fields, and because the schema matched, the renderer would report this
+// as a *malformed* `module-contract` rather than as a document meant for
+// somebody else — a version skew that is not one, pointing at the wrong owner.
+// Two shapes under one schema string is the one thing a reader branching on that
+// string cannot survive.
+const ContractSchema = "codefly/solution-runtime-contract/v1"
+
+// RendererContractSchema and RendererContractFile name what the *renderer*
+// reads, so the distinction above is greppable from here rather than folklore.
+// Nothing in this package writes that file; a generator for it would be a
+// separate deliverable in this repository, and the renderer stays a reader of
+// one file.
+const (
+	RendererContractSchema = "codefly/module-contract/v1"
+	RendererContractFile   = "module.contract.codefly.yaml"
+)
 
 // ContractPath is where a running solution publishes its effective contract.
 //
@@ -22,12 +46,17 @@ const ContractSchema = "codefly/module-contract/v1"
 // makes this solution present to nobody. It is the same document the build-time
 // artifact carries (ContractArtifact), narrowed to the one profile this process
 // actually runs under, so an operator can read what a process holds itself to
-// without inferring it from the renderer's inputs.
+// without inferring it from the composition's inputs.
 const ContractPath = "/.well-known/module-contract"
 
-// ModuleContract is the authority contract a solution publishes: the ceiling a
-// renderer derives this solution's authority document from, and the ceiling
-// this runtime holds its own declaration to at boot.
+// ModuleContract is the authority contract a solution declares: the ceiling
+// this runtime holds its own declaration to at boot, and the ceiling an
+// operator reads off a running process.
+//
+// It is the author's declaration of the most authority this solution may ever
+// ask for. It is not the renderer's input — that is RendererContractFile, whose
+// shape resolves audiences from the composition per environment rather than
+// keying ceilings by profile (codefly-dev/cli#855).
 //
 // It is declared, never derived from what the code happens to ask for. A
 // ceiling computed from the declaration would be satisfied by construction: a
@@ -150,7 +179,7 @@ func checkContract(modules []ConsumedModule, contract ModuleContract, profile st
 			continue
 		}
 		if !declared {
-			return nil, fmt.Errorf("the published contract declares no scope ceiling for %q in the %q profile: every consumed module this solution mints authority for needs one, and the renderer derives this solution's authority from it",
+			return nil, fmt.Errorf("the published contract declares no scope ceiling for %q in the %q profile: every consumed module this solution mints authority for needs one, and this runtime refuses an ask it cannot check against a declared ceiling",
 				module.As, profile)
 		}
 		if err := checkScopes(ceiling); err != nil {
@@ -171,7 +200,7 @@ func checkContract(modules []ConsumedModule, contract ModuleContract, profile st
 	// typo or a grant that outlives the consumption it was written for.
 	for audience := range ceilings {
 		if !slices.ContainsFunc(modules, func(m ConsumedModule) bool { return m.As == audience }) {
-			return nil, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, which this solution does not consume: the renderer would derive authority for an audience nothing calls",
+			return nil, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, which this solution does not consume: it is a ceiling governing a call that cannot happen, and whoever wrote it believes otherwise",
 				audience, profile)
 		}
 	}
@@ -283,10 +312,18 @@ func (s *Server) handleContract(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.contract)
 }
 
-// ContractArtifact renders the contract a renderer reads at build time: the
+// ContractArtifact renders this runtime's contract document at build time: the
 // binding set derived from this solution's api.consumes declaration, and the
-// scope ceiling it may ever ask of each, per profile — the bytes to write
-// beside the interface artifact (InterfaceArtifact).
+// scope ceiling it may ever ask of each, per profile — the bytes to write beside
+// the interface artifact (InterfaceArtifact).
+//
+// It is *not* the document the renderer derives authority from. The renderer
+// reads RendererContractFile under RendererContractSchema, a YAML shape with
+// `{from: <group>/<key>}` slots that a composition resolves per environment
+// (codefly-dev/cli#855); these bytes are this runtime's own document, under this
+// runtime's own schema string, and the renderer does not read them. What they
+// are good for is review and diffing a build: the ceiling an author declared,
+// checked by exactly the rule the boot applies.
 //
 // It takes the declaration rather than a running server, because a render
 // happens where no solution is running, and it resolves no profile for the same
@@ -320,7 +357,7 @@ func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedMod
 		}
 		// Every rule the boot holds a running process to, held here too, per
 		// profile — so a document that would refuse to boot cannot be
-		// published for a renderer to derive authority from.
+		// published at all.
 		if _, err := checkContract(modules, contract, profile); err != nil {
 			return nil, err
 		}
@@ -334,9 +371,12 @@ func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedMod
 }
 
 // artifactBinding is one audience the solution holds a binding for. A
-// ViewerBearer module is reported as one: the renderer derives no authority for
-// it, and a binding missing from the document would read as a module the
-// solution does not consume.
+// ViewerBearer module is reported as one, with the flag set: this solution mints
+// no authority for it, and a binding simply missing from the document would read
+// as a module the solution does not consume. (The renderer's own shape takes the
+// opposite convention — a binding it derives no authority for is one you do not
+// declare, so absence there means "asks for nothing" — which is one more reason
+// these two documents do not share a schema string.)
 type artifactBinding struct {
 	Audience     string `json:"audience"`
 	ViewerBearer bool   `json:"viewerBearer,omitempty"`

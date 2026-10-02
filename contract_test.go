@@ -216,10 +216,16 @@ func TestTheArtifactRefusesWhatTheBootWouldRefuse(t *testing.T) {
 	}
 }
 
-// TestTheContractArtifactIsWhatTheRendererReads: the build-time document
-// carries the binding set and the per-profile ceilings, and no principal — that
-// is a value only the deployment knows.
-func TestTheContractArtifactIsWhatTheRendererReads(t *testing.T) {
+// TestTheContractArtifactCarriesEveryProfileAndNoPrincipal: the build-time
+// document carries the binding set and the per-profile ceilings, and no
+// principal — that is a value only the deployment knows.
+//
+// It was called "…IsWhatTheRendererReads" until cli#855 answered that the
+// renderer reads RendererContractFile instead, in a different shape. The name
+// was the only thing asserting that, and a test name is where a refuted claim
+// survives longest: nothing here ever exercised a renderer, so nothing failed
+// when it stopped being true.
+func TestTheContractArtifactCarriesEveryProfileAndNoPrincipal(t *testing.T) {
 	raw, err := ContractArtifact(testSolutionID, ModuleContract{Ceilings: map[string]map[string][]Scope{
 		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		"staging":    {"things": {{ResourceKind: "things", Actions: []string{"read", "list"}}}},
@@ -243,7 +249,7 @@ func TestTheContractArtifactIsWhatTheRendererReads(t *testing.T) {
 		t.Errorf("artifact bindings = %+v, want the one audience the declaration consumes", document.Bindings)
 	}
 	if _, ok := document.Profiles["staging"]; !ok {
-		t.Error("artifact has no staging profile: a deployed render would have none to read")
+		t.Error("artifact has no staging profile: a deployed process would have none to resolve its ceiling from")
 	}
 	if strings.Contains(string(raw), testPrincipal) {
 		t.Error("the artifact carries a principal: that is a value only the deployment knows")
@@ -275,3 +281,60 @@ func TestAnUnusableProfileNameIsRefused(t *testing.T) {
 }
 
 var _ = manifest.APIConsumesEnvironmentVariable
+
+// TestThisRuntimesContractDoesNotClaimTheRenderersSchema pins a cross-repo fact
+// that is invisible from inside this package.
+//
+// The renderer reads one file — RendererContractFile, YAML, strict-decoded, at
+// the module directory the composition resolved — under
+// RendererContractSchema, in a shape carrying `{from: <group>/<key>}` slots a
+// composition resolves per environment (codefly-dev/cli#855). This runtime
+// publishes a different document, in JSON, keyed by profile, answering what a
+// process holds itself to.
+//
+// Both surfaces of this package once claimed the renderer's schema string for
+// that different shape, which is strictly worse than a mismatch: strict
+// decoding refuses the unknown fields, and because the string matched, the
+// renderer reports a *malformed* module-contract rather than a document meant
+// for someone else — a version skew that is not one, pointing at the wrong
+// owner. Two shapes under one schema string is the one case a reader branching
+// on that string cannot survive.
+//
+// So this test fails if the strings ever converge again, whichever side moves.
+func TestThisRuntimesContractDoesNotClaimTheRenderersSchema(t *testing.T) {
+	if ContractSchema == RendererContractSchema {
+		t.Fatalf("this runtime publishes %q, the schema string the renderer's own document uses: the renderer strict-decodes %s and would report these bytes as a malformed module contract rather than another document",
+			ContractSchema, RendererContractFile)
+	}
+
+	// And it is claimed on both surfaces, so neither can drift back on its own:
+	// the build-time artifact...
+	raw, err := ContractArtifact(testSolutionID, ModuleContract{Ceilings: map[string]map[string][]Scope{
+		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+	}}, ConsumedModule{As: "things", Scopes: []Scope{{ResourceKind: "things", Actions: []string{"read"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact struct{ Schema string }
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Schema != ContractSchema {
+		t.Errorf("the build-time artifact names schema %q, want %q", artifact.Schema, ContractSchema)
+	}
+
+	// ...and the document a running process answers with.
+	server := New(Manifest{ID: testSolutionID}).Consumes(ConsumedModule{
+		As: "things", Scopes: []Scope{{ResourceKind: "things", Actions: []string{"read"}}},
+	}).Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+	}})
+	server.cfg.profile = localProfile
+	effective, err := server.resolveContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective.Schema != ContractSchema {
+		t.Errorf("the served contract names schema %q, want %q", effective.Schema, ContractSchema)
+	}
+}

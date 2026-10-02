@@ -336,10 +336,22 @@ problem, not a module that is briefly unreachable.
 
 ## The published contract
 
-The renderer derives this solution's **authority document** from the contract it
-publishes: which audiences it holds bindings for, and the most authority it may
-ever ask of each. The runtime holds its own declaration to that contract at
-boot.
+A solution **declares** the most authority it may ever ask for: which audiences
+it holds bindings for, and the ceiling on each. The runtime holds its own asks
+to that declaration at boot, and answers it at `/.well-known/module-contract` so
+an operator can read what a process holds itself to.
+
+> **This is not the document the renderer derives authority from.** That is
+> `module.contract.codefly.yaml`, YAML, strict-decoded, read at the module
+> directory the composition resolved, under the schema
+> `codefly/module-contract/v1` — a shape whose audiences are
+> `{from: <group>/<key>}` slots a composition resolves per environment, rather
+> than ceilings keyed by profile (codefly-dev/cli#855). The runtime publishes
+> JSON under its own schema string, `codefly/solution-runtime-contract/v1`, and
+> nothing in this package writes the renderer's file. The two were briefly under
+> one schema string, which is worse than a mismatch: strict decoding refuses the
+> unknown fields, and a matching string makes that read as a *malformed* module
+> contract rather than a document meant for someone else.
 
 ```go
 solution.New(manifest).
@@ -378,20 +390,22 @@ Every one of these is a boot failure naming the value:
 
 | Refused | Because |
 |---|---|
-| no ceiling for a consumed audience | the renderer would derive no authority for a module this solution calls |
-| a ceiling for an audience nothing consumes | the renderer would grant authority for a call that cannot happen |
+| no ceiling for a consumed audience | this runtime would have no declared ceiling to check a mint against, for a module it does call |
+| a ceiling for an audience nothing consumes | the ceiling governs a call that cannot happen, and whoever wrote it believes otherwise |
 | an ask outside its ceiling (action, or resource id) | the ceiling is what a reviewer approved; widening it is an edit, not an inference |
 | an ask across a whole resource kind under a ceiling naming resources | "every document" is not inside "these two documents" |
 | a ceiling on a `ViewerBearer` module | it mints nothing, so the ceiling governs nothing — and whoever wrote it believes it does |
-| no profile at all, for a solution that mints authority | a deployed render would have no profile to read |
+| no profile at all, for a solution that mints authority | a deployed process would have no profile to resolve its ceiling from |
 | a profile name that is not a single path component | profile names select directories wherever one is read |
 
 A running solution publishes the contract of the profile it runs under at
 `/.well-known/module-contract` — the resolved principal, the profile, and each
 binding with its ceiling and the ask inside it. Nothing is pushed: answering
 there makes this solution present to nobody. `ContractArtifact(id, contract,
-modules...)` renders the build-time document the renderer reads, with every
-profile and no principal — that is a value only the deployment knows.
+modules...)` renders the same document at build time, with every profile and no
+principal — that is a value only the deployment knows — checked by exactly the
+rule the boot applies, so a contract that would refuse to boot cannot be
+published. It is for review and for diffing a build, not for the renderer.
 
 ### Where the host reaches the solution
 

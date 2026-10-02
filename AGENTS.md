@@ -104,6 +104,21 @@ on `Server.PassthroughHandler`, the handler `Serve` mounts.
   author declares the ceiling per profile, the boot refuses a declaration that
   exceeds it, and a deployed profile missing from the contract is a refusal
   rather than a silent read of the local one.
+- **The contract this runtime publishes is not the one the renderer reads, and
+  must never claim its schema string.** The renderer reads exactly one file,
+  `module.contract.codefly.yaml` — YAML, strict-decoded, at the module directory
+  the composition resolved — under `codefly/module-contract/v1`, whose audiences
+  are `{from: <group>/<key>}` slots a composition resolves per environment
+  (`codefly-dev/cli#855`); it never reads a running process or a build artifact.
+  This runtime publishes JSON, keyed by profile, under its own
+  `codefly/solution-runtime-contract/v1`, answering what a process holds *itself*
+  to. Both surfaces claimed the renderer's string once, which is worse than a
+  mismatch: strict decoding refuses the unknown fields, and a matching string
+  makes that a *malformed* module contract rather than somebody else's document —
+  a version skew that is not one, pointing at the wrong owner.
+  `TestThisRuntimesContractDoesNotClaimTheRenderersSchema` fails if the two ever
+  converge again. Writing the renderer's file would be a generator in this repo
+  and nothing here does it today.
 - Tests live beside the code in the same package. Every behaviour change brings
   one, and the counterpart it exercises is an `httptest` server, never a real
   host.
