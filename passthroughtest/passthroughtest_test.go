@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	solution "github.com/codefly-dev/solution-runtime-go"
 	"github.com/codefly-dev/solution-runtime-go/passthroughtest"
 	"google.golang.org/genproto/googleapis/api/annotations"
@@ -215,7 +215,7 @@ func TestAUnaryCallIsAnsweredByTheModuleAsTheViewer(t *testing.T) {
 		t.Fatalf("mint = %+v, want the module's audience in the viewer's org and session", mint)
 	}
 	upstream.mu.Lock()
-	presented := upstream.headers[0].Get(codefly.WorkContextHeaderName)
+	presented := upstream.headers[0].Get(workcontext.WorkContextHeaderName)
 	upstream.mu.Unlock()
 	if got := presented; got != mint.Token {
 		t.Fatalf("the module was presented %q, want the minted %q", got, mint.Token)

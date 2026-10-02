@@ -20,6 +20,8 @@
 package passthroughtest
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -32,7 +34,7 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/solution/manifest"
-	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	solution "github.com/codefly-dev/solution-runtime-go"
 )
 
@@ -193,7 +195,7 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	call := Call{Module: as, Method: r.Method, Path: r.URL.Path, Bearer: r.Header.Get("authorization")}
-	if presented := r.Header.Get(codefly.WorkContextHeaderName); presented != "" {
+	if presented := r.Header.Get(workcontext.WorkContextHeaderName); presented != "" {
 		for i := range h.mints {
 			if h.mints[i].Token == presented {
 				mint := h.mints[i]
@@ -257,7 +259,7 @@ func (h *Host) record(mint *Mint, granted bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if granted {
-		mint.Token = fmt.Sprintf("passthroughtest-%d.%s", len(h.mints)+1, mint.Audience)
+		mint.Token = capability(fmt.Sprintf("passthroughtest-%d-%s", len(h.mints)+1, mint.Audience))
 	}
 	h.mints = append(h.mints, *mint)
 }
@@ -332,4 +334,65 @@ func (t viewerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	return t.base.RoundTrip(r)
+}
+
+// capability is a Work-Context-shaped capability a stand-in issuer hands out.
+// It is genuinely signed and genuinely sealed, because the SDK reads the seal
+// out of the token before it will attach one to a request — a capability with
+// no readable installation is refused, so no transport can carry one. The key
+// is this process's, not a real issuer's, and nothing here verifies the
+// signature: what the fixture has to be is well-formed, not trusted.
+//
+// Memoised by seed so a test can recompute the capability it expects to have
+// been presented: the signer stamps a fresh nonce on every token, so signing
+// the same seed twice would otherwise produce two different strings.
+func capability(seed string) string {
+	capabilityMu.Lock()
+	defer capabilityMu.Unlock()
+	if issued, ok := issuedCapabilities[seed]; ok {
+		return issued
+	}
+	token, _, err := capabilitySigner().StartTask(workcontext.StartTaskInput{
+		Audience:           "stand-in",
+		TenantID:           "tenant",
+		OwnerPrincipalID:   "viewer-principal",
+		OwnerPrincipalKind: "user",
+		TaskID:             seed,
+		SessionID:          "session-1",
+		Seal: workcontext.Seal{
+			PrincipalEpoch:       1,
+			InstallationID:       "inst-stand-in",
+			InstallationRevision: 1,
+			BuildIncarnation:     "stand-in-build",
+		},
+		TTL: 10 * time.Minute,
+	})
+	if err != nil {
+		panic("stand-in capability: " + err.Error())
+	}
+	issuedCapabilities[seed] = token.Encoded()
+	return token.Encoded()
+}
+
+var (
+	capabilityMu       sync.Mutex
+	issuedCapabilities = map[string]string{}
+	capabilitySignerV  *workcontext.WorkContextSigner
+)
+
+func capabilitySigner() *workcontext.WorkContextSigner {
+	if capabilitySignerV != nil {
+		return capabilitySignerV
+	}
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	capabilitySignerV, err = workcontext.NewWorkContextSigner(workcontext.WorkContextSignerOptions{
+		Issuer: "stand-in-issuer", KeyID: "stand-in-key", PrivateKey: key,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return capabilitySignerV
 }

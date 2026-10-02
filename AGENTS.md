@@ -3,21 +3,35 @@
 This repository owns the generic Go runtime for **codefly solutions** — modules
 deployed independently of the host they extend, with no build-time coupling. It
 owns what every solution needs identically: configuration resolution through the
-codefly SDK, self-registration with the host frontend and the gateway (the
-credential exchanges and their heartbeats), CORS, Module Federation asset
-serving, the capability handshake, the manifest, and the gateway client a
-handler uses to read composed modules on the viewer's behalf.
+codefly SDK, obtaining this execution's credential once from the projected
+service-account token, a listener that presents the workload's own X.509-SVID,
+CORS, Module Federation asset serving, the capability handshake, the manifest,
+the published authority contract, and the gateway client a handler uses to read
+composed modules on the viewer's behalf.
 
-It owns none of the counterparts it talks to. The registration surfaces and
-their admission rules belong to the host (`codefly-dev/module-saas-starter`) and
-the gateway; endpoint, port and secret resolution to `codefly-dev/sdk-go`;
-workspace and manifest types to `codefly-dev/core`; running a composition and
-provisioning its secrets to `codefly-dev/cli`. Everything here is a library —
-one Go package at the repository root, consumed as the Go module
+**A runtime does not register itself.** Presence is delivered — a signed
+presence document declares which solution runs on which host, and the host
+reconciles towards it — and authority is delivered the same way, bound to one
+approved build. The heartbeat, both self-registrations, the per-beat single-use
+token exchange, the consumed-module registrations and every key that fed them
+are deleted, not fenced; the host's endpoints for them are deleted in the same
+cutover, so a runtime of the previous generation gets 404 and that is the
+intended outcome. Health is answered, never pushed. If you are about to add
+something that tells the host this process exists, you are rebuilding what this
+runtime removed.
+
+It owns none of the counterparts it talks to. The mint endpoint and the
+admission rules belong to the host (`codefly-dev/module-saas-starter`) and the
+gateway; the mint-once client, the authority reader and the TLS reloader to
+`codefly-dev/sdk-go`; endpoint, port and secret resolution to `sdk-go` as well;
+workspace, manifest and presence/authority document types to `codefly-dev/core`;
+running a composition, provisioning its secrets and rendering the authority
+document to `codefly-dev/cli`. Everything here is a library — one Go package at
+the repository root, consumed as the Go module
 `github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag, plus
-`passthroughtest`, the test seam a consumer runs the root package's
-passthrough under against a fake host. It holds no runtime behaviour of its
-own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
+`passthroughtest`, the test seam a consumer runs the root package's passthrough
+under against a fake host. It holds no runtime behaviour of its own: it builds
+on `Server.PassthroughHandler`, the handler `Serve` mounts.
 
 ## Boundaries
 
@@ -33,21 +47,42 @@ own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
 - Boot configuration is resolved in one place, `loadConfig`, and checked in one
   place, `validate()`: resolved through the SDK, with an explicit env override,
   refused loudly when unresolved. New configuration follows both rather than
-  reading the environment where it is used.
-- The exception is the consumed-API projection, read at serve time in
-  `registerConsumedAPIs` and never seen by `validate()`. A malformed one is not
-  refused: the runtime logs that the federation is disabled and serves on, so
-  every consumed facade 404s at the gateway while the solution looks healthy.
-  Anything you add on that path inherits that property — it degrades silently
-  unless you make it loud, and a log line is the only signal there is. Both
-  halves of this bullet are pinned by `environment_boundary_test.go`, so a
-  second exception fails the suite until this file describes it.
+  reading the environment where it is used. **There is no exception.** There used
+  to be one — the consumed-API projection was read at serve time to register each
+  consumed module's upstream, and a malformed one disabled the whole federation
+  with a log line while the solution served on — and it went with the
+  registrations. Every environment read now sits in `loadConfig`'s call tree,
+  which `environment_boundary_test.go` pins: a new read outside it fails the
+  suite until this file describes the exception.
+- The authority-bearing values are a narrower case still: the principal, the
+  mint audience and the projected token's own audience are read **once**, through
+  the SDK's authority reader, and frozen. The credential this process holds is
+  sealed to the values it was minted under, so a value that resolves differently
+  later is an error and never a reload — the reader rechecks them before every
+  renewal, which is the one moment a drifted value would otherwise be laundered
+  into a credential nobody approved. Do not add an ordinary accessor for one of
+  those three.
 - Validate at the boundary — boot, and the headers a request arrives with — not
   between internal callers. `validate()` is the model: each refusal names the
   variable or the provisioning path that fixes it.
-- A registration that cannot attest which publisher it speaks for is not a
-  registration. There is no fallback to the shared cluster-internal token and no
-  downgrade path when an exchange answers `404`.
+- The listener presents this workload's own identity and there is no plain-HTTP
+  listener. A configuration that cannot produce one is refused at boot naming the
+  material, because a solution serving plain HTTP is refused at the edge instead,
+  for a reason only the edge can see. Where the identity comes from is the
+  platform's: `IdentitySource` is the hook, and the default reads the pair the
+  platform projects through the SDK's reloader.
+- The credential is obtained **once**, before the listener exists, and a failure
+  to obtain it fails the boot with no retry. A refusal is the host saying this
+  build is not the one its presence document approved, which no number of
+  attempts changes; an unreachable mint leaves this process with no authority to
+  serve with. A loop around either is the audited-mint cost this runtime was
+  changed to remove.
+- The published contract is **declared, not derived**. A scope ceiling computed
+  from what the code asks for would be satisfied by construction — a method that
+  asked for one more action would widen the ceiling meant to refuse it — so the
+  author declares the ceiling per profile, the boot refuses a declaration that
+  exceeds it, and a deployed profile missing from the contract is a refusal
+  rather than a silent read of the local one.
 - Tests live beside the code in the same package. Every behaviour change brings
   one, and the counterpart it exercises is an `httptest` server, never a real
   host.
@@ -126,8 +161,11 @@ test -z "$(gofmt -l .)"
 Go comes from `go.mod` (1.27). Nothing else is needed: no Docker, no
 credentials, no running composition.
 
-- The suite takes ~20s, most of it two heartbeat tests that wait on real wall
-  time (10s and 5s). That is not a hang.
+- The suite is fast (a few seconds) and hermetic: the host's mint, its gateway
+  and accounts are all `httptest` servers on `127.0.0.1`, and the workload
+  identity is a key pair the test generates into a temp directory. The two
+  heartbeat tests that waited on 10s and 5s of real wall time are gone with the
+  heartbeat.
 - The formatting gate runs over the whole tree (`gofmt -l .`), so a package
   added in a subdirectory is format-checked as well as vetted and tested.
 - Dependency pins are how fixes from `core` and `sdk-go` reach consumers:
@@ -145,13 +183,15 @@ credentials, no running composition.
 Keep this file short; add depth to the file that owns the subject.
 
 - [README.md](README.md) — the consumer-facing contract: handler errors, the
-  full configuration and env-override table, self-registration and its
-  provisioning, consumed-module federation, and reading a
-  Work-Context-authenticated module.
-- The package doc comment and the comments in [`solution.go`](solution.go) —
-  why a refusal, a backoff cap or a cache lifetime is what it is. Several
-  record a failure mode that is not obvious from the code; read the one next to
-  what you are changing before you change it.
+  full configuration and env-override table, the workload identity and the one
+  mint, the published contract, consumed-module federation, and reading a
+  Work-Context-authenticated module. It also carries the migration note: an old
+  runtime against a new host gets 404, and nothing bridges the two.
+- The package doc comment and the comments in [`solution.go`](solution.go),
+  [`credential.go`](credential.go), [`identity.go`](identity.go) and
+  [`contract.go`](contract.go) — why a refusal, a renewal point or a cache
+  lifetime is what it is. Several record a failure mode that is not obvious from
+  the code; read the one next to what you are changing before you change it.
 - `.claude/skills/` — procedures an agent repeats, loaded only when relevant.
   None exist yet, because nothing here repeats beyond the four commands above.
   Add one instead of growing this file.

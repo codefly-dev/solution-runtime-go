@@ -14,6 +14,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/solution/manifest"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -450,7 +451,7 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 // this method (or the bearer alone, for a ViewerBearer module), and the
 // declared pin merged into the request.
 func (s *Server) authorize(ctx context.Context, route passthroughRoute, header http.Header, msg *dynamicpb.Message) (*Gateway, error) {
-	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
+	gw := s.gatewayFor(header)
 	if !route.module.ViewerBearer {
 		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)
 		if err != nil {
@@ -532,6 +533,14 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
+	case errors.Is(err, workcontext.ErrWorkContextInvalid):
+		// A capability this solution could not present is this solution's
+		// problem, not a module that is briefly unreachable. Reported as the
+		// unavailable fallthrough below it would be retried — by the page, by a
+		// client's own policy — against a credential that will be exactly as
+		// invalid next time, and the one signal that the issuer handed back
+		// something unusable would be spent on a retry loop.
+		return connect.NewError(connect.CodeInternal, errors.New("this solution could not present a usable credential for the module"))
 	}
 	return connect.NewError(connect.CodeUnavailable, errors.New("the module call failed"))
 }

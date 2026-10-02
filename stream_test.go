@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
@@ -60,7 +60,7 @@ func newStreamGateway(t *testing.T) *streamGateway {
 			g.mints = append(g.mints, mint)
 			g.mu.Unlock()
 			writeJSON(w, http.StatusOK, map[string]any{
-				"token": "context-" + mint.Audience + ".1", "orgId": mint.OrgID,
+				"token": capability("context-" + mint.Audience + ".1"), "orgId": mint.OrgID,
 				"ownerPrincipalId": "viewer", "currentActorPrincipalId": "viewer",
 				"expiresAt": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
 			})
@@ -166,7 +166,7 @@ func TestPassthroughStreamsEachMessageMaskedAsTheViewer(t *testing.T) {
 	if len(gw.watches) != 1 || gw.watches[0].Method != http.MethodGet || gw.watches[0].URL.Path != "/v1/things/e1/watch" {
 		t.Fatalf("module calls = %v", gw.watches)
 	}
-	if gw.watches[0].Header.Get(codefly.WorkContextHeaderName) != "context-things.1" || !strings.Contains(gw.watches[0].Header.Get("accept"), "application/x-ndjson") {
+	if gw.watches[0].Header.Get(workcontext.WorkContextHeaderName) != capability("context-things.1") || !strings.Contains(gw.watches[0].Header.Get("accept"), "application/x-ndjson") {
 		t.Fatalf("headers = %v", gw.watches[0].Header)
 	}
 	if len(gw.mints) != 1 || mintedActions(gw.mints[0]) != "things:watch" {
@@ -192,7 +192,7 @@ func TestPassthroughStreamForwardsOnlyTheBearerForAModuleThatAuthenticatesTheVie
 	if err := stream.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(gw.mints) != 0 || gw.watches[0].Header.Get(codefly.WorkContextHeaderName) != "" || gw.watches[0].Header.Get("authorization") != "Bearer viewer" {
+	if len(gw.mints) != 0 || gw.watches[0].Header.Get(workcontext.WorkContextHeaderName) != "" || gw.watches[0].Header.Get("authorization") != "Bearer viewer" {
 		t.Fatalf("want the viewer's bearer and no capability: mints %d, headers %v", len(gw.mints), gw.watches[0].Header)
 	}
 }

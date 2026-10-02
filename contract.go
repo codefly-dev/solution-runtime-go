@@ -1,0 +1,301 @@
+package solution
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/codefly-dev/core/resources"
+)
+
+// ContractSchema is the version of the contract document this runtime
+// publishes. A reader branches on it rather than on the presence of a field, so
+// a later shape is a new version and never a stricter reading of these bytes.
+const ContractSchema = "codefly/module-contract/v1"
+
+// ContractPath is where a running solution publishes its effective contract.
+//
+// Published, not announced: nothing is pushed anywhere, and answering here
+// makes this solution present to nobody. It is the same document the build-time
+// artifact carries (ContractArtifact), narrowed to the one profile this process
+// actually runs under, so an operator can read what a process holds itself to
+// without inferring it from the renderer's inputs.
+const ContractPath = "/.well-known/module-contract"
+
+// ModuleContract is the authority contract a solution publishes: the ceiling a
+// renderer derives this solution's authority document from, and the ceiling
+// this runtime holds its own declaration to at boot.
+//
+// It is declared, never derived from what the code happens to ask for. A
+// ceiling computed from the declaration would be satisfied by construction: a
+// method that asked for one more action would widen the ceiling that was
+// supposed to refuse it, and a reviewer approving the contract would be
+// approving whatever the next commit asks for. So the author declares the
+// ceiling, the runtime refuses a declaration that exceeds it, and the two
+// disagreeing is a boot failure naming the scope.
+//
+// What *is* derived is the binding set: the audiences are the `as` of the
+// solution's api.consumes entries, which Codefly projects and the passthrough
+// declaration is already checked against. Restating them here would be a second
+// source for one fact.
+type ModuleContract struct {
+	// Ceilings is the most authority this solution may ever ask a consumed
+	// module for, keyed by configuration profile and then by the audience it is
+	// asked of (the `as` of that module's api.consumes entry). Every audience
+	// the solution mints authority for needs a ceiling in the profile this
+	// process runs under, and every scope the declaration asks for must fall
+	// inside it.
+	//
+	// The profile key is why this is a map of maps rather than one table. A
+	// deployment and a developer machine do not grant the same authority, and a
+	// deployed environment reads its own profile — "staging", say — never the
+	// local one. That distinction is recent: a deployed environment used to
+	// render under the local profile (codefly-dev/core#687, closed in core
+	// v0.7.1), which is exactly the mistake this keying makes impossible. A
+	// contract that declares only "local" is refused in a deployment rather
+	// than read as if the deployment were somebody's laptop.
+	Ceilings map[string]map[string][]Scope
+}
+
+// Contract declares the authority contract this solution publishes. Chainable.
+//
+// Not to be confused with Manifest.Contract, which is the capability contract
+// id the host's handshake reads. This one is about authority: which audiences
+// this solution holds bindings for, and how much it may ever ask of each.
+func (s *Server) Contract(contract ModuleContract) *Server {
+	s.declaredContract = contract
+	return s
+}
+
+// effectiveContract is the contract of the one profile this process runs under:
+// what it publishes, and what its declaration was held to at boot.
+type effectiveContract struct {
+	Schema    string            `json:"schema"`
+	Solution  string            `json:"solution"`
+	Profile   string            `json:"profile"`
+	Principal string            `json:"principal"`
+	Bindings  []contractBinding `json:"bindings"`
+}
+
+// contractBinding is one audience this solution holds authority for, and the
+// ceiling it holds it within.
+type contractBinding struct {
+	Audience string  `json:"audience"`
+	Ceiling  []Scope `json:"ceiling"`
+	// Asked is what the declaration actually asks for inside that ceiling —
+	// the authority a reviewer is approving rather than the authority the
+	// ceiling would allow a later commit to ask for.
+	Asked []Scope `json:"asked"`
+}
+
+// resolveContract is the contract this process publishes, refused rather than
+// guessed. Every refusal names the value that is missing or the scope that
+// exceeds its ceiling, because the fix for each is a different edit in a
+// different file: a missing profile is a contract change, a scope outside its
+// ceiling is either a declaration change or a ceiling the reviewer has to widen
+// deliberately.
+func (s *Server) resolveContract() (effectiveContract, error) {
+	contract := effectiveContract{
+		Schema:   ContractSchema,
+		Solution: s.manifest.ID,
+		Profile:  s.cfg.profile,
+	}
+	// The principal is not declared here: it is one of the authority-bearing
+	// values the platform provisioned and this process froze at boot, so the
+	// contract reports who this workload actually is rather than who its author
+	// believed it would be. A contract that restated it would be a second
+	// source for one fact, and the one that disagreed would be this one.
+	contract.Principal = s.principal
+
+	ceilings, declared := s.declaredContract.Ceilings[s.cfg.profile]
+	if !declared && mintsAuthority(s.consumed) {
+		return contract, fmt.Errorf("the published contract declares no %q profile (it declares: %s): a deployed environment reads its own profile and never the local one, so declare this one — or set %s if this process runs under another",
+			s.cfg.profile, declaredProfiles(s.declaredContract), ContractProfileEnvironmentVariable)
+	}
+	for _, module := range s.consumed {
+		ceiling, declared := ceilings[module.As]
+		if module.ViewerBearer {
+			// A ViewerBearer module is called with the viewer's bearer and no
+			// minted capability, so there is no authority to cap — and a
+			// ceiling declared for one would describe authority nothing asks
+			// for. Refused rather than ignored: a reviewer who wrote it down
+			// believes it governs something.
+			if declared {
+				return contract, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, but that module is declared ViewerBearer: it mints no authority, so the ceiling governs nothing",
+					module.As, s.cfg.profile)
+			}
+			contract.Bindings = append(contract.Bindings, contractBinding{Audience: module.As})
+			continue
+		}
+		if !declared {
+			return contract, fmt.Errorf("the published contract declares no scope ceiling for %q in the %q profile: every consumed module this solution mints authority for needs one, and the renderer derives this solution's authority from it",
+				module.As, s.cfg.profile)
+		}
+		if err := checkScopes(ceiling); err != nil {
+			return contract, fmt.Errorf("the scope ceiling for %q in the %q profile is unusable: %w", module.As, s.cfg.profile, err)
+		}
+		asked := askedScopes(module)
+		for _, scope := range asked {
+			if err := withinCeiling(scope, ceiling); err != nil {
+				return contract, fmt.Errorf("this solution asks %q for authority outside the ceiling its contract publishes for the %q profile: %w",
+					module.As, s.cfg.profile, err)
+			}
+		}
+		contract.Bindings = append(contract.Bindings, contractBinding{Audience: module.As, Ceiling: ceiling, Asked: asked})
+	}
+	// A ceiling for an audience this solution does not consume is authority
+	// nobody can ask for, and the renderer would grant it: the solution's
+	// api.consumes is the binding set, so a name that is not in it is either a
+	// typo or a grant that outlives the consumption it was written for.
+	for audience := range ceilings {
+		if !slices.ContainsFunc(s.consumed, func(m ConsumedModule) bool { return m.As == audience }) {
+			return contract, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, which this solution does not consume: the renderer would derive authority for an audience nothing calls",
+				audience, s.cfg.profile)
+		}
+	}
+	sort.Slice(contract.Bindings, func(i, j int) bool { return contract.Bindings[i].Audience < contract.Bindings[j].Audience })
+	return contract, nil
+}
+
+// declaredProfiles lists the profiles a contract does declare, so a refusal
+// naming the missing one also says which ones exist — the difference between
+// "add staging" and "the profile name is not what you think it is".
+func declaredProfiles(contract ModuleContract) string {
+	if len(contract.Ceilings) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(contract.Ceilings))
+	for name := range contract.Ceilings {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// mintsAuthority reports whether any consumed module has authority to cap. A
+// solution whose every module is ViewerBearer mints nothing, and a solution
+// that consumes none mints nothing either: requiring a profile from them would
+// be requiring a declaration about authority that does not exist.
+func mintsAuthority(modules []ConsumedModule) bool {
+	return slices.ContainsFunc(modules, func(m ConsumedModule) bool { return !m.ViewerBearer })
+}
+
+// askedScopes is every scope this solution's declaration asks of one module:
+// the module's own, plus each method's override. The union is what the ceiling
+// is checked against, because a per-method scope replaces the module's rather
+// than narrowing it, so the widest ask is not the module-level one.
+func askedScopes(module ConsumedModule) []Scope {
+	asked := append([]Scope{}, module.Scopes...)
+	for _, method := range module.Methods {
+		asked = append(asked, method.Scopes...)
+	}
+	return asked
+}
+
+// withinCeiling reports whether one asked scope falls inside a ceiling: some
+// ceiling entry must cover its resource kind, every action it asks for, and —
+// when the ceiling names resource ids — every id it names.
+//
+// A ceiling entry with no resource ids covers the whole resource kind, which is
+// how Scope itself reads an empty ResourceIDs. An ask with no ids against a
+// ceiling that names some is therefore refused: "every document" is not inside
+// "these two documents", and silently reading it as the narrower ask would mint
+// authority the declaration did not write.
+func withinCeiling(asked Scope, ceiling []Scope) error {
+	for _, allowed := range ceiling {
+		if allowed.ResourceKind != asked.ResourceKind {
+			continue
+		}
+		for _, action := range asked.Actions {
+			if !slices.Contains(allowed.Actions, action) {
+				return fmt.Errorf("action %q on %q is not in the ceiling (which allows: %s)",
+					action, asked.ResourceKind, strings.Join(allowed.Actions, ", "))
+			}
+		}
+		if len(allowed.ResourceIDs) == 0 {
+			return nil
+		}
+		if len(asked.ResourceIDs) == 0 {
+			return fmt.Errorf("%q is asked for across the whole resource kind, but the ceiling names only these resources: %s",
+				asked.ResourceKind, strings.Join(allowed.ResourceIDs, ", "))
+		}
+		for _, id := range asked.ResourceIDs {
+			if !slices.Contains(allowed.ResourceIDs, id) {
+				return fmt.Errorf("resource %q of %q is not in the ceiling (which names: %s)",
+					id, asked.ResourceKind, strings.Join(allowed.ResourceIDs, ", "))
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("the ceiling names no resource kind %q at all", asked.ResourceKind)
+}
+
+func (s *Server) handleContract(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.contract)
+}
+
+// ContractArtifact renders the contract a renderer reads at build time: the
+// binding set derived from this solution's api.consumes declaration, and the
+// scope ceiling it may ever ask of each, per profile — the bytes to write
+// beside the interface artifact (InterfaceArtifact).
+//
+// It takes the declaration rather than a running server, because a render
+// happens where no solution is running, and it resolves no profile for the same
+// reason: which profile applies is the renderer's to decide, and a build-time
+// document that had already chosen one would be a document that is true in one
+// environment.
+//
+// It carries no principal. The principal is an authority-bearing value the
+// platform provisions and the running process freezes at boot
+// (AuthorityGroup/PRINCIPAL); a build-time document that named one would be
+// asserting at render time what only the deployment knows.
+func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedModule) ([]byte, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("a contract artifact names no solution: pass the manifest id")
+	}
+	document := struct {
+		Schema   string                        `json:"schema"`
+		Solution string                        `json:"solution"`
+		Bindings []artifactBinding             `json:"bindings"`
+		Profiles map[string]map[string][]Scope `json:"profiles"`
+	}{Schema: ContractSchema, Solution: id, Profiles: map[string]map[string][]Scope{}}
+
+	for _, module := range modules {
+		document.Bindings = append(document.Bindings, artifactBinding{Audience: module.As, ViewerBearer: module.ViewerBearer})
+	}
+	sort.Slice(document.Bindings, func(i, j int) bool { return document.Bindings[i].Audience < document.Bindings[j].Audience })
+
+	for profile, ceilings := range contract.Ceilings {
+		if err := resources.ValidateConfigurationProfileName(profile); err != nil {
+			return nil, fmt.Errorf("the contract declares an unusable profile name: %w", err)
+		}
+		for audience, ceiling := range ceilings {
+			if err := checkScopes(ceiling); err != nil {
+				return nil, fmt.Errorf("the scope ceiling for %q in the %q profile is unusable: %w", audience, profile, err)
+			}
+		}
+		document.Profiles[profile] = ceilings
+	}
+	if mintsAuthority(modules) && len(document.Profiles) == 0 {
+		return nil, fmt.Errorf("the contract declares no profile at all, and this solution mints authority for %d consumed module(s): declare the scope ceilings per profile, a deployed one beside %q",
+			len(modules), localProfile)
+	}
+	return json.MarshalIndent(document, "", "  ")
+}
+
+// artifactBinding is one audience the solution holds a binding for. A
+// ViewerBearer module is reported as one: the renderer derives no authority for
+// it, and a binding missing from the document would read as a module the
+// solution does not consume.
+type artifactBinding struct {
+	Audience     string `json:"audience"`
+	ViewerBearer bool   `json:"viewerBearer,omitempty"`
+}
+
+// localProfile is the profile a local run resolves to: the local environment's
+// own name, which is what Core uses for an environment that declares no profile
+// of its own.
+const localProfile = "local"

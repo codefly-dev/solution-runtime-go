@@ -11,63 +11,53 @@ import (
 	"testing"
 )
 
-// serveTimeEnvironmentRead is the one function that reads the environment
-// outside boot resolution: the consumed-API projection is parsed when the
-// server starts, never reaches validate(), and a malformed value disables the
-// federation with a log line instead of refusing the boot.
-const serveTimeEnvironmentRead = "registerConsumedAPIs"
-
 // AGENTS.md tells an agent that configuration is resolved in one place and
-// refused at boot, naming the single serve-time exception and the silent
-// failure it produces. Prose cannot notice a second exception appearing
-// underneath it, and an agent-context file is followed literally, so the claim
-// is pinned here: every environment read must sit in loadConfig's call tree,
-// where validate() governs the result, or be the documented exception.
+// refused at boot, with no exception. Prose cannot notice an exception
+// appearing underneath it, and an agent-context file is followed literally, so
+// the claim is pinned here: every environment read must sit in loadConfig's
+// call tree, where validate() governs the result.
+//
+// There used to be one exception, and deleting it is part of this runtime
+// ceasing to register itself. registerConsumedAPIs read the api.consumes
+// projection at serve time to register each consumed module's upstream with
+// the gateway; a malformed projection disabled the whole federation with a log
+// line while the solution served on, so every consumed facade 404'd at the
+// gateway and the solution looked healthy. Nothing registers now — the routes
+// are delivered — and the projection is resolved at boot like everything else,
+// so the refusal is a refusal and not a log line.
 func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 	pkg := parsePackage(t)
 	boot := pkg.reachableFrom("loadConfig")
 
 	var undocumented []string
 	for _, fn := range pkg.environmentReaders() {
-		if !boot[fn] && fn != serveTimeEnvironmentRead {
+		if !boot[fn] {
 			undocumented = append(undocumented, fn)
 		}
 	}
 	if len(undocumented) > 0 {
 		t.Errorf("these functions read the environment outside loadConfig's call tree: %s\n"+
-			"AGENTS.md states that boot configuration is resolved in loadConfig and refused by validate(), with %q as the only exception. "+
+			"AGENTS.md states that boot configuration is resolved in loadConfig and refused by validate(), with no exception. "+
 			"Either resolve the value in loadConfig, or document the new exception in AGENTS.md — a value read after boot is never refused, it degrades while the solution serves.",
-			strings.Join(undocumented, ", "), serveTimeEnvironmentRead)
+			strings.Join(undocumented, ", "))
 	}
 }
 
-// The documented exception has to keep being one. If it stops reading the
-// environment, or starts being called during boot resolution, AGENTS.md
-// describes a hazard that no longer exists where it says it does.
-func TestServeTimeEnvironmentReadIsStillTheException(t *testing.T) {
-	pkg := parsePackage(t)
-
-	reads := false
-	for _, fn := range pkg.environmentReaders() {
-		if fn == serveTimeEnvironmentRead {
-			reads = true
-		}
-	}
-	if !reads {
-		t.Errorf("%s no longer reads the environment, so AGENTS.md documents an exception that does not exist: remove it there and here",
-			serveTimeEnvironmentRead)
-	}
-	if pkg.reachableFrom("loadConfig")[serveTimeEnvironmentRead] {
-		t.Errorf("%s is now reachable from loadConfig, so its value is resolved at boot: AGENTS.md describes it as read at serve time and unseen by validate()",
-			serveTimeEnvironmentRead)
-	}
-
+// AGENTS.md has to keep saying so. A file that stopped describing the boundary
+// would leave the next agent to infer it from whichever call site they opened
+// first, which is how the serve-time exception came to exist.
+func TestTheEnvironmentBoundaryIsDocumented(t *testing.T) {
 	agents, err := os.ReadFile("AGENTS.md")
 	if err != nil {
 		t.Fatalf("read AGENTS.md: %v", err)
 	}
-	if !strings.Contains(string(agents), serveTimeEnvironmentRead) {
-		t.Errorf("AGENTS.md does not name %q, the one configuration read that is not refused at boot", serveTimeEnvironmentRead)
+	for _, claim := range []string{"loadConfig", "validate()"} {
+		if !strings.Contains(string(agents), claim) {
+			t.Errorf("AGENTS.md does not name %q, half of where configuration is resolved and refused", claim)
+		}
+	}
+	if strings.Contains(string(agents), "registerConsumedAPIs") {
+		t.Error("AGENTS.md still names registerConsumedAPIs, the serve-time exception this runtime deleted along with its registrations")
 	}
 }
 
