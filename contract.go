@@ -102,20 +102,39 @@ func (s *Server) resolveContract() (effectiveContract, error) {
 		Schema:   ContractSchema,
 		Solution: s.manifest.ID,
 		Profile:  s.cfg.profile,
+		// The principal is not declared here: it is one of the
+		// authority-bearing values the platform provisioned and this process
+		// froze at boot, so the contract reports who this workload actually is
+		// rather than who its author believed it would be. A contract that
+		// restated it would be a second source for one fact, and the one that
+		// disagreed would be this one.
+		Principal: s.principal,
 	}
-	// The principal is not declared here: it is one of the authority-bearing
-	// values the platform provisioned and this process froze at boot, so the
-	// contract reports who this workload actually is rather than who its author
-	// believed it would be. A contract that restated it would be a second
-	// source for one fact, and the one that disagreed would be this one.
-	contract.Principal = s.principal
+	bindings, err := checkContract(s.consumed, s.declaredContract, s.cfg.profile)
+	if err != nil {
+		return contract, err
+	}
+	contract.Bindings = bindings
+	return contract, nil
+}
 
-	ceilings, declared := s.declaredContract.Ceilings[s.cfg.profile]
-	if !declared && mintsAuthority(s.consumed) {
-		return contract, fmt.Errorf("the published contract declares no %q profile (it declares: %s): a deployed environment reads its own profile and never the local one, so declare this one — or set %s if this process runs under another",
-			s.cfg.profile, declaredProfiles(s.declaredContract), ContractProfileEnvironmentVariable)
+// checkContract is the whole of the contract's substantive rules, for one
+// profile, and it returns the bindings that profile publishes.
+//
+// One function, called by the boot *and* by the artifact a renderer reads. They
+// used to be separate, and the artifact checked only profile names and scope
+// syntax: a declaration consuming `things` could publish an artifact whose only
+// ceiling was `ghost`, and the artifact is the document authority is derived
+// from. A rule enforced on the running process and not on the published
+// document is a rule that governs the half nobody reads.
+func checkContract(modules []ConsumedModule, contract ModuleContract, profile string) ([]contractBinding, error) {
+	ceilings, declared := contract.Ceilings[profile]
+	if !declared && mintsAuthority(modules) {
+		return nil, fmt.Errorf("the published contract declares no %q profile (it declares: %s): a deployed environment reads its own profile and never the local one, so declare this one — or set %s if this process runs under another",
+			profile, declaredProfiles(contract), ContractProfileEnvironmentVariable)
 	}
-	for _, module := range s.consumed {
+	var bindings []contractBinding
+	for _, module := range modules {
 		ceiling, declared := ceilings[module.As]
 		if module.ViewerBearer {
 			// A ViewerBearer module is called with the viewer's bearer and no
@@ -124,40 +143,40 @@ func (s *Server) resolveContract() (effectiveContract, error) {
 			// for. Refused rather than ignored: a reviewer who wrote it down
 			// believes it governs something.
 			if declared {
-				return contract, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, but that module is declared ViewerBearer: it mints no authority, so the ceiling governs nothing",
-					module.As, s.cfg.profile)
+				return nil, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, but that module is declared ViewerBearer: it mints no authority, so the ceiling governs nothing",
+					module.As, profile)
 			}
-			contract.Bindings = append(contract.Bindings, contractBinding{Audience: module.As})
+			bindings = append(bindings, contractBinding{Audience: module.As})
 			continue
 		}
 		if !declared {
-			return contract, fmt.Errorf("the published contract declares no scope ceiling for %q in the %q profile: every consumed module this solution mints authority for needs one, and the renderer derives this solution's authority from it",
-				module.As, s.cfg.profile)
+			return nil, fmt.Errorf("the published contract declares no scope ceiling for %q in the %q profile: every consumed module this solution mints authority for needs one, and the renderer derives this solution's authority from it",
+				module.As, profile)
 		}
 		if err := checkScopes(ceiling); err != nil {
-			return contract, fmt.Errorf("the scope ceiling for %q in the %q profile is unusable: %w", module.As, s.cfg.profile, err)
+			return nil, fmt.Errorf("the scope ceiling for %q in the %q profile is unusable: %w", module.As, profile, err)
 		}
 		asked := askedScopes(module)
 		for _, scope := range asked {
 			if err := withinCeiling(scope, ceiling); err != nil {
-				return contract, fmt.Errorf("this solution asks %q for authority outside the ceiling its contract publishes for the %q profile: %w",
-					module.As, s.cfg.profile, err)
+				return nil, fmt.Errorf("this solution asks %q for authority outside the ceiling its contract publishes for the %q profile: %w",
+					module.As, profile, err)
 			}
 		}
-		contract.Bindings = append(contract.Bindings, contractBinding{Audience: module.As, Ceiling: ceiling, Asked: asked})
+		bindings = append(bindings, contractBinding{Audience: module.As, Ceiling: ceiling, Asked: asked})
 	}
 	// A ceiling for an audience this solution does not consume is authority
 	// nobody can ask for, and the renderer would grant it: the solution's
 	// api.consumes is the binding set, so a name that is not in it is either a
 	// typo or a grant that outlives the consumption it was written for.
 	for audience := range ceilings {
-		if !slices.ContainsFunc(s.consumed, func(m ConsumedModule) bool { return m.As == audience }) {
-			return contract, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, which this solution does not consume: the renderer would derive authority for an audience nothing calls",
-				audience, s.cfg.profile)
+		if !slices.ContainsFunc(modules, func(m ConsumedModule) bool { return m.As == audience }) {
+			return nil, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, which this solution does not consume: the renderer would derive authority for an audience nothing calls",
+				audience, profile)
 		}
 	}
-	sort.Slice(contract.Bindings, func(i, j int) bool { return contract.Bindings[i].Audience < contract.Bindings[j].Audience })
-	return contract, nil
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Audience < bindings[j].Audience })
+	return bindings, nil
 }
 
 // declaredProfiles lists the profiles a contract does declare, so a refusal
@@ -196,41 +215,68 @@ func askedScopes(module ConsumedModule) []Scope {
 }
 
 // withinCeiling reports whether one asked scope falls inside a ceiling: some
-// ceiling entry must cover its resource kind, every action it asks for, and —
-// when the ceiling names resource ids — every id it names.
+// one entry of the ceiling must cover its resource kind, every action it asks
+// for, and — when that entry names resource ids — every id it names.
 //
-// A ceiling entry with no resource ids covers the whole resource kind, which is
-// how Scope itself reads an empty ResourceIDs. An ask with no ids against a
-// ceiling that names some is therefore refused: "every document" is not inside
+// Every entry of that kind is examined before anything is refused. It used to
+// return the first matching kind's verdict, which made the answer depend on the
+// order the ceiling was written in: with `things/read/{a}` and
+// `things/read/{b}` declared in that order, an ask for `b` was refused against
+// the first entry and the second was never read. A ceiling is a set, and a
+// reviewer who writes one does not also choose a traversal order.
+//
+// Coverage has to come from a single entry rather than from the union of
+// several. Two entries that each cover half an ask describe two grants, and
+// treating their union as one would let a ceiling of "read on a" plus "list on
+// b" authorize "read and list on a and b" — authority nobody declared.
+//
+// An entry with no resource ids covers the whole resource kind, which is how
+// Scope itself reads an empty ResourceIDs. An ask with no ids against entries
+// that all name some is therefore refused: "every document" is not inside
 // "these two documents", and silently reading it as the narrower ask would mint
 // authority the declaration did not write.
 func withinCeiling(asked Scope, ceiling []Scope) error {
+	var reasons []string
+	kindNamed := false
 	for _, allowed := range ceiling {
 		if allowed.ResourceKind != asked.ResourceKind {
 			continue
 		}
-		for _, action := range asked.Actions {
-			if !slices.Contains(allowed.Actions, action) {
-				return fmt.Errorf("action %q on %q is not in the ceiling (which allows: %s)",
-					action, asked.ResourceKind, strings.Join(allowed.Actions, ", "))
-			}
-		}
-		if len(allowed.ResourceIDs) == 0 {
-			return nil
-		}
-		if len(asked.ResourceIDs) == 0 {
-			return fmt.Errorf("%q is asked for across the whole resource kind, but the ceiling names only these resources: %s",
-				asked.ResourceKind, strings.Join(allowed.ResourceIDs, ", "))
-		}
-		for _, id := range asked.ResourceIDs {
-			if !slices.Contains(allowed.ResourceIDs, id) {
-				return fmt.Errorf("resource %q of %q is not in the ceiling (which names: %s)",
-					id, asked.ResourceKind, strings.Join(allowed.ResourceIDs, ", "))
-			}
+		kindNamed = true
+		if reason := coveredBy(asked, allowed); reason != "" {
+			reasons = append(reasons, reason)
+			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("the ceiling names no resource kind %q at all", asked.ResourceKind)
+	if !kindNamed {
+		return fmt.Errorf("the ceiling names no resource kind %q at all", asked.ResourceKind)
+	}
+	// Every entry of that kind was read and none covers the ask. The reasons
+	// are reported together, because "which of the three entries did you mean"
+	// is the first question a reader has.
+	return fmt.Errorf("no single ceiling entry for %q covers it: %s", asked.ResourceKind, strings.Join(reasons, "; "))
+}
+
+// coveredBy is why one ceiling entry does not cover an ask, or "" when it does.
+func coveredBy(asked, allowed Scope) string {
+	for _, action := range asked.Actions {
+		if !slices.Contains(allowed.Actions, action) {
+			return fmt.Sprintf("the entry allowing [%s] does not allow %q", strings.Join(allowed.Actions, ", "), action)
+		}
+	}
+	if len(allowed.ResourceIDs) == 0 {
+		return ""
+	}
+	if len(asked.ResourceIDs) == 0 {
+		return fmt.Sprintf("the entry names only the resources [%s], and the ask covers the whole resource kind", strings.Join(allowed.ResourceIDs, ", "))
+	}
+	for _, id := range asked.ResourceIDs {
+		if !slices.Contains(allowed.ResourceIDs, id) {
+			return fmt.Sprintf("the entry naming [%s] does not name %q", strings.Join(allowed.ResourceIDs, ", "), id)
+		}
+	}
+	return ""
 }
 
 func (s *Server) handleContract(w http.ResponseWriter, _ *http.Request) {
@@ -272,10 +318,11 @@ func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedMod
 		if err := resources.ValidateConfigurationProfileName(profile); err != nil {
 			return nil, fmt.Errorf("the contract declares an unusable profile name: %w", err)
 		}
-		for audience, ceiling := range ceilings {
-			if err := checkScopes(ceiling); err != nil {
-				return nil, fmt.Errorf("the scope ceiling for %q in the %q profile is unusable: %w", audience, profile, err)
-			}
+		// Every rule the boot holds a running process to, held here too, per
+		// profile — so a document that would refuse to boot cannot be
+		// published for a renderer to derive authority from.
+		if _, err := checkContract(modules, contract, profile); err != nil {
+			return nil, err
 		}
 		document.Profiles[profile] = ceilings
 	}

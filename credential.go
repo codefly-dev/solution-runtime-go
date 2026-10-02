@@ -91,10 +91,11 @@ func readAuthority(ctx context.Context) (*codefly.Authority, error) {
 // pointed at the host's mint endpoint, presenting the service-account token the
 // platform projects for this workload.
 //
-// It carries this runtime's platform client, so the mint request is not proxied
-// and does not follow redirects: it presents the one thing that attests which
-// workload this process is, and a Location would hand that to whatever answered
-// at the mint URL.
+// It carries this runtime's outbound client, so the mint presents this
+// workload's own X.509-SVID, verifies the host against the anchor the platform
+// projected, is not proxied, and does not follow redirects: the request carries
+// the projected token that attests which workload this process is, and a
+// Location would hand that to whatever answered at the mint URL.
 func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	audience, err := s.authority.Value(AuthorityGroup, AuthorityAudienceKey)
 	if err != nil {
@@ -110,7 +111,7 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 		ProjectedToken:     workcontext.ProjectedTokenFile(s.cfg.projectedTokenPath),
 		ProjectionAudience: projectionAudience,
 		Authority:          s.authority,
-		HTTPClient:         platformClient,
+		HTTPClient:         s.outbound,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
@@ -157,44 +158,73 @@ func (s *Server) openCredential(ctx context.Context) error {
 		}
 		s.credential = source
 	}
-	wait := firstMintRetry
 	window := s.firstMintWindow
 	if window == 0 {
 		window = firstMintWait
 	}
-	deadline := time.Now().Add(window)
+	// The window is a deadline on the whole operation, not a stopwatch read
+	// between attempts. It used to be the latter: elapsed time was checked only
+	// after an unavailable answer, so an attempt could start at the deadline
+	// and a success after it was accepted — and a source that blocks until its
+	// context is cancelled was never cancelled at all, so a boot could wait
+	// forever inside one attempt.
+	deadline, cancel := context.WithDeadline(ctx, time.Now().Add(window))
+	defer cancel()
+	// The first wait is a quarter of the window at most, so a window shorter
+	// than the backoff still gets more than one attempt. At the real window
+	// (two minutes) this is just firstMintRetry; it matters for a caller that
+	// sets a short one, where a fixed first backoff would spend the whole
+	// window waiting after a single ask.
+	wait := firstMintRetry
+	if quarter := window / 4; quarter < wait {
+		wait = quarter
+	}
 	for attempt := 1; ; attempt++ {
-		credential, err := s.credential.Credential(ctx)
+		credential, err := s.credential.Credential(deadline)
 		switch {
-		case err == nil:
+		case err == nil && deadline.Err() == nil:
 			seal := credential.Seal()
 			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
 				s.manifest.ID, seal.InstallationID, seal.InstallationRevision, seal.BuildIncarnation,
 				credential.ExpiresAt().UTC().Format(time.RFC3339))
 			return nil
+		case err == nil:
+			// A credential that arrived after the window closed is not a
+			// credential this boot may act on: the deadline is what bounds the
+			// wait, and accepting a late success would make it advisory.
+			return fmt.Errorf("obtain this execution's credential from %s: a credential arrived after the %s window closed, so this boot does not hold one",
+				s.cfg.mintURL, window)
 		case !errors.Is(err, workcontext.ErrMintUnavailable):
 			// A judgement, or a configuration this client will not even send.
 			return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		case deadline.Err() != nil:
 			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s and %d attempt(s): %w — the issuer answers this way while a presence generation has not been applied yet, or while it cannot reach the Kubernetes API or its policy log; all three are transient, so this is an exit for the orchestrator to retry rather than a judgement on this build",
 				s.cfg.mintURL, window, attempt, err)
 		}
-		if wait > remaining {
+		if remaining := time.Until(mustDeadline(deadline)); wait > remaining {
 			wait = remaining
 		}
 		log.Printf("solution %q: this execution's credential is not available yet (attempt %d, retrying in %s): %v",
 			s.manifest.ID, attempt, wait, err)
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-deadline.Done():
+			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s and %d attempt(s): %w — the issuer answers this way while a presence generation has not been applied yet, or while it cannot reach the Kubernetes API or its policy log; all three are transient, so this is an exit for the orchestrator to retry rather than a judgement on this build",
+				s.cfg.mintURL, window, attempt, err)
 		case <-time.After(wait):
 		}
 		if wait *= 2; wait > firstMintRetryCap {
 			wait = firstMintRetryCap
 		}
 	}
+}
+
+// mustDeadline is the deadline of a context that has one. openCredential sets
+// it, so the fallback is only there to keep the arithmetic total.
+func mustDeadline(ctx context.Context) time.Time {
+	if at, ok := ctx.Deadline(); ok {
+		return at
+	}
+	return time.Now()
 }
 
 // firstMintWait bounds how long a boot waits for a credential the issuer says
@@ -218,12 +248,15 @@ const (
 // It happens before the contract is resolved and before anything is minted,
 // because the principal is part of what the contract publishes and because a
 // value the platform never provisioned is a refusal that should not cost a
-// round trip to discover. A consumer that supplied its own credential source
-// has said where its authority comes from, so nothing is read here for it.
+// round trip to discover.
+//
+// It happens on **every** path, including a boot that supplied its own
+// credential source. A hook changes where a credential comes from; it does not
+// change who this workload is. Skipping this for a custom source left the
+// published contract naming no principal and the listener held to nothing —
+// so the two strongest properties in the boot were off for exactly the
+// consumers who had written their own integration.
 func (s *Server) openAuthority(ctx context.Context) error {
-	if s.credential != nil {
-		return nil
-	}
 	authority, err := readAuthority(ctx)
 	if err != nil {
 		return err
@@ -234,7 +267,7 @@ func (s *Server) openAuthority(ctx context.Context) error {
 }
 
 // attestWorkload presents this execution's credential on a request this runtime
-// makes on its own behalf.
+// makes on its own behalf, and refuses the request when it cannot.
 //
 // It is what makes the credential more than a boot formality: the mint this
 // runtime runs for a viewer is an operation performed by *this module*, and
@@ -244,39 +277,55 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // is where that check belongs, since nothing a process reports about itself can
 // be trusted by the thing deciding what it may do.
 //
-// A credential that cannot be obtained does not fail the request. The boot
-// already established that this build may serve, and the host does not yet
-// require this attestation, so failing the viewer's call would break a page
-// over a renewal this runtime cannot fix — while the issuer refusing the mint
-// is a refusal with the issuer's own reason in it. The cost is real and worth
-// stating: between a failed renewal and a recovered one, some mints are
-// attributable to this module and some are not, which is a weaker property
-// than the boot's (no credential, no listener at all). The alternative is to
-// refuse the viewer's call, and it belongs to whoever makes the attestation
-// mandatory rather than to this runtime deciding on their behalf.
+// It used to log and carry on. That was fail-open, and it was wrong in the one
+// case the attestation exists for: a workload whose renewal the issuer has
+// started refusing — because the installation moved, the build is no longer
+// approved, the principal's epoch advanced — kept minting viewer capabilities
+// with no execution binding on them at all. "The host does not require the
+// attestation yet" is a statement about the counterpart's current state, which
+// is exactly the kind of concession that leaves a hole open for as long as the
+// counterpart takes; and boot-time approval is not authorization at use, which
+// is the whole premise of sealing a credential to an execution rather than
+// trusting a process that started successfully.
 //
-// So it is reported, and throttled: one line per distinct failure rather than
-// one per request, because a renewal that is failing fails on every request and
-// a log that says so per call buries the first occurrence under the rest.
-func attestWorkload(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string) {
+// So a credential this runtime cannot present stops the request here. The
+// viewer sees a refusal naming this solution's own authority rather than their
+// own — the handler maps it to a 503 through relayedError, since the condition
+// is this process's and one renewal fixes it — and no capability is minted
+// under an attribution nobody can check.
+func attestWorkload(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string) error {
 	if source == nil {
-		return
+		// No source at all is a programming error on a path that mints: every
+		// boot opens one, and a consumer that supplied its own supplied a
+		// source. Refused rather than treated as "nothing to attest with".
+		return fmt.Errorf("%w: this solution holds no credential source, so it cannot attest which module is asking", ErrNotAttested)
 	}
 	credential, err := source.Credential(ctx)
-	if err == nil {
-		if attachErr := credential.Attach(request); attachErr != nil {
-			report.say(id, "this workload's credential could not be attached to a mint request: "+attachErr.Error())
-		} else {
-			report.recovered(id)
-		}
-		return
+	if err != nil {
+		report.say(id, "refusing to mint for a viewer: this execution's credential could not be obtained: "+err.Error())
+		return fmt.Errorf("%w: %w", ErrNotAttested, err)
 	}
-	report.say(id, "presenting no workload credential on this mint: "+err.Error())
+	if err := credential.Attach(request); err != nil {
+		report.say(id, "refusing to mint for a viewer: this execution's credential could not be presented: "+err.Error())
+		return fmt.Errorf("%w: %w", ErrNotAttested, err)
+	}
+	report.recovered(id)
+	return nil
 }
+
+// ErrNotAttested is what a mint refused for want of this workload's own
+// credential reports. It is this solution's condition and not the viewer's, and
+// one renewal fixes it, which is what decides the status a handler answers.
+var ErrNotAttested = errors.New("this solution could not attest which module is asking")
 
 // attestationReport throttles what attestWorkload says. One per server, not a
 // package value, so one solution's failing renewal cannot silence another's in
 // a process that runs two.
+//
+// It still throttles even though a failure now refuses the request: a renewal
+// that is failing fails on every request, so a line per call would bury the
+// first occurrence under the rest. What a caller gets is not throttled — every
+// refused request is refused.
 type attestationReport struct {
 	mu   sync.Mutex
 	last string

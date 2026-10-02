@@ -1,8 +1,10 @@
 package solution
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codefly-dev/core/solution/manifest"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
@@ -32,7 +35,7 @@ func TestARefusedMintFailsTheBootAndIsNeverRetried(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mint := newHostMint(t, &hostMint{status: tc.status})
-			err := bootError(t, New(Manifest{ID: "lastlogin-go"}), mint)
+			err := bootFails(t, New(Manifest{ID: testSolutionID}), mint)
 			if !errors.Is(err, workcontext.ErrMintRefused) {
 				t.Fatalf("boot error = %v, want one wrapping %v so a caller can tell a judgement from an outage", err, workcontext.ErrMintRefused)
 			}
@@ -56,8 +59,8 @@ func TestAnUnavailableMintIsWaitedForWithinABound(t *testing.T) {
 	t.Run("it recovers when the issuer catches up", func(t *testing.T) {
 		mint := newHostMint(t, &hostMint{status: http.StatusServiceUnavailable})
 		mint.recoverAfter = 2
-		server := New(Manifest{ID: "lastlogin-go"})
-		server.firstMintWindow = 5 * time.Second
+		server := New(Manifest{ID: testSolutionID})
+		server.firstMintWindow = 20 * time.Second
 		solution := boot(t, server, mint)
 		if status := getStatus(t, solution.client, solution.base+HealthPath); status != http.StatusOK {
 			t.Fatalf("health = %d, want 200: the boot waited out an unapplied presence generation", status)
@@ -67,11 +70,17 @@ func TestAnUnavailableMintIsWaitedForWithinABound(t *testing.T) {
 		}
 	})
 
-	t.Run("it gives up when the window is spent", func(t *testing.T) {
+	t.Run("it gives up when the window is spent, and the window is a deadline", func(t *testing.T) {
 		mint := newHostMint(t, &hostMint{status: http.StatusServiceUnavailable})
-		server := New(Manifest{ID: "lastlogin-go"})
-		server.firstMintWindow = 50 * time.Millisecond
-		err := bootError(t, server, mint)
+		server := New(Manifest{ID: testSolutionID})
+		// Long enough for more than one attempt over TLS, short enough that
+		// the test spends the window rather than waiting out the real two
+		// minutes.
+		server.firstMintWindow = 1500 * time.Millisecond
+		started := time.Now()
+		err := bootFails(t, server, mint)
+		elapsed := time.Since(started)
+
 		if !errors.Is(err, workcontext.ErrMintUnavailable) {
 			t.Fatalf("boot error = %v, want one wrapping %v", err, workcontext.ErrMintUnavailable)
 		}
@@ -79,37 +88,137 @@ func TestAnUnavailableMintIsWaitedForWithinABound(t *testing.T) {
 			t.Errorf("boot error %q does not say the cause is transient, which is what makes the exit the orchestrator's to retry", err)
 		}
 		if got := mint.count(); got < 2 {
-			t.Errorf("the host was asked %d times, want more than one: an unavailable mint is waited for, not judged", got)
+			t.Errorf("the host was asked %d times, want more than one: an unavailable mint is waited for, not judged — boot said: %v", got, err)
+		}
+		// The window bounds the whole operation. It used to be read only
+		// between attempts, so an attempt could start at the deadline and run
+		// as long as it liked past it.
+		if elapsed > 4*server.firstMintWindow {
+			t.Errorf("the boot took %s for a %s window: the window is a deadline on the operation, not a stopwatch read between attempts", elapsed.Round(time.Millisecond), server.firstMintWindow)
+		}
+	})
+
+	t.Run("a source that never answers is cut off by the window", func(t *testing.T) {
+		// The sharpest case for the deadline: a source that waits for its
+		// context rather than returning. Without the window on the context it
+		// is handed, the boot waits in one attempt forever — no listener, no
+		// log, and nothing for an orchestrator to act on.
+		mint := newHostMint(t, &hostMint{})
+		blocking := &blockingCredentialSource{entered: make(chan struct{}, 1)}
+		server := New(Manifest{ID: testSolutionID}).Credential(blocking)
+		server.firstMintWindow = 400 * time.Millisecond
+		started := time.Now()
+		err := bootFails(t, server, mint)
+		elapsed := time.Since(started)
+		if err == nil {
+			t.Fatal("the boot came up on a source that never answered")
+		}
+		if elapsed > 10*server.firstMintWindow {
+			t.Fatalf("the boot waited %s on a source that never answers, for a %s window", elapsed.Round(time.Millisecond), server.firstMintWindow)
+		}
+		select {
+		case <-blocking.entered:
+		default:
+			t.Error("the source was never called, so this test did not exercise the deadline")
+		}
+		if !blocking.sawCancellation() {
+			t.Error("the source's context was never cancelled: the window has to reach the attempt, not just the loop around it")
 		}
 	})
 }
 
+// blockingCredentialSource waits for its context instead of answering: the
+// shape of a source talking to something that has stopped responding.
+type blockingCredentialSource struct {
+	entered   chan struct{}
+	mu        sync.Mutex
+	cancelled bool
+}
+
+func (b *blockingCredentialSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	b.mu.Lock()
+	b.cancelled = true
+	b.mu.Unlock()
+	return workcontext.Credential{}, fmt.Errorf("%w: %w", workcontext.ErrMintUnavailable, ctx.Err())
+}
+
+func (b *blockingCredentialSource) sawCancellation() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cancelled
+}
+
 // TestTheProjectedTokenIsReadAtEveryMintNotCachedAtBoot pins the rotation
-// property. The platform rotates the projection under a running process, so a
-// runtime that read the file once would renew with a token the issuer stopped
-// honouring long before the process stopped running — and the refusal would
-// read as "this build is not approved".
+// property, by forcing a renewal and reading what the second mint presented.
+//
+// It used to stop after the first mint, which proved nothing: a client that
+// read the projection once at boot and kept it forever passed. The platform
+// rotates that file under a running process, so a runtime holding the boot-time
+// copy renews with a token the issuer stopped honouring long before the process
+// stopped running — and the refusal reads as "this build is not approved".
 func TestTheProjectedTokenIsReadAtEveryMintNotCachedAtBoot(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
+	// A short credential so the client's own renewal lead is reached inside a
+	// test rather than in ten minutes.
+	mint := newHostMint(t, &hostMint{ttl: 30 * time.Second})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "first-projection")
 	source := mintClientFor(t, mint.URL, tokenFile)
 
-	if _, err := source.Credential(context.Background()); err != nil {
+	first, err := source.Credential(context.Background())
+	if err != nil {
 		t.Fatalf("first mint: %v", err)
 	}
-	writeFile(t, tokenFile, "rotated-projection")
-	// A credential that has not reached its renewal lead is handed back as it
-	// is: the rotation is picked up at the next mint, not at the next call.
+	// Still current: the same credential is handed back and nothing is minted.
 	if _, err := source.Credential(context.Background()); err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 	if got := mint.count(); got != 1 {
 		t.Fatalf("the host minted %d times for two calls, want 1: a current credential is reused, never re-minted per call", got)
 	}
-	if got := mint.presented[0]; got != "Bearer first-projection" {
-		t.Errorf("the mint presented %q, want the projection as it was on disk", got)
+
+	// The projection rotates, and the credential enters its renewal lead: the
+	// renewal has to present what is on disk now.
+	writeFile(t, tokenFile, "rotated-projection")
+	mint.ttl = time.Hour
+	waitUntilRenewed(t, source, first.Token())
+
+	if got := mint.count(); got != 2 {
+		t.Fatalf("the host minted %d times, want 2: the renewal never happened, so this test proves nothing about rotation", got)
 	}
+	if got := mint.presented[0]; got != "Bearer first-projection" {
+		t.Errorf("the first mint presented %q, want the projection as it was then", got)
+	}
+	if got := mint.presented[1]; got != "Bearer rotated-projection" {
+		t.Errorf("the renewal presented %q, want the rotated projection: a token read once at boot is expired long before the process is", got)
+	}
+}
+
+// waitUntilRenewed calls the source until it hands back a carrier other than
+// the one given, or the renewal plainly is not coming.
+//
+// The client renews at a fraction of the credential's own lifetime, so the wait
+// is on the issuer's clock rather than this test's: polling is what a caller
+// does anyway (every use goes through Credential), and the assertion is that a
+// renewal happens at all, not when.
+func waitUntilRenewed(t *testing.T, source CredentialSource, held string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		credential, err := source.Credential(context.Background())
+		if err != nil {
+			t.Fatalf("renewal: %v", err)
+		}
+		if credential.Token() != held {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the credential was never renewed: its lifetime entered the renewal lead and the client kept handing back the same carrier")
 }
 
 // TestEveryCallerOfOneExecutionSharesOneCarrier is the mint-once assertion that
@@ -179,20 +288,67 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 	}
 }
 
-// TestAMintingRuntimePresentsNoRegistrationCredential is the deletion, pinned:
-// the shared cluster-internal token and the per-solution registration secret
-// are gone from this package, so no boot can present either and no
-// configuration key can reinstate one.
-func TestAMintingRuntimePresentsNoRegistrationCredential(t *testing.T) {
+// TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet is the cutover
+// evidence the earlier version of this test did not provide.
+//
+// That version called the SDK's mint client directly and asserted no legacy
+// header was on the request — which would have stayed green with the whole
+// registration path still in the runtime. This one boots the real runtime with
+// every deleted configuration key set to a value a host would once have acted
+// on, and asserts what the host received: one request, to the mint, and
+// nothing resembling a registration.
+func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	writeFile(t, tokenFile, "projected")
-	if _, err := mintClientFor(t, mint.URL, tokenFile).Credential(context.Background()); err != nil {
-		t.Fatal(err)
+	// Every key the cutover deleted. If any of them still reaches a code path,
+	// the host below sees a second request — or a header it should never be
+	// shown again.
+	for key, value := range map[string]string{
+		"PUBLIC_URL":                              "https://public.example.com",
+		"SELF_UPSTREAM":                           "https://self.example.com",
+		"HOST_REGISTER_URL":                       "https://host.example.com/api/solutions/register",
+		"GATEWAY_REGISTER_URL":                    "https://gateway.example.com/solutions/_register",
+		"GATEWAY_MODULE_REGISTER_URL":             "https://gateway.example.com/modules/_register",
+		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   "https://gateway.example.com/modules/_registration-token",
+		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": "https://gateway.example.com/solutions/_registration-token",
+		"CODEFLY_INTERNAL_TOKEN":                  "internal-token-that-must-not-travel",
+		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "solution-secret-that-must-not-travel",
+		"CODEFLY__MODULE_REGISTRATION_SECRETS":    "things:module-secret-that-must-not-travel",
+		"CODEFLY__SOLUTION_REGISTRATION_INTERVAL": "1s",
+		"CODEFLY_HOST_FRONTEND":                   "frontend",
+	} {
+		t.Setenv(key, value)
 	}
-	for _, header := range []string{"x-codefly-internal-token", "x-codefly-solution-registration", "x-codefly-module-registration", "x-codefly-module-secret"} {
+
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
+	solution := boot(t, New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}), mint)
+
+	// A registration heartbeat was 15s; the shortest interval the deleted
+	// configuration accepted was 1s, and it is set above. Give any surviving
+	// beat several periods to happen.
+	time.Sleep(3 * time.Second)
+	if status := getStatus(t, solution.client, solution.base+HealthPath); status != http.StatusOK {
+		t.Fatalf("health = %d, want 200", status)
+	}
+
+	if got := mint.count(); got != 1 {
+		t.Errorf("the host received %d requests, want exactly 1 (the mint): anything more is a registration that survived", got)
+	}
+	for _, header := range []string{
+		"x-codefly-internal-token",
+		"x-codefly-solution-registration",
+		"x-codefly-module-registration",
+		"x-codefly-module-secret",
+	} {
 		if value := mint.headers[0].Get(header); value != "" {
-			t.Errorf("the mint presented %s=%q: this runtime has no registration credential to present", header, value)
+			t.Errorf("the one request this runtime made presented %s=%q: this runtime has no registration credential to present", header, value)
+		}
+	}
+	for _, path := range mint.paths {
+		if path != credentialMintPath {
+			t.Errorf("the host was asked for %q: the only endpoint this runtime calls on its own behalf is the mint", path)
 		}
 	}
 }
@@ -212,7 +368,7 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	}
 
 	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
-	server := New(Manifest{ID: "lastlogin-go"}).Credential(source)
+	server := New(Manifest{ID: testSolutionID}).Credential(source)
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
 	header.Set("authorization", "Bearer viewer")
@@ -234,12 +390,18 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	}
 }
 
-// TestAFailedAttestationIsReportedOnceNotPerRequest: a renewal that is failing
-// fails on every request, so a line per call would bury the first occurrence
-// under the rest — and this runtime deliberately serves on rather than failing
-// a viewer's call over its own renewal, which makes the report the only signal
-// there is.
-func TestAFailedAttestationIsReportedOnceNotPerRequest(t *testing.T) {
+// TestAMintIsRefusedWhenThisWorkloadCannotAttest is the blocker this PR was
+// first refused for, inverted into a test.
+//
+// The attestation used to be best-effort: a workload whose renewal the issuer
+// had started refusing kept minting viewer capabilities, with no execution
+// binding on any of them, and a test asserted that three such mints succeeded.
+// That is fail-open in the one case the attestation exists for — the issuer
+// stops renewing precisely when the installation has moved, the build is no
+// longer approved, or the principal's epoch has advanced — and "the host does
+// not require it yet" is a statement about the counterpart's current state
+// rather than a property of this runtime.
+func TestAMintIsRefusedWhenThisWorkloadCannotAttest(t *testing.T) {
 	buf := &syncBuffer{}
 	log.SetOutput(buf)
 	defer log.SetOutput(os.Stderr)
@@ -248,7 +410,7 @@ func TestAFailedAttestationIsReportedOnceNotPerRequest(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
 	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
-	server := New(Manifest{ID: "lastlogin-go"}).Credential(mintClientFor(t, refusing.URL, tokenFile))
+	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, refusing.URL, tokenFile))
 	server.cfg.gatewayURL = gw.URL
 
 	header := http.Header{}
@@ -256,22 +418,48 @@ func TestAFailedAttestationIsReportedOnceNotPerRequest(t *testing.T) {
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	for range 3 {
-		// Each call mints for the viewer and tries to attest; the attestation
-		// fails and the mint goes out with the viewer's bearer alone.
-		if _, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
-			t.Fatalf("ForModule: %v", err)
+		_, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
+		if err == nil {
+			t.Fatal("ForModule minted for a viewer while this workload could not attest which module was asking")
+		}
+		if !errors.Is(err, ErrNotAttested) {
+			t.Fatalf("ForModule error = %v, want one wrapping ErrNotAttested", err)
 		}
 	}
-	if got := strings.Count(buf.String(), "presenting no workload credential"); got != 1 {
-		t.Errorf("the failed attestation was reported %d times for 3 calls, want 1:\n%s", got, buf.String())
+	// Zero mints. Not fewer, not unattested ones: none.
+	if got := len(gw.observedMints()); got != 0 {
+		t.Errorf("observed %d viewer mints, want 0: a mint this solution cannot attest for must not be sent", got)
 	}
-	if got := len(gw.observedMints()); got != 3 {
-		t.Errorf("observed %d mints, want 3: a renewal this runtime cannot fix must not fail the viewer's call", got)
+	// The refusal reaches a page as this solution's condition, not the
+	// viewer's authority failing.
+	if code := connect.CodeOf(relayedError(fmt.Errorf("mint: %w", ErrNotAttested))); code != connect.CodeUnavailable {
+		t.Errorf("a page sees %v, want unavailable: the viewer's authority is not in question and one renewal fixes it", code)
 	}
-	for _, mint := range gw.observedMints() {
-		if mint.WorkContext != "" {
-			t.Errorf("a mint presented a workload credential %q while the issuer was refusing to mint one", mint.WorkContext)
-		}
+	// Still throttled: a renewal that is failing fails on every request, so
+	// the first occurrence must not be buried under the rest.
+	if got := strings.Count(buf.String(), "refusing to mint for a viewer"); got != 1 {
+		t.Errorf("the refusal was logged %d times for 3 calls, want 1:\n%s", got, buf.String())
+	}
+}
+
+// TestAServerWithNoCredentialSourceMintsNothing: the fail-closed rule has no
+// hole for a server that was never given a source. A gateway built outside the
+// boot — which is what the passthrough test seam does — mints nothing rather
+// than minting unattested.
+func TestAServerWithNoCredentialSourceMintsNothing(t *testing.T) {
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg.gatewayURL = gw.URL
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	_, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
+	if !errors.Is(err, ErrNotAttested) {
+		t.Fatalf("ForModule error = %v, want ErrNotAttested", err)
+	}
+	if got := len(gw.observedMints()); got != 0 {
+		t.Errorf("observed %d mints with no credential source at all, want 0", got)
 	}
 }
 
@@ -297,9 +485,24 @@ func TestAnAbsentAuthorityValueIsNamed(t *testing.T) {
 	}
 }
 
+// stubCredentialSource is a consumer-supplied source that holds one credential
+// it was handed. It exists for the boot tests, which care about which material
+// a selected source needs rather than about minting.
+type stubCredentialSource struct{ credential workcontext.Credential }
+
+func (s stubCredentialSource) Credential(context.Context) (workcontext.Credential, error) {
+	return s.credential, nil
+}
+
 // mintClientFor is the SDK's mint client as the runtime configures it, pointed
-// at a fake host. The runtime has no mint of its own, so this is the only
-// client any of these tests exercise.
+// at a fake host over plain HTTP. The runtime has no mint of its own, so this
+// is the only client any of these tests exercise.
+//
+// A boot's own client presents this workload's identity and verifies the host
+// against the projected anchor (outboundClient); that path is exercised by the
+// boot tests, which stand their fake host up under the cell's anchor. These
+// tests drive the client directly, where the question is the mint's behaviour
+// rather than who dialled it.
 func mintClientFor(t *testing.T, mintURL, tokenFile string) CredentialSource {
 	t.Helper()
 	client, err := workcontext.NewMintClient(workcontext.MintOptions{
@@ -307,35 +510,10 @@ func mintClientFor(t *testing.T, mintURL, tokenFile string) CredentialSource {
 		Audience:           testAudience,
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: testProjectionAudience,
-		HTTPClient:         platformClient,
+		HTTPClient:         &http.Client{Transport: unauthenticatedTransport, Timeout: platformRequestTimeout},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return client
-}
-
-// bootError boots far enough to reach the mint and returns what the boot said.
-func bootError(t *testing.T, server *Server, mint *hostMint) error {
-	t.Helper()
-	certFile, keyFile, _ := workloadIdentity(t)
-	authorityValues(t)
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	writeFile(t, tokenFile, "projected-token")
-	t.Setenv("PORT", freePort(t))
-	t.Setenv("GATEWAY_URL", mint.URL)
-	t.Setenv(CredentialMintURLEnvironmentVariable, mint.URL)
-	t.Setenv(ProjectedTokenFileEnvironmentVariable, tokenFile)
-	t.Setenv(IdentityCertFileEnvironmentVariable, certFile)
-	t.Setenv(IdentityKeyFileEnvironmentVariable, keyFile)
-	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
-	t.Setenv("ASSETS_DIR", t.TempDir())
-	ln, err := server.start(context.Background())
-	if ln != nil {
-		_ = ln.Close()
-	}
-	if err == nil {
-		t.Fatal("the boot came up; this helper is for boots that must fail")
-	}
-	return err
 }

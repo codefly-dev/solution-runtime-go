@@ -58,7 +58,7 @@ Four things follow, and each is a boot failure rather than a degraded run:
 | | |
 |---|---|
 | The listener presents this workload's X.509-SVID over TLS | there is no plain-HTTP listener, because the host refuses a plain-HTTP destination |
-| The credential is obtained once, before the listener exists | a refusal is terminal and is never retried — see [One credential per execution](#one-credential-per-execution) |
+| The credential is obtained once, before the listener exists | a refusal is terminal and never retried; an unavailable mint is waited out inside a bounded deadline — see [One credential per execution](#one-credential-per-execution) |
 | The authority-bearing values are read once and frozen | the credential is sealed to the values it was minted under, so a value that drifts is an error, never a reload |
 | The contract is published, and the declaration is held to it | an ask outside its declared ceiling fails the boot — see [The published contract](#the-published-contract) |
 
@@ -91,12 +91,12 @@ the SDK-resolved value is the default.
 | What | SDK resolution | Env override (default) |
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
-| Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally) | `GATEWAY_URL` |
-| Credential mint URL | `<gateway>/platform/_credential` | `CODEFLY__CREDENTIAL_MINT_URL` |
+| Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
+| Credential mint URL | `<gateway>/platform/_credential`. Must be `https` | `CODEFLY__CREDENTIAL_MINT_URL` |
 | Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
-| Peer trust anchor (optional) | `workload-identity`/`TRUST_BUNDLE_FILE` — set, the listener requires and verifies a client certificate | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
+| Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
@@ -139,8 +139,11 @@ its workspace module name: the runtime discovers the single module that owns the
 gateway role — from the injected endpoint carriers when deployed, or the
 workspace on disk when run locally — so a solution composing the host as `saas`,
 `saas-starter`, or any other name resolves identically (codefly-dev/core#382).
-The role is overridable: `CODEFLY_HOST_GATEWAY` (default `auth-gateway`, falling
-back to the pre-v0.0.49 `auth-sidecar` when unresolved). `CODEFLY_HOST_MODULE` is
+The role is overridable: `CODEFLY_HOST_GATEWAY` (default `auth-gateway`). There
+is no fallback to the pre-v0.0.49 `auth-sidecar` role: a composition exposing
+only that one is a composition to re-render, and an unresolved current gateway
+silently selecting the service that used to answer the deleted registration
+endpoints is worse than a boot that fails naming the role. `CODEFLY_HOST_MODULE` is
 empty by default and only needs setting to disambiguate a composition where
 **more than one** module exposes the same role — otherwise an ambiguous match
 resolves to nothing and the runtime fails loud at boot rather than picking a host
@@ -174,12 +177,38 @@ issuer with its own rotation, revocation or peer-verification rules keeps them.
 A source that returns no certificate is refused rather than started: a listener
 that completes no handshake reports a TLS error naming nothing to every caller.
 
-**Peer verification is the platform's to enable.** With a trust anchor projected
-the listener requires and verifies a client certificate; with none it cannot —
-the runtime has no way to invent the anchor its callers are issued under — so it
-logs that it is verifying no peer, once, loudly. An anchor that is configured
-but unusable is a refusal, never a drop: dropped, the listener would come up
-accepting any peer, which is exactly what configuring one was meant to prevent.
+**The listener authenticates its callers, and so does the identity it presents
+outward.** It requires and verifies a caller's certificate against the projected
+anchor — not optionally, and not when one happens to be configured: a listener
+that verifies no peer accepts anything that can route to the pod, which bypasses
+the admission and exposure decisions the host makes on its own routes. An absent
+anchor is a boot refusal naming the value; an unusable one fails the handshake
+rather than falling back, because judging callers by a stale anchor lets in who
+should be refused, which is not symmetric with serving a stale leaf. Peer trust
+is re-read **per handshake**, so removing a compromised root from the bundle
+stops it authenticating callers without a restart.
+
+The same identity goes out. Every platform request — the mint, and every call a
+handler's gateway makes — presents this workload's X.509-SVID and verifies the
+far end against the same anchor, because an `https` URL on its own says only
+that the scheme is https: without an anchor the far end is checked against
+whatever the image's system roots hold, and without a client certificate it
+cannot tell this workload from anything else that reached it. Nothing is
+proxied, and no redirect is followed.
+
+**The leaf is held to the frozen principal.** The pair the platform projects and
+the principal it provisioned are two facts nothing else in the boot compares, so
+the boot compares them: the SPIFFE ID in the leaf's URI SAN must equal
+`module-authority/PRINCIPAL`. A pair projected for a neighbouring workload — the
+wrong Secret mounted, a Certificate issued for another service — would otherwise
+be served happily, and the mismatch would surface at whatever verifies this
+destination, as a refusal naming neither file.
+
+Every one of those applies to a consumer-supplied `IdentitySource` too, checked
+on what it returns: a certificate, a TLS 1.3 floor, and a caller it
+authenticates. Checking only that a certificate came back left the floor and
+peer authentication silently optional for exactly the consumers who wrote their
+own integration.
 
 ## One credential per execution
 
@@ -230,15 +259,26 @@ on whose behalf, and this credential says which module is asking, so the issuer
 can hold that mint to the installation and binding the credential is sealed to
 instead of seeing only that somebody holding a viewer's bearer asked.
 
-A renewal that is failing does **not** fail the viewer's call. The boot already
-established that this build may serve, and the host does not yet require the
-attestation, so breaking a page over a renewal this runtime cannot fix would be
-the worse failure — while the issuer refusing a mint is a refusal carrying the
-issuer's own reason. The cost is worth stating: between a failed renewal and a
-recovered one, some mints are attributable to this module and some are not,
-which is weaker than the boot's property (no credential, no listener at all).
-It is reported once per distinct failure, not once per request, and once more
-when it recovers.
+**A mint this runtime cannot attest for is not sent.** If the credential cannot
+be obtained — no source, a refused renewal, authority that drifted, a capability
+that cannot be attached — the call is refused with `ErrNotAttested` and the page
+sees `unavailable`: the viewer's own authority is not in question and one
+renewal fixes it.
+
+It used to log and carry on, and that was wrong in the one case the attestation
+exists for. The issuer stops renewing precisely when the installation has moved,
+the build is no longer approved, or the principal's epoch has advanced — so a
+workload in exactly that state kept minting viewer capabilities with no
+execution binding on any of them. "The host does not require the attestation
+yet" is a statement about the counterpart's current state, and boot-time
+approval is not authorization at use. The refusal is logged once per distinct
+failure rather than once per request, and once more when it recovers; what a
+caller gets is not throttled, because every affected call is refused.
+
+A capability the far end reports as **superseded** (its sealed state has moved)
+is dropped from the request's cache rather than reused until its own clock runs
+out, so the next call mints instead of presenting a credential the issuer has
+stopped honouring.
 
 A consumer whose issuer is reached another way supplies its own source:
 

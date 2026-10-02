@@ -82,12 +82,22 @@ on `Server.PassthroughHandler`, the handler `Serve` mounts.
   for a reason only the edge can see. Where the identity comes from is the
   platform's: `IdentitySource` is the hook, and the default reads the pair the
   platform projects through the SDK's reloader.
-- The credential is obtained **once**, before the listener exists, and a failure
-  to obtain it fails the boot with no retry. A refusal is the host saying this
-  build is not the one its presence document approved, which no number of
-  attempts changes; an unreachable mint leaves this process with no authority to
-  serve with. A loop around either is the audited-mint cost this runtime was
-  changed to remove.
+- The credential is obtained **once**, before the listener exists. A *refusal*
+  fails the boot and is never retried — the host is saying this build is not the
+  one its presence document approved, which no number of attempts changes, and a
+  loop around it is the audited-mint cost this runtime was changed to remove. An
+  *unavailable* mint is not a judgement (a presence generation not yet applied,
+  an issuer that cannot reach its own dependencies), so the boot waits inside a
+  bounded window, with the window as a deadline on the operation, and then exits
+  non-zero for the orchestrator. Those two answers must stay distinguishable:
+  conflating them was a review blocker in both directions.
+- **Fail closed, with no exception for a counterpart's current state.** A mint
+  this runtime cannot attest for is not sent; a listener that cannot
+  authenticate its callers does not start; a credential-bearing destination that
+  is not authenticated https is refused at boot. "The gateway presents no client
+  certificate today" and "the host does not require the attestation yet" are
+  statements about someone else's deployment, and leaving a hole open for as long
+  as the counterpart takes is the concession this cutover exists to stop making.
 - The published contract is **declared, not derived**. A scope ceiling computed
   from what the code asks for would be satisfied by construction — a method that
   asked for one more action would widen the ceiling meant to refuse it — so the

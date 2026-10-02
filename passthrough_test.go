@@ -121,17 +121,35 @@ func call(t *testing.T, s *Server, path, bearer, body string) (int, map[string]a
 	return rec.Code, out
 }
 
-func passthroughServer(gatewayURL string, modules ...ConsumedModule) *Server {
-	s := New(Manifest{ID: "test"}).Consumes(modules...)
+// passthroughServer is a solution serving the passthrough against a fake
+// gateway, holding a real execution credential.
+//
+// The credential is not optional furniture here: minting for a viewer is
+// fail-closed, so a server without one refuses every call (see
+// TestAServerWithNoCredentialSourceMintsNothing). Every passthrough test
+// therefore stands up the same mint a booted runtime would.
+func passthroughServer(t *testing.T, gatewayURL string, modules ...ConsumedModule) *Server {
+	t.Helper()
+	s := New(Manifest{ID: "test"}).Consumes(modules...).Credential(attestingSource(t))
 	s.cfg.gatewayURL = gatewayURL
 	return s
+}
+
+// attestingSource is an execution credential from a fake host, for a test that
+// is about something other than the mint.
+func attestingSource(t *testing.T) CredentialSource {
+	t.Helper()
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	return mintClientFor(t, mint.URL, tokenFile)
 }
 
 const searchPath = "/modules/things/things.v1.Things/Search"
 
 func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1","big":"7","secret":"s3cret","sub":{"name":"x"}}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 
 	status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1","pageSize":3}`)
 	if status != http.StatusOK {
@@ -165,7 +183,7 @@ func TestPassthroughForwardsOnlyTheBearerToAModuleThatAuthenticatesTheViewer(t *
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1"}`)
 	module := passthroughModule()
 	module.Scopes, module.ViewerBearer = nil, true
-	s := passthroughServer(gw.URL, module)
+	s := passthroughServer(t, gw.URL, module)
 
 	if status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1"}`); status != http.StatusOK {
 		t.Fatalf("status %d: %v", status, body)
@@ -180,7 +198,7 @@ func TestPassthroughForwardsOnlyTheBearerToAModuleThatAuthenticatesTheViewer(t *
 
 func TestPassthroughServesOnlyWhatIsDeclared(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 	for _, path := range []string{
 		"/modules/things/things.v1.Things/Get",     // the module's, but not declared
 		"/modules/other/things.v1.Things/Search",   // not a consumed module
@@ -199,7 +217,7 @@ func TestPassthroughServesOnlyWhatIsDeclared(t *testing.T) {
 
 func TestPassthroughRequiresTheViewersBearer(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 	status, body := call(t, s, searchPath, "", `{}`)
 	if status != http.StatusUnauthorized || body["code"] != "unauthenticated" {
 		t.Fatalf("status %d %v", status, body)
@@ -211,7 +229,7 @@ func TestPassthroughRequiresTheViewersBearer(t *testing.T) {
 
 func TestPassthroughForwardsOnlyTheMethodsOwnFields(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 	// A field the method's request does not declare is not the page's to add:
 	// the request is re-encoded from the method's message, so it never reaches
 	// the module, and it can name no path or prefix of its own.
@@ -238,7 +256,7 @@ func TestPassthroughRelaysTheModulesRefusal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := newModuleGateway(t, tc.status, tc.reply)
-			s := passthroughServer(gw.URL, passthroughModule())
+			s := passthroughServer(t, gw.URL, passthroughModule())
 			status, body := call(t, s, searchPath, "Bearer viewer", `{}`)
 			if status != tc.wantStatus || body["code"] != tc.wantCode || body["message"] != tc.wantMessage {
 				t.Fatalf("status %d %v, want %d %s %q", status, body, tc.wantStatus, tc.wantCode, tc.wantMessage)
@@ -331,7 +349,7 @@ func TestPassthroughMergesTheDeclaredPinIntoEveryRequest(t *testing.T) {
 	pin.Set(pin.Descriptor().Fields().ByName("ids"), ids)
 	module := passthroughModule()
 	module.Methods[0].Pin = pin
-	s := passthroughServer(gw.URL, module)
+	s := passthroughServer(t, gw.URL, module)
 
 	if status, body := call(t, s, searchPath, "Bearer viewer", `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
 		t.Fatalf("status %d %v", status, body)

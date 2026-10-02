@@ -66,8 +66,8 @@ import (
 
 // Manifest is the small, solution-specific description the author provides.
 type Manifest struct {
-	ID            string   // logical id / gateway service alias, e.g. "lastlogin-go"
-	Title         string   // nav title, e.g. "Last Login · GO"
+	ID            string   // logical id / gateway service alias, e.g. "widgets-go"
+	Title         string   // nav title, e.g. "Widgets · GO"
 	Order         int      // nav order
 	ExposedModule string   // MF exposed module (default "./Page")
 	Contract      string   // capability contract id (default: ID)
@@ -266,6 +266,9 @@ type Server struct {
 	authority *codefly.Authority
 	// attestation throttles what a failed attestation says (see attestWorkload).
 	attestation attestationReport
+	// outbound is the authenticated client this boot makes platform requests
+	// with (see outboundClient). Nil until the boot builds it.
+	outbound *http.Client
 	// firstMintWindow bounds how long the boot waits for a credential the
 	// issuer says is not available yet. Zero means firstMintWait. Per-server
 	// rather than a package value so a test can spend the window in
@@ -303,10 +306,6 @@ type config struct {
 	// declares only "local" is refused in a deployment rather than read as if
 	// the deployment were a developer machine.
 	profile string
-	// runtimeContext is the kind of runtime Codefly says this process runs
-	// under (CODEFLY__RUNTIME_CONTEXT), the explicit signal validate() uses to
-	// tell a deployed process from a local one. Empty when nothing injected it.
-	runtimeContext string
 	// environmentLoadErr is the failure, if any, of loading Codefly's injected
 	// carriers. Every SDK-resolved value above is empty when that load failed,
 	// so validate() must say so rather than report each empty value as
@@ -439,20 +438,17 @@ func hostAddress(ctx context.Context, module, service, endpoint, api string) str
 	return address(ctx, module, service, endpoint, api)
 }
 
-// resolveGateway resolves the host gateway's rest endpoint by role, independent of
-// the host module's name (see hostAddress). saas-starter renamed this service
-// auth-sidecar → auth-gateway (v0.0.49); when the current name resolves empty we
-// retry the old one so a solution boots against either host version.
+// resolveGateway resolves the host gateway's rest endpoint by role, independent
+// of the host module's name (see hostAddress).
+//
+// One role, no fallback. It used to retry the pre-v0.0.49 `auth-sidecar` name
+// when the current one did not resolve, so a solution booted against either
+// host version — which is a compatibility path, and in this cutover an
+// unresolved current gateway silently selecting a legacy service is worse than
+// a boot that fails naming the role. A composition that still exposes only the
+// old role is a composition to re-render, not a case to accommodate.
 func resolveGateway(ctx context.Context, module, gateway string) string {
-	if addr := hostAddress(ctx, module, gateway, "rest", "rest"); addr != "" {
-		return addr
-	}
-	if gateway == "auth-gateway" {
-		if addr := hostAddress(ctx, module, "auth-sidecar", "rest", "rest"); addr != "" {
-			return addr
-		}
-	}
-	return ""
+	return hostAddress(ctx, module, gateway, "rest", "rest")
 }
 
 // loadConfig resolves every address, port, and path through the Codefly SDK so
@@ -508,7 +504,6 @@ func loadConfig(ctx context.Context) config {
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
 		trustBundleFile:    workloadPath(ctx, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey),
 		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
-		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 	}
 	return cfg
@@ -584,39 +579,6 @@ func workloadPath(ctx context.Context, override, key string) string {
 	return strings.TrimSpace(value)
 }
 
-// deployedRuntimeContext reports whether Codefly says this process runs in a
-// deployment rather than on a developer machine. The signal is explicit —
-// CODEFLY__RUNTIME_CONTEXT, which core's GitOps render injects (e.g.
-// "kubernetes") — and never the environment name: an environment called
-// "local-dogfood" or "staging" says nothing about where the process runs.
-// Every runtime context `codefly run` uses on a developer machine is local;
-// any other declared context is a deployment, so a new deployed kind is
-// covered without a change here. Nothing declared means not deployed.
-func deployedRuntimeContext(kind string) bool {
-	switch strings.ToLower(kind) {
-	case "", resources.RuntimeContextNative, resources.RuntimeContextNix,
-		resources.RuntimeContextContainer, resources.RuntimeContextFree:
-		return false
-	}
-	return true
-}
-
-// loopbackURL reports whether raw names this machine: localhost (or a name
-// under .localhost), a loopback IP, or the unspecified address. Such a URL is
-// reachable only from the process's own host.
-func loopbackURL(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
-}
-
 // validate rejects a config the runtime cannot actually serve under. When
 // neither the SDK nor an explicit env override resolves a value, loadConfig
 // leaves it empty; without this check Serve would bind ":"+"" — which the kernel
@@ -635,41 +597,38 @@ func (c config) validate() error {
 	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
 	}
-	required := map[string]string{
-		"gateway URL":         c.gatewayURL,
-		"credential mint URL": c.mintURL,
-	}
-	for name, raw := range required {
-		if u, err := url.Parse(raw); err != nil || !u.IsAbs() || u.Host == "" {
+	// Both of these carry credentials: the mint presents the projected token
+	// that attests which workload this process is, and the gateway carries the
+	// viewer's bearer and the capability minted for them. So each has to be
+	// resolved *and* has to be a destination this process can authenticate and
+	// cannot be read off the wire.
+	for _, required := range []struct{ name, value, override string }{
+		{"gateway URL", c.gatewayURL, "GATEWAY_URL"},
+		{"credential mint URL", c.mintURL, CredentialMintURLEnvironmentVariable},
+	} {
+		u, err := url.Parse(required.value)
+		if err != nil || !u.IsAbs() || u.Host == "" {
 			if c.environmentLoadErr != nil {
 				return fmt.Errorf("unresolved %s %q, and loading Codefly's injected environment failed first: %w — nothing the SDK resolves can be trusted to be absent until that is fixed",
-					name, raw, c.environmentLoadErr)
+					required.name, required.value, c.environmentLoadErr)
 			}
-			if name == "credential mint URL" {
+			if required.name == "credential mint URL" {
 				return fmt.Errorf("unresolved credential mint URL %q: it is %s on the gateway the SDK resolves, so an unresolved gateway leaves it empty; set %s explicitly for a host the resolver cannot see",
-					raw, credentialMintPath, CredentialMintURLEnvironmentVariable)
+					required.value, credentialMintPath, CredentialMintURLEnvironmentVariable)
 			}
-			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", name, raw)
+			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", required.name, required.value)
 		}
-	}
-	// The listener presents the workload's own identity and there is no
-	// plain-HTTP listener to fall back to, so an absent identity is a refusal
-	// naming the material rather than a solution that comes up unauthenticated
-	// and is refused by the host for a reason the host cannot explain.
-	for _, path := range []struct{ name, value, override, key string }{
-		{"workload identity certificate", c.identityCertFile, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey},
-		{"workload identity private key", c.identityKeyFile, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey},
-		{"projected service-account token", c.projectedTokenPath, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey},
-	} {
-		if path.value != "" {
-			continue
+		// Plaintext is refused rather than warned about. A TLS listener
+		// protects what callers send *to* this process and nothing this
+		// process sends out: over http://, the mint hands this workload's
+		// projected service-account token to anything on the path, and a
+		// viewer's mint hands over their bearer and the capability minted for
+		// them. The listener being TLS-only made the inbound hop safe and left
+		// the outbound ones exactly as they were.
+		if u.Scheme != "https" {
+			return fmt.Errorf("%s %q is not https: it carries %s, so a plaintext hop hands them to anything on the path. Set %s to an https destination",
+				required.name, required.value, credentialsCarriedOn(required.name), required.override)
 		}
-		if c.environmentLoadErr != nil {
-			return fmt.Errorf("no %s path resolved, and loading Codefly's injected environment failed first: %w — the projection may well be in place; fix the environment load before treating this as missing provisioning",
-				path.name, c.environmentLoadErr)
-		}
-		return fmt.Errorf("no %s path resolved: the listener presents this workload's X.509-SVID and there is no plain-HTTP listener, so this is required. Set %s, or have the platform provision %s/%s and declare that group as a workspace-configuration dependency of this backend",
-			path.name, path.override, WorkloadIdentityGroup, path.key)
 	}
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
@@ -685,13 +644,75 @@ func (c config) validate() error {
 	return nil
 }
 
+// credentialsCarriedOn names what a plaintext destination would disclose, so
+// the refusal says why https is not a preference.
+func credentialsCarriedOn(name string) string {
+	if name == "credential mint URL" {
+		return "the service-account token the platform projects for this workload"
+	}
+	return "the viewer's bearer and the capability minted on their behalf"
+}
+
+// validateSources checks the material the *selected* sources need, which is not
+// the same set for every boot.
+//
+// A consumer that supplied an IdentitySource has said where its identity comes
+// from — a mesh CA, a SPIFFE workload API — and requiring the projected file
+// paths from it as well would be requiring provisioning nothing reads. The same
+// goes for a credential source and the projected token. What no source changes
+// is the authority identity: the principal, the mint audience and the
+// projection audience are read once and frozen on every path, because the
+// published contract names the principal and the listener is held to it, and a
+// hook is not a way out of either.
+func (s *Server) validateSources() error {
+	if s.identity == nil {
+		for _, path := range []struct{ name, value, override, key string }{
+			{"workload identity certificate", s.cfg.identityCertFile, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey},
+			{"workload identity private key", s.cfg.identityKeyFile, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey},
+			{"workload identity trust anchor", s.cfg.trustBundleFile, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey},
+		} {
+			if err := s.cfg.requirePath(path.name, path.value, path.override, path.key); err != nil {
+				return err
+			}
+		}
+	}
+	if s.credential == nil {
+		if err := s.cfg.requirePath("projected service-account token", s.cfg.projectedTokenPath,
+			ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// requirePath refuses an unresolved path, naming the override and the group the
+// platform provisions it through — and saying so differently when the
+// environment never loaded, because sending an operator to provision something
+// that is already provisioned is the worse of the two mistakes.
+func (c config) requirePath(name, value, override, key string) error {
+	if value != "" {
+		return nil
+	}
+	if c.environmentLoadErr != nil {
+		return fmt.Errorf("no %s path resolved, and loading Codefly's injected environment failed first: %w — the projection may well be in place; fix the environment load before treating this as missing provisioning",
+			name, c.environmentLoadErr)
+	}
+	return fmt.Errorf("no %s path resolved: this listener presents this workload's X.509-SVID and requires its callers to present theirs, and there is no plain-HTTP listener, so this is required. Set %s, or have the platform provision %s/%s and declare that group as a workspace-configuration dependency of this backend",
+		name, override, WorkloadIdentityGroup, key)
+}
+
 // New starts a solution builder for the given manifest.
 func New(manifest Manifest) *Server {
 	if manifest.ExposedModule == "" {
 		manifest.ExposedModule = "./Page"
 	}
 	if manifest.Contract == "" {
-		manifest.Contract = "lastlogin"
+		// The solution's own id, which is what the field's documentation has
+		// always promised. It used to default to a product's name — a literal
+		// from one deployment, in a runtime that is supposed to know nothing
+		// about any specific solution, so every solution that left the field
+		// unset announced that product's capability contract to the host.
+		manifest.Contract = manifest.ID
 	}
 	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler)}
 }
@@ -752,6 +773,9 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if err := s.cfg.validate(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
+	if err := s.validateSources(); err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	// After the environment is loaded: the declaration is checked against the
 	// api.consumes projection Codefly injected.
 	routes, err := s.validatePassthrough()
@@ -764,6 +788,16 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// here rather than discovered when a mint is refused.
 	if err := s.openAuthority(ctx); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	// The client this process calls the platform with, presenting the same
+	// identity its listener presents. Built before the mint, because the mint
+	// is the first thing it carries.
+	if s.credential == nil || s.identity == nil {
+		outbound, err := s.outboundClient()
+		if err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+		}
+		s.outbound = outbound
 	}
 	// The contract this solution publishes is resolved from the same
 	// declaration, under the profile this process runs in, and every value it
@@ -1056,6 +1090,9 @@ type Gateway struct {
 	// writes, and report throttles that line.
 	id     string
 	report *attestationReport
+	// transport is what this gateway dials with: the boot's authenticated
+	// client, or nil on a gateway built outside a boot.
+	transport http.RoundTripper
 }
 
 func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
@@ -1074,6 +1111,9 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
 	gw.workload, gw.id, gw.report = s.credential, s.manifest.ID, &s.attestation
+	if s.outbound != nil {
+		gw.transport = s.outbound.Transport
+	}
 	return gw
 }
 
@@ -1090,7 +1130,7 @@ func (g *Gateway) OrgID() string { return g.orgID }
 // a gateway derived by ForModule, the viewer's Work Context — on every request.
 // Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
 func (g *Gateway) HTTPClient() *http.Client {
-	transport := bearerTransport{bearer: g.bearer, base: gatewayTransport}
+	transport := bearerTransport{bearer: g.bearer, base: g.roundTripper()}
 	if g.delegation != nil {
 		transport.acting = g
 	}
@@ -1103,60 +1143,84 @@ func (g *Gateway) HTTPClient() *http.Client {
 // verifies every presented context, so once the first lapsed it would 401 the
 // very call meant to replace it.
 func (g *Gateway) bearerClient() *http.Client {
-	return &http.Client{Transport: bearerTransport{bearer: g.bearer, base: gatewayTransport}}
+	return &http.Client{Transport: bearerTransport{bearer: g.bearer, base: g.roundTripper()}}
 }
 
-// gatewayTransport carries every request a solution makes through the gateway:
-// the module reads a handler issues, and the mint that authenticates them. It
-// is NOT http.DefaultTransport.
+// roundTripper carries every request this gateway makes: the module reads a
+// handler issues, and the mint that authenticates them.
 //
-// That transport carries Proxy: ProxyFromEnvironment, so with HTTP(S)_PROXY set
-// and a NO_PROXY that does not cover the host's in-cluster names, these requests
-// would be dialled to an arbitrary egress host — carrying, in headers, the
-// viewer's bearer and the signed capability minted on their behalf. The gateway
-// is composition-local (its address is resolved from the SDK's endpoint map), so
-// none of this may be proxied.
-var gatewayTransport = newPlatformTransport()
+// It is never http.DefaultTransport. That transport carries Proxy:
+// ProxyFromEnvironment, so with HTTP(S)_PROXY set and a NO_PROXY that does not
+// cover the host's in-cluster names, these requests would be dialled to an
+// arbitrary egress host — carrying the viewer's bearer, the capability minted on
+// their behalf, and this workload's own credential. Every target is
+// composition-local, so none of it may be proxied.
+//
+// A gateway built by a boot carries the transport that boot configured, which
+// presents this workload's identity and verifies the far end against the anchor
+// the platform projected. One built outside a boot — the passthrough test seam,
+// a unit test — falls back to the unauthenticated non-proxied transport, and
+// that is the only place it is used: there is no path on which a *booted*
+// runtime dials the platform without presenting its identity.
+func (g *Gateway) roundTripper() http.RoundTripper {
+	if g.transport != nil {
+		return g.transport
+	}
+	return unauthenticatedTransport
+}
 
-// newPlatformTransport is the default transport with proxying dropped: what
-// every request to a composition-local platform endpoint is carried on, whether
-// it presents the viewer's bearer (the gateway) or this workload's own
-// projected token (the mint).
+// unauthenticatedTransport is the non-proxied default for a gateway built
+// outside a boot.
+var unauthenticatedTransport = newPlatformTransport()
+
+// newPlatformTransport is the default transport with proxying dropped.
 func newPlatformTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return transport
 }
 
-// platformClient carries the requests this runtime makes on its own behalf —
-// today, the single credential mint. It is deliberately not http.DefaultClient
-// and not a client a consumer can reach.
+// outboundClient is the client this runtime makes platform requests with: the
+// credential mint, and every call a handler's gateway issues.
 //
-// No proxy, for the reason above: this request carries the projected
-// service-account token that attests which workload this process is, and every
-// target is composition-local.
+// This is the other half of refusing a plaintext destination. An https URL says
+// only that the scheme is https: without a trust anchor the connection is
+// verified against whatever the image's system roots happen to contain, and
+// without a client certificate the far end cannot tell this workload from
+// anything else that reached it. So the client presents this workload's
+// X.509-SVID and verifies the far end against the anchor the platform
+// projected — the same pair and the same anchor the listener uses, which is the
+// point: one identity, used in both directions.
 //
-// No redirects, either. net/http strips only Authorization, WWW-Authenticate
-// and Cookie when a redirect crosses to another host; every other header — the
-// token carrier included — is copied to the new target verbatim, and a 307/308
-// re-sends the body with them. So anything able to answer at the mint URL with
-// a Location (a gateway defect, an SSRF through it, a stale Service or DNS
-// record claiming that name) would be handed the credential that proves this
-// workload's identity, and the theft would look like an ordinary successful
-// mint. The mint endpoint has no reason to redirect, so a redirect is surfaced
-// as the response it is and never followed.
-//
-// And a Timeout, so a host that accepts the mint and never answers surfaces as
-// a failed boot rather than a process parked in Do forever with no listener and
-// no log.
-var platformClient = &http.Client{
-	Timeout:       platformRequestTimeout,
-	Transport:     newPlatformTransport(),
-	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+// It refuses to follow redirects. net/http strips only Authorization,
+// WWW-Authenticate and Cookie when a redirect crosses hosts; every other header
+// — the projected token on a mint, a viewer's capability on a module read — is
+// copied to the new target verbatim, and a 307/308 re-sends the body with them.
+// So anything able to answer with a Location would be handed the credentials
+// that prove who this workload is, and the theft would look like an ordinary
+// successful request.
+func (s *Server) outboundClient() (*http.Client, error) {
+	anchor, err := peerAnchor(s.cfg.trustBundleFile)
+	if err != nil {
+		return nil, fmt.Errorf("configure this workload's outbound trust: %w", err)
+	}
+	config, err := codefly.ClientTLSConfig(s.cfg.identityCertFile, s.cfg.identityKeyFile, anchor)
+	if err != nil {
+		return nil, fmt.Errorf("configure this workload's outbound identity from %q/%q: %w — the same pair the listener presents is what names this workload to the platform it calls",
+			s.cfg.identityCertFile, s.cfg.identityKeyFile, err)
+	}
+	transport := newPlatformTransport()
+	transport.TLSClientConfig = config
+	return &http.Client{
+		Timeout:       platformRequestTimeout,
+		Transport:     transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, nil
 }
 
 // platformRequestTimeout bounds one request this runtime makes on its own
-// behalf, end to end.
+// behalf, end to end, so a host that accepts a request and never answers
+// surfaces as a failure rather than a goroutine parked in Do forever.
 const platformRequestTimeout = 10 * time.Second
 
 // --- Work Context ---
@@ -1398,7 +1462,9 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	// request — the capability being minted is what the answer carries, and the
 	// viewer has none yet — so attesting here collides with nothing the module
 	// call later presents.
-	attestWorkload(ctx, g.workload, g.report, post, g.id)
+	if err := attestWorkload(ctx, g.workload, g.report, post, g.id); err != nil {
+		return "", time.Time{}, err
+	}
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
@@ -1602,6 +1668,22 @@ func (c *workContextCache) resolve(
 	return token, err
 }
 
+// supersede drops the capability held for one ask, so the next call mints
+// instead of presenting it again.
+//
+// It is the other half of classifying a refusal as ErrRevoked. That sentinel
+// means the capability was sound when it was minted and the state moved under
+// it — an installation revision, a principal's epoch, a build incarnation, a
+// binding — and the holder's answer is to mint again. Classifying the error and
+// then keeping the capability until its *time* ran out would answer every call
+// in that window with the same refusal: the cache reused a credential the
+// issuer had already stopped honouring, and a caller that re-asked got it back.
+func (c *workContextCache) supersede(key string) {
+	c.mu.Lock()
+	delete(c.minted, key)
+	c.mu.Unlock()
+}
+
 // Unary makes a typed Connect call to a fully-qualified procedure through the
 // gateway. Req and Resp are generated protobuf messages; the gateway URL, the
 // bearer, and the wire protocol are hidden so a handler only names a procedure
@@ -1627,16 +1709,40 @@ type bearerTransport struct {
 
 func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r.Header.Set("authorization", t.bearer)
-	if t.acting != nil {
-		token, err := t.acting.workContext(r.Context())
-		if err != nil {
-			return nil, err
-		}
-		if err := workcontext.Attach(r, token); err != nil {
-			return nil, err
-		}
+	if t.acting == nil {
+		return t.base.RoundTrip(r)
 	}
-	return t.base.RoundTrip(r)
+	token, err := t.acting.workContext(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	if err := workcontext.Attach(r, token); err != nil {
+		return nil, err
+	}
+	resp, err := t.base.RoundTrip(r)
+	if err == nil && supersededCapability(resp) {
+		// The far end says the capability it was shown is sealed to state that
+		// has moved. Dropping it here is what makes the next call mint instead
+		// of presenting the same one until its clock ran out: a capability the
+		// issuer has stopped honouring is not a capability to reuse, however
+		// much of its validity window is left.
+		t.acting.contexts.supersede(t.acting.delegation.key)
+	}
+	return resp, err
+}
+
+// supersededCapability reads a far end saying the capability presented is
+// sealed to state it has moved past.
+//
+// The signal is the status and the installation headers the carrier puts beside
+// a capability, which is all a caller gets: the far end verifies, this runtime
+// does not, so what reaches here is an HTTP refusal and not a sentinel. A 409
+// is what the issuer answers for a revision that has moved — distinct from the
+// 401 of a capability that never verified and the 403 of authority the viewer
+// does not hold, neither of which another mint would fix.
+func supersededCapability(resp *http.Response) bool {
+	return resp.StatusCode == http.StatusConflict &&
+		resp.Header.Get(workcontext.InstallationIDHeaderName) != ""
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

@@ -15,7 +15,7 @@ func contractServer(t *testing.T, profile string, contract ModuleContract, modul
 	if len(modules) == 0 {
 		modules = []ConsumedModule{passthroughModule()}
 	}
-	server := New(Manifest{ID: "lastlogin-go"}).Consumes(modules...).Contract(contract)
+	server := New(Manifest{ID: testSolutionID}).Consumes(modules...).Contract(contract)
 	server.cfg = config{profile: profile, apiConsumes: consumesThings}
 	server.principal = testPrincipal
 	return server
@@ -132,11 +132,95 @@ func TestAViewerBearerModuleTakesNoCeiling(t *testing.T) {
 	})
 }
 
+// TestACeilingIsASetNotAnOrderedList: the verdict used to depend on which
+// entry of the matching kind came first, so reordering a ceiling changed
+// whether a declaration booted. A reviewer who writes a ceiling does not also
+// choose a traversal order.
+func TestACeilingIsASetNotAnOrderedList(t *testing.T) {
+	module := passthroughModule()
+	module.Scopes = []Scope{{ResourceKind: "things", Actions: []string{"read"}, ResourceIDs: []string{"b"}}}
+	entries := [][]Scope{
+		{{ResourceKind: "things", Actions: []string{"read"}, ResourceIDs: []string{"a"}}, {ResourceKind: "things", Actions: []string{"read"}, ResourceIDs: []string{"b"}}},
+		{{ResourceKind: "things", Actions: []string{"read"}, ResourceIDs: []string{"b"}}, {ResourceKind: "things", Actions: []string{"read"}, ResourceIDs: []string{"a"}}},
+	}
+	for i, ceiling := range entries {
+		server := contractServer(t, localProfile, ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": ceiling},
+		}}, module)
+		if _, err := server.resolveContract(); err != nil {
+			t.Errorf("ceiling order %d refused an ask a later entry covers: %v", i, err)
+		}
+	}
+
+	// And the refusal, when no single entry covers the ask, says so rather
+	// than reporting whichever entry happened to be first.
+	module.Scopes = []Scope{{ResourceKind: "things", Actions: []string{"read", "list"}}}
+	server := contractServer(t, localProfile, ModuleContract{Ceilings: map[string]map[string][]Scope{
+		localProfile: {"things": {
+			{ResourceKind: "things", Actions: []string{"read"}},
+			{ResourceKind: "things", Actions: []string{"list"}},
+		}},
+	}}, module)
+	_, err := server.resolveContract()
+	if err == nil {
+		t.Fatal("two entries each covering half an ask were treated as covering it: that is authority nobody declared")
+	}
+	if !strings.Contains(err.Error(), "no single ceiling entry") {
+		t.Errorf("refusal %q does not say that no single entry covers the ask", err)
+	}
+}
+
+// TestTheArtifactRefusesWhatTheBootWouldRefuse: the artifact is the document
+// authority is derived from, so a rule enforced on the running process and not
+// on the published document governs the half nobody reads.
+func TestTheArtifactRefusesWhatTheBootWouldRefuse(t *testing.T) {
+	module := passthroughModule()
+	for _, tc := range []struct {
+		name     string
+		ceilings map[string]map[string][]Scope
+		says     string
+	}{
+		{
+			name:     "a surplus audience",
+			ceilings: map[string]map[string][]Scope{localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}, "ghost": {{ResourceKind: "ghost", Actions: []string{"read"}}}}},
+			says:     "ghost",
+		},
+		{
+			name:     "an audience with no ceiling",
+			ceilings: map[string]map[string][]Scope{localProfile: {"ghost": {{ResourceKind: "ghost", Actions: []string{"read"}}}}},
+			says:     "things",
+		},
+		{
+			name:     "an ask outside its ceiling",
+			ceilings: map[string]map[string][]Scope{localProfile: {"things": {{ResourceKind: "things", Actions: []string{"list"}}}}},
+			says:     "outside the ceiling",
+		},
+		{
+			name: "a profile that is fine beside one that is not",
+			ceilings: map[string]map[string][]Scope{
+				localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+				"staging":    {"things": {{ResourceKind: "things", Actions: []string{"list"}}}},
+			},
+			says: "staging",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ContractArtifact(testSolutionID, ModuleContract{Ceilings: tc.ceilings}, module)
+			if err == nil {
+				t.Fatal("the artifact published a contract the boot would refuse")
+			}
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("refusal %q does not name %q", err, tc.says)
+			}
+		})
+	}
+}
+
 // TestTheContractArtifactIsWhatTheRendererReads: the build-time document
 // carries the binding set and the per-profile ceilings, and no principal — that
 // is a value only the deployment knows.
 func TestTheContractArtifactIsWhatTheRendererReads(t *testing.T) {
-	raw, err := ContractArtifact("lastlogin-go", ModuleContract{Ceilings: map[string]map[string][]Scope{
+	raw, err := ContractArtifact(testSolutionID, ModuleContract{Ceilings: map[string]map[string][]Scope{
 		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		"staging":    {"things": {{ResourceKind: "things", Actions: []string{"read", "list"}}}},
 	}}, passthroughModule())
@@ -152,8 +236,8 @@ func TestTheContractArtifactIsWhatTheRendererReads(t *testing.T) {
 	if err := json.Unmarshal(raw, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Schema != ContractSchema || document.Solution != "lastlogin-go" {
-		t.Errorf("artifact names %q/%q, want %q/%q", document.Schema, document.Solution, ContractSchema, "lastlogin-go")
+	if document.Schema != ContractSchema || document.Solution != testSolutionID {
+		t.Errorf("artifact names %q/%q, want %q/%q", document.Schema, document.Solution, ContractSchema, testSolutionID)
 	}
 	if len(document.Bindings) != 1 || document.Bindings[0].Audience != "things" {
 		t.Errorf("artifact bindings = %+v, want the one audience the declaration consumes", document.Bindings)
@@ -165,7 +249,7 @@ func TestTheContractArtifactIsWhatTheRendererReads(t *testing.T) {
 		t.Error("the artifact carries a principal: that is a value only the deployment knows")
 	}
 
-	if _, err := ContractArtifact("lastlogin-go", ModuleContract{}, passthroughModule()); err == nil {
+	if _, err := ContractArtifact(testSolutionID, ModuleContract{}, passthroughModule()); err == nil {
 		t.Error("a contract declaring no profile at all was rendered for a solution that mints authority")
 	}
 	if _, err := ContractArtifact("", ModuleContract{}); err == nil {
@@ -176,14 +260,14 @@ func TestTheContractArtifactIsWhatTheRendererReads(t *testing.T) {
 // TestAnUnusableProfileNameIsRefused: a profile name selects a directory on
 // disk wherever one is read, so Core's own rule applies here too.
 func TestAnUnusableProfileNameIsRefused(t *testing.T) {
-	if _, err := ContractArtifact("lastlogin-go", ModuleContract{Ceilings: map[string]map[string][]Scope{
+	if _, err := ContractArtifact(testSolutionID, ModuleContract{Ceilings: map[string]map[string][]Scope{
 		"../local": {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 	}}, passthroughModule()); err == nil {
 		t.Error("a traversing profile name was rendered")
 	}
 	cfg := config{
-		port: "8080", gatewayURL: "http://gateway:42152", mintURL: "http://gateway:42152" + credentialMintPath,
-		identityCertFile: "c", identityKeyFile: "k", projectedTokenPath: "t", profile: "../local",
+		port: "8080", gatewayURL: "https://gateway:42152", mintURL: "https://gateway:42152" + credentialMintPath,
+		identityCertFile: "c", identityKeyFile: "k", projectedTokenPath: "t", trustBundleFile: "b", profile: "../local",
 	}
 	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), ContractProfileEnvironmentVariable) {
 		t.Errorf("validate = %v, want a refusal naming %s", err, ContractProfileEnvironmentVariable)

@@ -28,6 +28,8 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -102,17 +104,21 @@ type Refusal struct {
 type Host struct {
 	server *httptest.Server
 
+	// dir holds the projected files this fake host stands in for.
+	dir     string
 	mu      sync.Mutex
 	modules map[string]*httputil.ReverseProxy
 	refuse  func(Mint) *Refusal
 	mints   []Mint
 	calls   []Call
+	// workloadMints counts the solution's own execution credentials.
+	workloadMints int
 }
 
 // NewHost starts a fake host, closed when the test ends.
 func NewHost(t testing.TB) *Host {
 	t.Helper()
-	h := &Host{modules: map[string]*httputil.ReverseProxy{}}
+	h := &Host{modules: map[string]*httputil.ReverseProxy{}, dir: t.TempDir()}
 	h.server = httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	t.Cleanup(h.server.Close)
 	return h
@@ -170,6 +176,50 @@ func (h *Host) Calls() []Call {
 	return append([]Call(nil), h.calls...)
 }
 
+// workloadMintPath is where this fake host mints the solution's own execution
+// credential — the same path the runtime derives from its resolved gateway.
+//
+// It exists because minting for a viewer is fail-closed: a solution that cannot
+// attest which module is asking does not ask. A seam that handed the
+// passthrough no credential would therefore be a seam in which every call is
+// refused, so the fake host mints one, exactly as the real host does.
+const workloadMintPath = "/platform/_credential"
+
+// mintWorkload answers the solution's own mint: one credential per execution,
+// sealed to this fake host's installation.
+func (h *Host) mintWorkload(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	h.workloadMints++
+	h.mu.Unlock()
+	token, _, err := standInAuthority().Start(r.Context(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
+		TaskID:             fmt.Sprintf("passthroughtest-execution-%d", h.workloadMints),
+		Audience:           WorkloadAudience,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     corework.FixtureInstallation,
+		TTL:                10 * time.Minute,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": 13, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"work_context": token})
+}
+
+// WorkloadAudience is the audience this fake host mints the solution's own
+// execution credential for.
+const WorkloadAudience = "passthroughtest-workload"
+
+// WorkloadMints is how many execution credentials this host was asked for. A
+// correct run asks once, however many calls the page makes.
+func (h *Host) WorkloadMints() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.workloadMints
+}
+
 // consumes is the api.consumes projection of the routed modules.
 func (h *Host) consumes() []manifest.ConsumedAPI {
 	h.mu.Lock()
@@ -182,6 +232,10 @@ func (h *Host) consumes() []manifest.ConsumedAPI {
 }
 
 func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == workloadMintPath {
+		h.mintWorkload(w, r)
+		return
+	}
 	if r.URL.Path == startTaskProcedure {
 		h.mint(w, r)
 		return
@@ -282,8 +336,30 @@ type Solution struct {
 // modules host routes as the solution's api.consumes: the real handler, and
 // the error Serve would refuse the declaration with at boot.
 func Handler(host *Host, consumes ...solution.ConsumedModule) (http.Handler, error) {
-	server := solution.New(solution.Manifest{ID: "passthroughtest"}).Consumes(consumes...)
+	source, err := host.credentialSource()
+	if err != nil {
+		return nil, err
+	}
+	server := solution.New(solution.Manifest{ID: "passthroughtest"}).
+		Consumes(consumes...).
+		Credential(source)
 	return server.PassthroughHandler(solution.PassthroughEnvironment{GatewayURL: host.URL(), Consumes: host.consumes()})
+}
+
+// credentialSource is the solution's own execution credential, obtained from
+// this fake host through the SDK's mint client — the same client a booted
+// runtime uses, so the seam exercises the attestation rather than skipping it.
+func (h *Host) credentialSource() (solution.CredentialSource, error) {
+	tokenFile := filepath.Join(h.dir, "projected-token")
+	if err := os.WriteFile(tokenFile, []byte("passthroughtest-projected-token"), 0o600); err != nil {
+		return nil, err
+	}
+	return workcontext.NewMintClient(workcontext.MintOptions{
+		URL:                h.URL() + workloadMintPath,
+		Audience:           WorkloadAudience,
+		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
+		ProjectionAudience: "accounts",
+	})
 }
 
 // Start serves the passthrough for the declaration against host, until the

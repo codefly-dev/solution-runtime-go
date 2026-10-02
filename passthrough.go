@@ -533,6 +533,12 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
+	case errors.Is(err, ErrNotAttested):
+		// This solution could not attest which module is asking, so it did not
+		// ask. The viewer's authority is not in question and the condition is
+		// one renewal away, which is what unavailable says and what neither
+		// internal nor permission_denied would.
+		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
 	case errors.Is(err, workcontext.ErrRevoked):
 		// The capability was sound when it was minted and the state moved under
 		// it — an installation revision, a principal's epoch, a build

@@ -3,6 +3,7 @@ package solution
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	corework "github.com/codefly-dev/core/workcontext"
@@ -129,7 +130,7 @@ func sampleDataGraph() map[string]any {
 // through JSON, so the host receives exactly what the solution declared.
 func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
 	graph := sampleDataGraph()
-	s := &Server{manifest: Manifest{ID: "lastlogin-go", Dashboard: graph}}
+	s := &Server{manifest: Manifest{ID: testSolutionID, Dashboard: graph}}
 
 	var got map[string]any
 	body, err := json.Marshal(s.manifestMap())
@@ -148,7 +149,7 @@ func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
 // not even a null one, which would break a host that feeds a present slot into
 // its data-graph validator and would perturb the existing wire contract.
 func TestManifestOmitsAbsentDashboard(t *testing.T) {
-	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	s := &Server{manifest: Manifest{ID: testSolutionID}}
 	if _, ok := s.manifestMap()["dashboard"]; ok {
 		t.Errorf("emitted a dashboard key with no dashboard declared")
 	}
@@ -219,7 +220,7 @@ func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
 
 // A solution that offers nothing inside a client must not gain the key at all.
 func TestManifestOmitsAbsentSurfaces(t *testing.T) {
-	bare := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	bare := &Server{manifest: Manifest{ID: testSolutionID}}
 	if _, ok := bare.manifestMap()["surfaces"]; ok {
 		t.Errorf("emitted a surfaces key with no surface declared")
 	}
@@ -374,37 +375,37 @@ func setEndpoint(t *testing.T, key, addr string) {
 	})
 }
 
-// TestLoadConfigResolvesRenamedGateway proves the gateway default follows the
-// saas-starter auth-sidecar → auth-gateway rename (v0.0.49): loadConfig resolves
-// the gateway URL from the SDK against either service name, with no explicit
-// CODEFLY_HOST_GATEWAY or GATEWAY_URL override — so a solution boots against both
-// the renamed host and older ones.
-func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
-	const addr = "http://gateway:42152"
-	cases := []struct {
-		name    string
-		service string
-	}{
-		{"auth-gateway (v0.0.49+)", "auth-gateway"},
-		{"auth-sidecar (pre-v0.0.49 fallback)", "auth-sidecar"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			key := "CODEFLY__ENDPOINT__SAAS__" +
-				strings.ToUpper(strings.ReplaceAll(tc.service, "-", "_")) + "__REST__REST"
-			setEndpoint(t, key, addr)
+// TestOnlyTheCurrentGatewayRoleResolves reverses an acceptance test this PR
+// deleted the behaviour of.
+//
+// Gateway resolution used to fall back to the pre-v0.0.49 `auth-sidecar` role
+// when the current one did not resolve, and a test asserted a solution booted
+// against either host version. That is a compatibility path: in this cutover an
+// unresolved current gateway silently selecting a legacy service is worse than a
+// boot that fails naming the role, because the legacy service is the one that
+// served the registration endpoints being deleted.
+func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
+	const addr = "https://gateway:42152"
+	t.Run("the current role resolves", func(t *testing.T) {
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", addr)
+		cfg := loadConfig(context.Background())
+		if cfg.gatewayURL != addr {
+			t.Fatalf("gatewayURL = %q, want %q resolved from the current role without an override", cfg.gatewayURL, addr)
+		}
+		if want := addr + credentialMintPath; cfg.mintURL != want {
+			t.Errorf("mintURL = %q, want %q derived from the resolved gateway", cfg.mintURL, want)
+		}
+	})
 
-			cfg := loadConfig(context.Background())
-			if cfg.gatewayURL != addr {
-				t.Fatalf("gatewayURL = %q, want %q resolved from %s without an override", cfg.gatewayURL, addr, tc.service)
-			}
-			// The credential mint URL defaults to the resolved gateway plus
-			// the mint path, with no explicit override.
-			if want := addr + credentialMintPath; cfg.mintURL != want {
-				t.Errorf("mintURL = %q, want %q derived from the resolved gateway", cfg.mintURL, want)
-			}
-		})
-	}
+	t.Run("the legacy role resolves to nothing", func(t *testing.T) {
+		// Hermetic: no workspace on disk, so only the injected carriers drive
+		// resolution and the only role present is the legacy one.
+		t.Chdir(t.TempDir())
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_SIDECAR__REST__REST", addr)
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
+			t.Fatalf("resolveGateway = %q, want %q: a host exposing only the pre-rename role is one to re-render, and the boot must fail naming the role rather than selecting a legacy service", got, "")
+		}
+	})
 }
 
 // TestLoadConfigResolvesHostByRole proves the host gateway resolves by service
@@ -413,15 +414,15 @@ func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
 // the current saas (auth-gateway service), the pre-rename saas-starter
 // (auth-sidecar), or any other name a solution composes it under (codefly-dev/core#382).
 func TestLoadConfigResolvesHostByRole(t *testing.T) {
-	const gatewayAddr = "http://gateway:42152"
+	const gatewayAddr = "https://gateway:42152"
 	cases := []struct {
 		name    string
 		module  string
 		gateway string
 	}{
-		{"saas host (post-rename)", "SAAS", "AUTH_GATEWAY"},
-		{"saas-starter host (pre-rename)", "SAAS_STARTER", "AUTH_SIDECAR"},
-		{"arbitrary host module name", "SOME_OTHER_HOST", "AUTH_GATEWAY"},
+		{"a host module named saas", "SAAS", "AUTH_GATEWAY"},
+		{"a host module named saas-starter", "SAAS_STARTER", "AUTH_GATEWAY"},
+		{"any other name a solution composes it under", "SOME_OTHER_HOST", "AUTH_GATEWAY"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -458,15 +459,15 @@ func TestResolveGatewayAmbiguousModuleFailsLoud(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	t.Run("single owning module resolves", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "http://gateway:42152")
-		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "http://gateway:42152" {
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "https://gateway:42152")
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "https://gateway:42152" {
 			t.Fatalf("resolveGateway = %q, want the single module's address", got)
 		}
 	})
 
 	t.Run("two modules owning the same role are ambiguous", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "http://gateway-a:42152")
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__REST__REST", "http://gateway-b:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "https://gateway-a:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__REST__REST", "https://gateway-b:42152")
 		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
 			t.Fatalf("resolveGateway = %q, want %q so validate() fails loud on the ambiguous host", got, "")
 		}
@@ -583,6 +584,10 @@ type workContextGateway struct {
 	// mintDelay holds each mint open, so concurrent asks genuinely overlap
 	// rather than serialising by luck.
 	mintDelay time.Duration
+	// supersedeFirstCall answers the first module call the way a far end
+	// answers a capability sealed to state it has moved past: 409, with the
+	// installation headers the carrier put beside it.
+	supersedeFirstCall bool
 
 	mu     sync.Mutex
 	minted int
@@ -640,6 +645,16 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
 			return
 		}
+		g.mu.Lock()
+		supersede := g.supersedeFirstCall
+		g.supersedeFirstCall = false
+		g.mu.Unlock()
+		if supersede {
+			w.Header().Set(workcontext.InstallationIDHeaderName, corework.FixtureInstallation)
+			w.Header().Set(workcontext.InstallationRevisionHeaderName, "4")
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "installation revision superseded"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"collection": "handbook"})
 	default:
 		w.WriteHeader(http.StatusOK)
@@ -691,11 +706,24 @@ func lapseCachedCapabilities(gw *Gateway) {
 // serveHandler runs one solution handler behind the runtime's own wrapper, so a
 // test exercises the same Gateway a real request produces — including the
 // viewer identity the gateway injects, which wrap is the only place to read.
+// serveHandler serves one handler against a fake gateway, with the execution
+// credential a booted runtime holds: minting for a viewer is fail-closed, so a
+// handler whose solution cannot attest which module is asking never reaches the
+// gateway at all.
 func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Server {
 	t.Helper()
-	s := New(Manifest{ID: "wiki", Title: "Wiki"})
+	return serveHandlerWith(t, gatewayURL, attestingSource(t), handler)
+}
+
+// serveHandlerWith is serveHandler against a credential source the test holds,
+// for an assertion about the credential itself.
+func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, handler Handler) *httptest.Server {
+	t.Helper()
+	s := New(Manifest{ID: "wiki", Title: "Wiki"}).Credential(source)
 	s.cfg = config{gatewayURL: gatewayURL}
-	server := httptest.NewServer(s.wrap(handler))
+	server := httptest.NewServer(s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
+		return handler(r.Context(), gw)
+	}))
 	t.Cleanup(server.Close)
 	return server
 }
@@ -975,13 +1003,21 @@ func TestDerivedGatewayResolvesTheCapabilityPerRequest(t *testing.T) {
 	}
 }
 
-// TestMintCarriesNoOtherModulesCapability keeps the mint on a bearer-only
-// client. Riding a capability minted for one module along on the request that
-// mints another's is harmless only until the first lapses: the edge verifies
-// every presented context, so it would then 401 the call meant to replace it.
-func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
+// TestMintCarriesThisWorkloadsCredentialAndNoOthers pins what rides on a mint.
+//
+// One capability belongs there — this execution's own, which says which module
+// is asking and is the same on every mint of the process. A capability minted
+// for a *module* must not: riding one along on the request that mints another's
+// is harmless only until the first lapses, since the edge verifies every
+// presented context and would then refuse the call meant to replace it.
+func TestMintCarriesThisWorkloadsCredentialAndNoOthers(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+	source := attestingSource(t)
+	workload, err := source.Credential(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	solution := serveHandlerWith(t, gw.URL, source, func(ctx context.Context, g *Gateway) (any, error) {
 		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 		if err != nil {
 			return nil, err
@@ -1001,8 +1037,8 @@ func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
 	}
 	for range 2 {
 		mint := <-gw.mints
-		if mint.WorkContext != "" {
-			t.Errorf("mint for %q carried work context %q, want none", mint.Audience, mint.WorkContext)
+		if mint.WorkContext != workload.Token() {
+			t.Errorf("mint for %q carried work context %q, want this execution's own credential: the issuer has to know which module is asking", mint.Audience, mint.WorkContext)
 		}
 		if mint.Bearer != "Bearer viewer-token" {
 			t.Errorf("mint for %q carried bearer %q, want the viewer's", mint.Audience, mint.Bearer)
@@ -1010,13 +1046,89 @@ func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
 	}
 }
 
-// TestGatewayTrafficIsNeverProxied keeps the viewer's credentials off an
-// arbitrary egress host. Every gateway target is composition-local, and these
-// requests carry the bearer and the capability minted for it in headers — the
-// same reasoning that already forbids proxying registration traffic.
-func TestGatewayTrafficIsNeverProxied(t *testing.T) {
-	if gatewayTransport.Proxy != nil {
-		t.Error("gatewayTransport carries a proxy: with HTTP(S)_PROXY set and a NO_PROXY that misses the in-cluster gateway, the viewer's bearer and Work Context would be dialled to an arbitrary egress host")
+// TestASupersededCapabilityIsDroppedNotReused closes the other half of
+// classifying a refusal as ErrRevoked.
+//
+// That sentinel means the capability was sound when it was minted and the state
+// moved under it, so the holder's answer is to mint again. Classifying the
+// error and keeping the capability until its own clock ran out would answer
+// every call in that window with the same refusal — the cache handing back a
+// credential the issuer had already stopped honouring, and a caller that
+// re-asked getting it straight back.
+func TestASupersededCapabilityIsDroppedNotReused(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{supersedeFirstCall: true})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		// Two reads through one derived gateway. The first is refused as
+		// superseded; the second must present a freshly minted capability
+		// rather than the dropped one.
+		if _, err := getThrough(ctx, docs); err != nil {
+			return nil, err
+		}
+		return getThrough(ctx, docs)
+	})
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+
+	first, second := <-gw.calls, <-gw.calls
+	if first.WorkContext == second.WorkContext {
+		t.Error("the second read presented the capability the far end said was superseded: the cache reused a credential the issuer had stopped honouring")
+	}
+	if got := gw.mintCount(); got != 2 {
+		t.Errorf("minted %d capabilities, want 2: a superseded one costs exactly one re-mint", got)
+	}
+}
+
+// TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload keeps the viewer's
+// credentials and this workload's own off an arbitrary egress host, and makes
+// the outbound hop authenticated rather than merely https.
+//
+// Every platform target is composition-local, and these requests carry the
+// viewer's bearer, the capability minted for them, and — on a mint — the
+// projected token that attests which workload this process is. An https URL
+// alone says only that the scheme is https: without a trust anchor the far end
+// is verified against whatever the image's system roots happen to hold, and
+// without a client certificate it cannot tell this workload from anything else
+// that reached it.
+func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
+	if unauthenticatedTransport.Proxy != nil {
+		t.Error("the platform transport carries a proxy: with HTTP(S)_PROXY set and a NO_PROXY that misses the in-cluster gateway, the viewer's bearer and capability would be dialled to an arbitrary egress host")
+	}
+
+	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
+	client, err := server.outboundClient()
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
+	}
+	switch {
+	case transport.Proxy != nil:
+		t.Error("the outbound client carries a proxy")
+	case transport.TLSClientConfig == nil:
+		t.Fatal("the outbound client has no TLS configuration: it would verify the platform against the image's system roots")
+	case transport.TLSClientConfig.RootCAs == nil:
+		t.Error("the outbound client verifies the platform against no projected anchor")
+	case transport.TLSClientConfig.GetClientCertificate == nil:
+		t.Error("the outbound client presents no identity, so the platform cannot tell this workload from anything else that reached it")
+	case transport.TLSClientConfig.MinVersion != tls.VersionTLS13:
+		t.Errorf("the outbound client's floor is 0x%04x, want TLS 1.3", transport.TLSClientConfig.MinVersion)
+	}
+	if client.CheckRedirect == nil {
+		t.Error("the outbound client follows redirects: net/http copies every header but three across hosts, so a Location would be handed this workload's credentials")
+	}
+	// A boot with no trust anchor cannot build one at all, which is the same
+	// refusal the listener makes.
+	server.cfg.trustBundleFile = ""
+	if _, err := server.outboundClient(); err == nil {
+		t.Error("an outbound client was built with no projected anchor to verify the platform against")
 	}
 }
 
@@ -1186,8 +1298,8 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	}
 	defer drainAndClose(resp)
 
-	if mint := <-gw.mints; mint.WorkContext != "" {
-		t.Errorf("mint carried work context %q, want none — a caller-supplied capability must not authenticate the mint", mint.WorkContext)
+	if mint := <-gw.mints; mint.WorkContext == capability("forged") {
+		t.Error("the mint presented the capability the browser sent: a caller-supplied capability must not authenticate anything")
 	}
 	if call := <-gw.calls; call.WorkContext != capability("context-documents.1") {
 		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
@@ -1265,9 +1377,9 @@ func TestRefusedBoundariesAnswerAStatusTheCallerCanAct(t *testing.T) {
 // PUBLIC_URL is gone with the registration that was the only reason to build an
 // origin here.
 func TestManifestURLIsNeverAnAbsoluteOrigin(t *testing.T) {
-	t.Setenv("PUBLIC_URL", "https://solutions.example.com/lastlogin")
+	t.Setenv("PUBLIC_URL", "https://solutions.example.com/widgets")
 	t.Setenv("PORT", "8080")
-	s := New(Manifest{ID: "lastlogin-go"})
+	s := New(Manifest{ID: testSolutionID})
 	s.cfg = loadConfig(context.Background())
 	frontend, _ := s.manifestMap()["frontend"].(map[string]any)
 	if got := frontend["manifestUrl"]; got != federationManifestPath {

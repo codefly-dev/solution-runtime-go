@@ -138,7 +138,7 @@ func has(m *dynamicpb.Message, name string) bool {
 
 func TestPassthroughStreamsEachMessageMaskedAsTheViewer(t *testing.T) {
 	gw := newStreamGateway(t)
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{}))
 	gw.lines <- `{"result":{"entryId":"e1","big":"1","secret":"s1"}}`
 	gw.lines <- ``
 	gw.lines <- `{"result":{"entryId":"e1","big":"2","secret":"s2","sub":{"name":"x"}}}`
@@ -181,7 +181,7 @@ func TestPassthroughStreamForwardsOnlyTheBearerForAModuleThatAuthenticatesTheVie
 	for i := range module.Methods {
 		module.Methods[i].Scopes = nil
 	}
-	s := passthroughServer(gw.URL, module)
+	s := passthroughServer(t, gw.URL, module)
 	close(gw.lines)
 	stream, err := watchClient(t, s).CallServerStream(context.Background(), watchRequest("e1"))
 	if err != nil {
@@ -207,7 +207,7 @@ func receiveAll(stream *connect.ServerStreamForClient[dynamicpb.Message]) (int, 
 
 func TestPassthroughStreamEndsWithTheModulesErrorLine(t *testing.T) {
 	gw := newStreamGateway(t)
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{}))
 	gw.lines <- `{"result":{"entryId":"e1"}}`
 	gw.lines <- `{"error":{"code":9,"message":"the turn was deleted"}}`
 	stream, err := watchClient(t, s).CallServerStream(context.Background(), watchRequest("e1"))
@@ -223,7 +223,7 @@ func TestPassthroughStreamEndsWithTheModulesErrorLine(t *testing.T) {
 func TestPassthroughStreamRelaysARefusalBeforeTheStream(t *testing.T) {
 	gw := newStreamGateway(t)
 	gw.status = http.StatusForbidden
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{}))
 	stream, err := watchClient(t, s).CallServerStream(context.Background(), watchRequest("e1"))
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +235,7 @@ func TestPassthroughStreamRelaysARefusalBeforeTheStream(t *testing.T) {
 
 func TestPassthroughStreamRefusesAnOversizedMessageWithoutTruncating(t *testing.T) {
 	gw := newStreamGateway(t)
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{MaxStreamMessageBytes: 64}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{MaxStreamMessageBytes: 64}))
 	gw.lines <- `{"result":{"entryId":"e1"}}`
 	gw.lines <- `{"result":{"entryId":"` + strings.Repeat("x", 200) + `"}}`
 	stream, err := watchClient(t, s).CallServerStream(context.Background(), watchRequest("e1"))
@@ -250,7 +250,7 @@ func TestPassthroughStreamRefusesAnOversizedMessageWithoutTruncating(t *testing.
 
 func TestPassthroughStreamEndsAtItsDeclaredDuration(t *testing.T) {
 	gw := newStreamGateway(t)
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{MaxStreamDuration: 300 * time.Millisecond}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{MaxStreamDuration: 300 * time.Millisecond}))
 	gw.lines <- `{"result":{"entryId":"e1"}}`
 	stream, err := watchClient(t, s).CallServerStream(context.Background(), watchRequest("e1"))
 	if err != nil {
@@ -273,7 +273,7 @@ func TestPassthroughStreamEndsAtItsDeclaredDuration(t *testing.T) {
 
 func TestPassthroughStreamCancelsTheModuleWhenThePageGoesAway(t *testing.T) {
 	gw := newStreamGateway(t)
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{}))
 	gw.lines <- `{"result":{"entryId":"e1"}}`
 	ctx, cancel := context.WithCancel(context.Background())
 	stream, err := watchClient(t, s).CallServerStream(ctx, watchRequest("e1"))
@@ -295,7 +295,7 @@ func TestPassthroughStreamCancelsTheModuleWhenThePageGoesAway(t *testing.T) {
 func TestPassthroughStreamRefusesAnAnswerThatIsNotAStream(t *testing.T) {
 	gw := newStreamGateway(t)
 	gw.contentType = "text/html"
-	s := passthroughServer(gw.URL, streamModule(ConsumedMethod{}))
+	s := passthroughServer(t, gw.URL, streamModule(ConsumedMethod{}))
 	close(gw.lines)
 	stream, err := watchClient(t, s).CallServerStream(context.Background(), watchRequest("e1"))
 	if err != nil {
