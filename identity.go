@@ -154,6 +154,7 @@ func (s *Server) listen() (net.Listener, error) {
 	if err := presentsThisWorkload(config, s.principal); err != nil {
 		return nil, err
 	}
+	holdPerConnectionPosture(config, s.principal)
 	ln, err := net.Listen("tcp", ":"+s.cfg.port)
 	if err != nil {
 		return nil, err
@@ -193,6 +194,50 @@ func usableServerIdentity(config *tls.Config) error {
 			config.ClientAuth)
 	}
 	return nil
+}
+
+// holdPerConnectionPosture holds a source's per-connection callback to the
+// posture its base configuration was checked against.
+//
+// The checks above read the configuration a source returns *at boot*. Go hands
+// each handshake to GetConfigForClient when one is set, and the configuration
+// that callback returns replaces the base one for that connection — floor, peer
+// requirement and certificate included. So without this, a source could conform
+// at boot, pass every check in this file, and then answer each individual
+// handshake with TLS 1.2, no peer authentication, or a neighbouring workload's
+// leaf.
+//
+// That is not a theoretical shape: the projected source uses that very callback
+// to re-read peer trust, so "a source with a per-connection callback" is the
+// documented pattern here rather than an odd one — and a consumer following it
+// is one line away from lowering the floor for every connection while the boot
+// still reports a conforming listener.
+//
+// It is the same argument as the rest of this cutover, one layer along:
+// boot-time approval is not authorization at use. A callback returning nil is
+// Go's "serve the base configuration", which was already checked, so it passes
+// through untouched; anything else is checked again, and a configuration below
+// the posture fails that handshake rather than serving it weakened — the caller
+// that happens to arrive is not what is in question, the configuration the
+// listener would answer anyone with is.
+func holdPerConnectionPosture(config *tls.Config, principal string) {
+	inner := config.GetConfigForClient
+	if inner == nil {
+		return
+	}
+	config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		answer, err := inner(hello)
+		if err != nil || answer == nil {
+			return answer, err
+		}
+		if err := usableServerIdentity(answer); err != nil {
+			return nil, fmt.Errorf("the identity source answered this handshake with a configuration below the posture its boot configuration was held to: %w", err)
+		}
+		if err := presentsThisWorkload(answer, principal); err != nil {
+			return nil, err
+		}
+		return answer, nil
+	}
 }
 
 // presentsThisWorkload refuses a listener whose leaf is not the identity this

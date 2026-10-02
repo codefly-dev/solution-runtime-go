@@ -85,8 +85,17 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 // so that the strongest check in the model cannot be the easiest to skip. A
 // solution runtime holds none of those: it is the party presenting a
 // capability, not the party that decides on one. So there is no verifier here
-// to configure, no conformance kit for this package to run, and a future change
-// that adds one has to answer where those four sources come from.
+// to configure, and a future change that adds one has to answer where those
+// four sources come from.
+//
+// This is not an exemption from Core's conformance kit. The kit runs — against
+// the boundary this package does own, carriage, in
+// TestCoreConformanceFixturesThroughTheCarrier — and it is what keeps the line
+// below checkable: every fixture whose refusal is a property of the bytes in
+// hand is refused here with Core's own sentinel, and every fixture whose
+// refusal is a judgement against live state is carried, because claiming that
+// judgement without the issuer's four sources is the silent downgrade this
+// single-implementation rule exists to prevent.
 func TestThisRuntimeVerifiesNothing(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {

@@ -210,6 +210,18 @@ authenticates. Checking only that a certificate came back left the floor and
 peer authentication silently optional for exactly the consumers who wrote their
 own integration.
 
+It is checked **per connection** as well as at boot. A `*tls.Config` may carry a
+`GetConfigForClient` callback, and the configuration that callback returns
+replaces the base one for that handshake — floor, peer requirement and
+certificate included — so a source that conforms at boot could answer each
+individual connection with TLS 1.2, no peer authentication, or a neighbouring
+workload's leaf. This is the documented shape here rather than an odd one: the
+projected source uses that callback to re-read peer trust. So each returned
+configuration is held to the same posture and the same frozen principal, and one
+below it fails that handshake instead of serving it weakened. A callback that
+returns `nil` is Go's "serve the base configuration", which was already checked,
+and passes through.
+
 ## One credential per execution
 
 `Serve` obtains this execution's credential once, before the listener exists,

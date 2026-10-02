@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -356,4 +357,186 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+// TestASourcesPerConnectionCallbackCannotLowerThePosture closes the last way
+// into this file, and it is the same argument the rest of the cutover is built
+// on: boot-time approval is not authorization at use.
+//
+// usableServerIdentity and presentsThisWorkload read the configuration a source
+// returns at boot. Go hands each handshake to GetConfigForClient when one is
+// set, and the configuration that callback returns replaces the base one for
+// that connection. So a source could conform at boot, pass every other check
+// here, and serve each individual handshake under TLS 1.2, with no peer
+// authentication, or holding a neighbouring workload's leaf.
+//
+// The projected source uses that callback to re-read peer trust, so this is the
+// documented pattern in this package, not an odd one — a consumer following it
+// is one line from lowering the floor on every connection while the boot still
+// reports a conforming listener.
+//
+// A configuration below the posture fails the handshake outright rather than
+// serving it in a weakened form: the caller that happens to arrive is not the
+// thing in question, the configuration the listener would answer anyone with
+// is.
+func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
+	// One anchor for the whole test, so a rival leaf is one a caller would
+	// actually verify — issued by the same CA, naming another workload.
+	c := newCell(t)
+	certFile, keyFile, bundleFile, caller, roots := c.workload(t, testPrincipal)
+	rival := c.identity(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
+	conforming, err := projectedIdentity{certFile: certFile, keyFile: keyFile, trustBundleFile: bundleFile}.ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated := func() *tls.Config {
+		return &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{*caller}, MinVersion: tls.VersionTLS13, ServerName: "localhost"}
+	}
+
+	// A source conforming at boot — certificate, TLS 1.3,
+	// RequireAndVerifyClientCert — that downgrades per connection.
+	downgrading := func(change func(*tls.Config)) *tls.Config {
+		base := conforming.Clone()
+		base.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			answer := conforming.Clone()
+			answer.GetConfigForClient = nil
+			anchor, err := peerAnchor(bundleFile)
+			if err != nil {
+				return nil, err
+			}
+			answer.ClientCAs = anchor
+			answer.ClientAuth = tls.RequireAndVerifyClientCert
+			change(answer)
+			return answer, nil
+		}
+		return base
+	}
+
+	for _, tc := range []struct {
+		name string
+		// what the callback does to each connection's configuration
+		change func(*tls.Config)
+		// a caller the lowered posture would have admitted, and that must not
+		// be, alongside the authenticated one which is refused with it
+		exploits func() *tls.Config
+	}{
+		{
+			"a floor below TLS 1.3 per connection",
+			func(cfg *tls.Config) { cfg.MinVersion = tls.VersionTLS12 },
+			func() *tls.Config {
+				return &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{*caller}, MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12, ServerName: "localhost"}
+			},
+		},
+		{
+			"no peer authentication per connection",
+			func(cfg *tls.Config) { cfg.ClientAuth = tls.NoClientCert },
+			func() *tls.Config {
+				return &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13, ServerName: "localhost"}
+			},
+		},
+		{
+			"a peer verified but not required per connection",
+			func(cfg *tls.Config) { cfg.ClientAuth = tls.VerifyClientCertIfGiven },
+			func() *tls.Config {
+				return &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13, ServerName: "localhost"}
+			},
+		},
+		{
+			// Nothing extra is admitted here; what changes is whose identity
+			// the listener presents, so the authenticated caller is the one
+			// that reads the defect.
+			"another workload's leaf per connection",
+			func(cfg *tls.Config) { cfg.Certificates, cfg.GetCertificate = []tls.Certificate{*rival}, nil },
+			nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: downgrading(tc.change)})
+			server.cfg = config{port: freePort(t)}
+			server.principal = testPrincipal
+			ln, err := server.listen()
+			if err != nil {
+				// Refusing at boot is an acceptable answer too; what must not
+				// happen is a handshake served under the lowered posture.
+				return
+			}
+			defer func() { _ = ln.Close() }()
+			serve(t, ln)
+
+			if tc.exploits != nil {
+				if conn, err := tls.Dial("tcp", ln.Addr().String(), tc.exploits()); err == nil {
+					state := conn.ConnectionState()
+					_ = conn.Close()
+					t.Errorf("a caller the boot configuration would have refused was served over TLS 0x%04x with %d peer certificate(s): the per-connection configuration is not held to the posture the boot checked",
+						state.Version, len(state.PeerCertificates))
+				}
+			}
+			// And the lowered configuration is refused for everyone, not
+			// weakened for whoever asks: the configuration is what is wrong.
+			conn, err := tls.Dial("tcp", ln.Addr().String(), authenticated())
+			if err == nil {
+				state := conn.ConnectionState()
+				served := "none"
+				if len(state.PeerCertificates) > 0 && len(state.PeerCertificates[0].URIs) > 0 {
+					served = state.PeerCertificates[0].URIs[0].String()
+				}
+				_ = conn.Close()
+				t.Errorf("the listener answered a handshake under a configuration below its boot posture (TLS 0x%04x, presenting %s)", state.Version, served)
+			}
+		})
+	}
+
+	// The other direction, or the check above is just a broken listener: a
+	// per-connection callback that keeps the posture is served normally. This
+	// is the projected source's own shape — it uses the callback to re-read
+	// peer trust on every handshake.
+	t.Run("a conforming callback is served", func(t *testing.T) {
+		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: conforming})
+		server.cfg = config{port: freePort(t)}
+		server.principal = testPrincipal
+		ln, err := server.listen()
+		if err != nil {
+			t.Fatalf("listen refused the projected source's own per-connection shape: %v", err)
+		}
+		defer func() { _ = ln.Close() }()
+		serve(t, ln)
+
+		good, err := tls.Dial("tcp", ln.Addr().String(), authenticated())
+		if err != nil {
+			t.Fatalf("a conforming caller was refused, so the per-connection check broke the listener: %v", err)
+		}
+		state := good.ConnectionState()
+		_ = good.Close()
+		if state.Version < tls.VersionTLS13 {
+			t.Errorf("the connection was served TLS 0x%04x, want a 1.3 floor", state.Version)
+		}
+		leaf := state.PeerCertificates[0]
+		if len(leaf.URIs) == 0 || leaf.URIs[0].String() != testPrincipal {
+			t.Errorf("the connection was served %v, want this workload's frozen principal %q", leaf.URIs, testPrincipal)
+		}
+	})
+}
+
+// serve accepts and handshakes until the listener closes, so a refused
+// handshake is refused by the listener's own configuration rather than by
+// nobody being there.
+func serve(t *testing.T, ln net.Listener) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				if tlsConn, ok := conn.(*tls.Conn); ok {
+					_ = tlsConn.Handshake()
+				}
+				_ = conn.Close()
+			}()
+		}
+	}()
+	t.Cleanup(func() { <-done })
 }
