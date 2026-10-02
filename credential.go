@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	codefly "github.com/codefly-dev/sdk-go"
@@ -243,20 +244,69 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // is where that check belongs, since nothing a process reports about itself can
 // be trusted by the thing deciding what it may do.
 //
-// A credential that cannot be obtained does not fail the request here. The boot
-// already established that this build may serve; if a renewal is failing, the
-// issuer refusing the mint is the right place for that to surface, with the
-// issuer's own reason, rather than this runtime guessing on its behalf.
-func attestWorkload(ctx context.Context, source CredentialSource, request *http.Request, id string) {
+// A credential that cannot be obtained does not fail the request. The boot
+// already established that this build may serve, and the host does not yet
+// require this attestation, so failing the viewer's call would break a page
+// over a renewal this runtime cannot fix — while the issuer refusing the mint
+// is a refusal with the issuer's own reason in it. The cost is real and worth
+// stating: between a failed renewal and a recovered one, some mints are
+// attributable to this module and some are not, which is a weaker property
+// than the boot's (no credential, no listener at all). The alternative is to
+// refuse the viewer's call, and it belongs to whoever makes the attestation
+// mandatory rather than to this runtime deciding on their behalf.
+//
+// So it is reported, and throttled: one line per distinct failure rather than
+// one per request, because a renewal that is failing fails on every request and
+// a log that says so per call buries the first occurrence under the rest.
+func attestWorkload(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string) {
 	if source == nil {
 		return
 	}
 	credential, err := source.Credential(ctx)
-	if err != nil {
-		log.Printf("solution %q: presenting no workload credential on this mint: %v", id, err)
+	if err == nil {
+		if attachErr := credential.Attach(request); attachErr != nil {
+			report.say(id, "this workload's credential could not be attached to a mint request: "+attachErr.Error())
+		} else {
+			report.recovered(id)
+		}
 		return
 	}
-	if err := credential.Attach(request); err != nil {
-		log.Printf("solution %q: this workload's credential could not be attached to a mint request: %v", id, err)
+	report.say(id, "presenting no workload credential on this mint: "+err.Error())
+}
+
+// attestationReport throttles what attestWorkload says. One per server, not a
+// package value, so one solution's failing renewal cannot silence another's in
+// a process that runs two.
+type attestationReport struct {
+	mu   sync.Mutex
+	last string
+}
+
+func (r *attestationReport) say(id, what string) {
+	if r == nil {
+		log.Printf("solution %q: %s", id, what)
+		return
+	}
+	r.mu.Lock()
+	repeat := r.last == what
+	r.last = what
+	r.mu.Unlock()
+	if !repeat {
+		log.Printf("solution %q: %s", id, what)
+	}
+}
+
+// recovered closes an episode, so the next failure is reported even if it is
+// the same one. A renewal that recovers and fails again is two occurrences.
+func (r *attestationReport) recovered(id string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	had := r.last
+	r.last = ""
+	r.mu.Unlock()
+	if had != "" {
+		log.Printf("solution %q: presenting this workload's credential again", id)
 	}
 }

@@ -3,7 +3,9 @@ package solution
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -229,6 +231,47 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	}
 	if mints[0].WorkContext != credential.Token() {
 		t.Errorf("the mint presented work context %q, want this workload's own credential %q", mints[0].WorkContext, credential.Token())
+	}
+}
+
+// TestAFailedAttestationIsReportedOnceNotPerRequest: a renewal that is failing
+// fails on every request, so a line per call would bury the first occurrence
+// under the rest — and this runtime deliberately serves on rather than failing
+// a viewer's call over its own renewal, which makes the report the only signal
+// there is.
+func TestAFailedAttestationIsReportedOnceNotPerRequest(t *testing.T) {
+	buf := &syncBuffer{}
+	log.SetOutput(buf)
+	defer log.SetOutput(os.Stderr)
+
+	refusing := newHostMint(t, &hostMint{status: http.StatusForbidden})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	server := New(Manifest{ID: "lastlogin-go"}).Credential(mintClientFor(t, refusing.URL, tokenFile))
+	server.cfg.gatewayURL = gw.URL
+
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	for range 3 {
+		// Each call mints for the viewer and tries to attest; the attestation
+		// fails and the mint goes out with the viewer's bearer alone.
+		if _, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+			t.Fatalf("ForModule: %v", err)
+		}
+	}
+	if got := strings.Count(buf.String(), "presenting no workload credential"); got != 1 {
+		t.Errorf("the failed attestation was reported %d times for 3 calls, want 1:\n%s", got, buf.String())
+	}
+	if got := len(gw.observedMints()); got != 3 {
+		t.Errorf("observed %d mints, want 3: a renewal this runtime cannot fix must not fail the viewer's call", got)
+	}
+	for _, mint := range gw.observedMints() {
+		if mint.WorkContext != "" {
+			t.Errorf("a mint presented a workload credential %q while the issuer was refusing to mint one", mint.WorkContext)
+		}
 	}
 }
 

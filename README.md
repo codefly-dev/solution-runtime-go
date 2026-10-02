@@ -230,6 +230,16 @@ on whose behalf, and this credential says which module is asking, so the issuer
 can hold that mint to the installation and binding the credential is sealed to
 instead of seeing only that somebody holding a viewer's bearer asked.
 
+A renewal that is failing does **not** fail the viewer's call. The boot already
+established that this build may serve, and the host does not yet require the
+attestation, so breaking a page over a renewal this runtime cannot fix would be
+the worse failure — while the issuer refusing a mint is a refusal carrying the
+issuer's own reason. The cost is worth stating: between a failed renewal and a
+recovered one, some mints are attributable to this module and some are not,
+which is weaker than the boot's property (no credential, no listener at all).
+It is reported once per distinct failure, not once per request, and once more
+when it recovers.
+
 A consumer whose issuer is reached another way supplies its own source:
 
 ```go

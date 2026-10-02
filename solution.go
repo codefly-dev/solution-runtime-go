@@ -264,6 +264,8 @@ type Server struct {
 	// authority is the frozen set of authority-bearing values this process runs
 	// under, read once at boot and rechecked before every credential renewal.
 	authority *codefly.Authority
+	// attestation throttles what a failed attestation says (see attestWorkload).
+	attestation attestationReport
 	// firstMintWindow bounds how long the boot waits for a credential the
 	// issuer says is not available yet. Zero means firstMintWait. Per-server
 	// rather than a package value so a test can spend the window in
@@ -1051,8 +1053,9 @@ type Gateway struct {
 	// every gateway in a test that does not exercise the attestation.
 	workload CredentialSource
 	// id is this solution's manifest id, for the log line a failed attestation
-	// writes.
-	id string
+	// writes, and report throttles that line.
+	id     string
+	report *attestationReport
 }
 
 func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
@@ -1070,7 +1073,7 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 // mints it will run.
 func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
-	gw.workload, gw.id = s.credential, s.manifest.ID
+	gw.workload, gw.id, gw.report = s.credential, s.manifest.ID, &s.attestation
 	return gw
 }
 
@@ -1395,7 +1398,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	// request — the capability being minted is what the answer carries, and the
 	// viewer has none yet — so attesting here collides with nothing the module
 	// call later presents.
-	attestWorkload(ctx, g.workload, post, g.id)
+	attestWorkload(ctx, g.workload, g.report, post, g.id)
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
