@@ -127,20 +127,37 @@ func deferredEnvironmentReads(fset *token.FileSet, file *ast.File, readers map[s
 func environmentValuesEscaping(fset *token.FileSet, file *ast.File, readers map[string]bool) []int {
 	var lines []int
 	ast.Inspect(file, func(node ast.Node) bool {
-		// A call's own Fun is a call, not an escaping reference.
-		if call, ok := node.(*ast.CallExpr); ok {
-			ast.Inspect(call.Fun, func(ast.Node) bool { return false })
-			for _, arg := range call.Args {
+		switch held := node.(type) {
+		// A call's own Fun is a call, not an escaping reference — but its
+		// arguments are.
+		case *ast.CallExpr:
+			for _, arg := range held.Args {
 				lines = append(lines, referencedReaders(fset, arg, readers)...)
 			}
-			return true
-		}
-		assign, ok := node.(*ast.AssignStmt)
-		if !ok {
-			return true
-		}
-		for _, rhs := range assign.Rhs {
-			lines = append(lines, referencedReaders(fset, rhs, readers)...)
+		case *ast.AssignStmt:
+			for _, rhs := range held.Rhs {
+				lines = append(lines, referencedReaders(fset, rhs, readers)...)
+			}
+		// `var r = env`, which is an assignment with no AssignStmt.
+		case *ast.ValueSpec:
+			for _, value := range held.Values {
+				lines = append(lines, referencedReaders(fset, value, readers)...)
+			}
+		// `return workloadPath`, handing the reader to a caller.
+		case *ast.ReturnStmt:
+			for _, result := range held.Results {
+				lines = append(lines, referencedReaders(fset, result, readers)...)
+			}
+		// `config{resolve: workloadPath}`, which is how the shape this gate
+		// exists for was actually written.
+		case *ast.CompositeLit:
+			for _, element := range held.Elts {
+				if pair, ok := element.(*ast.KeyValueExpr); ok {
+					lines = append(lines, referencedReaders(fset, pair.Value, readers)...)
+					continue
+				}
+				lines = append(lines, referencedReaders(fset, element, readers)...)
+			}
 		}
 		return true
 	})
@@ -382,9 +399,12 @@ func readsEnvironment(call *ast.CallExpr) bool {
 		return false
 	}
 	// os.Getenv and friends.
-	if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "os" {
+	if pkg, ok := selector.X.(*ast.Ident); ok && (pkg.Name == "os" || pkg.Name == "syscall") {
 		switch selector.Sel.Name {
-		case "Getenv", "LookupEnv", "Environ":
+		// ExpandEnv reads every variable it finds in the string, and
+		// syscall.Getenv is the same read one package down; the rule named
+		// neither.
+		case "Getenv", "LookupEnv", "Environ", "ExpandEnv":
 			return true
 		}
 	}
@@ -453,6 +473,32 @@ func wire() {
 	hold(workloadPath)
 }`,
 			true,
+		},
+		{
+			"a composite-literal field, which is how the real one was written",
+			`package solution
+func loadConfig() config {
+	return config{resolve: workloadPath}
+}`,
+			true,
+		},
+		{
+			"returned to a caller",
+			`package solution
+func resolver() func() string { return workloadPath }`,
+			true,
+		},
+		{
+			"a package-level var holding the reader",
+			`package solution
+var resolve = env`,
+			true,
+		},
+		{
+			"handed to a goroutine",
+			`package solution
+func wire() { go readTheSet() }`,
+			false,
 		},
 		{
 			"calling it, which is a read at boot and fine",

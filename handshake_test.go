@@ -473,7 +473,7 @@ func TestTheProvisionedCallerSetIsReadThroughLoadConfig(t *testing.T) {
 	peers := identitiesFile(t, testGatewayPrincipal)
 	t.Setenv(IdentityMintPeersFileEnvironmentVariable, peers)
 
-	cfg := loadConfig(context.Background())
+	cfg := loadConfig(context.Background(), nil)
 	if cfg.allowedCallersFile != callers {
 		t.Fatalf("loadConfig resolved the caller set from %q, want the provisioned %q", cfg.allowedCallersFile, callers)
 	}
@@ -1931,4 +1931,137 @@ func TestAFreshDialFollowsTheProvisionedPeerSet(t *testing.T) {
 	if !strings.Contains(err.Error(), testGatewayPrincipal) {
 		t.Errorf("the refusal %q does not name the identity that answered", err)
 	}
+}
+
+// TestASourceCarryingBothAPoolAndACallbackIsRefused is N4 again, and the
+// regression this round's own fix introduced.
+//
+// The refusal lived in peerAnchorFrom, which reached it only when the base pool
+// was nil — so a source carrying BOTH a base pool and a per-handshake callback
+// was accepted at boot, and then had that pool frozen for every recheck and
+// every outbound dial while its callback went on resolving a fresh anchor.
+// Executed: after the bundle rotated A→B, a fresh A-caller was refused and the
+// established A-caller served 30 requests over 3 seconds. The doc comment and
+// the README both claimed such a source was refused. The only shape that was
+// refused is the one nobody writes.
+func TestASourceCarryingBothAPoolAndACallbackIsRefused(t *testing.T) {
+	boot := newCell(t)
+	current := newCell(t)
+	approved := boot.identity(t, testPrincipal)
+
+	withCallback := func() *tls.Config {
+		return &tls.Config{
+			Certificates: []tls.Certificate{*approved},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			MinVersion:   tls.VersionTLS13,
+			// A pool from boot *and* a callback resolving a fresh one.
+			ClientCAs: boot.roots,
+			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{
+					Certificates: []tls.Certificate{*approved},
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+					MinVersion:   tls.VersionTLS13,
+					ClientCAs:    current.roots,
+				}, nil
+			},
+		}
+	}
+
+	server := New(Manifest{ID: testSolutionID}).Identity(unaskableIdentity{config: withCallback()})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	if _, err := server.serverIdentity(); err == nil {
+		t.Fatal("a source resolving its configuration per handshake, carrying a base pool as well, was accepted: that pool is one object fixed when the source built it, so every recheck and every outbound dial would be judged by the anchor this process booted with while the callback resolved a fresh one")
+	} else if !strings.Contains(err.Error(), "PeerAnchor") {
+		t.Errorf("the refusal %q does not name the interface that fixes it", err)
+	}
+
+	// The control: the same shape, askable, boots.
+	askable := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{
+		config: withCallback(),
+		anchor: func() *x509.CertPool { return current.roots },
+	})
+	askable.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	askable.principal = testPrincipal
+	if _, err := askable.serverIdentity(); err != nil {
+		t.Fatalf("a source that can say what its anchor is was refused: %v", err)
+	}
+}
+
+// TestASharedDestinationAddressIsHeldToBothSets: the per-destination split was
+// silently not in force in the only configuration that exists.
+//
+// admittedAt matched the mint first, so when the mint and the gateway share a
+// host and port — the brokered shape the PR proposes and every fixture here
+// uses — every gateway dial answered to the mint's set, and the gateway's set
+// was validated at boot and then never read. Executed: a gateway set naming
+// somebody else still got 200, and rewriting it cut nothing.
+func TestASharedDestinationAddressIsHeldToBothSets(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	const other = "spiffe://codefly.test/ns/platform/sa/somebody-else"
+	host := newPlatformHost(t, c, testGatewayPrincipal)
+
+	build := func(t *testing.T, mintSet, gatewaySet []string) *http.Client {
+		t.Helper()
+		server := New(Manifest{ID: testSolutionID})
+		server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+			// One address for both, which is the deployed shape.
+			mintURL:          host.URL + credentialMintPath,
+			gatewayURL:       host.URL,
+			mintPeersFile:    identitiesFile(t, mintSet...),
+			gatewayPeersFile: identitiesFile(t, gatewaySet...),
+		}
+		server.principal = testPrincipal
+		client, err := server.outboundClient(nil)
+		if err != nil {
+			t.Fatalf("outboundClient: %v", err)
+		}
+		return client
+	}
+
+	t.Run("both sets admit it", func(t *testing.T) {
+		resp, err := build(t, []string{testGatewayPrincipal}, []string{testGatewayPrincipal}).Get(host.URL + credentialMintPath)
+		if err != nil {
+			t.Fatalf("an identity both sets admit was refused: %v", err)
+		}
+		_ = resp.Body.Close()
+	})
+
+	// The two halves that used to pass because only the mint's set was read.
+	for _, tc := range []struct {
+		name                string
+		mintSet, gatewaySet []string
+	}{
+		{"only the mint's set admits it", []string{testGatewayPrincipal}, []string{other}},
+		{"only the gateway's set admits it", []string{other}, []string{testGatewayPrincipal}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := build(t, tc.mintSet, tc.gatewaySet).Get(host.URL + credentialMintPath)
+			if err == nil {
+				_ = resp.Body.Close()
+				t.Fatal("an identity only one of the two sets admits was presented this workload's credentials at an address both destinations share: a dial there cannot be attributed to one of them, so only an identity both admit is safe — and reading one set alone means the other is provisioned, validated at boot, and never consulted again")
+			}
+		})
+	}
+
+	t.Run("an empty intersection is refused at boot", func(t *testing.T) {
+		server := New(Manifest{ID: testSolutionID})
+		server.cfg = config{port: "8080", identityCertFile: certFile, identityKeyFile: keyFile,
+			projectedTokenPath: "t", trustBundleFile: bundleFile, profile: localProfile,
+			mintURL:            host.URL + credentialMintPath,
+			gatewayURL:         host.URL,
+			allowedCallersFile: identitiesFile(t, testGatewayPrincipal),
+			mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
+			gatewayPeersFile:   identitiesFile(t, other),
+		}
+		server.principal = testPrincipal
+		err := server.validateSources()
+		if err == nil {
+			t.Fatal("a boot accepted two sets with nothing in common at an address both destinations share: every dial there would be refused, discovered at the first mint rather than named as the provisioning gap it is")
+		}
+		if !strings.Contains(err.Error(), "both provisioned sets") {
+			t.Errorf("the refusal %q does not say the sets share no identity", err)
+		}
+	})
 }

@@ -354,9 +354,26 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 				}
 			case *ast.GenDecl:
 				for _, spec := range declared.Specs {
-					typed, ok := spec.(*ast.TypeSpec)
-					if ok && typed.Name.Name == "PassthroughEnvironment" {
+					if typed, ok := spec.(*ast.TypeSpec); ok && typed.Name.Name == "PassthroughEnvironment" {
 						t.Errorf("%s exports PassthroughEnvironment, the argument of the constructor this change removed", name)
+					}
+					// An exported *variable* holding the seam is the same
+					// bypass with no function to inspect: `var
+					// BuildPassthrough = passthroughSeam` in the root package,
+					// or `var Build = seam.Passthrough` in passthroughtest,
+					// both passed a gate that only read function bodies.
+					value, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for i, declaredName := range value.Names {
+						if !declaredName.IsExported() || i >= len(value.Values) {
+							continue
+						}
+						if named := renderedReference(value.Values[i]); reachesTheSeam[named] || named == "seam.Passthrough" {
+							t.Errorf("%s exports the variable %s holding %s: that is a path to a credential-bearing handler with no function body for a gate to read and no refusal in front of it",
+								name, declaredName.Name, named)
+						}
 					}
 				}
 			}
@@ -381,6 +398,10 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 	servable := map[string]bool{
 		"http.Handler": true, "http.HandlerFunc": true, "http.ServeMux": true,
 		"http.RoundTripper": true,
+		// Local aliases and this package's own handler types count too: the
+		// rule is about handing out something servable, not about one
+		// package's spelling of it.
+		"Handler": true, "RequestHandler": true,
 	}
 	fset := token.NewFileSet()
 	for _, name := range moduleSources(t) {
@@ -400,6 +421,15 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 				continue
 			}
 			for _, result := range fn.Type.Results.List {
+				// A func type whose own signature is ServeHTTP's is a handler
+				// however it is spelled, which is the shape `func (s *Server)
+				// Routes() func(http.ResponseWriter, *http.Request)` uses to
+				// avoid naming http.Handler at all.
+				if servesHTTP(result.Type) {
+					t.Errorf("%s exports %s returning a function with ServeHTTP's signature: naming the type something else does not make it less servable",
+						name, fn.Name.Name)
+					continue
+				}
 				if rendered := renderedType(result.Type); servable[rendered] {
 					t.Errorf("%s exports %s returning %s: a servable handler obtained outside Serve has skipped validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, and whoever mounts it serves the viewer's bearer and this workload's credential over whatever it is mounted on. Let Serve mount it.",
 						name, fn.Name.Name, rendered)
@@ -407,6 +437,31 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 			}
 		}
 	}
+}
+
+// renderedReference is pkg.Name or Name for an expression that merely refers to
+// something, which is what an exported variable's initialiser is.
+func renderedReference(expr ast.Expr) string {
+	switch named := expr.(type) {
+	case *ast.Ident:
+		return named.Name
+	case *ast.SelectorExpr:
+		if pkg, ok := named.X.(*ast.Ident); ok {
+			return pkg.Name + "." + named.Sel.Name
+		}
+	}
+	return ""
+}
+
+// servesHTTP reports whether a type is a function taking
+// (http.ResponseWriter, *http.Request).
+func servesHTTP(expr ast.Expr) bool {
+	fn, ok := expr.(*ast.FuncType)
+	if !ok || fn.Params == nil || len(fn.Params.List) != 2 {
+		return false
+	}
+	return renderedType(fn.Params.List[0].Type) == "http.ResponseWriter" &&
+		renderedType(fn.Params.List[1].Type) == "http.Request"
 }
 
 // renderedType is pkg.Name for a qualified type, with one level of pointer and
@@ -461,7 +516,10 @@ func seamReachability(files []*ast.File) (reaches, refuses map[string]bool) {
 			if callsThe(fn, "seam", "Passthrough") {
 				reaches[fn.Name.Name] = true
 			}
-			if callsThe(fn, "", "mustBeATest") || callsThe(fn, "", "refuseOutsideTest") {
+			// A refusal swallowed by recover(), or sitting on a branch that
+			// cannot be taken, is not a refusal. Counting the call alone made
+			// both of those read as guarded.
+			if (callsThe(fn, "", "mustBeATest") || callsThe(fn, "", "refuseOutsideTest")) && !defeatsItsOwnRefusal(fn) {
 				refuses[fn.Name.Name] = true
 			}
 			ast.Inspect(fn.Body, func(node ast.Node) bool {
@@ -491,6 +549,26 @@ func seamReachability(files []*ast.File) (reaches, refuses map[string]bool) {
 		}
 	}
 	return reaches, refuses
+}
+
+// defeatsItsOwnRefusal reports whether fn recovers from a panic or guards the
+// refusal behind a constant false, either of which makes the call decorative.
+func defeatsItsOwnRefusal(fn *ast.FuncDecl) bool {
+	defeated := false
+	ast.Inspect(fn, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			if named, ok := call.Fun.(*ast.Ident); ok && named.Name == "recover" {
+				defeated = true
+			}
+		}
+		if branch, ok := node.(*ast.IfStmt); ok {
+			if cond, ok := branch.Cond.(*ast.Ident); ok && cond.Name == "false" {
+				defeated = true
+			}
+		}
+		return true
+	})
+	return defeated
 }
 
 // callsThe reports whether fn calls pkg.name, or bare name when pkg is empty.

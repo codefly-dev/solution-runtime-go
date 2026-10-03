@@ -308,11 +308,17 @@ type Server struct {
 	terminal     chan struct{}
 	terminalOnce sync.Once
 	terminalErr  atomic.Pointer[error]
-	// credentialValidUntil is when the credential this process last obtained
-	// expires, in Unix nanoseconds. It is what decides a route's answer when
-	// the source does not respond inside the route's bound: see
-	// credentialWithin.
-	credentialValidUntil atomic.Int64
+	// The one in-flight credential ask and what it last produced. See askOnce:
+	// without single-flight, a credential entering its renewal window turns
+	// every concurrent viewer request into its own audited mint.
+	credentialMu         sync.Mutex
+	credentialAsk        chan struct{}
+	credentialAskErr     error
+	credentialHeld       workcontext.Credential
+	credentialQuietUntil time.Time
+	// credentialSuperseded is the token the host refused as no longer
+	// honoured. See executionCredentialSuperseded.
+	credentialSuperseded string
 	// handshakeTimeout overrides platformHandshakeTimeout, for a test that
 	// would otherwise spend the real one. Unset means the constant, as
 	// firstMintWindow does for the credential window.
@@ -563,7 +569,7 @@ func resolveGateway(ctx context.Context, module, gateway string) string {
 // credential.go); the shared cluster-internal token and the per-solution
 // registration secret that preceded it are gone, along with the surfaces that
 // accepted them.
-func loadConfig(ctx context.Context) config {
+func loadConfig(ctx context.Context, environmentLoadErr error) config {
 	// Empty by default: the host is resolved by service+endpoint role, not by its
 	// workspace module name (see resolveGateway). An explicit CODEFLY_HOST_MODULE
 	// scopes the lookup only when a composition is genuinely ambiguous.
@@ -624,7 +630,7 @@ func loadConfig(ctx context.Context) config {
 	// value delivered inline and by file carrier is "two sources for one fact
 	// and are refused" (file_carrier.go) — applied to the one kind of value
 	// where being wrong admits a caller.
-	cfg.admissionConflict = conflictingAdmissionSources(ctx)
+	cfg.admissionConflict = conflictingAdmissionSources(ctx, environmentLoadErr)
 	return cfg
 }
 
@@ -637,7 +643,7 @@ func loadConfig(ctx context.Context) config {
 // reaches the rest of the group: a substituted *trust bundle* widens admission
 // exactly as much as a substituted caller list, and a substituted key pair
 // changes who this process is. The two sets were simply where it was noticed.
-func conflictingAdmissionSources(ctx context.Context) error {
+func conflictingAdmissionSources(ctx context.Context, loadErr error) error {
 	for _, admission := range []struct{ what, override, key string }{
 		{"allowed callers", IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityAllowedCallersFileKey},
 		{"credential mint peer identity", IdentityMintPeersFileEnvironmentVariable, WorkloadIdentityMintPeersFileKey},
@@ -651,7 +657,28 @@ func conflictingAdmissionSources(ctx context.Context) error {
 		if overridden == "" {
 			continue
 		}
-		provisioned, _ := codefly.For(ctx).WorkspaceConfiguration(WorkloadIdentityGroup, admission.key)
+		provisioned, err := codefly.For(ctx).WorkspaceConfiguration(WorkloadIdentityGroup, admission.key)
+		if err != nil {
+			// An error here is NOT evidence of a second answer, and that is
+			// the awkward part: the SDK returns the same "no workspace
+			// configuration value" whether the key was never provisioned or
+			// the carriers holding it never loaded. So this cannot refuse on
+			// the error alone — doing that refuses every legitimate override,
+			// which is what it did when first written.
+			//
+			// The one signal that separates them is whether the environment
+			// loaded at all, which is why loadConfig keeps that error. With a
+			// clean load, an error means genuinely absent and the override
+			// stands alone. With a failed load, nothing the SDK says is
+			// absent can be trusted to be absent, and an override put in force
+			// against provisioning this process could not see is the conflict
+			// the rule exists to refuse.
+			if loadErr != nil {
+				return fmt.Errorf("the %s is overridden by %s while loading Codefly's injected environment failed (%w), so the platform's own answer for %s/%s cannot be read: this process will not put an override in force against provisioning it cannot see, because the two may disagree and the one it ignored would be the decision nobody applied. Fix the environment load, or unset the override",
+					admission.what, admission.override, loadErr, WorkloadIdentityGroup, admission.key)
+			}
+			continue
+		}
 		if strings.TrimSpace(provisioned) == "" {
 			continue
 		}
@@ -806,13 +833,13 @@ func (c config) validate() error {
 		if err != nil || !u.IsAbs() || u.Host == "" {
 			if c.environmentLoadErr != nil {
 				return fmt.Errorf("unresolved %s %q, and loading Codefly's injected environment failed first: %w — nothing the SDK resolves can be trusted to be absent until that is fixed",
-					required.name, required.value, c.environmentLoadErr)
+					required.name, redactedURL(required.value), c.environmentLoadErr)
 			}
 			if required.name == "credential mint URL" {
 				return fmt.Errorf("no credential mint URL resolved: this runtime POSTs the projected service-account token that attests which workload it is to this address, so there is no default for it — a path assumed on the resolved gateway would be sending that attestation to an endpoint nobody published. Set %s to the endpoint this host actually serves. The fix that removes the override is the host publishing its mint as a resolvable endpoint role, which belongs to the host and the SDK rather than here",
 					CredentialMintURLEnvironmentVariable)
 			}
-			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", required.name, required.value)
+			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", required.name, redactedURL(required.value))
 		}
 		// Plaintext is refused rather than warned about. A TLS listener
 		// protects what callers send *to* this process and nothing this
@@ -822,8 +849,11 @@ func (c config) validate() error {
 		// them. The listener being TLS-only made the inbound hop safe and left
 		// the outbound ones exactly as they were.
 		if u.Scheme != "https" {
+			// Redacted here too: a refusal is a log line like any other, and
+			// the URL being refused is exactly the one most likely to carry
+			// something that should not be written down.
 			return fmt.Errorf("%s %q is not https: it carries %s, so a plaintext hop hands them to anything on the path. Set %s to an https destination",
-				required.name, required.value, credentialsCarriedOn(required.name), required.override)
+				required.name, redactedURL(required.value), credentialsCarriedOn(required.name), required.override)
 		}
 		// And nothing but a destination. These three were accepted, and the
 		// first two were then written to the log at every boot:
@@ -968,6 +998,11 @@ func (s *Server) validateSources() error {
 		{"allowed callers", s.admittedCallers()},
 		{"credential mint peer identity", s.admittedMint()},
 		{"gateway peer identity", s.admittedGateway()},
+		// And, when the two share an address, the set that actually governs a
+		// dial there: an empty intersection is a provisioning gap an operator
+		// can fix, and discovering it at the first mint instead would read as
+		// the mint being unreachable.
+		{"identities admitted at the address the mint and the gateway share", s.admittedAt(dialAddress(s.cfg.mintURL))},
 	} {
 		if _, err := set.admits(); err != nil {
 			return fmt.Errorf("the provisioned %s are not usable at boot: %w", set.what, err)
@@ -1013,15 +1048,57 @@ func (s *Server) admittedGateway() func() ([]string, error) {
 // there is no set that should admit it.
 func (s *Server) admittedAt(addr string) func() ([]string, error) {
 	mint, gateway := dialAddress(s.cfg.mintURL), dialAddress(s.cfg.gatewayURL)
-	switch addr {
-	case mint:
+	// One address for both is the brokered shape, and it is the shape this
+	// runtime is actually deployed in today: the mint has lived on the
+	// gateway's host and port. Switching on the mint first silently made every
+	// gateway dial answer to the mint's set, and the gateway's set was then
+	// validated at boot and never read again — so a gateway set naming
+	// somebody else let the gateway through, and rewriting it cut nothing.
+	// The split was not in force in the only configuration that exists.
+	//
+	// The intersection, because a dial to a shared address cannot be
+	// attributed: this runtime does not know whether it is talking to the mint
+	// or to the gateway, so the only identity it can safely present
+	// credentials to is one BOTH sets admit. An empty intersection admits
+	// nobody, which validate() reports at boot rather than leaving to the
+	// first dial.
+	switch {
+	case mint == gateway && addr == mint:
+		return intersectedIdentities(s.admittedMint(), s.admittedGateway(), addr)
+	case addr == mint:
 		return s.admittedMint()
-	case gateway:
+	case addr == gateway:
 		return s.admittedGateway()
 	}
 	return func() ([]string, error) {
 		return nil, fmt.Errorf("refusing to present this workload's credentials at %s: this runtime dials the credential mint (%s) and the gateway (%s) and nothing else, so an address that is neither has no authorization set and is not a destination this runtime has one for",
 			addr, mint, gateway)
+	}
+}
+
+// intersectedIdentities is the identities both sets admit, for an address the
+// two destinations share.
+func intersectedIdentities(first, second func() ([]string, error), addr string) func() ([]string, error) {
+	return func() ([]string, error) {
+		mint, err := first()
+		if err != nil {
+			return nil, err
+		}
+		gateway, err := second()
+		if err != nil {
+			return nil, err
+		}
+		var both []string
+		for _, identity := range mint {
+			if slices.Contains(gateway, identity) {
+				both = append(both, identity)
+			}
+		}
+		if len(both) == 0 {
+			return nil, fmt.Errorf("the credential mint and the gateway are both at %s and no identity is in both provisioned sets, so there is none this runtime may present its credentials to there: a dial to a shared address cannot be attributed to one of them, so only an identity both admit is safe. Provision the party that answers there in both sets, or give them separate addresses",
+				addr)
+		}
+		return both, nil
 	}
 }
 
@@ -1263,8 +1340,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if environmentLoadErr != nil {
 		log.Printf("codefly: load environment: %v", environmentLoadErr)
 	}
-	s.cfg = loadConfig(ctx)
-	s.cfg.environmentLoadErr = environmentLoadErr
+	s.cfg = loadConfig(ctx, environmentLoadErr)
 	if err := s.cfg.validate(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -1500,48 +1576,205 @@ func (s *Server) actingForAViewer(ctx context.Context) error {
 // credential is still in hand, since renewal starts inside a lead before expiry
 // — into a 503 for every viewer.
 func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (workcontext.Credential, error) {
-	type answer struct {
-		credential workcontext.Credential
-		err        error
+	// Held and unexpired is the answer whenever the issuer is not answering,
+	// and this is the branch that was missing.
+	//
+	// The timeout path below already served on a held credential, and the
+	// error path refused outright — so with the credential inside its renewal
+	// window and the issuer answering 503, every viewer request asked, every
+	// ask minted, and every request got a 503 while a perfectly valid
+	// credential sat in hand. Forty requests, forty audited mints. That is not
+	// a smaller version of the heartbeat this runtime deleted, it is a larger
+	// one: the heartbeat minted on a timer, this minted on traffic.
+	//
+	// So a failed ask starts a backoff, and inside it nothing asks again. The
+	// renewal the credential's own expiry dictates still happens, because the
+	// backoff is shorter than the renewal lead; what cannot happen is one mint
+	// per request.
+	if held, ok := s.heldCredential(); ok && s.askingIsPointless() {
+		return held, nil
 	}
-	answered := make(chan answer, 1)
-	go func() {
-		asked, cancel := context.WithTimeout(context.WithoutCancel(ctx), platformRequestTimeout)
-		defer cancel()
-		credential, err := s.credential.Credential(asked)
-		if err == nil {
-			s.credentialValidUntil.Store(credential.ExpiresAt().UnixNano())
-		}
-		answered <- answer{credential, err}
-	}()
+	credential, err := s.askOnce(ctx, d)
+	if err == nil {
+		return credential, nil
+	}
+	if errors.Is(err, ErrCredentialRefused) {
+		return credential, err
+	}
+	// Unavailable, for any reason including the ask not answering in time. A
+	// credential already in hand decides, because renewal begins inside a lead
+	// before expiry and refusing here would 503 every viewer over a slow
+	// issuer this process does not yet need.
+	if held, ok := s.heldCredential(); ok {
+		return held, nil
+	}
+	return credential, err
+}
+
+// heldCredential is the credential this process last obtained, if it has not
+// expired. The zero credential never counts as held: a source that hands back
+// nothing has given this process no authority, which is the case a wrapper
+// keyed on the token's *value* could not see.
+func (s *Server) heldCredential() (workcontext.Credential, bool) {
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	if s.credentialHeld.Token() == "" {
+		return workcontext.Credential{}, false
+	}
+	if !time.Now().Before(s.credentialHeld.ExpiresAt()) {
+		return workcontext.Credential{}, false
+	}
+	return s.credentialHeld, true
+}
+
+// askingIsPointless reports whether a recent ask failed and the backoff has not
+// elapsed, so this caller must not ask again.
+func (s *Server) askingIsPointless() bool {
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	return time.Now().Before(s.credentialQuietUntil)
+}
+
+// askOnce asks the source for the credential, at most one ask at a time, and
+// never waits longer than d.
+//
+// Single-flight, because the alternative is one mint per concurrent caller the
+// moment the credential enters its renewal window. The bound is imposed here
+// rather than passed down, because a context does not reach what blocks: the
+// SDK's client holds a sync.Mutex across the network mint and sync.Mutex.Lock
+// ignores contexts (see the drafted sdk-go issue, which is the durable half of
+// this).
+func (s *Server) askOnce(ctx context.Context, d time.Duration) (workcontext.Credential, error) {
+	s.credentialMu.Lock()
+	inflight := s.credentialAsk
+	if inflight == nil {
+		inflight = make(chan struct{})
+		s.credentialAsk = inflight
+		go s.resolveCredential(ctx, inflight)
+	}
+	s.credentialMu.Unlock()
+
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
-	case got := <-answered:
-		if got.err != nil {
-			if terminalCredentialFailure(got.err) {
-				// Records it, which also ends the process: the first caller to
-				// discover a refused build is as good a place to learn it as
-				// the probe, and better than the next one.
-				s.credentialRefused(got.err)
-				return got.credential, fmt.Errorf("%w: %w", ErrCredentialRefused, got.err)
-			}
-			return got.credential, fmt.Errorf("%w: %w", ErrCredentialUnavailable, got.err)
-		}
-		return got.credential, nil
+	case <-inflight:
 	case <-timer.C:
-		if until := s.credentialValidUntil.Load(); until > 0 && time.Now().UnixNano() < until {
-			// A credential is in hand and has not expired. The ask continues
-			// in the background and the next caller gets its result.
-			return workcontext.Credential{}, nil
-		}
 		return workcontext.Credential{}, fmt.Errorf("%w: it did not answer within %s", ErrCredentialUnavailable, d)
 	}
+
+	s.credentialMu.Lock()
+	credential, err := s.credentialHeld, s.credentialAskErr
+	s.credentialMu.Unlock()
+	if err != nil {
+		if terminalCredentialFailure(err) {
+			// Records it, which also ends the process: the first caller to
+			// discover a refused build is as good a place to learn it as the
+			// probe, and better than the next one.
+			s.credentialRefused(err)
+			return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialRefused, err)
+		}
+		return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialUnavailable, err)
+	}
+	return credential, nil
+}
+
+// resolveCredential performs the one in-flight ask and records its outcome.
+//
+// On a context detached from the caller's, deliberately: a request that gives
+// up must not cancel an ask other callers are waiting on, and the SDK caches
+// the result so the work is not wasted.
+func (s *Server) resolveCredential(ctx context.Context, done chan struct{}) {
+	asked, cancel := context.WithTimeout(context.WithoutCancel(ctx), platformRequestTimeout)
+	defer cancel()
+	credential, err := s.credential.Credential(asked)
+	if err == nil {
+		err = usableCredential(credential)
+	}
+
+	// Recorded HERE, where the answer lands, and not only where a caller
+	// happens to be waiting for it.
+	//
+	// This ask runs on a detached context so a request that gives up does not
+	// cancel it — which means its answer can arrive after every caller has
+	// gone. A terminal refusal classified only by the waiting caller was
+	// therefore discarded whenever acquisition outlived its caller: the route
+	// served on the held credential, nothing called credentialRefused, and the
+	// process went on acting for viewers after its own source had reported
+	// this execution refused. The classification belongs to the answer, not to
+	// whoever was still listening.
+	if err != nil && terminalCredentialFailure(err) {
+		s.credentialRefused(err)
+	}
+
+	s.credentialMu.Lock()
+	s.credentialAskErr = err
+	switch {
+	case err != nil:
+		s.credentialQuietUntil = time.Now().Add(credentialAskBackoff)
+	case credential.Token() == s.credentialSuperseded:
+		// The far end said this exact credential is no longer honoured, and
+		// the source has handed back the same one — the SDK caches it until
+		// its renewal lead, so asking again returns it. Holding it again would
+		// make the invalidation reversible by the very thing that triggered
+		// it, so the belief is not restored until the token changes.
+		s.credentialAskErr = fmt.Errorf("%w: the credential this process holds was superseded by the host and the source has not replaced it yet",
+			workcontext.ErrMintUnavailable)
+		s.credentialQuietUntil = time.Now().Add(credentialAskBackoff)
+	default:
+		s.credentialHeld = credential
+		s.credentialQuietUntil = time.Time{}
+	}
+	s.credentialAsk = nil
+	s.credentialMu.Unlock()
+	close(done)
+}
+
+// credentialAskBackoff is how long a failed ask quiets the next one.
+//
+// Shorter than any renewal lead, so the renewal a credential's own expiry
+// dictates still happens on time; long enough that a stream of viewer requests
+// against an unavailable issuer is one ask rather than one per request.
+const credentialAskBackoff = time.Second
+
+// usableCredential refuses a credential that authorises nothing.
+//
+// A source is consumer code and may hand back the zero value — a
+// half-initialised client, a stub that forgot to fail — and this runtime then
+// held "a credential" with no token, no seal and no expiry, booted, answered
+// /health 200, and acted for viewers under it. An expired one is the same
+// shape with a timestamp.
+//
+// The authority wrapper could not see either: it keys on the token *changing*,
+// and a token that is always "" never changes.
+func usableCredential(credential workcontext.Credential) error {
+	if credential.Token() == "" {
+		return fmt.Errorf("%w: the credential source returned no credential at all (empty token), so this process holds nothing that attests which workload it is",
+			workcontext.ErrMintRefused)
+	}
+	if seal := credential.Seal(); seal.InstallationID == "" {
+		return fmt.Errorf("%w: the credential this process holds is sealed to no installation, so there is nothing for a far end to hold it to",
+			workcontext.ErrMintRefused)
+	}
+	if expiry := credential.ExpiresAt(); !time.Now().Before(expiry) {
+		return fmt.Errorf("%w: the credential this process holds expired at %s",
+			workcontext.ErrMintUnavailable, expiry.UTC().Format(time.RFC3339))
+	}
+	return nil
 }
 
 // routeCredentialTimeout bounds what a route acting for a viewer will wait for
 // the credential. Short, because the answer is almost always a comparison
 // against one already held, and a route is not the place to wait out a mint.
+
+// credentialRefusalForAViewer is what a viewer is told when this process will
+// not act for them: which of the two conditions it is, and nothing about the
+// issuer, the destination or the source's own words.
+func credentialRefusalForAViewer(err error) string {
+	if errors.Is(err, ErrCredentialRefused) {
+		return "this solution's authority for this execution has been refused and will not be renewed"
+	}
+	return "this solution cannot currently obtain the authority it needs to act for you"
+}
 
 // ErrCredentialRefused and ErrCredentialUnavailable are why a route refused to
 // act for a viewer: a judgement about this build, or an issuer that cannot
@@ -1571,7 +1804,19 @@ var (
 // runtime classifies it as transient rather than terminal, and the next ask
 // mints afresh.
 func (s *Server) executionCredentialSuperseded() {
-	s.credentialValidUntil.Store(0)
+	s.credentialMu.Lock()
+	// By token, not merely by clearing what is held. Clearing alone was
+	// immediately reversible: the next ask returns the SDK's cached credential
+	// — the same one the host just refused, since the client re-mints only at
+	// its renewal lead — and the belief was restored by the very credential
+	// that triggered the invalidation. Remembering the token is what makes it
+	// stick until something actually replaces it.
+	if s.credentialHeld.Token() != "" {
+		s.credentialSuperseded = s.credentialHeld.Token()
+	}
+	s.credentialHeld = workcontext.Credential{}
+	s.credentialQuietUntil = time.Time{}
+	s.credentialMu.Unlock()
 }
 
 // credentialRefused records a judgement the issuer will not reverse.
@@ -1768,7 +2013,15 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 		// gateway carrying the viewer's bearer, and sending that anywhere under
 		// a credential the issuer has withdrawn is acting without authority.
 		if err := s.actingForAViewer(r.Context()); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			// The sanitized sentence, not the error. The error wraps whatever
+			// the source said — a mint URL, an issuer's own text, a dial
+			// failure naming an internal address — and this route gate wrote
+			// it straight into the viewer's response and the log, which is the
+			// disclosure handlerErrorResponse exists to prevent. Adding a gate
+			// in front of the handler put a new path around the sanitization
+			// rather than through it.
+			log.Printf("solution %q: refusing to act for a viewer: %v", s.manifest.ID, err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": credentialRefusalForAViewer(err)})
 			return
 		}
 		result, err := handler(r, s.gatewayFor(r.Header))

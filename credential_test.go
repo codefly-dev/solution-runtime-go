@@ -755,8 +755,20 @@ func TestAPlainHandlerRefusesToActWithoutACredential(t *testing.T) {
 			if got := reached.Load(); got != 0 {
 				t.Errorf("the handler body ran %d times, want 0: the refusal has to come before anything acts for the viewer", got)
 			}
-			if body := recorder.Body.String(); !strings.Contains(body, "credential") {
-				t.Errorf("the 503 body %q does not say the credential is why", body)
+			body := recorder.Body.String()
+			if !strings.Contains(body, "authority") {
+				t.Errorf("the 503 body %q does not say why this solution will not act", body)
+			}
+			// And it carries nothing the source said. The error wraps whatever
+			// came back — a mint URL, the issuer's own text, a dial failure
+			// naming an internal address — and this gate wrote it into the
+			// viewer's response verbatim, which is the disclosure
+			// handlerErrorResponse exists to prevent. A new gate in front of
+			// the handler put a path *around* the sanitization.
+			for _, leaked := range []string{"issuer", "presence document", "dependencies", "mint"} {
+				if strings.Contains(body, leaked) {
+					t.Errorf("the 503 body %q carries %q from the source's own error", body, leaked)
+				}
 			}
 			// Terminal and transient stay distinguishable: conflating them was
 			// a review blocker in both directions.
@@ -844,8 +856,10 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 	// renewal begins while a valid credential is still held, so a slow renewal
 	// must not 503 every viewer.
 	t.Run("with an unexpired credential in hand, the route proceeds", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{})
+		held := mintedCredential(t, mint, "held")
 		server := New(Manifest{ID: testSolutionID}).Credential(slow)
-		server.credentialValidUntil.Store(time.Now().Add(time.Hour).UnixNano())
+		server.credentialHeld = held
 		done := make(chan error, 1)
 		go func() { done <- server.actingForAViewer(context.Background()) }()
 		select {
@@ -860,8 +874,14 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 
 	// An expired one is not "in hand" at all.
 	t.Run("with an expired credential, the route refuses", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{ttl: time.Second})
+		expired := mintedCredential(t, mint, "expired")
 		server := New(Manifest{ID: testSolutionID}).Credential(slow)
-		server.credentialValidUntil.Store(time.Now().Add(-time.Minute).UnixNano())
+		server.credentialHeld = expired
+		// Past its expiry, which is the state a route must not act under.
+		for !time.Now().After(expired.ExpiresAt()) {
+			time.Sleep(50 * time.Millisecond)
+		}
 		done := make(chan error, 1)
 		go func() { done <- server.actingForAViewer(context.Background()) }()
 		select {
@@ -933,16 +953,26 @@ type handingSource struct {
 	mu          sync.Mutex
 	credentials []workcontext.Credential
 	at          int
+	asks        int
 }
 
 func (h *handingSource) Credential(context.Context) (workcontext.Credential, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.asks++
 	credential := h.credentials[h.at]
 	if h.at < len(h.credentials)-1 {
 		h.at++
 	}
 	return credential, nil
+}
+
+// count is how many times this source was reached, which is what shows whether
+// a check ran before the ask or after it.
+func (h *handingSource) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.asks
 }
 
 // mintedCredential is one credential from the fake host, so a test can hand out
@@ -956,4 +986,268 @@ func mintedCredential(t *testing.T, mint *hostMint, projection string) workconte
 		t.Fatalf("mint a credential for the test: %v", err)
 	}
 	return credential
+}
+
+// unavailableAfter answers normally until `after` asks, then reports the issuer
+// unavailable — the shape of a credential inside its renewal window against an
+// issuer that has stopped answering.
+type unavailableAfter struct {
+	mu         sync.Mutex
+	credential workcontext.Credential
+	asks       int
+	after      int
+}
+
+func (u *unavailableAfter) Credential(context.Context) (workcontext.Credential, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.asks++
+	if u.asks > u.after {
+		return workcontext.Credential{}, fmt.Errorf("%w: the issuer cannot answer right now", workcontext.ErrMintUnavailable)
+	}
+	return u.credential, nil
+}
+
+func (u *unavailableAfter) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.asks
+}
+
+// TestAStreamOfViewerRequestsDoesNotMintPerRequest is the regression this
+// round's own fix introduced, and it is the worst kind this runtime can have.
+//
+// With the credential inside its renewal window and the issuer answering 503,
+// every viewer request asked, every ask minted, and every request answered 503
+// — while a perfectly valid credential sat in hand. Forty requests, forty
+// audited mints. That is not a smaller version of the heartbeat this runtime
+// deleted; it is a larger one, because the heartbeat minted on a timer and this
+// minted on traffic. The PR body's own claim is that a client minting per
+// request "would be worse than the heartbeat it replaced".
+//
+// The fast-failure path refused outright while the timeout path, three lines
+// below, already served on a held credential. The two disagreed.
+func TestAStreamOfViewerRequestsDoesNotMintPerRequest(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	held := mintedCredential(t, mint, "held")
+	source := &unavailableAfter{credential: held, after: 1}
+
+	server := New(Manifest{ID: testSolutionID}).Credential(source)
+	handler := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+		return map[string]string{"ok": "yes"}, nil
+	})
+
+	// The first request takes the credential, which is valid for a while yet.
+	request := httptest.NewRequest(http.MethodGet, "/thing", nil)
+	request.Header.Set("authorization", "Bearer viewer")
+	first := httptest.NewRecorder()
+	handler(first, request)
+	if first.Code != http.StatusOK {
+		t.Fatalf("the first request answered %d, want 200: %s", first.Code, first.Body.String())
+	}
+
+	// Now the issuer stops answering, and forty viewers arrive.
+	const viewers = 40
+	for range viewers {
+		recorder := httptest.NewRecorder()
+		handler(recorder, httptest.NewRequest(http.MethodGet, "/thing", nil).WithContext(request.Context()))
+		served := httptest.NewRequest(http.MethodGet, "/thing", nil)
+		served.Header.Set("authorization", "Bearer viewer")
+		recorder = httptest.NewRecorder()
+		handler(recorder, served)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("a viewer request answered %d while this process held a credential valid until %s: the issuer being unavailable is not a reason to refuse a viewer when the authority to act for them is already in hand",
+				recorder.Code, held.ExpiresAt().UTC().Format(time.RFC3339))
+		}
+	}
+
+	// And the asks were not one per request. One ask failed, which quiets the
+	// next ones; the renewal the credential's own expiry dictates is still
+	// ahead of us.
+	if got := source.count(); got > 4 {
+		t.Errorf("the source was asked %d times for %d viewer requests: a runtime that asks — and therefore mints — per request is worse than the heartbeat it replaced, which at least minted on a timer", got, viewers)
+	}
+}
+
+// TestACredentialThatAuthorisesNothingIsRefused: a supplied source may hand
+// back the zero credential, or an expired one, and this runtime held it,
+// booted, answered /health 200 and acted for viewers under it.
+//
+// The authority wrapper could not see either: it keys on the token *changing*,
+// and a token that is always "" never changes.
+func TestACredentialThatAuthorisesNothingIsRefused(t *testing.T) {
+	mint := newHostMint(t, &hostMint{ttl: time.Second})
+	expiring := mintedCredential(t, mint, "expiring")
+	for !time.Now().After(expiring.ExpiresAt()) {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		credential workcontext.Credential
+		terminal   bool
+	}{
+		{"the zero credential", workcontext.Credential{}, true},
+		{"an expired credential", expiring, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// At the boot.
+			boot := newHostMint(t, &hostMint{})
+			server := New(Manifest{ID: testSolutionID}).Credential(stubCredentialSource{credential: tc.credential})
+			server.firstMintWindow = 750 * time.Millisecond
+			if err := bootFailsWithin(t, server, boot, 10*time.Second); err == nil {
+				t.Fatal("the boot accepted a credential that authorises nothing: this process would serve, answer /health 200, and act for viewers under it")
+			}
+
+			// And at a route, for a source that only degrades later.
+			serving := New(Manifest{ID: testSolutionID}).Credential(stubCredentialSource{credential: tc.credential})
+			if err := serving.actingForAViewer(context.Background()); err == nil {
+				t.Fatal("a route acted for a viewer under a credential that authorises nothing")
+			}
+			// And classified: nothing to mint with is a judgement, an expiry
+			// that has passed is not.
+			err := usableCredential(tc.credential)
+			if got := terminalCredentialFailure(err); got != tc.terminal {
+				t.Errorf("terminal = %v, want %v for %v: the boot and the run have to classify these the same way", got, tc.terminal, err)
+			}
+		})
+	}
+}
+
+// slowThenRefused answers slowly, and then with a judgement — the shape where
+// acquisition outlives the caller that started it.
+type slowThenRefused struct {
+	after time.Duration
+	asked chan struct{}
+}
+
+func (s *slowThenRefused) Credential(ctx context.Context) (workcontext.Credential, error) {
+	select {
+	case s.asked <- struct{}{}:
+	default:
+	}
+	select {
+	case <-time.After(s.after):
+	case <-ctx.Done():
+		return workcontext.Credential{}, ctx.Err()
+	}
+	return workcontext.Credential{}, fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused)
+}
+
+// TestATerminalRefusalIsRecordedWhereverItLands is the blocker the static round
+// six found in this round's own fix.
+//
+// The ask runs on a context detached from the caller's, so a request that gives
+// up does not cancel work other callers are waiting on. That also means the
+// answer can arrive after every caller has gone — and a terminal refusal
+// classified only by whoever was still waiting was simply discarded. The route
+// served on the held credential, nothing recorded the refusal, and the process
+// went on acting for viewers after its own source had reported this execution
+// refused. The classification belongs to the answer, not to the audience.
+func TestATerminalRefusalIsRecordedWhereverItLands(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	held := mintedCredential(t, mint, "held")
+	source := &slowThenRefused{after: 750 * time.Millisecond, asked: make(chan struct{}, 1)}
+
+	server := New(Manifest{ID: testSolutionID}).Credential(source)
+	server.credentialHeld = held
+
+	// A route asks, times out well before the source answers, and is served
+	// from the credential in hand — which is correct.
+	if err := server.actingForAViewer(context.Background()); err != nil {
+		t.Fatalf("a route was refused while this process held a valid credential and the source was merely slow: %v", err)
+	}
+	select {
+	case <-source.asked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the source was never asked, so this test does not exercise the detached ask")
+	}
+
+	// The refusal lands with nobody waiting.
+	deadline := time.Now().Add(5 * time.Second)
+	for server.terminalErr.Load() == nil && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if server.terminalErr.Load() == nil {
+		t.Fatal("this execution's credential was refused and nothing recorded it, because the caller that started the ask had already been served: the process keeps acting for viewers under an authority its own source says is gone, and /health keeps answering 200")
+	}
+
+	// And the process now refuses to act, rather than carrying on with the
+	// credential it still holds.
+	if err := server.actingForAViewer(context.Background()); !errors.Is(err, ErrCredentialRefused) {
+		t.Errorf("after a recorded refusal a route answered %v, want one wrapping %v: a held credential does not survive a judgement about the build that holds it", err, ErrCredentialRefused)
+	}
+}
+
+// TestAWithdrawnAuthorityIsCaughtBeforeTheMint: the recheck ran after the ask,
+// so a withdrawn authority was discovered one renewal too late — the mint had
+// already happened, sealed to values nobody approved, and the caller that
+// triggered it was served.
+func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
+	fabricator := newHostMint(t, &hostMint{})
+	handing := &handingSource{credentials: []workcontext.Credential{
+		mintedCredential(t, fabricator, "first"),
+		mintedCredential(t, fabricator, "second"),
+	}}
+
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := New(Manifest{ID: testSolutionID}).Credential(handing)
+	if _, err := server.start(ctx); err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	asksAtBoot := handing.count()
+
+	// The authority drifts, and then something asks.
+	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
+		"spiffe://codefly.test/ns/solutions/sa/somebody-else")
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.credential.Credential(ctx); err == nil {
+		t.Fatal("an ask proceeded under a drifted authority")
+	}
+	// And the source was never reached, so nothing was minted under it.
+	if got := handing.count(); got != asksAtBoot {
+		t.Errorf("the source was asked %d times after the authority drifted (%d at boot): the recheck has to come before the ask, or the credential is already minted and sealed to a value nobody approved by the time the drift is noticed",
+			got-asksAtBoot, asksAtBoot)
+	}
+}
+
+// TestASupersededCredentialIsNotRestoredByTheNextAsk: dropping the belief was
+// immediately reversible.
+//
+// The SDK's client re-mints only at its renewal lead, so the next ask returns
+// the same credential the host just refused — and storing it restored the belief
+// that it was honoured, undone by the very credential that triggered the
+// invalidation.
+func TestASupersededCredentialIsNotRestoredByTheNextAsk(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	// The real client, so the cache behaves as it does in production: the same
+	// credential comes back until its renewal lead.
+	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+
+	if err := server.actingForAViewer(context.Background()); err != nil {
+		t.Fatalf("a route was refused with a fresh credential in hand: %v", err)
+	}
+	held, _ := server.heldCredential()
+	if held.Token() == "" {
+		t.Fatal("nothing was held after a successful ask")
+	}
+
+	// The host says this credential is no longer honoured.
+	server.executionCredentialSuperseded()
+	if _, ok := server.heldCredential(); ok {
+		t.Fatal("the superseded credential is still held")
+	}
+
+	// The next ask returns the same one. The belief must not come back.
+	_ = server.actingForAViewer(context.Background())
+	if again, ok := server.heldCredential(); ok && again.Token() == held.Token() {
+		t.Error("the superseded credential was held again after the next ask returned it: the SDK re-mints only at its renewal lead, so the invalidation is undone by the very credential that triggered it unless the token is remembered")
+	}
 }

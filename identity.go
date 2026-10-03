@@ -386,6 +386,23 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 	if err := usableServerIdentity(answered); err != nil {
 		return nil, err
 	}
+	// A source that resolves anything per handshake has to be askable, and
+	// carrying a base pool as well does not make it so.
+	//
+	// The refusal used to live in peerAnchorFrom, which reached it only when
+	// the base pool was nil — so a source with BOTH a base pool and a
+	// per-handshake callback was accepted, and then had the base pool frozen
+	// for every recheck and every outbound dial while its callback went on
+	// resolving a fresh one. Executed: after the bundle rotated A→B a fresh
+	// A-caller was refused and the ESTABLISHED A-caller served 30 requests
+	// over 3 seconds. This file and the README both said that source was
+	// refused at boot. It was not, and the half that was true was the half
+	// nobody writes.
+	if answered.GetConfigForClient != nil {
+		if _, askable := source.(PeerAnchorSource); !askable {
+			return nil, fmt.Errorf("the identity source resolves its configuration per handshake (GetConfigForClient is set) and does not implement PeerAnchorSource, so this runtime cannot obtain the anchor it re-verifies established peers against — or verifies the platform it dials against — except through a handshake nobody made. Carrying a pool on the base configuration does not answer it: that pool is one object fixed when the source built it, so it would freeze the anchor this process judges by. Implement PeerAnchor() (*x509.CertPool, error)")
+		}
+	}
 	// On a clone, because everything below writes to it: the certificate hold
 	// wraps GetCertificate, admitOnly composes over VerifyConnection, and the
 	// per-connection hold wraps GetConfigForClient. A source is under no
@@ -517,7 +534,20 @@ func oneURIIdentity(state tls.ConnectionState, side string) (string, error) {
 	if len(state.PeerCertificates) == 0 {
 		return "", fmt.Errorf("refusing a %s that presented no certificate", side)
 	}
-	leaf := state.PeerCertificates[0]
+	// From the raw DER, parsed here, not from the *x509.Certificate the
+	// handshake left in the state.
+	//
+	// That object is reachable by a source's own VerifyPeerCertificate and
+	// VerifyConnection, both of which run on the same connection and are handed
+	// pointers to it — and a source that rewrites leaf.URIs there was
+	// demonstrated having a rival caller admitted, with the per-second recheck
+	// then reading the same mutated leaf and agreeing. The bytes the peer
+	// actually signed are the only thing that cannot be edited between the
+	// handshake and this check.
+	leaf, err := x509.ParseCertificate(state.PeerCertificates[0].Raw)
+	if err != nil {
+		return "", fmt.Errorf("refusing a %s whose certificate cannot be parsed from the bytes it presented: %w", side, err)
+	}
 	if len(leaf.URIs) != 1 {
 		return "", fmt.Errorf("refusing a %s whose certificate names %d URI identities: a SPIFFE certificate names exactly one, and a leaf naming several could be accepted on whichever happens to match",
 			side, len(leaf.URIs))
@@ -685,6 +715,15 @@ func refuseResumption(config *tls.Config) {
 // unsubvertedPosture refuses the fields that leave every check above passing
 // and the posture gone.
 //
+// It is a denylist over a struct this package does not own, and the claim that
+// it was "complete for the fields that exist in the Go version in go.mod" was
+// false twice: first for the session-ticket keys, then for
+// VerifyPeerCertificate. A Clone() copies 29 of 32 fields unchanged, so what
+// this does not name, a source keeps. Where a property matters it is taken
+// rather than checked — resumption is disabled outright, and the caller's
+// identity is read from a fresh parse of the raw DER — and this list is the
+// part that only *tells* a source it has gone wrong.
+//
 // The checks above enumerate what a conforming listener must *have*, which
 // answers the wrong question on its own: a source can satisfy all of them and
 // still hand back a configuration whose certificate validity is judged against
@@ -713,6 +752,15 @@ func unsubvertedPosture(config *tls.Config) error {
 		{"WrapSession", "resumption tickets are encoded by this, and a resumed connection presents no certificate, so a source encoding its own tickets admits callers without a handshake this package sees", config.WrapSession != nil},
 		{"UnwrapSession", "resumption tickets are decoded by this, with the same consequence as WrapSession", config.UnwrapSession != nil},
 		{"InsecureSkipVerify", "the peer's certificate chain is not verified at all", config.InsecureSkipVerify},
+		// VerifyPeerCertificate is handed the parsed chain this runtime then
+		// reads the caller's identity from, and it runs first. A source that
+		// rewrites leaf.URIs there had a rival caller admitted — and the
+		// per-second recheck read the same mutated leaf and agreed with it.
+		// The identity check now re-parses the raw DER, so the mutation no
+		// longer decides anything; this refusal is the other half, because a
+		// source has no business holding a pointer to the chain this
+		// listener's admission is computed from.
+		{"VerifyPeerCertificate", "it is handed the parsed certificate chain this runtime reads the caller's identity from, and it runs first — a source that rewrites the leaf's URI SANs there decides who is admitted. Verify what you need in VerifyConnection, which is given a copy of the connection state", config.VerifyPeerCertificate != nil},
 		// The ticket *keys*, not just the ticket callbacks. Resumption is the
 		// sharpest of these because a resumed connection presents no
 		// certificate, and a source can reach it two ways: by encoding the
@@ -721,13 +769,10 @@ func unsubvertedPosture(config *tls.Config) error {
 		// fewer lines — anyone holding it can forge a ticket this listener
 		// accepts — and the denylist named only the callbacks.
 		{"SessionTicketKey", "resumption tickets are sealed with a key the source chose, and anyone holding it can forge a ticket this listener resumes without any certificate being presented", config.SessionTicketKey != [32]byte{}},
-		// And the opposite setting, for the opposite reason: a source that
-		// disables resumption is not lowering the posture, so it is allowed —
-		// but a source that leaves it on while controlling the keys is, and
-		// SetSessionTicketKeys is a method rather than a field, so the keys it
-		// installs cannot be read back off the configuration. That is the one
-		// hole here a check cannot close, which is why it is written down
-		// rather than implied.
+		// SetSessionTicketKeys installs keys that cannot be read back off the
+		// configuration, so no entry here can catch it. That hole is closed by
+		// refuseResumption instead, which is why this list is advice to a
+		// source and not the control.
 	} {
 		if field.set {
 			return fmt.Errorf("the identity source returned a TLS configuration that sets %s: %s. Leave it unset and Go's own is used — this listener's posture is not a thing a source may replace, only a thing it may satisfy", field.name, field.why)

@@ -389,7 +389,7 @@ func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
 	const addr = "https://gateway:42152"
 	t.Run("the current role resolves", func(t *testing.T) {
 		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", addr)
-		cfg := loadConfig(context.Background())
+		cfg := loadConfig(context.Background(), nil)
 		if cfg.gatewayURL != addr {
 			t.Fatalf("gatewayURL = %q, want %q resolved from the current role without an override", cfg.gatewayURL, addr)
 		}
@@ -433,7 +433,7 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__REST__REST", gatewayAddr)
 
-			cfg := loadConfig(context.Background())
+			cfg := loadConfig(context.Background(), nil)
 			if cfg.gatewayURL != gatewayAddr {
 				t.Errorf("gatewayURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.gatewayURL, gatewayAddr)
 			}
@@ -1452,7 +1452,7 @@ func TestManifestURLIsNeverAnAbsoluteOrigin(t *testing.T) {
 	t.Setenv("PUBLIC_URL", "https://solutions.example.com/widgets")
 	t.Setenv("PORT", "8080")
 	s := New(Manifest{ID: testSolutionID})
-	s.cfg = loadConfig(context.Background())
+	s.cfg = loadConfig(context.Background(), nil)
 	frontend, _ := s.manifestMap()["frontend"].(map[string]any)
 	if got := frontend["manifestUrl"]; got != federationManifestPath {
 		t.Errorf("manifestUrl = %v, want %q: no environment variable may make it absolute again", got, federationManifestPath)
@@ -1578,12 +1578,26 @@ func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
 		}
 	})
 
-	t.Run("both answering is refused, naming both", func(t *testing.T) {
+	// Driven through the real resolver, not injected. The comment that used to
+	// stand here said a test cannot make the SDK's workspace configuration
+	// answer, and that was simply false — authorityValues does it for the
+	// authority group, the same way. So the conflict rule had no behavioural
+	// test at all and three mutants of it survived.
+	t.Run("both answering is refused, through the resolver", func(t *testing.T) {
+		provisionedWorkloadValue(t, WorkloadIdentityAllowedCallersFileKey, "/provisioned/callers")
+		t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, "/override/callers")
+		conflict := conflictingAdmissionSources(context.Background(), nil)
+		if conflict == nil {
+			t.Fatal("the resolver saw no conflict while both the override and the platform answered for the caller set")
+		}
+		for _, named := range []string{"/override/callers", "/provisioned/callers"} {
+			if !strings.Contains(conflict.Error(), named) {
+				t.Errorf("the refusal %q does not name %s, so an operator cannot tell which two answers are in play", conflict, named)
+			}
+		}
+
 		cfg := base(t)
-		// Simulated at the boundary the resolver produces, because a test
-		// cannot make the SDK's workspace configuration answer: what is under
-		// test is that validate() refuses rather than ranks.
-		cfg.admissionConflict = errors.New("the allowed callers are answered twice: CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE names \"/a\" and the platform provisioned workload-identity/ALLOWED_CALLERS_FILE as \"/b\"")
+		cfg.admissionConflict = conflict
 		err := cfg.validate()
 		if err == nil {
 			t.Fatal("a boot accepted an admission set answered by two sources: ranking them silently is how a caller set gets widened with nothing recording that the platform's decision was not in force")
@@ -1600,8 +1614,30 @@ func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
 	})
 
 	t.Run("the resolver finds no conflict with no override set", func(t *testing.T) {
-		if err := conflictingAdmissionSources(context.Background()); err != nil {
+		provisionedWorkloadValue(t, WorkloadIdentityAllowedCallersFileKey, "/provisioned/callers")
+		if err := conflictingAdmissionSources(context.Background(), nil); err != nil {
 			t.Errorf("a conflict was reported with no override set: %v", err)
+		}
+	})
+
+	// And an override against provisioning this process cannot READ is a
+	// conflict too. The resolver discarded the SDK's error, saw no second
+	// answer, and put the override in force — against provisioning it simply
+	// could not see.
+	t.Run("an unreadable platform answer is a conflict, not an absent one", func(t *testing.T) {
+		t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, "/override/wide")
+		// No workspace configuration loaded at all, so the SDK errors rather
+		// than answering empty.
+		withoutWorkloadValues(t)
+		// With a failed environment load, which is the one signal that
+		// separates "never provisioned" from "could not be read": the SDK
+		// answers both with the same error.
+		err := conflictingAdmissionSources(context.Background(), errors.New("loading the injected environment failed"))
+		if err == nil {
+			t.Fatal("an override was put in force while the platform's own answer could not be read: an unreadable answer is still an answer somebody provisioned, and choosing between two is exactly what this rule refuses")
+		}
+		if !strings.Contains(err.Error(), "cannot be read") {
+			t.Errorf("the refusal %q does not say the platform's answer was unreadable", err)
 		}
 	})
 }

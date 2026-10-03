@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -342,9 +343,37 @@ func TestTheListenerServesTheRotatedLeaf(t *testing.T) {
 
 // staticIdentity is a consumer-supplied identity source, including the
 // degenerate ones a consumer can write by mistake.
-type staticIdentity struct{ config *tls.Config }
+type staticIdentity struct {
+	config *tls.Config
+	// anchor, when set, is what this source says its current anchor is. Unset,
+	// it answers with the pool on the configuration — truthful for a source
+	// whose anchor really is static, which is every source in these tests.
+	anchor func() *x509.CertPool
+}
 
 func (s staticIdentity) ServerTLSConfig() (*tls.Config, error) { return s.config, nil }
+
+// PeerAnchor makes this source askable, which a source setting
+// GetConfigForClient now has to be: the runtime re-verifies established peers
+// and verifies the platform it dials, and neither can be answered by probing a
+// per-handshake callback with a hello nobody sent.
+func (s staticIdentity) PeerAnchor() (*x509.CertPool, error) {
+	if s.anchor != nil {
+		return s.anchor(), nil
+	}
+	if s.config.ClientCAs != nil {
+		return s.config.ClientCAs, nil
+	}
+	// Mirrors what the projected source does: resolve it now rather than hold
+	// a pool from boot.
+	if s.config.GetConfigForClient != nil {
+		answer, err := s.config.GetConfigForClient(&tls.ClientHelloInfo{})
+		if err == nil && answer != nil && answer.ClientCAs != nil {
+			return answer.ClientCAs, nil
+		}
+	}
+	return nil, fmt.Errorf("this test source names no anchor")
+}
 
 // withoutAnchor is a source that requires a caller's certificate and names
 // nothing to verify it against, with no per-connection callback to resolve one
@@ -989,7 +1018,7 @@ func TestASourcesAnchorIsAskedForAndNeverFabricated(t *testing.T) {
 
 	t.Run("a source carrying only a base anchor uses it", func(t *testing.T) {
 		config := &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: boot.roots}
-		anchor, err := peerAnchorFrom(staticIdentity{config: config}, config)
+		anchor, err := peerAnchorFrom(unaskableIdentity{config: config}, config)
 		if err != nil {
 			t.Fatalf("peerAnchorFrom: %v", err)
 		}
@@ -1008,7 +1037,7 @@ func TestASourcesAnchorIsAskedForAndNeverFabricated(t *testing.T) {
 				return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: current.roots}, nil
 			},
 		}
-		anchor, err := peerAnchorFrom(staticIdentity{config: config}, config)
+		anchor, err := peerAnchorFrom(unaskableIdentity{config: config}, config)
 		if err == nil {
 			t.Fatal("an anchor was obtained from a source that can only answer through a handshake: the only way to get one is to fabricate a ClientHelloInfo, and a source keyed on the hello answers a probe and a real handshake differently — which is the blocker this runtime was already held up on, one field along")
 		}
@@ -1020,6 +1049,13 @@ func TestASourcesAnchorIsAskedForAndNeverFabricated(t *testing.T) {
 		}
 	})
 }
+
+// unaskableIdentity is a source that does NOT implement PeerAnchorSource,
+// which the test sources here otherwise do. It exists so the refusal for a
+// source that can only answer through a handshake stays reachable.
+type unaskableIdentity struct{ config *tls.Config }
+
+func (u unaskableIdentity) ServerTLSConfig() (*tls.Config, error) { return u.config, nil }
 
 // TestASourceCannotReplaceThePostureItIsHeldTo: the posture checks enumerate
 // what a conforming listener must have, which a source can satisfy completely
@@ -1076,16 +1112,53 @@ func TestASourceCannotReplaceThePostureItIsHeldTo(t *testing.T) {
 
 	// And a per-connection answer is held to the same list, not a copy of its
 	// reasoning: the answer replaces the base for that connection.
-	config := conforming(t)
-	config.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
-		answer := conforming(t)
-		answer.GetConfigForClient = nil
-		answer.KeyLogWriter = io.Discard
-		return answer, nil
+	//
+	// The answer carries a real anchor, which is the part this case got wrong
+	// before: without one it was refused for the missing pool, so the
+	// assertion held whether or not the denylist was applied to the answer at
+	// all, and the mutant that stopped applying it survived.
+	anchor, err := peerAnchor(bundleFile)
+	if err != nil {
+		t.Fatal(err)
 	}
-	holdPerConnectionPosture(config, testPrincipal, func() ([]string, error) { return []string{testGatewayPrincipal}, nil })
-	if _, err := config.GetConfigForClient(&tls.ClientHelloInfo{}); err == nil {
-		t.Error("a per-connection answer that writes out every connection's session secrets was served: the configuration the callback returns replaces the base one, so it is held to the same posture")
+	answered := func(lower func(*tls.Config)) *tls.Config {
+		base := conforming(t)
+		base.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			answer := conforming(t)
+			answer.GetConfigForClient = nil
+			answer.ClientCAs = anchor
+			lower(answer)
+			return answer, nil
+		}
+		holdPerConnectionPosture(base, testPrincipal, func() ([]string, error) { return []string{testGatewayPrincipal}, nil })
+		return base
+	}
+
+	// The control: a conforming answer, with the anchor, is served.
+	if _, err := answered(func(*tls.Config) {}).GetConfigForClient(&tls.ClientHelloInfo{}); err != nil {
+		t.Fatalf("a conforming per-connection answer was refused, so nothing below is about the denylist: %v", err)
+	}
+	for _, tc := range []struct {
+		name, names string
+		lower       func(*tls.Config)
+	}{
+		{"the session secrets written out", "KeyLogWriter", func(cfg *tls.Config) { cfg.KeyLogWriter = io.Discard }},
+		{"a clock of its own", "Time", func(cfg *tls.Config) { cfg.Time = func() time.Time { return time.Unix(0, 0) } }},
+		{"its own chain verifier", "VerifyPeerCertificate", func(cfg *tls.Config) {
+			cfg.VerifyPeerCertificate = func([][]byte, [][]*x509.Certificate) error { return nil }
+		}},
+	} {
+		t.Run("per connection: "+tc.name, func(t *testing.T) {
+			_, err := answered(tc.lower).GetConfigForClient(&tls.ClientHelloInfo{})
+			if err == nil {
+				t.Fatalf("a per-connection answer setting %s was served: the configuration a callback returns replaces the base one, so it is held to the same posture", tc.names)
+			}
+			// And refused for THAT, not for something else the answer happens
+			// to be missing.
+			if !strings.Contains(err.Error(), tc.names) {
+				t.Errorf("the refusal %q does not name %s, so this case does not cover it", err, tc.names)
+			}
+		})
 	}
 }
 

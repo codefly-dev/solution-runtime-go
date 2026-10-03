@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -467,7 +468,14 @@ func (s *Server) authorize(ctx context.Context, route passthroughRoute, header h
 	// actingForAViewer: the credential is what authorises this process to act
 	// for a viewer, not merely what it mints with.
 	if err := s.actingForAViewer(ctx); err != nil {
-		return nil, connect.NewError(connect.CodeUnavailable, err)
+		// Sanitized, for the reason wrapRequest records: the error wraps what
+		// the source said, and this branch handed it to the page verbatim.
+		code := connect.CodeUnavailable
+		if errors.Is(err, ErrCredentialRefused) {
+			code = connect.CodeFailedPrecondition
+		}
+		log.Printf("solution: refusing to act for a viewer on %s: %v", route.module.As, err)
+		return nil, connect.NewError(code, errors.New(credentialRefusalForAViewer(err)))
 	}
 	gw := s.gatewayFor(header)
 	if !route.module.ViewerBearer {

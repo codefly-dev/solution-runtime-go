@@ -141,13 +141,31 @@ type authorityHeldSource struct {
 }
 
 func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	// Before the ask, because the ask is what mints.
+	//
+	// Rechecking afterwards discovers a withdrawn authority one renewal too
+	// late: the mint has already happened, sealed to values nobody approved,
+	// and the first caller is served with it. The SDK does this ahead of its
+	// own renewals for the platform source; a supplied source has no such
+	// hook, which is the whole reason this wrapper exists.
+	if err := a.authority.Recheck(ctx); err != nil {
+		return workcontext.Credential{}, fmt.Errorf("%w: an authority-bearing value has drifted from the one this process froze at boot, so nothing further is minted under it: %w",
+			workcontext.ErrMintRefused, err)
+	}
 	credential, err := a.inner.Credential(ctx)
 	if err != nil {
 		return credential, err
 	}
+	// Before the renewal comparison, because that comparison keys on the
+	// token *changing* and a token that is always "" never changes — so the
+	// zero credential walked past this wrapper every time.
+	if err := usableCredential(credential); err != nil {
+		return workcontext.Credential{}, err
+	}
 	a.mu.Lock()
 	renewed := a.last != "" && credential.Token() != a.last
 	a.mu.Unlock()
+	// And again after, for drift that landed during the ask itself.
 	if renewed {
 		if err := a.authority.Recheck(ctx); err != nil {
 			return workcontext.Credential{}, fmt.Errorf("%w: this execution's credential was renewed while an authority-bearing value had drifted from the one this process froze at boot: %w",
@@ -260,6 +278,17 @@ func (s *Server) openCredential(ctx context.Context) error {
 	for attempt := 1; ; attempt++ {
 		credential, err := s.credential.Credential(deadline)
 		switch {
+		case err == nil && usableCredential(credential) != nil:
+			// A source may hand back the zero credential or an expired one,
+			// and this boot used to accept either: it logged a credential
+			// sealed to installation "" and served. The classification is
+			// usableCredential's — an empty token is a judgement, an expired
+			// one is not — so an unavailable answer here keeps waiting inside
+			// the window and a refused one fails the boot.
+			err = usableCredential(credential)
+			if !errors.Is(err, workcontext.ErrMintUnavailable) {
+				return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
+			}
 		case err == nil && deadline.Err() == nil:
 			seal := credential.Seal()
 			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",

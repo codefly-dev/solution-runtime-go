@@ -1002,3 +1002,30 @@ func TestACredentialThatCannotBePresentedRefusesTheMint(t *testing.T) {
 		t.Errorf("observed %d mints for a credential that could not be attached, want 0", got)
 	}
 }
+
+// provisionedWorkloadValue makes the SDK answer for one workload-identity key,
+// the way authorityValues does for the authority group.
+//
+// It exists because a comment in this suite claimed a test could not make the
+// SDK's workspace configuration answer. It can, and because it was believed it
+// could not, the two-sources rule had no behavioural test and three mutants of
+// it survived.
+func provisionedWorkloadValue(t *testing.T, key, value string) {
+	t.Helper()
+	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__WORKLOAD_IDENTITY__"+key, value)
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
+}
+
+// withoutWorkloadValues leaves the SDK with no workspace configuration at all,
+// so a lookup errors rather than answering empty.
+func withoutWorkloadValues(t *testing.T) {
+	t.Helper()
+	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION", "")
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
+}
