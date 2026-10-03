@@ -2,15 +2,20 @@ package solution
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -286,7 +291,15 @@ func TestTheCertificateServedIsTheCertificateChecked(t *testing.T) {
 			config, err := server.serverIdentity()
 			if err != nil {
 				// Refused at boot, which is the better of the two outcomes:
-				// nothing is served and the mint has not happened yet.
+				// nothing is served and the mint has not happened yet. But
+				// only for the right reason — returning on *any* boot error
+				// made every case here pass the moment serverIdentity failed
+				// over an unresolved path or an unreadable admission set,
+				// which is a test reporting success for a cause it never
+				// exercised.
+				if !mentionsTheCertificate(err) {
+					t.Fatalf("the boot refused this source for something other than the certificate it would serve, so this case never ran: %v", err)
+				}
 				return
 			}
 			outcome := servedTo(t, config, caller, tc.sni)
@@ -557,11 +570,19 @@ func (h *platformHost) called() []string {
 	}
 }
 
-// TestTheOutboundLeafIsHeldWhenItIsPresented: the outbound check was a
-// preflight. It called the reloader once, compared what came back, and left the
-// source's own callback installed for the handshake — so a rotation between the
-// two presented a neighbouring workload's leaf to the mint, successfully, with
-// this workload's projected service-account token on the request.
+// TestTheOutboundLeafIsHeldWhenItIsPresented: a projection that rotates to a
+// neighbouring workload's identity before anything is dialled is refused, and
+// the rival never reaches the platform.
+//
+// What this does NOT prove, despite its name, is that the hold runs at the
+// moment of presentation. The outbound configuration is rebuilt per dial, so
+// the check made while building it is already at-use for this case, and
+// removing the wrapper around the callback leaves this test passing. The
+// at-use half — a rotation landing between that check and the handshake — is
+// TestARotationBetweenTheCheckAndTheHandshakeIsRefused, and the wrapper is
+// driven directly by TestTheOutboundHoldRefusesTheAnswerAHandshakeGets.
+// Saying so here because a test whose name claims the stronger property is
+// how the weaker one gets mistaken for coverage.
 func TestTheOutboundLeafIsHeldWhenItIsPresented(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
@@ -1221,4 +1242,187 @@ func TestANonAtomicRotationDoesNotFailANewDial(t *testing.T) {
 		t.Fatalf("a new dial failed while a rotation was half-written: the reloader keeps the last good pair for exactly this, and resolving a new one per dial reports the half-written state as a failure to reach the platform: %v", err)
 	}
 	_ = resp.Body.Close()
+}
+
+// issueMultiURILeaf is a leaf naming two SPIFFE identities, which no SPIFFE
+// certificate has. The rule it tests is not pedantry about a field: a leaf
+// naming several identities could be admitted on whichever one happens to
+// match, and the identity it would be held to anywhere else is unknowable from
+// here.
+func issueMultiURILeaf(t *testing.T, c *cell, first, second string) *tls.Certificate {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := url.Parse(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := url.Parse(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: first},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		URIs:         []*url.URL{one, two},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, c.anchor, public, c.anchorKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: private}
+}
+
+// TestALeafNamingSeveralIdentitiesIsRefusedInEveryDirection: a mutation that
+// accepted the first URI SAN of several survived in three places, because
+// every committed test used a conforming single-SAN leaf.
+func TestALeafNamingSeveralIdentitiesIsRefusedInEveryDirection(t *testing.T) {
+	c := newCell(t)
+	doubled := issueMultiURILeaf(t, c, testGatewayPrincipal, rivalPrincipal)
+
+	t.Run("an inbound caller", func(t *testing.T) {
+		approved := c.identity(t, testPrincipal)
+		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: serverConfigFor(t, approved, c)})
+		server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+		server.principal = testPrincipal
+		config, err := server.serverIdentity()
+		if err != nil {
+			t.Fatalf("boot: %v", err)
+		}
+		outcome := servedTo(t, config, doubled, "")
+		if !outcome.refused() {
+			t.Fatal("a caller whose leaf names two identities was admitted: it can be accepted on whichever one matches, and the identity it is held to elsewhere is unknowable here")
+		}
+	})
+
+	t.Run("this workload's own leaf", func(t *testing.T) {
+		if err := pairPresentsThisWorkload(doubled, testGatewayPrincipal); err == nil {
+			t.Fatal("this workload's own leaf was accepted while naming two identities, one of which is another workload's")
+		}
+	})
+
+	t.Run("an outbound platform destination", func(t *testing.T) {
+		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{parsedLeaf(t, doubled)}}
+		if _, err := oneURIIdentity(state, "platform destination"); err == nil {
+			t.Fatal("a platform destination naming two identities was accepted, so the one it is held to is whichever the check happened to read first")
+		}
+	})
+}
+
+// parsedLeaf is a pair's leaf, parsed from its own DER rather than read off the
+// Leaf cache.
+func parsedLeaf(t *testing.T, pair *tls.Certificate) *x509.Certificate {
+	t.Helper()
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return leaf
+}
+
+// serverConfigFor is a conforming listening configuration presenting pair,
+// verifying callers against the cell.
+func serverConfigFor(t *testing.T, pair *tls.Certificate, c *cell) *tls.Config {
+	t.Helper()
+	return &tls.Config{
+		Certificates: []tls.Certificate{*pair},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    c.roots,
+		MinVersion:   tls.VersionTLS13,
+	}
+}
+
+// TestAPerConnectionAnswerIsHeldToTheAdmittedSet: holdPerConnectionPosture
+// re-imposes admitOnly on the configuration a callback returns, because that
+// configuration REPLACES the base one for the connection — so without it a
+// source's callback serves that connection admitting every identity in the
+// cell. The mutation removing it survived: every committed test drove the base
+// configuration.
+func TestAPerConnectionAnswerIsHeldToTheAdmittedSet(t *testing.T) {
+	c := newCell(t)
+	approved := c.identity(t, testPrincipal)
+	stranger := c.identity(t, rivalPrincipal)
+
+	base := serverConfigFor(t, approved, c)
+	base.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		// A conforming answer that simply says nothing about admission.
+		answer := serverConfigFor(t, approved, c)
+		return answer, nil
+	}
+	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	// The control: the admitted caller is served over the per-connection answer.
+	admitted := c.identity(t, testGatewayPrincipal)
+	if outcome := servedTo(t, config, admitted, ""); outcome.refused() {
+		t.Fatalf("an admitted caller was refused over the per-connection answer, so nothing below is about admission: %s", outcome.reason())
+	}
+	// And a caller nobody admitted is refused on that same answer.
+	if outcome := servedTo(t, config, stranger, ""); !outcome.refused() {
+		t.Fatal("a caller outside the provisioned set was served over a per-connection answer: the configuration a callback returns replaces the base one, so the admission has to be re-imposed on it or that connection admits every identity in the cell")
+	}
+}
+
+// TestASourcesOwnVerifyConnectionStillRuns: admitOnly composes over whatever
+// the source already verifies instead of assigning over it. Assigning silently
+// deletes a check the source author wrote, which is the opposite of what adding
+// a check should do — and nothing committed noticed, because no test gave a
+// source a VerifyConnection of its own.
+func TestASourcesOwnVerifyConnectionStillRuns(t *testing.T) {
+	c := newCell(t)
+	approved := c.identity(t, testPrincipal)
+	admitted := c.identity(t, testGatewayPrincipal)
+
+	var theirs atomic.Int64
+	base := serverConfigFor(t, approved, c)
+	base.VerifyConnection = func(tls.ConnectionState) error {
+		theirs.Add(1)
+		return fmt.Errorf("the source refuses this caller for a reason this runtime knows nothing about")
+	}
+	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	outcome := servedTo(t, config, admitted, "")
+	if theirs.Load() == 0 {
+		t.Fatal("the source's own VerifyConnection was never called: composing the admission check over it was replaced by assigning over it, which deletes a check the source author wrote")
+	}
+	if !outcome.refused() {
+		t.Fatal("a caller the source itself refused was served: the source's check runs first, because a caller its rules refuse should be refused for its reason")
+	}
+	if reason := outcome.reason(); !strings.Contains(reason, "knows nothing about") {
+		t.Errorf("the handshake was refused for %q, not for the source's own reason", reason)
+	}
+}
+
+// mentionsTheCertificate reports whether a boot refusal is about the identity
+// the listener would present, rather than any other way a boot can fail.
+func mentionsTheCertificate(err error) bool {
+	for _, named := range []string{
+		"issued for another workload",
+		"certificate",
+		"identity source",
+		"principal",
+	} {
+		if strings.Contains(err.Error(), named) {
+			return true
+		}
+	}
+	return false
 }

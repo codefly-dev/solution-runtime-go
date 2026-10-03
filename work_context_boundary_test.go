@@ -360,6 +360,68 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 	}
 }
 
+// TestNoExportedPathHandsOutAServableHandler is the type-based half, and the
+// half the rule above cannot be.
+//
+// The rule above keys on reaching internal/seam and on the identifier
+// PassthroughEnvironment, which is a rule about this change's own vocabulary:
+// an exported `func (s *Server) Mux() http.Handler` returning the very mux
+// Serve mounts passes it, because it calls no seam and is not named
+// "Passthrough". What makes a bypass a bypass is handing a caller something
+// SERVABLE that was built without the boot, so the gate is on the type.
+//
+// No exported declaration in this module returns one today, which is why this
+// can be absolute rather than a list of blessed exceptions. A consumer writes
+// Handler and RequestHandler and lets Serve mount them.
+func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
+	servable := map[string]bool{
+		"http.Handler": true, "http.HandlerFunc": true, "http.ServeMux": true,
+		"http.RoundTripper": true,
+	}
+	fset := token.NewFileSet()
+	for _, name := range moduleSources(t) {
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || !fn.Name.IsExported() || fn.Type.Results == nil {
+				continue
+			}
+			// passthroughtest is where a consumer's test is *supposed* to get a
+			// handler; it refuses a non-test binary instead, which
+			// TestTheSeamRefusesANonTestBinary drives.
+			if strings.Contains(name, "passthroughtest") || strings.Contains(name, "internal/seam") {
+				continue
+			}
+			for _, result := range fn.Type.Results.List {
+				if rendered := renderedType(result.Type); servable[rendered] {
+					t.Errorf("%s exports %s returning %s: a servable handler obtained outside Serve has skipped validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, and whoever mounts it serves the viewer's bearer and this workload's credential over whatever it is mounted on. Let Serve mount it.",
+						name, fn.Name.Name, rendered)
+				}
+			}
+		}
+	}
+}
+
+// renderedType is pkg.Name for a qualified type, with one level of pointer and
+// slice stripped, which is enough to recognise a handler however it is handed
+// back.
+func renderedType(expr ast.Expr) string {
+	switch typed := expr.(type) {
+	case *ast.StarExpr:
+		return renderedType(typed.X)
+	case *ast.ArrayType:
+		return renderedType(typed.Elt)
+	case *ast.SelectorExpr:
+		if pkg, ok := typed.X.(*ast.Ident); ok {
+			return pkg.Name + "." + typed.Sel.Name
+		}
+	}
+	return ""
+}
+
 // callsThe reports whether fn calls pkg.name, or bare name when pkg is empty.
 func callsThe(fn *ast.FuncDecl, pkg, name string) bool {
 	found := false

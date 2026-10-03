@@ -288,11 +288,14 @@ func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
 	return routes, checkConsumed(s.consumed, consumed)
 }
 
-// mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix,
-// as serve does and as PassthroughHandler does: the one place the passthrough
-// is wired, so a test through PassthroughHandler serves what Serve serves.
-// Serve has already resolved and checked the routes; a test that calls serve
-// directly has not, and resolves them here.
+// mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix:
+// the one place the passthrough is wired, so the test seam serves what Serve
+// serves. Serve has already resolved and checked the routes; a test that calls
+// serve directly has not, and resolves them here.
+//
+// It named Server.PassthroughHandler as the other caller, which was removed —
+// an exported constructor for a credential-bearing handler with no boot behind
+// it. The seam reached through internal/seam replaced it.
 func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 	if len(s.consumed) == 0 {
 		return nil
@@ -457,6 +460,15 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 // this method (or the bearer alone, for a ViewerBearer module), and the
 // declared pin merged into the request.
 func (s *Server) authorize(ctx context.Context, route passthroughRoute, header http.Header, msg *dynamicpb.Message) (*Gateway, error) {
+	// Whether or not this route mints anything. A ViewerBearer route forwards
+	// the viewer's bearer and asks the credential for nothing, so it was the
+	// one route that never consulted it — and it kept forwarding that bearer
+	// to the gateway after the issuer refused this build. See
+	// actingForAViewer: the credential is what authorises this process to act
+	// for a viewer, not merely what it mints with.
+	if err := s.actingForAViewer(ctx); err != nil {
+		return nil, connect.NewError(connect.CodeUnavailable, err)
+	}
 	gw := s.gatewayFor(header)
 	if !route.module.ViewerBearer {
 		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)

@@ -79,7 +79,10 @@ func TestAnUnavailableMintIsWaitedForWithinABound(t *testing.T) {
 		// minutes.
 		server.firstMintWindow = 1500 * time.Millisecond
 		started := time.Now()
-		err := bootFails(t, server, mint)
+		// Bounded here, not measured afterwards: against a runtime whose
+		// window is not a deadline this call never returns, and every
+		// assertion below is unreachable.
+		err := bootFailsWithin(t, server, mint, 4*server.firstMintWindow)
 		elapsed := time.Since(started)
 
 		if !errors.Is(err, workcontext.ErrMintUnavailable) {
@@ -109,7 +112,7 @@ func TestAnUnavailableMintIsWaitedForWithinABound(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Credential(blocking)
 		server.firstMintWindow = 400 * time.Millisecond
 		started := time.Now()
-		err := bootFails(t, server, mint)
+		err := bootFailsWithin(t, server, mint, 10*server.firstMintWindow)
 		elapsed := time.Since(started)
 		if err == nil {
 			t.Fatal("the boot came up on a source that never answered")
@@ -503,6 +506,15 @@ func (s stubCredentialSource) Credential(context.Context) (workcontext.Credentia
 // mintClientFor is the SDK's mint client as the runtime configures it, pointed
 // at a fake host over plain HTTP. The runtime has no mint of its own, so this
 // is the only client any of these tests exercise.
+//
+// Which also says what the tests over it can and cannot prove, and it is worth
+// being explicit because a reader naturally assumes otherwise: they pin the
+// SDK's *contract* — one carrier per execution, the projected token re-read at
+// every mint — and they reach no line of this repository, so no mutation of
+// this package's own code can fail them. Their value is that an SDK bump
+// changing either property fails here rather than in a deployment. What this
+// runtime does with the client is covered by the boot and health tests, which
+// drive start() and serve().
 //
 // A boot's own client presents this workload's identity and verifies the host
 // against the projected anchor (outboundClient); that path is exercised by the

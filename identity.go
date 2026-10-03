@@ -333,13 +333,25 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 			trustBundleFile: s.cfg.trustBundleFile,
 		}
 	}
-	config, err := source.ServerTLSConfig()
+	answered, err := source.ServerTLSConfig()
 	if err != nil {
 		return nil, err
 	}
-	if err := usableServerIdentity(config); err != nil {
+	if err := usableServerIdentity(answered); err != nil {
 		return nil, err
 	}
+	// On a clone, because everything below writes to it: the certificate hold
+	// wraps GetCertificate, admitOnly composes over VerifyConnection, and the
+	// per-connection hold wraps GetConfigForClient. A source is under no
+	// obligation to hand back a fresh configuration — a consumer may return one
+	// it keeps and reuses, which is the ordinary way to write one — so mutating
+	// the answer is a write to a value another handshake may be reading, and a
+	// second call would wrap the wrapper.
+	//
+	// holdPerConnectionPosture already says this about a *per-connection*
+	// answer, in those words, and this function then did the thing that comment
+	// forbids one level up.
+	config := answered.Clone()
 	if err := holdServedCertificate(config, s.principal); err != nil {
 		return nil, err
 	}

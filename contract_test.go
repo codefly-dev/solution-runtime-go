@@ -534,6 +534,10 @@ func TestAViewerBearerAudienceCannotBeMintedFor(t *testing.T) {
 		t.Fatalf("resolveContract: %v", err)
 	}
 	server.contract = contract
+	// Said explicitly, because the ceiling is governing only for a contract a
+	// boot resolved. It used to be inferred from the contract carrying a
+	// solution id, which is why an empty Manifest.ID switched the ceiling off.
+	server.contractResolved = true
 	// The binding is published, with the flag and no ceiling.
 	var published bool
 	for _, binding := range contract.Bindings {

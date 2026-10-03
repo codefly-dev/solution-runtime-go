@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -27,6 +28,7 @@ import (
 	"github.com/codefly-dev/core/solution/manifest"
 	corework "github.com/codefly-dev/core/workcontext"
 	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
 // The authority-bearing values every test in this package boots under. They are
@@ -446,15 +448,46 @@ func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 // bootFails runs the same boot and returns what it refused with.
 func bootFails(t *testing.T, server *Server, mint *hostMint) error {
 	t.Helper()
+	return bootFailsWithin(t, server, mint, 30*time.Second)
+}
+
+// bootFailsWithin is bootFails with a bound on how long the boot may take to
+// fail.
+//
+// The bound is the point. Several of these tests assert that a window is a
+// deadline, and they measured the elapsed time *after* start() returned — so
+// against a runtime where the window is not a deadline, start() never returns,
+// the assertion is never reached, and the only thing that ends the test is `go
+// test -timeout`. That kills the mutant by hanging, which is indistinguishable
+// from an infrastructure problem and takes the whole suite's timeout to report.
+func bootFailsWithin(t *testing.T, server *Server, mint *hostMint, within time.Duration) error {
+	t.Helper()
 	bootEnvironment(t, mint)
-	ln, err := server.start(context.Background())
-	if ln != nil {
-		_ = ln.Close()
+	type outcome struct {
+		ln  net.Listener
+		err error
 	}
-	if err == nil {
-		t.Fatal("the boot came up; this helper is for boots that must fail")
+	done := make(chan outcome, 1)
+	go func() {
+		ln, err := server.start(context.Background())
+		done <- outcome{ln, err}
+	}()
+	select {
+	case got := <-done:
+		if got.ln != nil {
+			_ = got.ln.Close()
+		}
+		if got.err == nil {
+			t.Fatal("the boot came up; this helper is for boots that must fail")
+		}
+		return got.err
+	case <-time.After(within):
+		// Not t.Fatal: this goroutine is the test's, but the boot's is still
+		// running and will outlive the test. Reporting and failing is all that
+		// is safe.
+		t.Fatalf("the boot neither came up nor failed within %s: a bounded window that does not reach the operation leaves the process with no listener, no log and nothing for an orchestrator to act on, and a test that waits for the harness timeout cannot tell you that", within)
+		return nil
 	}
-	return err
 }
 
 // TestBootMintsExactlyOnceAndServesOverTLS is the acceptance criterion of this
@@ -762,5 +795,159 @@ func TestABootWithAnUnusableAdmissionFileIsRefused(t *testing.T) {
 				t.Errorf("the refusal %q does not say the provisioned set is unusable, so it reads as a different problem", err)
 			}
 		})
+	}
+}
+
+// TestABootRefusesAPlaintextMintBeforeSendingTheToken: validate() refuses a
+// plaintext credential mint, and start() has to *call* validate() for that to
+// mean anything. Removing the call left every boot test passing, because none
+// of them boots with a configuration validate() would reject — they all
+// provision a conforming one and then assert on behaviour.
+//
+// The consequence is the whole reason this runtime refuses a plaintext
+// destination at boot: the request to the mint carries the projected
+// service-account token that attests which workload this process is, and over
+// http that is readable by anything on the path.
+func TestABootRefusesAPlaintextMintBeforeSendingTheToken(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	// Everything else resolved, and the mint moved to plaintext.
+	plaintext := strings.Replace(mint.URL, "https://", "http://", 1)
+	t.Setenv(CredentialMintURLEnvironmentVariable, plaintext+credentialMintPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := New(Manifest{ID: testSolutionID})
+	ln, err := server.start(ctx)
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if err == nil {
+		t.Fatal("the boot accepted a plaintext credential mint: the projected service-account token attesting which workload this is would go out in the clear")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("the refusal %q does not say the destination has to be https", err)
+	}
+	// And it did not reach the mint on the way to refusing.
+	if got := mint.count(); got != 0 {
+		t.Errorf("the boot minted %d times before refusing the configuration: the refusal has to come before the token is sent anywhere", got)
+	}
+}
+
+// TestServeEndsOnATerminalCredentialRefusal: a refused build is not something
+// to keep serving under. serve() watches credentialRefusedC and closes the
+// listener; removing that watch left the process serving indefinitely while
+// /health answered 503, which is the "answers 503 forever while reporting
+// itself healthy" shape inverted — and no committed test observed serve
+// returning.
+func TestServeEndsOnATerminalCredentialRefusal(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := New(Manifest{ID: testSolutionID})
+	ln, err := server.start(ctx)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- server.serve(ctx, ln) }()
+
+	// The control: it is still serving, so the assertion below is about the
+	// refusal and not about a listener that never came up.
+	select {
+	case err := <-served:
+		t.Fatalf("serve returned before anything refused this execution's credential: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	refusal := fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused)
+	server.credentialRefused(refusal)
+
+	select {
+	case err := <-served:
+		if err == nil {
+			t.Fatal("serve ended without reporting why: the orchestrator restarts against a judgement, so the reason is what it has to be given")
+		}
+		if !strings.Contains(err.Error(), "presence document approved") {
+			t.Errorf("serve ended with %q, which does not carry the issuer's judgement", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not end after this execution's credential was refused for good: the process keeps serving a binding it has no authority for, and the host keeps routing to it")
+	}
+}
+
+// TestTheMintIsConfiguredWithTheFrozenAuthority: the SDK rechecks the authority
+// before every renewal, which is the one moment a drifted authority value would
+// be laundered into a credential nobody approved. Dropping it leaves the boot
+// and the first mint perfect and only renewals wrong, which no test over a
+// happy path can see — the mutation survived every one of them.
+func TestTheMintIsConfiguredWithTheFrozenAuthority(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := New(Manifest{ID: testSolutionID})
+	ln, err := server.start(ctx)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	_ = ln.Close()
+
+	options := server.mintOptions("audience", "projection")
+	if options.Authority == nil {
+		t.Error("the mint client is configured with no authority to recheck, so a renewal proceeds after the principal, the mint audience or the projection audience has drifted — the one moment that drift would otherwise be caught")
+	}
+	if options.Authority != server.authority {
+		t.Error("the mint client rechecks something other than the reader this boot froze: a second reader is a second answer, and the one that disagrees is the one nobody approved")
+	}
+	// The rest of the options are decisions too, and each has been wrong once.
+	if options.HTTPClient != server.outbound {
+		t.Error("the mint does not use this runtime's authenticated outbound client, so it would not present this workload's identity, would not verify the host against the projected anchor, and would follow a redirect carrying the projected token")
+	}
+	if options.URL != server.cfg.mintURL {
+		t.Errorf("the mint is configured for %q, not the resolved %q", options.URL, server.cfg.mintURL)
+	}
+}
+
+// TestACredentialThatCannotBePresentedRefusesTheMint: attestWorkload checks
+// that the credential actually attached to the outgoing request. Ignoring that
+// error sends the mint with no attestation on it, which the host answers by
+// minting for the viewer with nothing saying which module asked — the confused
+// deputy this runtime exists to prevent, reached by skipping an error check.
+func TestACredentialThatCannotBePresentedRefusesTheMint(t *testing.T) {
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	server := New(Manifest{ID: testSolutionID}).
+		Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}).
+		// A credential that holds no token: Attach cannot seal a request with
+		// it, which is the shape a half-initialised source produces.
+		Credential(stubCredentialSource{credential: workcontext.Credential{}})
+	server.cfg.profile = localProfile
+	server.cfg.gatewayURL = gw.URL
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolveContract: %v", err)
+	}
+	server.contract = contract
+	server.contractResolved = true
+
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	_, err = server.gatewayFor(header).ForModule(context.Background(), "things",
+		Scope{ResourceKind: "things", Actions: []string{"read"}})
+	if err == nil {
+		t.Fatal("a mint went out with a credential that could not be presented: the host would mint for the viewer with nothing attesting which module asked")
+	}
+	if !errors.Is(err, ErrNotAttested) {
+		t.Errorf("the refusal %v is not reported as this solution failing to attest itself, which is what decides the status a handler answers", err)
+	}
+	if got := len(gw.observedMints()); got != 0 {
+		t.Errorf("observed %d mints for a credential that could not be attached, want 0", got)
 	}
 }

@@ -105,18 +105,36 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := workcontext.NewMintClient(workcontext.MintOptions{
-		URL:                s.cfg.mintURL,
-		Audience:           audience,
-		ProjectedToken:     workcontext.ProjectedTokenFile(s.cfg.projectedTokenPath),
-		ProjectionAudience: projectionAudience,
-		Authority:          s.authority,
-		HTTPClient:         s.outbound,
-	})
+	client, err := workcontext.NewMintClient(s.mintOptions(audience, projectionAudience))
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
 	}
 	return client, nil
+}
+
+// mintOptions is how this runtime asks the SDK's mint client for a credential.
+//
+// A function of its own so it can be read in a test. Every field here is a
+// decision, and the one most easily lost is Authority: the SDK rechecks it
+// before every renewal, which is the single moment a drifted authority value
+// would otherwise be laundered into a credential nobody approved. Dropping it
+// leaves the boot and the first mint working perfectly and only renewals wrong,
+// which is not a shape a test over the happy path can see.
+func (s *Server) mintOptions(audience, projectionAudience string) workcontext.MintOptions {
+	return workcontext.MintOptions{
+		URL:                s.cfg.mintURL,
+		Audience:           audience,
+		ProjectedToken:     workcontext.ProjectedTokenFile(s.cfg.projectedTokenPath),
+		ProjectionAudience: projectionAudience,
+		// The frozen reader, not a value read again here: it is what rechecks
+		// the three authority-bearing values before each renewal.
+		Authority: s.authority,
+		// This runtime's own authenticated client, so the mint presents this
+		// workload's X.509-SVID, verifies the host against the projected
+		// anchor, is unproxied, and does not follow a redirect that would hand
+		// the projected token to whatever answered.
+		HTTPClient: s.outbound,
+	}
 }
 
 // openCredential obtains this execution's credential, once, before the listener

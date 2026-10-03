@@ -145,6 +145,21 @@ var surfaceClients = map[string]bool{"word": true, "powerpoint": true, "excel": 
 // author writes these in code, so every failure here is a mistake a boot should
 // name rather than a condition the runtime can recover from.
 func (m Manifest) validateSurfaces() error {
+	// The solution's own id first. Nothing refused an empty one, and it was
+	// load-bearing in a place it does not look load-bearing: the published
+	// contract carries it as `Solution`, which was also the test for whether a
+	// contract had been resolved at all — so an empty id switched the scope
+	// ceiling off while every other part of the boot reported success, and a
+	// ForModule asking for no scopes against an undeclared audience reached the
+	// host as a viewer mint. The ceiling is keyed on its own flag now, and this
+	// refusal closes the way to produce the state.
+	//
+	// It is also what the host's presence document names this solution by, and
+	// what every refusal in this package identifies the process as, so an empty
+	// one makes the logs of a misconfigured deployment anonymous.
+	if strings.TrimSpace(m.ID) == "" {
+		return fmt.Errorf("this solution declares no id: Manifest.ID is what the host's presence document names it by, what the published contract reports as its own, and what every refusal here identifies this process as. Set it to the module id the composition deploys")
+	}
 	// Keyed by client and id together: two clients never see each other's
 	// surfaces, so the same offering carries the same id in Word and in
 	// PowerPoint, and only a collision within one client is ambiguous. The id
@@ -259,6 +274,18 @@ type Server struct {
 	// process runs under, which is what it publishes.
 	declaredContract ModuleContract
 	contract         effectiveContract
+	// contractResolved says the boot resolved that contract, which is the only
+	// thing that makes its ceilings governing.
+	//
+	// A flag, because the test for it was `s.contract.Solution != ""` — a
+	// field that is the solution's own id, so it doubled as the sentinel for
+	// "this contract came from a boot". An empty Manifest.ID therefore left the
+	// ceiling switched off while everything else about the boot succeeded, and
+	// ForModule accepted no scopes for an undeclared audience and minted as the
+	// viewer. New() refuses an empty id now as well, so there are two
+	// independent reasons this cannot recur; a value that is also a sentinel
+	// has one.
+	contractResolved bool
 	// identity is where the listener's workload identity comes from. Nil means
 	// the one the platform projects, read from the configured files; a consumer
 	// whose platform issues an identity another way supplies it with Identity.
@@ -1029,6 +1056,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
 	s.contract = contract
+	s.contractResolved = true
 	// One mint per execution, before the listener is up. A runtime that cannot
 	// obtain its credential has no authority to serve anything with, and the
 	// model it serves under has nothing for it to retry against: its presence
@@ -1155,6 +1183,59 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // healthCredentialTimeout bounds what a probe will wait for the credential, so
 // a hung issuer makes the probe fail rather than parking it.
 const healthCredentialTimeout = 2 * time.Second
+
+// actingForAViewer refuses to act on a viewer's behalf while this process holds
+// no credential the issuer still approves.
+//
+// Every route that does anything for a viewer asks this first, and that was the
+// hole: the *probe* asked the credential and the routes did not. The reasoning
+// is written out at handleHealth — renewal is lazy, so a solution serving only
+// plain handlers and ViewerBearer routes never asks and never learns the issuer
+// has stopped approving this build — and it was applied to the one caller that
+// reports health rather than to the callers that act. A booted server whose
+// credential had been refused kept answering 200 and kept forwarding the
+// viewer's bearer to the gateway, with the credential consulted zero times.
+//
+// A plain handler looks like it needs no credential, which is the trap. What
+// authorises this process to act for a viewer at all *is* the credential: it is
+// what the host approved for this build. Forwarding a viewer's bearer under a
+// credential the issuer has withdrawn is acting without authority, whether or
+// not a capability is minted on the way.
+//
+// Cheap, and not a heartbeat: the client holds one credential and hands the
+// same one back until its own renewal point, so this is a mutex and a
+// comparison except at the renewal the credential's expiry dictates.
+func (s *Server) actingForAViewer(ctx context.Context) error {
+	if err := s.terminalErr.Load(); err != nil {
+		return fmt.Errorf("%w: %w", ErrCredentialRefused, *err)
+	}
+	if s.credential == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, healthCredentialTimeout)
+	defer cancel()
+	if _, err := s.credential.Credential(ctx); err != nil {
+		if terminalCredentialFailure(err) {
+			// Records it, which also ends the process: the first route to
+			// discover a refused build is as good a place to learn it as the
+			// probe, and better than the next one.
+			s.credentialRefused(err)
+			return fmt.Errorf("%w: %w", ErrCredentialRefused, err)
+		}
+		return fmt.Errorf("%w: %w", ErrCredentialUnavailable, err)
+	}
+	return nil
+}
+
+// ErrCredentialRefused and ErrCredentialUnavailable are why a route refused to
+// act for a viewer: a judgement about this build, or an issuer that cannot
+// answer right now. Both are 503 — this process cannot act either way — and
+// they stay distinguishable because conflating them was a review blocker in
+// both directions.
+var (
+	ErrCredentialRefused     = errors.New("this execution's credential has been refused and will not be renewed, so this process will not act for a viewer")
+	ErrCredentialUnavailable = errors.New("this execution's credential cannot currently be obtained, so this process will not act for a viewer")
+)
 
 // credentialRefused records a judgement the issuer will not reverse.
 func (s *Server) credentialRefused(err error) {
@@ -1345,6 +1426,14 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
+		// Before the handler, because the handler is what acts. See
+		// actingForAViewer: a plain handler that mints nothing still receives a
+		// gateway carrying the viewer's bearer, and sending that anywhere under
+		// a credential the issuer has withdrawn is acting without authority.
+		if err := s.actingForAViewer(r.Context()); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
 		result, err := handler(r, s.gatewayFor(r.Header))
 		if err != nil {
 			status, message := handlerErrorResponse(err)
@@ -1430,10 +1519,9 @@ func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw.terminal = s.credentialRefused
 	// The ceiling this process published, carried onto the gateway a handler
 	// gets, so what it mints is held to what the contract claims. Resolved
-	// contracts only: s.contract.Solution is set by resolveContract and by
-	// nothing else, so an unbooted gateway is distinguishable from a booted one
-	// that declared nothing.
-	if s.contract.Solution != "" {
+	// contracts only, read off the flag the boot sets — see contractResolved
+	// for why this was the solution's id and why that was wrong.
+	if s.contractResolved {
 		gw.ceilings = make(map[string][]Scope, len(s.contract.Bindings))
 		for _, binding := range s.contract.Bindings {
 			gw.ceilings[binding.Audience] = binding.Ceiling

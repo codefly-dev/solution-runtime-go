@@ -2,9 +2,14 @@
 // test, against a fake host, so a consuming solution can exercise the calls its
 // page makes — unary and server-streaming — without a composition.
 //
-// It serves the real passthrough: Server.PassthroughHandler, the handler Serve
-// mounts, checked by the same boot check, over an httptest server. Only the
-// host is fake. Host stands in for the gateway the passthrough calls through:
+// It serves the real passthrough — the handler Serve mounts, checked by the
+// same boot check — over an httptest server, reached through internal/seam.
+// Only the host is fake. The seam is not public API: Server.PassthroughHandler
+// was exported once, and a deployment calling it completed a viewer mint and a
+// module call over plaintext with no validate(), no mTLS boot, no caller
+// allow-list, no ceiling and no authenticated outbound. This package is the one
+// caller Go's internal rule lets reach it, and because any module can import
+// *this* package, its constructors refuse a non-test binary. Host stands in for the gateway the passthrough calls through:
 // it mints the viewer's Work Context (the accounts StartTask procedure the
 // gateway routes) and forwards each /v1/<as>/* call to the module address the
 // test gave it, typically an httptest server of the test's own that answers
