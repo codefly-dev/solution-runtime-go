@@ -1208,6 +1208,14 @@ func parsedIdentities(raw string) ([]string, error) {
 			if trimmed == "" {
 				continue
 			}
+			// Shape, not canonicalisation. An entry is matched by exact
+			// string equality against the peer's single URI SAN, so a
+			// percent-encoded, IDN, ported, userinfo-bearing or trailing-dot
+			// variant fails closed — it simply never matches anything. This
+			// refuses entries that could never match *anything at all*, which
+			// is a provisioning mistake worth naming at boot; it is not a
+			// claim that the entry is canonical, and describing it as
+			// "validated as a SPIFFE ID" overstated it.
 			if err := usableIdentity(trimmed); err != nil {
 				return nil, err
 			}
@@ -1233,28 +1241,6 @@ func usableIdentity(entry string) error {
 		return fmt.Errorf("the entry %q is not a SPIFFE ID (spiffe://<trust-domain>/<path>): it is compared against the one URI SAN a peer's certificate carries, so an entry of another shape admits nobody and is a provisioning mistake rather than a narrower set", entry)
 	}
 	return nil
-}
-
-// parsedAllowedCallers splits and trims the configured caller identities.
-// A provisioned file is naturally one identity per line and a hand-written
-// override is naturally comma-separated, so both separate, and a comment line
-// is dropped: a set an operator cannot annotate gets annotated anyway, in a
-// place nothing reads.
-func parsedAllowedCallers(raw string) []string {
-	var allowed []string
-	for _, line := range strings.Split(raw, "\n") {
-		// Comments are stripped per line and before the commas are split, so a
-		// commented-out line cannot contribute its tail as an identity.
-		if hash := strings.Index(line, "#"); hash >= 0 {
-			line = line[:hash]
-		}
-		for _, id := range strings.Split(line, ",") {
-			if trimmed := strings.TrimSpace(id); trimmed != "" {
-				allowed = append(allowed, trimmed)
-			}
-		}
-	}
-	return allowed
 }
 
 // requirePath refuses an unresolved path, naming the override and the group the

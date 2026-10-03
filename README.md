@@ -422,7 +422,14 @@ credential it holds while that one is current and renews it once it has entered
 its renewal lead, re-reading the rotated projection and rechecking the frozen
 authority values first. A process that runs for a week under credentials the
 issuer chose to make long-lived mints once and renews a handful of times; it
-never mints per request, per probe or per beat.
+never mints per beat or per probe, and does not mint per request: acquisition is
+single-flight, a failed ask quiets the next ones for a second, and a credential
+already in hand and unexpired is what serves meanwhile. That last part is not a
+detail — renewal begins inside a lead *before* expiry, so refusing while the
+issuer is slow would answer 503 to every viewer over a dependency this process
+does not yet need. A route gate that asked per request turned a 503-ing issuer
+into one audited mint per request, which is worse than the heartbeat this
+runtime replaced, because the heartbeat at least minted on a timer.
 
 **A refused first mint fails the boot and is never retried. An unavailable one
 is waited for, within a bound.** The two are different answers:

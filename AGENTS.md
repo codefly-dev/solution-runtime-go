@@ -109,9 +109,16 @@ embedding it.
   is exact — and resumption is the sharpest, because a resumed connection
   presents no certificate, so a source encoding its own tickets admits callers
   without any check here seeing a handshake. That list is a denylist over a
-  struct this package does not own: it is complete for the Go version in
-  `go.mod` and not by construction, which is why the per-connection answer runs
-  through the same function rather than a copy of its reasoning. `SessionTicketKey`
+  struct this package does not own, and it is **not** complete. That claim was
+  made here and falsified twice: first by the session-ticket keys, then by
+  `VerifyPeerCertificate`. A `Clone()` copies 29 of 32 fields unchanged, so
+  whatever this list does not name, a source keeps. Where a property is
+  load-bearing, **take** it rather than check it — resumption is disabled
+  outright, and a caller's identity is read from a fresh parse of the raw DER
+  rather than from the `*x509.Certificate` a source's own verifier was handed a
+  pointer to. This list is what *tells* a source it has gone wrong; it is not
+  what makes the listener safe. The per-connection answer runs through the same
+  function rather than a copy of its reasoning. `SessionTicketKey`
   is on that list for the same reason as the callbacks — choosing the key tickets
   are sealed with is the same capability as encoding them — and
   `SetSessionTicketKeys` is the one hole a check cannot close, because it is a
