@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -599,11 +600,20 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 	// still governing, because it no longer reads an id to decide.
 	t.Run("the ceiling governs a resolved contract with no id", func(t *testing.T) {
 		gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+		mint := newHostMint(t, &hostMint{})
 		server := New(Manifest{ID: ""}).
 			Consumes(passthroughModule()).
 			Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 				localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
-			}})
+			}}).
+			// A working credential, so the only thing that can refuse this ask
+			// is the ceiling. Without it the ask fails for want of an
+			// attestation whether the ceiling governs or not, and this test
+			// passes either way — which is exactly how the mutation survived
+			// the first version of it.
+			Credential(mintClientFor(t, mint.URL, tokenFile))
 		server.cfg.profile = localProfile
 		server.cfg.gatewayURL = gw.URL
 		contract, err := server.resolveContract()
@@ -620,12 +630,33 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 		header.Set("authorization", "Bearer viewer")
 		header.Set(orgHeader, "org-1")
 		header.Set(sessionHeader, "session-1")
-		_, err = server.gatewayFor(header).ForModule(context.Background(), "undeclared")
+		// With a stated scope, so the ask reaches the ceiling rather than the
+		// earlier refusal for an ask that names no authority at all.
+		_, err = server.gatewayFor(header).ForModule(context.Background(), "undeclared",
+			Scope{ResourceKind: "secrets", Actions: []string{"read"}})
 		if err == nil {
 			t.Fatal("an ask for an audience the contract does not declare was minted for, on a contract carrying no solution id: the ceiling has to be keyed on whether a boot resolved it, not on a field that happens to be non-empty")
 		}
-		if got := len(gw.observedMints()); got != 0 {
-			t.Errorf("observed %d mints outside the published ceiling, want 0", got)
+		// And refused BY THE CEILING. Any-error would be satisfied by an ask
+		// that failed for want of a credential, a gateway, or anything else.
+		if !strings.Contains(err.Error(), "names no binding for that audience") {
+			t.Fatalf("the ask was refused for %q, not by the published ceiling: the ceiling is not governing this contract at all", err)
+		}
+
+		// The control: a declared audience inside the ceiling is still minted
+		// for, so the ceiling is applying rather than refusing everything.
+		if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
+			Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+			t.Fatalf("an ask inside the published ceiling was refused: %v", err)
+		}
+		mints := gw.observedMints()
+		if len(mints) != 1 {
+			t.Errorf("observed %d mints, want exactly the one inside the ceiling: an ask outside it must never reach the host", len(mints))
+		}
+		for _, mint := range mints {
+			if mint.Audience == "undeclared" {
+				t.Error("the ask for an undeclared audience reached the host")
+			}
 		}
 	})
 }
