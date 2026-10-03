@@ -498,9 +498,23 @@ func TestBootMintsExactlyOnceAndServesOverTLS(t *testing.T) {
 // runtime, drives concurrent requests through its handler, and counts what the
 // host was asked.
 func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
+	// The handler has to *use* the credential, or this test is green against a
+	// runtime that builds a client per request: a second reviewer pointed out
+	// that the previous handler returned a literal, so no request reached the
+	// credential source at all and the only mint being counted was the boot's.
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
 	mint := newHostMint(t, &hostMint{})
 	solution := boot(t, New(Manifest{ID: testSolutionID}).
-		Handle("/thing", func(context.Context, *Gateway) (any, error) { return map[string]string{"ok": "yes"}, nil }), mint)
+		Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}).
+		Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
+			if _, err := gw.ForModule(ctx, "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+				return nil, err
+			}
+			return map[string]string{"ok": "yes"}, nil
+		}), mint)
 
 	const callers = 16
 	var wg sync.WaitGroup
@@ -516,6 +530,10 @@ func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
 				return
 			}
 			request.Header.Set("authorization", "Bearer viewer")
+			// The identity headers the gateway stamps from the verified bearer;
+			// ForModule needs both to mint.
+			request.Header.Set(orgHeader, "org-1")
+			request.Header.Set(sessionHeader, "session-1")
 			resp, err := solution.client.Do(request)
 			if err != nil {
 				t.Errorf("call: %v", err)
@@ -533,6 +551,11 @@ func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
 	if got := mint.count(); got != 1 {
 		t.Errorf("the host minted %d credentials for one process serving %d concurrent requests, want exactly 1: a runtime that minted per request would be worse than the heartbeat it replaced",
 			got, callers)
+	}
+	// And the requests really did reach the credential: without this the
+	// assertion above holds for a runtime whose handler never touches it.
+	if got := len(mint.observedStartTasks()); got == 0 {
+		t.Error("no viewer mint was attempted, so nothing in this test exercised the credential at all")
 	}
 	// And the mint named this workload on the way out, not just in its body:
 	// the outbound client presents the same identity the listener does.

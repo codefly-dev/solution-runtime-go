@@ -303,14 +303,19 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 	// Every key the cutover deleted. If any of them still reaches a code path,
 	// the host below sees a second request — or a header it should never be
 	// shown again.
+	// Every deleted URL points at the host this test counts requests on, not at
+	// example.com. A second reviewer caught that: aimed elsewhere, a surviving
+	// registration would have been a connection to a domain that does not
+	// resolve and the host would have counted nothing, so the test passed
+	// because the old code never minted rather than because nothing registers.
 	for key, value := range map[string]string{
 		"PUBLIC_URL":                              "https://public.example.com",
 		"SELF_UPSTREAM":                           "https://self.example.com",
-		"HOST_REGISTER_URL":                       "https://host.example.com/api/solutions/register",
-		"GATEWAY_REGISTER_URL":                    "https://gateway.example.com/solutions/_register",
-		"GATEWAY_MODULE_REGISTER_URL":             "https://gateway.example.com/modules/_register",
-		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   "https://gateway.example.com/modules/_registration-token",
-		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": "https://gateway.example.com/solutions/_registration-token",
+		"HOST_REGISTER_URL":                       mint.URL + "/api/solutions/register",
+		"GATEWAY_REGISTER_URL":                    mint.URL + "/solutions/_register",
+		"GATEWAY_MODULE_REGISTER_URL":             mint.URL + "/modules/_register",
+		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   mint.URL + "/modules/_registration-token",
+		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": mint.URL + "/solutions/_registration-token",
 		"CODEFLY_INTERNAL_TOKEN":                  "internal-token-that-must-not-travel",
 		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "solution-secret-that-must-not-travel",
 		"CODEFLY__MODULE_REGISTRATION_SECRETS":    "things:module-secret-that-must-not-travel",

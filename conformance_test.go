@@ -1,9 +1,11 @@
 package solution
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -63,8 +65,17 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 	var carried, refusedHere, mustNotJudge, eitherWay int
 	for _, fixture := range fixtures {
 		t.Run(fixture.Name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, "https://gateway.test/v1/things/search", nil)
-			err := workcontext.Attach(request, fixture.Token)
+			// Through *this package's* boundary, not the SDK's.
+			//
+			// This used to call workcontext.Attach directly, which a second
+			// reviewer rightly said is not "through its carriage boundary": it
+			// exercised sdk-go and touched no line of this runtime, so the
+			// division of labour it asserts could have been true of the SDK
+			// while this package did something else entirely. What carries a
+			// capability here is bearerTransport, on a gateway derived for a
+			// module, and that is what is driven now — the capability is put in
+			// the cache the way a mint would, and a real request is made.
+			request, err := carryThroughThisRuntime(t, fixture.Token)
 
 			switch {
 			case fixture.Outcome == corework.OutcomeAccepted:
@@ -123,4 +134,63 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 	}
 	t.Logf("core's kit through the carrier: %d carried, %d refused here (unsealed / not-a-core-token), %d carried because only a verifier may judge them, %d either way (ErrInvalid)",
 		carried, refusedHere, mustNotJudge, eitherWay)
+}
+
+// carryThroughThisRuntime drives one capability through this package's carriage
+// path and returns the request that reached the far end, or the refusal that
+// stopped it before anything was sent.
+//
+// The path is the real one: a Gateway derived by ForModule holds a delegation,
+// bearerTransport resolves the capability per round trip and attaches it, and
+// the request only leaves if that succeeds. A capability this runtime cannot
+// carry therefore has to fail here, before a module is called — which is the
+// property the kit is being used to check, and the one that cannot be observed
+// by calling the SDK directly.
+func carryThroughThisRuntime(t *testing.T, token string) (*http.Request, error) {
+	t.Helper()
+	var reached *http.Request
+	far := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = r.Clone(context.Background())
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "yes"})
+	}))
+	defer far.Close()
+
+	gateway := newGateway(far.URL, "Bearer viewer", "org-1", "session-1")
+	// The capability as a mint would have left it in the cache, so the
+	// transport resolves this exact token rather than minting another.
+	const key = "conformance"
+	gateway.delegation = &delegation{key: key}
+	if _, err := gateway.contexts.resolve(context.Background(), key,
+		func(context.Context) (string, time.Time, error) {
+			return token, time.Now().Add(time.Hour), nil
+		}); err != nil {
+		// The cache refused to hold it at all, which is this runtime refusing
+		// to carry it — the same answer as a refusal at attach time.
+		return nil, err
+	}
+
+	request, err := http.NewRequest(http.MethodPost, far.URL+"/v1/things/search", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := gateway.HTTPClient().Do(request)
+	if err != nil {
+		return nil, unwrapURLError(err)
+	}
+	_ = resp.Body.Close()
+	if reached == nil {
+		t.Fatal("the far end was not reached and nothing refused the call")
+	}
+	return reached, nil
+}
+
+// unwrapURLError returns what a transport refusal actually was: http.Client
+// wraps a RoundTrip error in *url.Error, which errors.Is sees through but a
+// reader of the message does not.
+func unwrapURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
 }
