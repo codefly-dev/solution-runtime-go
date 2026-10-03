@@ -30,13 +30,19 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 		key      string
 		token    string
 		bundle   string
+		callers  string
 		names    string
 		variable string
 	}{
-		{name: "no certificate", key: keyFile, token: "t", bundle: bundleFile, names: "certificate", variable: IdentityCertFileEnvironmentVariable},
-		{name: "no private key", cert: certFile, token: "t", bundle: bundleFile, names: "private key", variable: IdentityKeyFileEnvironmentVariable},
-		{name: "no trust anchor", cert: certFile, key: keyFile, token: "t", names: "trust anchor", variable: IdentityTrustBundleFileEnvironmentVariable},
-		{name: "no projected token", cert: certFile, key: keyFile, bundle: bundleFile, names: "projected service-account token", variable: ProjectedTokenFileEnvironmentVariable},
+		{name: "no certificate", key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "certificate", variable: IdentityCertFileEnvironmentVariable},
+		{name: "no private key", cert: certFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "private key", variable: IdentityKeyFileEnvironmentVariable},
+		{name: "no trust anchor", cert: certFile, key: keyFile, token: "t", callers: testGatewayPrincipal, names: "trust anchor", variable: IdentityTrustBundleFileEnvironmentVariable},
+		{name: "no projected token", cert: certFile, key: keyFile, bundle: bundleFile, callers: testGatewayPrincipal, names: "projected service-account token", variable: ProjectedTokenFileEnvironmentVariable},
+		// Not material this workload presents, but the other half of the
+		// posture: a listener that verifies every caller in the cell and
+		// admits all of them is a listener with no admission at all, so the
+		// admitted set is provisioned and named when it is absent.
+		{name: "no allowed callers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, names: "allowed caller identities", variable: IdentityAllowedCallersEnvironmentVariable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID})
@@ -48,6 +54,7 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 				identityKeyFile:    tc.key,
 				projectedTokenPath: tc.token,
 				trustBundleFile:    tc.bundle,
+				allowedCallers:     tc.callers,
 				profile:            localProfile,
 			}
 			if err := server.cfg.validate(); err != nil {
@@ -111,6 +118,9 @@ func TestASuppliedSourceNeedsNoProvisioningItDoesNotRead(t *testing.T) {
 		gatewayURL: "https://gateway:42152",
 		mintURL:    "https://gateway:42152" + credentialMintPath,
 		profile:    localProfile,
+		// Required whatever the identity source is: the source says who this
+		// workload is, this says which callers it serves.
+		allowedCallers: testGatewayPrincipal,
 	}
 	t.Run("an identity source replaces the projected pair", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{})
@@ -716,5 +726,110 @@ func TestAMismatchedLeafIsRefusedBeforeTheMint(t *testing.T) {
 	}
 	if got := mint.count(); got != 0 {
 		t.Errorf("the host was asked %d time(s) before the leaf was checked: a mismatched identity must reach nothing, and the projected token travels on that request", got)
+	}
+}
+
+// TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne is the confused
+// deputy a second reviewer found behind "authenticated peers, both directions".
+//
+// Verifying a caller's certificate against the cell's anchor answers whether it
+// holds an identity the platform issued. In a cell that is every workload,
+// including the modules this solution consumes. So any of them could reach a
+// handler or a passthrough route directly, bypassing the admission the host
+// decides on its own routes — and since gatewayFor reads x-org-id and
+// x-session-id as headers the gateway stamped from a verified bearer, such a
+// caller could set them itself and have this runtime mint capabilities under
+// *this workload's* attestation for an org and session nobody authenticated.
+// The deputy being confused is the one process the issuer trusts to say which
+// module is asking.
+//
+// Authentication was added in the previous round and authorisation was not,
+// which is why the first reviewer asked for "authenticated, authorized peers".
+func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	cell := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := cell.workload(t, testPrincipal)
+	mint.serveTLS(t, cell)
+	authorityValues(t)
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected-token")
+	t.Setenv("PORT", freePort(t))
+	t.Setenv("GATEWAY_URL", mint.URL)
+	t.Setenv(CredentialMintURLEnvironmentVariable, mint.URL+credentialMintPath)
+	t.Setenv(ProjectedTokenFileEnvironmentVariable, tokenFile)
+	t.Setenv(IdentityCertFileEnvironmentVariable, certFile)
+	t.Setenv(IdentityKeyFileEnvironmentVariable, keyFile)
+	t.Setenv(IdentityTrustBundleFileEnvironmentVariable, bundleFile)
+	t.Setenv(IdentityAllowedCallersEnvironmentVariable, testGatewayPrincipal)
+	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
+	t.Setenv("ASSETS_DIR", t.TempDir())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	reached := make(chan struct{}, 8)
+	server := New(Manifest{ID: testSolutionID}).Handle("/thing", func(context.Context, *Gateway) (any, error) {
+		reached <- struct{}{}
+		return map[string]string{"ok": "yes"}, nil
+	})
+	ln, err := server.start(ctx)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- server.serve(ctx, ln) }()
+	t.Cleanup(func() { cancel(); <-served })
+	base := "https://127.0.0.1:" + os.Getenv("PORT")
+
+	call := func(identity string) (*http.Response, error) {
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			RootCAs:      cell.roots,
+			Certificates: []tls.Certificate{*cell.identity(t, identity)},
+			MinVersion:   tls.VersionTLS13,
+		}}}
+		request, err := http.NewRequest(http.MethodGet, base+"/thing", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("authorization", "Bearer viewer")
+		// The headers a caller must not be able to assert for itself.
+		request.Header.Set(orgHeader, "org-the-caller-chose")
+		request.Header.Set(sessionHeader, "session-the-caller-chose")
+		return client.Do(request)
+	}
+
+	t.Run("the gateway is served", func(t *testing.T) {
+		resp, err := call(testGatewayPrincipal)
+		if err != nil {
+			t.Fatalf("the admitted caller was refused, so this check is just a broken listener: %v", err)
+		}
+		_ = resp.Body.Close()
+		select {
+		case <-reached:
+		default:
+			t.Error("the admitted caller did not reach the handler")
+		}
+	})
+
+	for _, identity := range []string{
+		// A module this solution consumes: holds a cell certificate, and is
+		// precisely the party that must not be able to drive this runtime's
+		// mints.
+		"spiffe://codefly.test/ns/modules/sa/things",
+		// Any other workload in the trust domain.
+		"spiffe://codefly.test/ns/solutions/sa/someone-else",
+	} {
+		t.Run("refused: "+identity, func(t *testing.T) {
+			resp, err := call(identity)
+			if err == nil {
+				defer func() { _ = resp.Body.Close() }()
+				t.Errorf("a caller authenticated as %s was served %d: holding a certificate from this cell's anchor is not the same as being a caller this solution serves, and this one set its own %s and %s",
+					identity, resp.StatusCode, orgHeader, sessionHeader)
+			}
+			select {
+			case <-reached:
+				t.Error("the handler ran for a caller this solution does not admit")
+			default:
+			}
+		})
 	}
 }

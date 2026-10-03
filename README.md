@@ -97,6 +97,7 @@ the SDK-resolved value is the default.
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
+| Allowed callers | `workload-identity`/`ALLOWED_CALLERS` — **required**, comma-separated identities (normally the gateway's). Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
@@ -104,7 +105,8 @@ the SDK-resolved value is the default.
 | Deployed or local | `CODEFLY__RUNTIME_CONTEXT`, injected by Codefly: `native`/`nix`/`container`/`free` (or unset) is a local run, anything else (a GitOps render's `kubernetes`) a deployment | — |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 
-The three `workload-identity` values are **paths, never material**. The files
+`ALLOWED_CALLERS` is the only one of these that is a value rather than a path.
+The other `workload-identity` values are **paths, never material**. The files
 behind them are read by this process — the token at every mint, the key pair at
 every handshake — so the SDK's value accessors would be the wrong tool for the
 material itself: a file-carried configuration value is read once and kept for
@@ -177,6 +179,21 @@ issuer with its own rotation, revocation or peer-verification rules keeps them.
 A source that returns no certificate is refused rather than started: a listener
 that completes no handshake reports a TLS error naming nothing to every caller.
 
+**The listener authorises its callers, not merely authenticates them.** Every
+workload in the trust domain holds a certificate from the same anchor —
+including the modules this solution consumes — so verifying one answers "did the
+platform issue this identity", not "may this caller call me". The admitted set
+is therefore declared and provisioned (`workload-identity`/`ALLOWED_CALLERS`)
+and the boot is refused when it is absent, naming the value; the comparison is
+the SPIFFE ID in the caller's URI SAN. Without it a consumed module could call a
+handler or a passthrough route directly, bypassing the admission the host
+decides on its own routes, and — because `x-org-id` and `x-session-id` are read
+as headers the gateway stamped from a verified bearer — set them itself and have
+this runtime mint capabilities under its attestation for an organization and
+session nobody authenticated. A confused deputy, where the deputy is the one
+process the issuer trusts to say which module is asking. The refusal names the
+identity that arrived and never the admitted set.
+
 **The listener authenticates its callers, and so does the identity it presents
 outward.** It requires and verifies a caller's certificate against the projected
 anchor — not optionally, and not when one happens to be configured: a listener
@@ -187,6 +204,18 @@ rather than falling back, because judging callers by a stale anchor lets in who
 should be refused, which is not symmetric with serving a stale leaf. Peer trust
 is re-read **per handshake**, so removing a compromised root from the bundle
 stops it authenticating callers without a restart.
+
+**No credential-bearing request follows a redirect, and none leaves the
+gateway's own origin.** Go copies a request's headers onto a redirected one and
+strips only `Authorization`, `WWW-Authenticate` and `Cookie`; a 307 re-sends the
+body; and this runtime sets the bearer per round trip, which puts back the one
+header Go strips. So a single `307 Location: http://elsewhere/` would hand a
+third party the viewer's bearer, the capability minted for them and this
+workload's own credential, in cleartext — nothing about an `http://` hop involves
+the TLS configuration that protects the first one. Every client is therefore
+built with `ErrUseLastResponse` (a 3xx is reported, never taken), and the
+transport refuses any destination that is not the gateway's origin, so a client
+built later without the policy is still stopped.
 
 The same identity goes out. Every platform request — the mint, and every call a
 handler's gateway makes — presents this workload's X.509-SVID and verifies the
@@ -434,6 +463,19 @@ optional dashboard), `/.well-known/capabilities` (the contract id and the
 majors), `/.well-known/module-contract` (the authority contract above) and
 `/health`. Publishing is not announcing — nothing is pushed, and answering
 makes this solution present to nobody.
+
+`/health` answers 200 while this process can do its job, and **503 once the
+issuer has refused this execution's credential for good** — `ErrMintRefused` or
+`ErrRevoked` at renewal, which are judgements about this execution that no retry
+changes. The process then stops serving and returns that reason, for the
+orchestrator to restart it against the delivery as it stands. An unconditional
+200 was wrong in exactly the case the probe exists for: the boot already treats a
+refusal as terminal, while at renewal the same judgement reached a page as
+"unavailable, one renewal fixes it", so a solution would answer 503 to every
+request forever and report itself healthy throughout — a solution that serves
+nothing and looks alive, which is what the delivered-presence model replaced the
+heartbeat to avoid. An *unavailable* mint is not a judgement and deliberately
+does not do this: exiting on a transient dependency failure is a crash loop.
 
 The manifest declares the contract majors it is built against
 (`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving a reader to

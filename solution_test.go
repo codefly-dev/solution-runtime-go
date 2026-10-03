@@ -155,14 +155,14 @@ func TestManifestOmitsAbsentDashboard(t *testing.T) {
 	}
 }
 
-// wordFootnote is the surface shape the wiki declares for a Word document: the
+// wordFootnote is the surface shape the notes solution declares for a Word document: the
 // whole set of slots a client reads, so a test can assert on all of them.
 func wordFootnote() Surface {
 	return Surface{
 		ID:          "footnote",
 		Client:      "word",
 		Title:       "Footnote",
-		Description: "Cite a claim from the wiki.",
+		Description: "Cite a claim from the notes solution.",
 		Module:      "/surfaces/word/footnote.js",
 		Contract:    1,
 		Applies:     "always",
@@ -174,7 +174,7 @@ func wordFootnote() Surface {
 // so every declared slot must survive the trip through JSON — including the
 // applies selector, which the runtime carries without interpreting.
 func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
-	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote()}}}
+	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{wordFootnote()}}}
 
 	var got map[string]any
 	body, err := json.Marshal(s.manifestMap())
@@ -188,7 +188,7 @@ func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
 		"id":          "footnote",
 		"client":      "word",
 		"title":       "Footnote",
-		"description": "Cite a claim from the wiki.",
+		"description": "Cite a claim from the notes solution.",
 		"module":      "/surfaces/word/footnote.js",
 		"contract":    float64(1),
 		"applies":     "always",
@@ -205,7 +205,7 @@ func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
 	applies := map[string]any{"tagged": []any{"legal", "finance"}}
 	surface := wordFootnote()
 	surface.Applies = applies
-	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{surface}}}
 
 	var got map[string]any
 	body, _ := json.Marshal(s.manifestMap())
@@ -236,7 +236,7 @@ func TestManifestDefaultsAppliesAndOmitsEmptySurfaceSlots(t *testing.T) {
 	surface.Applies = nil
 	surface.Events = nil
 	surface.Description = ""
-	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{surface}}}
 
 	entry := s.manifestMap()["surfaces"].([]any)[0].(map[string]any)
 	if got := entry["applies"]; got != "always" {
@@ -308,7 +308,7 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := Manifest{ID: "wiki", Surfaces: tc.surfaces}.validateSurfaces()
+			err := Manifest{ID: "notes", Surfaces: tc.surfaces}.validateSurfaces()
 			if err == nil {
 				t.Fatalf("validateSurfaces accepted %s", tc.name)
 			}
@@ -319,21 +319,21 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 	}
 }
 
-// The same offering in two clients carries the same id — the wiki's footnote is
+// The same offering in two clients carries the same id — the notes solution's footnote is
 // "footnote" in Word and in PowerPoint — and neither client can see the other's,
 // so that is not a collision. Only two surfaces of one client are ambiguous.
 func TestSurfaceIDsAreUniquePerClientNotPerSolution(t *testing.T) {
 	powerpoint := wordFootnote()
 	powerpoint.Client = "powerpoint"
 	powerpoint.Module = "/surfaces/powerpoint/footnote.js"
-	if err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), powerpoint}}).validateSurfaces(); err != nil {
+	if err := (Manifest{ID: "notes", Surfaces: []Surface{wordFootnote(), powerpoint}}).validateSurfaces(); err != nil {
 		t.Errorf("validateSurfaces refused one id shared across two clients: %v", err)
 	}
 
 	second := wordFootnote()
 	second.Title = "Footnote, again"
 	second.Module = "/surfaces/word/footnote-2.js"
-	err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), second}}).validateSurfaces()
+	err := (Manifest{ID: "notes", Surfaces: []Surface{wordFootnote(), second}}).validateSurfaces()
 	if err == nil {
 		t.Fatal("validateSurfaces accepted two surfaces sharing an id within one client")
 	}
@@ -349,7 +349,7 @@ func TestServeRejectsUnusableSurface(t *testing.T) {
 	surface := wordFootnote()
 	surface.Module = `/\evil.example/footnote.js`
 
-	s := New(Manifest{ID: "wiki", Title: "Wiki", Surfaces: []Surface{surface}})
+	s := New(Manifest{ID: "notes", Title: "Notes", Surfaces: []Surface{surface}})
 	err := s.Serve()
 	if err == nil {
 		t.Fatal("Serve returned nil for an off-origin surface module; expected a boot error and no bind")
@@ -537,7 +537,7 @@ func send[T any](ch chan T, value T) {
 }
 
 // consumesDocuments is the api.consumes projection core surfaces to a running
-// backend for the wiki→documents federation. The literal key is
+// backend for the notes→documents federation. The literal key is
 // manifest.APIConsumesEnvironmentVariable (a wire contract).
 const consumesDocuments = `[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`
 
@@ -719,7 +719,7 @@ func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Se
 // for an assertion about the credential itself.
 func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, handler Handler) *httptest.Server {
 	t.Helper()
-	s := New(Manifest{ID: "wiki", Title: "Wiki"}).Credential(source)
+	s := New(Manifest{ID: "notes", Title: "Notes"}).Credential(source)
 	s.cfg = config{gatewayURL: gatewayURL}
 	server := httptest.NewServer(s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
 		return handler(r.Context(), gw)

@@ -83,10 +83,13 @@ func handlerErrorResponse(err error) (int, string) {
 	// it; a 502 told the page a module was broken. The two paths now agree, and
 	// the message says whose problem it is and nothing about where.
 	switch {
-	case errors.Is(err, ErrNotAttested):
-		return http.StatusServiceUnavailable, "this solution cannot currently act for the viewer against the module"
+	// ErrRevoked first: ErrNotAttested wraps it when a renewal is refused
+	// because the state the credential is sealed to has moved, and the first
+	// matching branch is what the page is told.
 	case errors.Is(err, workcontext.ErrRevoked):
 		return http.StatusConflict, "the authority this solution presented has been superseded; the call was not made"
+	case errors.Is(err, ErrNotAttested):
+		return http.StatusServiceUnavailable, "this solution cannot currently act for the viewer against the module"
 	case errors.Is(err, workcontext.ErrUnsealed), errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
 		return http.StatusBadGateway, "this solution could not present a usable credential for the module"
 	}

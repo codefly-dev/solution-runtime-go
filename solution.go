@@ -113,9 +113,11 @@ type Surface struct {
 	// this runtime at all. The host's registry and the client's loader own that
 	// boundary and have to enforce it themselves.
 	Module string
-	// Contract is the surface contract major this module is built against
-	// (obin-ai/obin-word docs/SURFACE.md), so a client refuses a surface it
-	// cannot run rather than loading it and failing inside.
+	// Contract is the surface contract major this module is built against, as
+	// the host client's own surface documentation defines it, so a client
+	// refuses a surface it cannot run rather than loading it and failing
+	// inside. Named generically on purpose: this runtime is the generic one,
+	// and the comment used to point at one product's repository.
 	Contract int
 	// Applies is "always" or a {"tagged": [...]} selector, and Events are the
 	// journal namespaces the surface reconciles on. Both are carried verbatim:
@@ -298,12 +300,13 @@ type config struct {
 	port       string
 	gatewayURL string
 	assetsDir  string
-	// mintURL is the host endpoint that mints this execution's credential, and
-	// mintAudience is the audience the projected service-account token must be
-	// bound to for that endpoint to accept it. Both are resolved, never
-	// defaulted to a path on a guessed host.
-	mintURL      string
-	mintAudience string
+	// mintURL is the host endpoint that mints this execution's credential. The
+	// audience the projected token must be bound to is read through the SDK's
+	// authority reader and frozen (see openAuthority), not carried here: there
+	// used to be a mintAudience field beside this one, unread by anything, and
+	// its comment claimed both were "resolved, never defaulted" while mintURL
+	// does carry a default path.
+	mintURL string
 	// projectedTokenPath is the file the platform projects this workload's
 	// service-account token into. It is re-read before every renewal, because
 	// the projection is rotated under the running process and a token read once
@@ -313,6 +316,11 @@ type config struct {
 	// X.509-SVID and the anchor its peers are verified against. The listener
 	// presents the first pair; there is no plain-HTTP listener to fall back to.
 	identityCertFile, identityKeyFile, trustBundleFile string
+	// allowedCallers is the comma-separated set of identities this listener
+	// admits. Authentication says a caller holds a certificate from the cell's
+	// anchor; this says which of them may call, which is a different question
+	// and the one the host's own route admission answers for everybody else.
+	allowedCallers string
 	// profile is the configuration profile this process runs under, which the
 	// published contract is keyed by. A deployed environment has a profile of
 	// its own (codefly-dev/core#687, fixed in core v0.7.1), so a contract that
@@ -516,6 +524,7 @@ func loadConfig(ctx context.Context) config {
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
 		trustBundleFile:    workloadPath(ctx, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey),
+		allowedCallers:     workloadPath(ctx, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityAllowedCallersKey),
 		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 	}
@@ -544,6 +553,9 @@ const (
 	WorkloadIdentityCertFileKey        = "CERT_FILE"
 	WorkloadIdentityKeyFileKey         = "KEY_FILE"
 	WorkloadIdentityTrustBundleFileKey = "TRUST_BUNDLE_FILE"
+	// WorkloadIdentityAllowedCallersKey names the identities allowed to call
+	// this solution, comma-separated. See allowedCallers.
+	WorkloadIdentityAllowedCallersKey = "ALLOWED_CALLERS"
 )
 
 // The environment overrides for the four paths above.
@@ -552,6 +564,9 @@ const (
 	IdentityCertFileEnvironmentVariable        = "CODEFLY__WORKLOAD_IDENTITY_CERT_FILE"
 	IdentityKeyFileEnvironmentVariable         = "CODEFLY__WORKLOAD_IDENTITY_KEY_FILE"
 	IdentityTrustBundleFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE"
+	// IdentityAllowedCallersEnvironmentVariable overrides the identities
+	// allowed to call this solution, comma-separated.
+	IdentityAllowedCallersEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS"
 )
 
 // CredentialMintURLEnvironmentVariable overrides the host endpoint this runtime
@@ -695,7 +710,25 @@ func (s *Server) validateSources() error {
 			return err
 		}
 	}
+	// Who may call is required whatever the identity source is, because it is
+	// not a property of the source: the source says who this workload *is*, and
+	// this says which callers it serves.
+	if len(parsedAllowedCallers(s.cfg.allowedCallers)) == 0 {
+		return fmt.Errorf("no allowed caller identities resolved: this listener verifies a caller's certificate against the cell's trust anchor, which every workload in the cell holds one from — so without this it authenticates callers and authorizes all of them, including the modules this solution consumes, which could then set their own %s and %s and drive mints carrying this workload's attestation. Set %s, or have the platform provision %s/%s (comma-separated identities, e.g. the gateway's)",
+			orgHeader, sessionHeader, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey)
+	}
 	return nil
+}
+
+// parsedAllowedCallers splits and trims the configured caller identities.
+func parsedAllowedCallers(raw string) []string {
+	var allowed []string
+	for _, id := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			allowed = append(allowed, trimmed)
+		}
+	}
+	return allowed
 }
 
 // requirePath refuses an unresolved path, naming the override and the group the
@@ -1094,12 +1127,6 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) wrap(handler Handler) http.HandlerFunc {
-	return s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
-		return handler(r.Context(), gw)
-	})
-}
-
 func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		bearer := r.Header.Get("authorization")
@@ -1119,8 +1146,8 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 
 // drainAndClose consumes what is left of a response body before closing it, so
 // the connection returns to the pool instead of being dropped and re-dialled on
-// the next beat. Bounded: a body larger than this is not worth reading to keep
-// one connection.
+// the next request. Bounded: a body larger than this is not worth reading to
+// keep one connection.
 func drainAndClose(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
@@ -1923,7 +1950,7 @@ func (c *workContextCache) supersede(key string) {
 // Unary makes a typed Connect call to a fully-qualified procedure through the
 // gateway. Req and Resp are generated protobuf messages; the gateway URL, the
 // bearer, and the wire protocol are hidden so a handler only names a procedure
-// and passes typed messages — the twin of the Python runtime's gateway.unary.
+// and passes typed messages.
 func Unary[Req, Resp any](ctx context.Context, gw *Gateway, procedure string, req *Req) (*Resp, error) {
 	client := connect.NewClient[Req, Resp](gw.HTTPClient(), gw.baseURL+procedure)
 	resp, err := client.CallUnary(ctx, connect.NewRequest(req))

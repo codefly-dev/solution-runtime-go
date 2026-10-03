@@ -364,8 +364,21 @@ func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedMod
 		document.Profiles[profile] = ceilings
 	}
 	if mintsAuthority(modules) && len(document.Profiles) == 0 {
-		return nil, fmt.Errorf("the contract declares no profile at all, and this solution mints authority for %d consumed module(s): declare the scope ceilings per profile, a deployed one beside %q",
-			len(modules), localProfile)
+		// Says what it checks. It used to demand "a deployed one beside local"
+		// while accepting a contract that declared only local, which is a
+		// refusal promising a stricter rule than the one it applies — and the
+		// reader who satisfies the message learns nothing, because they were
+		// already passing.
+		//
+		// Which profiles will be deployed is not knowable here: a build-time
+		// document is rendered once and read under whichever profile a
+		// composition runs. A deployed environment missing its profile is
+		// refused at boot, where the profile it ran under is a fact and the
+		// refusal can name it, rather than guessed at here — and a
+		// local-only contract is the correct contract for a solution that is
+		// only ever run locally.
+		return nil, fmt.Errorf("the contract declares no profile at all, and this solution mints authority for %d consumed module(s): declare the scope ceilings per profile — a deployed environment missing its own profile is then refused at boot, naming the profile it ran under",
+			len(modules))
 	}
 	return json.MarshalIndent(document, "", "  ")
 }

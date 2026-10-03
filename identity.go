@@ -5,7 +5,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	codefly "github.com/codefly-dev/sdk-go"
@@ -180,9 +182,65 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 	if err := presentsThisWorkload(config, s.principal); err != nil {
 		return nil, err
 	}
-	holdPerConnectionPosture(config, s.principal)
+	admitOnly(config, parsedAllowedCallers(s.cfg.allowedCallers))
+	holdPerConnectionPosture(config, s.principal, parsedAllowedCallers(s.cfg.allowedCallers))
 	s.identityConfig = config
 	return config, nil
+}
+
+// admitOnly decides which authenticated callers this listener actually serves.
+//
+// Verifying a caller's certificate against the cell's anchor answers "does this
+// caller hold an identity the platform issued". It does not answer "may this
+// caller call me", and in a cell those are very different sets: every workload
+// in the trust domain holds such a certificate, including the modules this
+// solution consumes. Without this, any of them could reach a handler or a
+// passthrough route directly, bypassing the admission the host decides on its
+// own routes — and because gatewayFor reads x-org-id and x-session-id as
+// headers the gateway stamped from a verified bearer, such a caller could set
+// them itself and have this runtime mint capabilities, under this workload's
+// attestation, for an organization and session nobody authenticated. A confused
+// deputy, where the deputy is the one process the issuer trusts to say which
+// module is asking.
+//
+// So the admitted set is declared, provisioned, and refused at boot when
+// absent (validateSources) — not derived from the anchor, which is exactly the
+// set that is too wide. The comparison is the SPIFFE ID in the leaf's URI SAN,
+// the same thing the listener's own identity is held to.
+func admitOnly(config *tls.Config, allowed []string) {
+	if len(allowed) == 0 {
+		return
+	}
+	config.VerifyConnection = verifyCaller(allowed)
+}
+
+// verifyCaller is the check itself, so it can be applied to a per-connection
+// configuration as well as the base one.
+func verifyCaller(allowed []string) func(tls.ConnectionState) error {
+	return func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return fmt.Errorf("refusing a caller that presented no certificate")
+		}
+		leaf := state.PeerCertificates[0]
+		for _, uri := range leaf.URIs {
+			if slices.Contains(allowed, uri.String()) {
+				return nil
+			}
+		}
+		// The refusal names what arrived, not the allowed set: a caller is not
+		// told who else may call.
+		return fmt.Errorf("refusing a caller whose identity %s is not one this solution admits: it holds a certificate from this cell's anchor, which is not the same as being a caller this solution serves — see %s and %s/%s",
+			presentedIdentities(uriStrings(leaf.URIs)), IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey)
+	}
+}
+
+// uriStrings renders a leaf's URI SANs for a refusal.
+func uriStrings(uris []*url.URL) []string {
+	rendered := make([]string, 0, len(uris))
+	for _, uri := range uris {
+		rendered = append(rendered, uri.String())
+	}
+	return rendered
 }
 
 // peerAnchorOf is the pool a resolved server configuration verifies its callers
@@ -310,7 +368,7 @@ func usableServerIdentity(config *tls.Config) error {
 // the posture fails that handshake rather than serving it weakened — the caller
 // that happens to arrive is not what is in question, the configuration the
 // listener would answer anyone with is.
-func holdPerConnectionPosture(config *tls.Config, principal string) {
+func holdPerConnectionPosture(config *tls.Config, principal string, allowed []string) {
 	inner := config.GetConfigForClient
 	if inner == nil {
 		return
@@ -332,6 +390,10 @@ func holdPerConnectionPosture(config *tls.Config, principal string) {
 		if err := presentsThisWorkload(answer, principal); err != nil {
 			return nil, err
 		}
+		// Who may call is re-imposed too: a source's callback that returned a
+		// configuration without it would serve that connection admitting every
+		// identity in the cell.
+		admitOnly(answer, allowed)
 		return answer, nil
 	}
 }

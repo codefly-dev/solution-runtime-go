@@ -21,7 +21,7 @@ something that tells the host this process exists, you are rebuilding what this
 runtime removed.
 
 It owns none of the counterparts it talks to. The mint endpoint and the
-admission rules belong to the host (`codefly-dev/module-saas-starter`) and the
+admission rules belong to the host (the composition's own host module) and the
 gateway; the mint-once client, the authority reader and the TLS reloader to
 `codefly-dev/sdk-go`; endpoint, port and secret resolution to `sdk-go` as well;
 workspace, manifest and presence/authority document types to `codefly-dev/core`;
@@ -91,6 +91,27 @@ on `Server.PassthroughHandler`, the handler `Serve` mounts.
   bounded window, with the window as a deadline on the operation, and then exits
   non-zero for the orchestrator. Those two answers must stay distinguishable:
   conflating them was a review blocker in both directions.
+- **Credential-bearing traffic never follows a redirect and never leaves the
+  gateway's origin.** Go copies a request's headers onto a redirected one and
+  strips only `Authorization`, `WWW-Authenticate` and `Cookie`, a 307 re-sends
+  the body, and this runtime sets the bearer per round trip — so a client that
+  merely inherits a transport, as every gateway client once did, hands a `307
+  Location: http://…` the viewer's bearer, their capability and this workload's
+  credential in cleartext. Build clients through `Gateway.platformClient`, which
+  carries `ErrUseLastResponse`, and leave the transport's origin pin in place.
+- **Authentication is not authorisation.** Every workload in the trust domain
+  holds a certificate from the same anchor, the consumed modules included, so
+  the admitted caller set is provisioned
+  (`workload-identity`/`ALLOWED_CALLERS`) and refused at boot when absent. A
+  listener that verifies every caller and admits all of them lets a consumed
+  module set its own `x-org-id`/`x-session-id` and drive mints under this
+  workload's attestation.
+- **A terminal credential refusal ends the process; a transient one does not.**
+  `ErrMintRefused` and `ErrRevoked` at renewal fail `/health` and end `serve`
+  with the reason. `ErrMintUnavailable` must not: it is transient by
+  construction and exiting on it is a crash loop. The boot and the run have to
+  classify these the same way — they did not, and the result was a solution
+  answering 503 forever while reporting itself healthy.
 - **Fail closed, with no exception for a counterpart's current state.** A mint
   this runtime cannot attest for is not sent; a listener that cannot
   authenticate its callers does not start; a credential-bearing destination that

@@ -42,6 +42,7 @@ const (
 	testSolutionTitle = "Widgets"
 
 	testPrincipal          = "spiffe://codefly.test/ns/solutions/sa/widgets"
+	testGatewayPrincipal   = "spiffe://codefly.test/ns/platform/sa/gateway"
 	testAudience           = testSolutionID
 	testProjectionAudience = "accounts"
 )
@@ -137,7 +138,7 @@ func (m *hostMint) serveTLS(t *testing.T, c *cell) {
 	m.Server = httptest.NewUnstartedServer(http.HandlerFunc(m.serve))
 	m.Server.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{*c.identity(t, "spiffe://codefly.test/ns/platform/sa/gateway")},
+		Certificates: []tls.Certificate{*c.identity(t, testGatewayPrincipal)},
 		ClientCAs:    c.roots,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
@@ -255,7 +256,7 @@ func (c *cell) workload(t *testing.T, spiffeID string) (certFile, keyFile, bundl
 	writeFile(t, certFile, string(leafPEM))
 	writeFile(t, keyFile, string(keyPEM))
 
-	return certFile, keyFile, bundleFile, c.identity(t, "spiffe://codefly.test/ns/platform/sa/gateway"), c.roots
+	return certFile, keyFile, bundleFile, c.identity(t, testGatewayPrincipal), c.roots
 }
 
 // identity is a TLS certificate for one SPIFFE ID, for a party in a test that
@@ -390,6 +391,11 @@ func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, key
 	t.Setenv(IdentityCertFileEnvironmentVariable, certFile)
 	t.Setenv(IdentityKeyFileEnvironmentVariable, keyFile)
 	t.Setenv(IdentityTrustBundleFileEnvironmentVariable, bundleFile)
+	// Who may call: the gateway, which is the identity cell.workload hands back
+	// as the caller. Holding a certificate from the cell's anchor is not the
+	// same as being a caller this solution serves, so the admitted set is
+	// provisioned rather than derived from the anchor.
+	t.Setenv(IdentityAllowedCallersEnvironmentVariable, testGatewayPrincipal)
 	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
 	// A test that serves assets provisions the directory before booting, since
 	// a boot's configuration is read by the serving goroutine and must not be

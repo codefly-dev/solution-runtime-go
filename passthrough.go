@@ -533,13 +533,13 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
-	case errors.Is(err, ErrNotAttested):
-		// This solution could not attest which module is asking, so it did not
-		// ask. The viewer's authority is not in question and the condition is
-		// one renewal away, which is what unavailable says and what neither
-		// internal nor permission_denied would.
-		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
 	case errors.Is(err, workcontext.ErrRevoked):
+		// Checked before ErrNotAttested, which now wraps it: a renewal the
+		// issuer refuses because the state the credential is sealed to has
+		// moved arrives here as both, and the first matching branch decides
+		// what a page is told. Reported as unavailable it reads as "retry
+		// shortly", which is the one thing that cannot help.
+		//
 		// The capability was sound when it was minted and the state moved under
 		// it — an installation revision, a principal's epoch, a build
 		// incarnation, a binding. The holder's answer to every one of those is
@@ -551,6 +551,12 @@ func relayedError(err error) error {
 		// re-asks gets a fresh mint because the cache no longer holds a current
 		// one.
 		return connect.NewError(connect.CodeAborted, errors.New("the authority this solution presented has been superseded; the call was not made"))
+	case errors.Is(err, ErrNotAttested):
+		// This solution could not attest which module is asking, so it did not
+		// ask. The viewer's authority is not in question and the condition is
+		// one renewal away, which is what unavailable says and what neither
+		// internal nor permission_denied would.
+		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
 	case errors.Is(err, workcontext.ErrUnsealed), errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
 		// A capability this solution could not present is this solution's
 		// problem, not a module that is briefly unreachable, and not the
