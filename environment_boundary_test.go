@@ -11,63 +11,216 @@ import (
 	"testing"
 )
 
-// serveTimeEnvironmentRead is the one function that reads the environment
-// outside boot resolution: the consumed-API projection is parsed when the
-// server starts, never reaches validate(), and a malformed value disables the
-// federation with a log line instead of refusing the boot.
-const serveTimeEnvironmentRead = "registerConsumedAPIs"
-
 // AGENTS.md tells an agent that configuration is resolved in one place and
-// refused at boot, naming the single serve-time exception and the silent
-// failure it produces. Prose cannot notice a second exception appearing
-// underneath it, and an agent-context file is followed literally, so the claim
-// is pinned here: every environment read must sit in loadConfig's call tree,
-// where validate() governs the result, or be the documented exception.
+// refused at boot, with no exception. Prose cannot notice an exception
+// appearing underneath it, and an agent-context file is followed literally, so
+// the claim is pinned here: every environment read must sit in loadConfig's
+// call tree, where validate() governs the result.
+//
+// There used to be one exception, and deleting it is part of this runtime
+// ceasing to register itself. registerConsumedAPIs read the api.consumes
+// projection at serve time to register each consumed module's upstream with
+// the gateway; a malformed projection disabled the whole federation with a log
+// line while the solution served on, so every consumed facade 404'd at the
+// gateway and the solution looked healthy. Nothing registers now — the routes
+// are delivered — and the projection is resolved at boot like everything else,
+// so the refusal is a refusal and not a log line.
 func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 	pkg := parsePackage(t)
 	boot := pkg.reachableFrom("loadConfig")
 
 	var undocumented []string
 	for _, fn := range pkg.environmentReaders() {
-		if !boot[fn] && fn != serveTimeEnvironmentRead {
+		if !boot[fn] {
 			undocumented = append(undocumented, fn)
 		}
 	}
 	if len(undocumented) > 0 {
 		t.Errorf("these functions read the environment outside loadConfig's call tree: %s\n"+
-			"AGENTS.md states that boot configuration is resolved in loadConfig and refused by validate(), with %q as the only exception. "+
+			"AGENTS.md states that boot configuration is resolved in loadConfig and refused by validate(), with no exception. "+
 			"Either resolve the value in loadConfig, or document the new exception in AGENTS.md — a value read after boot is never refused, it degrades while the solution serves.",
-			strings.Join(undocumented, ", "), serveTimeEnvironmentRead)
+			strings.Join(undocumented, ", "))
 	}
 }
 
-// The documented exception has to keep being one. If it stops reading the
-// environment, or starts being called during boot resolution, AGENTS.md
-// describes a hazard that no longer exists where it says it does.
-func TestServeTimeEnvironmentReadIsStillTheException(t *testing.T) {
-	pkg := parsePackage(t)
-
-	reads := false
-	for _, fn := range pkg.environmentReaders() {
-		if fn == serveTimeEnvironmentRead {
-			reads = true
+// And the read has to happen at boot, not merely be written there.
+//
+// Static reachability is not the claim AGENTS.md makes, and the difference was
+// exploitable without meaning to: a closure *defined* inside loadConfig that
+// reads the environment is in loadConfig's call tree for this gate's purposes
+// while running per handshake, long after validate() has had its say. Two of
+// them existed, resolving the caller and peer admission sets, and the gate
+// reported the boundary intact — the reads were lexically where the rule wanted
+// them and temporally nowhere near it. A value genuinely resolved at boot does
+// not need a closure to do it, so the whole shape is refused rather than
+// inspected for intent.
+func TestNoClosureDefersAnEnvironmentReadPastBoot(t *testing.T) {
+	// Indirectly too. The closures this gate exists to catch did not call
+	// os.Getenv: they called workloadPath, which calls env, which does — so a
+	// rule that looked only for a direct read would have passed the exact code
+	// it was written for. A probe below pins that.
+	readers := parsePackage(t).environmentReachers()
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package directory: %v", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, line := range deferredEnvironmentReads(fset, file, readers) {
+			t.Errorf("%s:%d defines a function literal that reads the environment: a read inside a closure happens when the closure is called, which is not boot, so validate() never governs it. Resolve the value in loadConfig's own body and carry the result.",
+				name, line)
 		}
 	}
-	if !reads {
-		t.Errorf("%s no longer reads the environment, so AGENTS.md documents an exception that does not exist: remove it there and here",
-			serveTimeEnvironmentRead)
-	}
-	if pkg.reachableFrom("loadConfig")[serveTimeEnvironmentRead] {
-		t.Errorf("%s is now reachable from loadConfig, so its value is resolved at boot: AGENTS.md describes it as read at serve time and unseen by validate()",
-			serveTimeEnvironmentRead)
-	}
+}
 
+// deferredEnvironmentReads is every environment read inside a function literal
+// in one file, by line.
+//
+// Separated from the test so the gate can be run against a file the test
+// writes. A gate that only ever sees conforming code reports success whether
+// or not it works, which is how the shape it exists to catch got in.
+func deferredEnvironmentReads(fset *token.FileSet, file *ast.File, readers map[string]bool) []int {
+	var lines []int
+	ast.Inspect(file, func(node ast.Node) bool {
+		lit, ok := node.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		ast.Inspect(lit.Body, func(inner ast.Node) bool {
+			call, ok := inner.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if readsEnvironment(call) {
+				lines = append(lines, fset.Position(call.Pos()).Line)
+				return true
+			}
+			if callee, ok := calleeName(call); ok && readers[callee] {
+				lines = append(lines, fset.Position(call.Pos()).Line)
+			}
+			return true
+		})
+		return true
+	})
+	return lines
+}
+
+// environmentReachers is the package's configuration resolvers: the functions
+// that read the environment themselves, and the ones whose whole job is to call
+// those (workloadPath over env).
+//
+// One hop, not the transitive closure. The closure marks most of the package —
+// enough of it that this gate failed two function literals doing nothing but
+// holding a certificate to a principal — and a rule with false positives gets
+// relaxed rather than obeyed. One hop is what the shape under test needed: the
+// closures called workloadPath, which calls env, which reads. A resolver added
+// later is caught the same way, because a new resolver reading the environment
+// is itself a direct reader.
+func (p pkgFuncs) environmentReachers() map[string]bool {
+	reaches := map[string]bool{}
+	for name := range p.reads {
+		reaches[name] = true
+	}
+	for caller, callees := range p.calls {
+		for _, callee := range callees {
+			if p.reads[callee] {
+				reaches[caller] = true
+				break
+			}
+		}
+	}
+	return reaches
+}
+
+// TestTheClosureGateCatchesTheShapeThatEvadedIt runs the gate against the two
+// closures that passed the boundary check while reading the environment per
+// handshake — they resolved the caller and peer admission sets — and against
+// the conforming shape, so the gate is not simply refusing every closure.
+func TestTheClosureGateCatchesTheShapeThatEvadedIt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source string
+		caught bool
+	}{
+		{
+			"the admission-set resolver as it was written",
+			`package solution
+func loadConfig() config {
+	return config{
+		resolveAllowedCallers: func() string {
+			return workloadPath(ctx, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityAllowedCallersKey)
+		},
+	}
+}`,
+			true,
+		},
+		{
+			"a closure reading the environment directly",
+			`package solution
+func f() func() string {
+	return func() string { return os.Getenv("ANYTHING") }
+}`,
+			true,
+		},
+		{
+			"a closure that reads a file, which is what a live value needs",
+			`package solution
+func f() func() ([]byte, error) {
+	return func() ([]byte, error) { return os.ReadFile(path) }
+}`,
+			false,
+		},
+		{
+			"a read in a function body, where boot can govern it",
+			`package solution
+func loadConfig() config {
+	return config{port: env("PORT", "")}
+}`,
+			false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "probe.go", tc.source, 0)
+			if err != nil {
+				t.Fatalf("parse the probe: %v", err)
+			}
+			// The helpers the real closures reached the environment through.
+			found := len(deferredEnvironmentReads(fset, file, map[string]bool{"workloadPath": true, "env": true})) > 0
+			if found != tc.caught {
+				if tc.caught {
+					t.Error("the gate did not see an environment read deferred into a closure, so a value read per handshake can be written as if it were resolved at boot")
+				} else {
+					t.Error("the gate flagged a closure that reads no environment: resolving a value from a file per use is how a live value is supposed to work here, and refusing it would refuse the fix")
+				}
+			}
+		})
+	}
+}
+
+// AGENTS.md has to keep saying so. A file that stopped describing the boundary
+// would leave the next agent to infer it from whichever call site they opened
+// first, which is how the serve-time exception came to exist.
+func TestTheEnvironmentBoundaryIsDocumented(t *testing.T) {
 	agents, err := os.ReadFile("AGENTS.md")
 	if err != nil {
 		t.Fatalf("read AGENTS.md: %v", err)
 	}
-	if !strings.Contains(string(agents), serveTimeEnvironmentRead) {
-		t.Errorf("AGENTS.md does not name %q, the one configuration read that is not refused at boot", serveTimeEnvironmentRead)
+	for _, claim := range []string{"loadConfig", "validate()"} {
+		if !strings.Contains(string(agents), claim) {
+			t.Errorf("AGENTS.md does not name %q, half of where configuration is resolved and refused", claim)
+		}
+	}
+	if strings.Contains(string(agents), "registerConsumedAPIs") {
+		t.Error("AGENTS.md still names registerConsumedAPIs, the serve-time exception this runtime deleted along with its registrations")
 	}
 }
 

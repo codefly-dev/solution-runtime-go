@@ -38,7 +38,7 @@ func mintedActions(m mintRequest) string {
 
 func TestPassthroughMintsOnlyTheCalledMethodsScopes(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1"}`)
-	s := passthroughServer(gw.URL, perMethodModule())
+	s := passthroughServer(t, gw.URL, perMethodModule())
 
 	if status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1"}`); status != http.StatusOK {
 		t.Fatalf("search: status %d: %v", status, body)
@@ -67,7 +67,7 @@ func TestPassthroughMethodScopesReplaceTheModules(t *testing.T) {
 	module := perMethodModule()
 	module.Scopes = []Scope{{ResourceKind: "things", Actions: []string{"read"}}}
 	module.Methods[0].Scopes = nil // Search falls back to the module's.
-	s := passthroughServer(gw.URL, module)
+	s := passthroughServer(t, gw.URL, module)
 
 	call(t, s, searchPath, "Bearer viewer", `{}`)
 	call(t, s, getPath, "Bearer viewer", `{"entryId":"e1"}`)
@@ -79,7 +79,7 @@ func TestPassthroughMethodScopesReplaceTheModules(t *testing.T) {
 func TestPassthroughRefusesOnlyTheMethodWhoseAuthorityTheViewerLacks(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1"}`)
 	gw.deny = "inspect"
-	s := passthroughServer(gw.URL, perMethodModule())
+	s := passthroughServer(t, gw.URL, perMethodModule())
 
 	status, body := call(t, s, getPath, "Bearer member", `{"entryId":"e1"}`)
 	if status != http.StatusForbidden || body["code"] != "permission_denied" {
