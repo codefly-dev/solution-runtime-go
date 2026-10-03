@@ -5,10 +5,13 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	codefly "github.com/codefly-dev/sdk-go"
 )
@@ -146,7 +149,165 @@ func (s *Server) listen() (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The per-connection recheck is installed on the *server*, not here: see
+	// watchInboundTrust. A listener that wrapped its connections would hide
+	// the *tls.Conn from net/http, which decides from that concrete type alone
+	// whether a connection is TLS at all — so r.TLS would be nil in every
+	// handler, ALPN and HTTP/2 would not be negotiated, and the handshake
+	// deadline would never be set. The recheck must not cost the listener its
+	// TLS-ness to get it.
 	return tls.NewListener(ln, config), nil
+}
+
+// inboundHandshakeTimeout bounds the TLS handshake and the request headers of
+// an accepted connection.
+//
+// http.Server derives its handshake deadline from the smallest of
+// ReadHeaderTimeout, ReadTimeout and WriteTimeout, so this one value bounds
+// both. With all three unset, as they were, any peer that completes a TCP
+// connect and then sends a partial ClientHello — or a header line at a byte a
+// minute — holds a goroutine and a file descriptor indefinitely, and every
+// ClientHello costs a read of the trust bundle, so the cheap half of that is
+// the attacker's. Neither ReadTimeout nor WriteTimeout is set, deliberately:
+// they bound the whole body, and a declared long-running stream (up to
+// MaxStreamDurationLimit) is a conforming request, not a slow one.
+const inboundHandshakeTimeout = 10 * time.Second
+
+// inboundIdleTimeout bounds a keep-alive connection nobody is using. It is pool
+// hygiene, not the trust bound — what bounds the trust decision is the recheck,
+// because an inactivity timeout cannot bound a connection that is never
+// inactive, which is the finding this runtime already answered outbound.
+const inboundIdleTimeout = 30 * time.Second
+
+// peerTrustAnchor resolves the anchor this runtime verifies its peers against,
+// per call, in whichever direction.
+//
+// One resolution for both directions because it is one anchor: the listener
+// verifies a caller against it and the client verifies the platform against it,
+// which is what makes a removed root take effect on both halves at once.
+func (s *Server) peerTrustAnchor(identityConfig *tls.Config) func() (*x509.CertPool, error) {
+	if s.identity != nil {
+		return func() (*x509.CertPool, error) {
+			anchor, err := peerAnchorOf(identityConfig)
+			if err != nil {
+				return nil, fmt.Errorf("resolve the anchor this workload verifies its peers against, from the supplied identity source: %w", err)
+			}
+			return anchor, nil
+		}
+	}
+	return func() (*x509.CertPool, error) {
+		anchor, err := peerAnchor(s.cfg.trustBundleFile)
+		if err != nil {
+			return nil, fmt.Errorf("resolve the anchor this workload verifies its peers against: %w", err)
+		}
+		return anchor, nil
+	}
+}
+
+// watchInboundTrust re-verifies every served connection's caller against
+// current trust for as long as the connection lives, and closes it when it
+// stops verifying.
+//
+// It is the inbound half of an argument this file already made outbound, and
+// made in one direction only. Re-reading trust per *handshake* bounds nothing
+// about a connection that has already had its handshake: a caller whose
+// identity was removed from the admitted set, or whose issuing root was pulled
+// from the bundle, kept the keep-alive connection it already had and kept being
+// served on it. Inbound is where the decision is whom to *admit*, which is the
+// direction where judging by something stale lets in whoever should be refused.
+//
+// Installed through http.Server.ConnState so the connection stays the
+// *tls.Conn net/http requires it to be. StateActive is the first point at which
+// there is a peer chain to re-verify — crypto/tls handshakes lazily, so at
+// Accept there is nothing yet — and StateClosed/StateHijacked is where the
+// watch ends.
+func (s *Server) watchInboundTrust() (func(net.Conn, http.ConnState), error) {
+	config, err := s.serverIdentity()
+	if err != nil {
+		return nil, err
+	}
+	trust := s.peerTrustAnchor(config)
+	admitted := s.admittedCallers()
+	var watching sync.Map
+	return func(conn net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateActive:
+			tlsConn, ok := conn.(*tls.Conn)
+			if !ok {
+				return
+			}
+			done := make(chan struct{})
+			if _, already := watching.LoadOrStore(conn, done); already {
+				return
+			}
+			go recheckCaller(tlsConn, done, trust, admitted)
+		case http.StateClosed, http.StateHijacked:
+			if done, ok := watching.LoadAndDelete(conn); ok {
+				close(done.(chan struct{}))
+			}
+		}
+	}, nil
+}
+
+// recheckCaller re-verifies one established caller until the connection ends.
+func recheckCaller(conn *tls.Conn, done <-chan struct{}, trust func() (*x509.CertPool, error), admitted func() ([]string, error)) {
+	ticker := time.NewTicker(inboundTrustRecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := callerStillAdmitted(conn.ConnectionState(), trust, admitted); err != nil {
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// inboundTrustRecheckInterval bounds how long an accepted connection may
+// outlive the trust that admitted it. The outbound interval's reasoning, in the
+// direction where being wrong means serving a caller who should be refused.
+const inboundTrustRecheckInterval = time.Second
+
+// callerStillAdmitted re-verifies an established caller against the current
+// anchor and the current admitted set.
+//
+// Client auth, not server auth, and no hostname: a caller is held to the chain
+// and the identity it presented, which is the same pair of questions the
+// handshake answered, asked again against trust as it is now.
+func callerStillAdmitted(state tls.ConnectionState, trust func() (*x509.CertPool, error), admitted func() ([]string, error)) error {
+	anchor, err := trust()
+	if err != nil {
+		return err
+	}
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("the established connection presents no caller certificate to re-verify")
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range state.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
+		Roots:         anchor,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return fmt.Errorf("the caller this connection was authenticated against no longer verifies: %w", err)
+	}
+	allowed, err := admitted()
+	if err != nil {
+		return err
+	}
+	identity, err := oneURIIdentity(state, "caller")
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(allowed, identity) {
+		return fmt.Errorf("the established connection's caller %q is no longer one this solution admits", identity)
+	}
+	return nil
 }
 
 // serverIdentity resolves this workload's identity once and holds it to every
@@ -245,7 +406,7 @@ func verifyCaller(allowed func() ([]string, error)) func(tls.ConnectionState) er
 		// The refusal names what arrived, not the allowed set: a caller is not
 		// told who else may call.
 		return fmt.Errorf("refusing a caller whose identity %q is not one this solution admits: it holds a certificate from this cell's anchor, which is not the same as being a caller this solution serves — see %s and %s/%s",
-			identity, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey)
+			identity, IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersFileKey)
 	}
 }
 
@@ -282,7 +443,7 @@ func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
 			return nil
 		}
 		return fmt.Errorf("refusing to present this workload's credentials to %q: it holds a certificate from this cell's anchor for the address this runtime dialled, which is not the same as being the platform — see %s and %s/%s",
-			identity, IdentityPlatformPeersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityPlatformPeersKey)
+			identity, IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityPlatformPeersFileKey)
 	}
 }
 
@@ -322,10 +483,17 @@ func uriStrings(uris []*url.URL) []string {
 // projected one does the latter, so a removed root takes effect without a
 // restart), so both are read here. usableServerIdentity has already refused a
 // configuration that has neither.
+//
+// The per-connection answer is asked FIRST, and the base pool is the fallback.
+// The other order looks equivalent and is not: a *x509.CertPool on the base
+// configuration is one object fixed when the source built it, so a source
+// carrying a base pool *and* a callback had its anchor snapshotted at boot for
+// every outbound dial, however often the callback was re-resolving it. That is
+// the stale-anchor defect this file argues against, surviving in the one source
+// shape the per-connection posture check tells a source to adopt — the refusal
+// for a nil answer says to set ClientCAs on the base, so following the advice
+// was what triggered it.
 func peerAnchorOf(config *tls.Config) (*x509.CertPool, error) {
-	if config.ClientCAs != nil {
-		return config.ClientCAs, nil
-	}
 	if config.GetConfigForClient != nil {
 		answer, err := config.GetConfigForClient(&tls.ClientHelloInfo{})
 		if err != nil {
@@ -334,6 +502,11 @@ func peerAnchorOf(config *tls.Config) (*x509.CertPool, error) {
 		if answer != nil && answer.ClientCAs != nil {
 			return answer.ClientCAs, nil
 		}
+	}
+	// A nil answer is Go's "serve the base", so the base pool is this source's
+	// current anchor rather than a stale one.
+	if config.ClientCAs != nil {
+		return config.ClientCAs, nil
 	}
 	return nil, fmt.Errorf("the identity source names no trust anchor, so there is nothing to verify the platform against when this runtime dials it: an https URL alone is checked against this host's system roots, which cannot tell the platform from anything holding a public certificate")
 }
@@ -417,6 +590,45 @@ func usableServerIdentity(config *tls.Config) error {
 	// holdPerConnectionPosture checks it there.
 	if config.ClientCAs == nil && config.GetConfigForClient == nil {
 		return fmt.Errorf("the identity source returned a TLS configuration that requires a caller's certificate but names no trust anchor to verify it against (ClientCAs is nil): Go would fall back to this host's system roots, so the listener would accept a client certificate from any public CA. Set ClientCAs, or resolve it per handshake in GetConfigForClient")
+	}
+	return unsubvertedPosture(config)
+}
+
+// unsubvertedPosture refuses the fields that leave every check above passing
+// and the posture gone.
+//
+// The checks above enumerate what a conforming listener must *have*, which
+// answers the wrong question on its own: a source can satisfy all of them and
+// still hand back a configuration whose certificate validity is judged against
+// a clock it chose, whose session secrets it writes to a file, whose key
+// material comes from a reader it supplies, or whose resumption it encodes and
+// decodes itself — and resumption is the sharpest of them, because a resumed
+// connection does not re-present a certificate, so a source that controls
+// ticket encoding controls who gets in without the rest of this file ever
+// seeing a handshake.
+//
+// Each of these has a safe zero value that means "use Go's own", so refusing a
+// non-zero one is exact rather than a guess about intent. That is also the
+// limit worth stating: this is a denylist over a struct this package does not
+// own, so it is complete for the fields that exist in the Go version in go.mod
+// and not by construction. A field added later that lowers posture would pass
+// until it is named here, which is why the per-connection answer is checked by
+// the same function rather than by a copy of its reasoning.
+func unsubvertedPosture(config *tls.Config) error {
+	for _, field := range []struct {
+		name, why string
+		set       bool
+	}{
+		{"Time", "certificate expiry and validity are judged against this clock, so a source supplying one decides that an expired certificate is current", config.Time != nil},
+		{"Rand", "the handshake's key material comes from this reader, so a source supplying one decides how guessable this connection's secrets are", config.Rand != nil},
+		{"KeyLogWriter", "the session secrets of every connection are written here in the clear, which is a decryption key for the traffic this listener exists to protect", config.KeyLogWriter != nil},
+		{"WrapSession", "resumption tickets are encoded by this, and a resumed connection presents no certificate, so a source encoding its own tickets admits callers without a handshake this package sees", config.WrapSession != nil},
+		{"UnwrapSession", "resumption tickets are decoded by this, with the same consequence as WrapSession", config.UnwrapSession != nil},
+		{"InsecureSkipVerify", "the peer's certificate chain is not verified at all", config.InsecureSkipVerify},
+	} {
+		if field.set {
+			return fmt.Errorf("the identity source returned a TLS configuration that sets %s: %s. Leave it unset and Go's own is used — this listener's posture is not a thing a source may replace, only a thing it may satisfy", field.name, field.why)
+		}
 	}
 	return nil
 }

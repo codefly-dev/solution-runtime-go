@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -275,7 +278,7 @@ func TestTheCertificateServedIsTheCertificateChecked(t *testing.T) {
 			shape := tc.shape
 			shape.approved, shape.rival, shape.roots = approved, rival, c.roots
 			server := New(Manifest{ID: testSolutionID}).Identity(shape)
-			server.cfg = config{allowedCallers: testGatewayPrincipal, platformPeers: testGatewayPrincipal}
+			server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 			server.principal = testPrincipal
 
 			config, err := server.serverIdentity()
@@ -303,7 +306,7 @@ func TestTheCertificateServedIsTheCertificateChecked(t *testing.T) {
 		// case above, which is not a listener.
 		shape := shapeShifter{approved: approved, rival: rival, roots: c.roots}
 		server := New(Manifest{ID: testSolutionID}).Identity(shape)
-		server.cfg = config{allowedCallers: testGatewayPrincipal, platformPeers: testGatewayPrincipal}
+		server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 		server.principal = testPrincipal
 		config, err := server.serverIdentity()
 		if err != nil {
@@ -332,7 +335,7 @@ func TestANilPerConnectionAnswerCannotDropTheTrustAnchor(t *testing.T) {
 	caller := c.identity(t, testGatewayPrincipal)
 
 	server := New(Manifest{ID: testSolutionID}).Identity(conditionalAnchor{approved: approved, roots: c.roots})
-	server.cfg = config{allowedCallers: testGatewayPrincipal, platformPeers: testGatewayPrincipal}
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
 	if err != nil {
@@ -383,17 +386,23 @@ func (a conditionalAnchor) ServerTLSConfig() (*tls.Config, error) {
 // already refuses to accept for the trust anchor. Removing a compromised
 // consumed module from the provisioned set left this listener admitting it
 // until somebody restarted the process.
+//
+// The drift here is a rewrite of the provisioned file, which is what a platform
+// rotating an admission set actually does. The previous version of this test
+// drifted the set by mutating a closure the test itself supplied, and passed
+// against a runtime where no deployment could drift it at all: the set was read
+// through the SDK's value accessor, which is fixed at process start, so the
+// production answer never changed and only the test's closure did.
 func TestTheAdmittedCallerSetIsResolvedPerHandshake(t *testing.T) {
 	c := newCell(t)
 	approved := c.identity(t, testPrincipal)
 	caller := c.identity(t, testGatewayPrincipal)
 
-	provisioned := testGatewayPrincipal
+	provisioned := identitiesFile(t, testGatewayPrincipal)
 	server := New(Manifest{ID: testSolutionID}).Identity(shapeShifter{approved: approved, roots: c.roots})
 	server.cfg = config{
-		allowedCallers:        provisioned,
-		platformPeers:         testGatewayPrincipal,
-		resolveAllowedCallers: func() string { return provisioned },
+		allowedCallersFile: provisioned,
+		platformPeersFile:  identitiesFile(t, testGatewayPrincipal),
 	}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
@@ -404,39 +413,105 @@ func TestTheAdmittedCallerSetIsResolvedPerHandshake(t *testing.T) {
 		t.Fatalf("an admitted caller was refused: %v", outcome.reason())
 	}
 
-	// The operator removes that caller. No restart, no new listener.
-	provisioned = "spiffe://codefly.test/ns/platform/sa/somebody-else"
+	// The platform removes that caller from the file. No restart, no new
+	// listener.
+	writeFile(t, provisioned, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
 	outcome := servedTo(t, config, caller, "")
 	if !outcome.refused() {
 		t.Fatal("a caller removed from the provisioned set was still admitted: the listener is judging by the set it booted with, so revocation needs a restart somebody has to remember to perform")
 	}
 
-	// And a set that resolves to nothing refuses, rather than falling back to
-	// the set this process booted with.
-	provisioned = ""
+	// A set that resolves to nothing refuses, rather than falling back to the
+	// set this process booted with.
+	writeFile(t, provisioned, "\n")
 	if outcome := servedTo(t, config, caller, ""); !outcome.refused() {
 		t.Fatal("a caller was admitted while the provisioned set resolved to nothing: an admission decision that cannot be resolved is not one to guess at")
 	}
+
+	// And so does one that cannot be read at all, for the same reason: an
+	// unreadable set is not an empty set and it is not the boot set either.
+	if err := os.Remove(provisioned); err != nil {
+		t.Fatal(err)
+	}
+	if outcome := servedTo(t, config, caller, ""); !outcome.refused() {
+		t.Fatal("a caller was admitted while the provisioned set could not be read: the only safe reading of an unreadable admission set is to refuse")
+	}
 }
 
-// TestLoadConfigResolvesTheCallerSetThroughTheOverride is the other half of the
-// test above, which supplies its own resolver: the resolver production uses has
-// to be the one loadConfig builds, and it has to follow the documented override.
-func TestLoadConfigResolvesTheCallerSetThroughTheOverride(t *testing.T) {
-	t.Setenv(IdentityAllowedCallersEnvironmentVariable, testGatewayPrincipal)
+// TestTheProvisionedCallerSetIsReadThroughLoadConfig is the other half: the
+// path production reads has to be the one loadConfig resolves, through the
+// documented override, and the content has to be re-read rather than captured.
+//
+// It is the test that could not have been written before. The set was a
+// configuration *value*, and a configuration value is fixed at process start —
+// inline or file-carried, the SDK reads it once and keeps it (sdk-go
+// file_carrier.go) — so "re-resolved per handshake" returned the boot answer
+// forever, and the only way to make a test show drift was to drift something no
+// platform touches. Here the test changes what the platform changes.
+func TestTheProvisionedCallerSetIsReadThroughLoadConfig(t *testing.T) {
+	callers := identitiesFile(t, testGatewayPrincipal)
+	t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, callers)
+	peers := identitiesFile(t, testGatewayPrincipal)
+	t.Setenv(IdentityPlatformPeersFileEnvironmentVariable, peers)
+
 	cfg := loadConfig(context.Background())
-	if cfg.resolveAllowedCallers == nil {
-		t.Fatal("loadConfig resolved no caller-set reader, so a handshake can only use the boot-time snapshot")
+	if cfg.allowedCallersFile != callers {
+		t.Fatalf("loadConfig resolved the caller set from %q, want the provisioned %q", cfg.allowedCallersFile, callers)
 	}
-	if got := cfg.resolveAllowedCallers(); got != testGatewayPrincipal {
-		t.Errorf("the caller-set reader answered %q, want the provisioned %q", got, testGatewayPrincipal)
+	if cfg.platformPeersFile != peers {
+		t.Fatalf("loadConfig resolved the peer set from %q, want the provisioned %q", cfg.platformPeersFile, peers)
 	}
-	t.Setenv(IdentityAllowedCallersEnvironmentVariable, "spiffe://codefly.test/ns/platform/sa/somebody-else")
-	if got := cfg.resolveAllowedCallers(); got != "spiffe://codefly.test/ns/platform/sa/somebody-else" {
-		t.Errorf("the caller-set reader answered %q after the provisioned value changed: it is reading something it captured", got)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = cfg
+	admits := server.admittedCallers()
+	got, err := admits()
+	if err != nil {
+		t.Fatalf("resolve the admitted callers: %v", err)
 	}
-	if cfg.resolvePlatformPeers == nil {
-		t.Error("loadConfig resolved no platform-peer reader")
+	if len(got) != 1 || got[0] != testGatewayPrincipal {
+		t.Fatalf("the admitted callers resolved to %v, want %q", got, testGatewayPrincipal)
+	}
+
+	// The platform rewrites it. Nothing restarts.
+	writeFile(t, callers, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
+	got, err = admits()
+	if err != nil {
+		t.Fatalf("resolve the admitted callers after the set was rewritten: %v", err)
+	}
+	if len(got) != 1 || got[0] != "spiffe://codefly.test/ns/platform/sa/somebody-else" {
+		t.Fatalf("the admitted callers resolved to %v after the provisioned set was rewritten: it is reading something it captured", got)
+	}
+}
+
+// TestAnAdmissionSetIsNeitherCachedNorDefaulted pins the two answers that are
+// not an identity list, since each one has a plausible-looking wrong behaviour:
+// falling back to the boot set, or treating an empty file as "admit nobody" and
+// carrying on.
+func TestAnAdmissionSetIsNeitherCachedNorDefaulted(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		write   bool
+	}{
+		{"an empty file", "", true},
+		{"a file of only separators", ",,\n\n", true},
+		{"a file of only comments", "# the gateway, once\n", true},
+		{"no file at all", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "identities")
+			if tc.write {
+				writeFile(t, path, tc.content)
+			}
+			if _, err := resolvedIdentities(path, "unresolved")(); err == nil {
+				t.Error("an unusable admission set resolved without an error, so a handshake would be judged by something other than the provisioned set")
+			}
+		})
+	}
+	// And the path itself being unset is refused, not read as "no restriction".
+	if _, err := resolvedIdentities("", "unresolved")(); err == nil {
+		t.Error("an unset admission path resolved without an error")
 	}
 }
 
@@ -492,7 +567,7 @@ func TestTheOutboundLeafIsHeldWhenItIsPresented(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers: testGatewayPrincipal}
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -534,7 +609,7 @@ func TestTheOutboundPeerMustBeAProvisionedPlatformIdentity(t *testing.T) {
 		t.Helper()
 		server := New(Manifest{ID: testSolutionID})
 		server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-			platformPeers: testGatewayPrincipal}
+			platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 		server.principal = testPrincipal
 		client, err := server.outboundClient(nil)
 		if err != nil {
@@ -584,18 +659,19 @@ func TestABusyConnectionDoesNotOutliveTheTrustThatAuthenticatedIt(t *testing.T) 
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers: testGatewayPrincipal}
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
 		t.Fatalf("outboundClient: %v", err)
 	}
 
-	resp, err := client.Get(host.URL + credentialMintPath)
-	if err != nil {
-		t.Fatalf("the platform was not reachable with its own root in the bundle: %v", err)
-	}
-	_ = resp.Body.Close()
+	// The control first, and it is the half that was missing: while trust is
+	// intact, a connection kept this busy has to keep working across several
+	// recheck intervals. Without this, a recheck that closed every connection
+	// unconditionally — or one that closed them for an unrelated reason —
+	// satisfied the assertion below and the test reported the guarantee.
+	staysUsable(t, client, host.URL+credentialMintPath, 3*outboundTrustRecheckInterval)
 
 	// The root is removed and replaced by an unrelated one: the bundle still
 	// parses and no longer contains the issuer of the certificate the platform
@@ -603,24 +679,83 @@ func TestABusyConnectionDoesNotOutliveTheTrustThatAuthenticatedIt(t *testing.T) 
 	other := newCell(t)
 	writeFile(t, bundleFile, string(other.anchorPEM))
 
-	deadline := time.Now().Add(3 * outboundTrustRecheckInterval)
-	for {
-		resp, err := client.Get(host.URL + credentialMintPath)
+	err = busyUntilRefused(t, client, host.URL+credentialMintPath, 3*outboundTrustRecheckInterval)
+	if err == nil {
+		t.Fatalf("requests still succeeded %s after the platform's root was removed from the bundle, on a connection kept busy throughout: an inactivity timeout cannot bound a connection that is never inactive, so the documented staleness window held only for a quiet process",
+			3*outboundTrustRecheckInterval)
+	}
+	// And it ended for the reason under test. Any-error was what let two
+	// mutants through: a recheck broken in a way that fails requests for some
+	// other cause looks identical to one that works.
+	if !mentionsTrustFailure(err) {
+		t.Errorf("the connection stopped being usable, but not over the peer's trust: %v", err)
+	}
+}
+
+// staysUsable keeps one connection busy for d and fails if a request stops
+// succeeding. It is the survive-control for every recheck test here.
+func staysUsable(t *testing.T, client *http.Client, url string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
 		if err != nil {
-			return // the established connection stopped being used, which is the point
+			t.Fatalf("a request failed while trust was intact, so nothing this test goes on to assert is about trust being withdrawn: %v", err)
+		}
+		_ = resp.Body.Close()
+		time.Sleep(outboundTrustRecheckInterval / 20)
+	}
+}
+
+// busyUntilRefused keeps one connection busy until a request fails, and returns
+// that error — or nil if requests were still succeeding after d, which is the
+// defect these tests exist to catch.
+func busyUntilRefused(t *testing.T, client *http.Client, url string, d time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		resp, err := client.Get(url)
+		if err != nil {
+			return err
 		}
 		_ = resp.Body.Close()
 		if time.Now().After(deadline) {
-			t.Fatalf("requests still succeeded %s after the platform's root was removed from the bundle, on a connection kept busy throughout: an inactivity timeout cannot bound a connection that is never inactive, so the documented staleness window held only for a quiet process",
-				3*outboundTrustRecheckInterval)
+			return nil
 		}
 		time.Sleep(outboundTrustRecheckInterval / 20)
 	}
 }
 
+// mentionsTrustFailure reports whether an error is the recheck's own judgement
+// about the peer, rather than any other way a request can fail.
+func mentionsTrustFailure(err error) bool {
+	// Both the recheck's own judgement and the refusal a *re-dial* makes
+	// count: once the recheck closes the connection, net/http dials again, and
+	// that dial is refused by the same anchor and peer set. What must not pass
+	// is an error from anywhere else.
+	for _, named := range []string{
+		"no longer verifies",
+		"no longer one this runtime presents",
+		"no longer one this solution admits",
+		"refusing to present this workload's credentials",
+		"certificate signed by unknown authority",
+		"certificate is not trusted",
+	} {
+		if strings.Contains(err.Error(), named) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestEveryPlatformConnectionIsWatched is the narrow half of the test above: it
 // is the production transport's own dialler that has to attach the recheck, not
 // a wrapper a test builds.
+//
+// It asserts the recheck's *behaviour* on the dialled connection, not its type.
+// A type assertion on the wrapper proves the transport returned something
+// named right, which survives a recheck that never fires — and a mutant that
+// stopped the ticker left this test green.
 func TestEveryPlatformConnectionIsWatched(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
@@ -628,7 +763,7 @@ func TestEveryPlatformConnectionIsWatched(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers: testGatewayPrincipal}
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -638,14 +773,39 @@ func TestEveryPlatformConnectionIsWatched(t *testing.T) {
 	if !ok {
 		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
 	}
+	if transport.DialTLSContext == nil {
+		t.Fatal("the outbound transport has no TLS dialler of its own, so every connection it makes is configured once and never re-judged")
+	}
 	address := strings.TrimPrefix(host.URL, "https://")
 	conn, err := transport.DialTLSContext(context.Background(), "tcp", address)
 	if err != nil {
 		t.Fatalf("dial the platform: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
-	if _, ok := conn.(*recheckedConn); !ok {
-		t.Fatalf("the transport dialled a %T: a connection whose trust is never re-verified is bounded only by how long it stays idle, which traffic prevents", conn)
+
+	// The connection is usable, and stays usable while trust holds.
+	if _, err := conn.Write([]byte("GET " + credentialMintPath + " HTTP/1.0\r\n\r\n")); err != nil {
+		t.Fatalf("the dialled connection was not usable: %v", err)
+	}
+	time.Sleep(2 * outboundTrustRecheckInterval)
+
+	// Now the root goes, and this connection — which no transport is polling,
+	// so nothing but its own watcher can notice — has to close itself.
+	other := newCell(t)
+	writeFile(t, bundleFile, string(other.anchorPEM))
+
+	deadline := time.Now().Add(5 * outboundTrustRecheckInterval)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(outboundTrustRecheckInterval / 4))
+		var buf [1]byte
+		_, err := conn.Read(buf[:])
+		if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+			return // the watcher closed it, which is the whole point
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a connection the transport dialled was still open %s after the platform's root was removed: a connection whose trust is never re-verified is bounded only by how long it stays idle, which traffic prevents",
+				5*outboundTrustRecheckInterval)
+		}
 	}
 }
 
@@ -736,7 +896,7 @@ func TestARotationBetweenTheCheckAndTheHandshakeIsRefused(t *testing.T) {
 	source := rotatingIdentity{approved: c.identity(t, testPrincipal), rival: c.identity(t, rivalPrincipal), roots: c.roots, asked: &asked}
 
 	server := New(Manifest{ID: testSolutionID}).Identity(source)
-	server.cfg = config{allowedCallers: testGatewayPrincipal, platformPeers: testGatewayPrincipal}
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	identity, err := server.serverIdentity()
 	if err != nil {
@@ -807,12 +967,49 @@ func TestAnEstablishedConnectionFollowsTheProvisionedPeerSet(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	host := newPlatformHost(t, c, testGatewayPrincipal)
 
-	provisioned := testGatewayPrincipal
+	provisioned := identitiesFile(t, testGatewayPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers:        provisioned,
-		resolvePlatformPeers: func() string { return provisioned },
+		platformPeersFile: provisioned}
+	server.principal = testPrincipal
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
 	}
+	staysUsable(t, client, host.URL+credentialMintPath, 3*outboundTrustRecheckInterval)
+
+	// That destination is removed from the provisioned set, and traffic keeps
+	// arriving on the connection it already has.
+	writeFile(t, provisioned, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
+	err = busyUntilRefused(t, client, host.URL+credentialMintPath, 3*outboundTrustRecheckInterval)
+	if err == nil {
+		t.Fatalf("this workload kept presenting its credentials for %s after the destination was removed from the provisioned set, on the connection it already held",
+			3*outboundTrustRecheckInterval)
+	}
+	if !mentionsTrustFailure(err) {
+		t.Errorf("the connection ended for something other than the peer set it is held to: %v", err)
+	}
+}
+
+// TestALeafReadFailureDoesNotCloseATrustedConnection: the recheck may only
+// close a connection over a judgement about the PEER.
+//
+// The previous revision rebuilt the whole outbound configuration on every
+// recheck, this workload's own certificate included, and closed the connection
+// on any error from it. So a rotation of this pod's own key pair that was not
+// atomic — the certificate replaced, the key a moment behind — made
+// X509KeyPair fail and tore down every established platform connection,
+// streams included, while every peer on them was still perfectly trusted. The
+// SDK's reloader exists to swallow exactly that and keep the last good pair;
+// building a new one per recheck threw the property away.
+func TestALeafReadFailureDoesNotCloseATrustedConnection(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	host := newPlatformHost(t, c, testGatewayPrincipal)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -820,24 +1017,124 @@ func TestAnEstablishedConnectionFollowsTheProvisionedPeerSet(t *testing.T) {
 	}
 	resp, err := client.Get(host.URL + credentialMintPath)
 	if err != nil {
-		t.Fatalf("the provisioned platform destination was refused: %v", err)
+		t.Fatalf("the platform was not reachable with its own root in the bundle: %v", err)
 	}
 	_ = resp.Body.Close()
 
-	// That destination is removed from the provisioned set, and traffic keeps
-	// arriving on the connection it already has.
-	provisioned = "spiffe://codefly.test/ns/platform/sa/somebody-else"
-	deadline := time.Now().Add(3 * outboundTrustRecheckInterval)
-	for {
-		resp, err := client.Get(host.URL + credentialMintPath)
-		if err != nil {
-			return
-		}
-		_ = resp.Body.Close()
-		if time.Now().After(deadline) {
-			t.Fatalf("this workload kept presenting its credentials for %s after the destination was removed from the provisioned set, on the connection it already held",
-				3*outboundTrustRecheckInterval)
-		}
-		time.Sleep(outboundTrustRecheckInterval / 20)
+	// A rotation caught halfway: this workload's certificate is replaced by
+	// something that does not pair with the key on disk. Nothing about the
+	// peer has changed.
+	writeFile(t, certFile, "-----BEGIN CERTIFICATE-----\nhalf a rotation\n-----END CERTIFICATE-----\n")
+
+	staysUsable(t, client, host.URL+credentialMintPath, 3*outboundTrustRecheckInterval)
+}
+
+// TestAnEstablishedCallerDoesNotOutliveTheTrustThatAdmittedIt is the inbound
+// half of the busy-connection finding, and it is the half that went unanswered.
+//
+// The argument — an inactivity timeout cannot bound a connection that is never
+// inactive, so re-verify the established peer — was written down in this
+// repository, reproduced outbound, fixed outbound, and documented as a property
+// of the runtime. Inbound the listener was still `&http.Server{Handler: mux}`:
+// no recheck, no IdleTimeout, no ReadHeaderTimeout. So a caller removed from
+// the admitted set, or whose issuing root was pulled from the bundle, kept
+// every keep-alive connection it already held — in the direction where the
+// decision is whom to admit.
+func TestAnEstablishedCallerDoesNotOutliveTheTrustThatAdmittedIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// what the platform withdraws, after the caller is connected
+		withdraw func(t *testing.T, bundleFile, callersFile string, c *cell)
+	}{
+		{
+			"its issuing root is removed from the bundle",
+			func(t *testing.T, bundleFile, _ string, _ *cell) {
+				other := newCell(t)
+				writeFile(t, bundleFile, string(other.anchorPEM))
+			},
+		},
+		{
+			"it is removed from the admitted set",
+			func(t *testing.T, _, callersFile string, _ *cell) {
+				writeFile(t, callersFile, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCell(t)
+			certFile, keyFile, bundleFile, caller, roots := c.workload(t, testPrincipal)
+			callersFile := identitiesFile(t, testGatewayPrincipal)
+
+			server := New(Manifest{ID: testSolutionID})
+			server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
+				trustBundleFile: bundleFile, allowedCallersFile: callersFile}
+			server.principal = testPrincipal
+
+			ln, err := server.listen()
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer func() { _ = ln.Close() }()
+			watch, err := server.watchInboundTrust()
+			if err != nil {
+				t.Fatalf("watchInboundTrust: %v", err)
+			}
+			// The production server, so the hook under test is the one a
+			// deployment runs with rather than one this test installs.
+			srv := &http.Server{
+				Handler:           http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+				ReadHeaderTimeout: inboundHandshakeTimeout,
+				IdleTimeout:       inboundIdleTimeout,
+				ConnState:         watch,
+			}
+			go func() { _ = srv.Serve(ln) }()
+			defer func() { _ = srv.Close() }()
+
+			client := &http.Client{Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{*caller},
+					MinVersion: tls.VersionTLS13, ServerName: "localhost"},
+			}}
+			url := "https://" + ln.Addr().String() + "/"
+
+			// The control: an admitted caller is served, and keeps being
+			// served on one busy connection while trust holds.
+			resp, err := client.Get(url)
+			if err != nil {
+				t.Fatalf("an admitted caller was refused: %v", err)
+			}
+			_ = resp.Body.Close()
+			staysUsable(t, client, url, 2*inboundTrustRecheckInterval)
+
+			tc.withdraw(t, bundleFile, callersFile, c)
+
+			if err := busyUntilRefused(t, client, url, 4*inboundTrustRecheckInterval); err == nil {
+				t.Fatalf("this caller was still being served %s after the trust that admitted it was withdrawn, on the connection it already held: re-reading trust per handshake bounds nothing about a connection that has already handshaken",
+					4*inboundTrustRecheckInterval)
+			}
+		})
+	}
+}
+
+// TestTheListenerBoundsAStalledPeer: with no timeouts at all, a peer that
+// completes a TCP connect and then says nothing holds a goroutine and a
+// descriptor indefinitely, and each ClientHello costs a read of the trust
+// bundle — the cheap half of which is the peer's.
+func TestTheListenerBoundsAStalledPeer(t *testing.T) {
+	if inboundHandshakeTimeout <= 0 {
+		t.Fatal("the listener sets no handshake or header deadline, so a peer that stalls mid-ClientHello is bounded by nothing")
+	}
+	if inboundIdleTimeout <= 0 {
+		t.Fatal("the listener sets no idle timeout, so a keep-alive connection nobody uses is never dropped")
+	}
+	// And neither of the two that would cut a conforming long-running stream.
+	// A declared stream may run to MaxStreamDurationLimit, so bounding the
+	// whole body would refuse conforming traffic to answer a question the
+	// recheck already answers without refusing any.
+	srv := &http.Server{ReadHeaderTimeout: inboundHandshakeTimeout, IdleTimeout: inboundIdleTimeout}
+	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 {
+		t.Error("the listener bounds the whole request or response, which cuts a declared long-running stream that is conforming")
+	}
+	if inboundHandshakeTimeout >= MaxStreamDurationLimit {
+		t.Errorf("the handshake deadline %s is not shorter than the longest declared stream %s, so it is not bounding anything", inboundHandshakeTimeout, MaxStreamDurationLimit)
 	}
 }

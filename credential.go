@@ -294,7 +294,7 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // is this process's and one renewal fixes it — and no capability is minted
 // under an attribution nobody can check.
 // attestWorkloadReporting is attestWorkload with somewhere to report a
-// *terminal* failure, which is the half the first round got wrong.
+// *terminal* failure, which is the half that is easy to get backwards.
 //
 // The boot already separates the issuer's two answers and must: a refusal is a
 // judgement on this build — the installation moved, the build is not the one
@@ -388,7 +388,7 @@ func (r *attestationReport) recovered(id string) {
 // no retry can change.
 //
 // ErrMintRefused only, and the correction is worth recording because the
-// previous revision got it from the wrong direction. It also treated ErrRevoked
+// it is easy to get from the wrong direction. It also treated ErrRevoked
 // as terminal here, on the reasoning that live state moving under a sound
 // credential is as final as a refused build. Two things are wrong with that:
 // the mint client does not return ErrRevoked at all (it comes back from a

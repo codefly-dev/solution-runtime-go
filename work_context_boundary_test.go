@@ -106,46 +106,152 @@ func TestThisRuntimeVerifiesNothing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		// Whatever the file calls them.
-		//
-		// This matched the identifiers "workcontext" and "corework", which is
-		// the import name those packages happen to get here and not a property
-		// of anything: a compilable non-test file importing core under a third
-		// alias and calling Verify on the verifier it built passed this gate
-		// untouched. The alias is now read off the import declaration, which is
-		// the only place it can come from.
-		for alias, path := range workContextImports(file) {
-			if alias == "." {
-				// A dot-import makes every name in that package unqualified, so
-				// nothing below could find them. It is also not a style this
-				// package uses anywhere.
-				t.Errorf("%s dot-imports %s: the names a verifier is built from would then be unqualified, which this gate cannot see and a reader cannot either", name, path)
-				continue
-			}
-			ast.Inspect(file, func(node ast.Node) bool {
-				selector, ok := node.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				pkg, ok := selector.X.(*ast.Ident)
-				if !ok || pkg.Name != alias {
-					return true
-				}
-				// Every name a verifier can be reached by: the constructor, the
-				// type (so a declared field or variable is caught as well as a
-				// call), and the methods. A verifier cannot be obtained without
-				// naming one of them through the package it lives in, which is
-				// what makes matching on the name sufficient here — the earlier
-				// rule matched only the call, so declaring the type and calling
-				// a method on the value escaped it.
-				if strings.HasPrefix(selector.Sel.Name, "Verif") {
-					t.Errorf("%s names %s.%s: verifying a capability needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold. It presents its own credential and lets the component that holds them decide.",
-						name, pkg.Name, selector.Sel.Name)
-				}
-				return true
-			})
+		for _, reached := range verifiersReachedBy(file) {
+			t.Errorf("%s names %s: verifying a capability needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold. It presents its own credential and lets the component that holds them decide.",
+				name, reached)
+		}
+		if dotted := dotImportedWorkContext(file); dotted != "" {
+			// A dot-import makes every name in that package unqualified, so
+			// nothing above could find them. It is also not a style this
+			// package uses anywhere.
+			t.Errorf("%s dot-imports %s: the names a verifier is built from would then be unqualified, which this gate cannot see and a reader cannot either", name, dotted)
 		}
 	}
+}
+
+// verifiersReachedBy is every way one file reaches a Work Context verifier,
+// rendered as alias.Name.
+//
+// Separated from the test so the gate can be run against a file the test
+// writes, which is the only way to show it catches an escape rather than
+// merely passing over this package's current contents.
+func verifiersReachedBy(file *ast.File) []string {
+	var reached []string
+	for alias := range workContextImports(file) {
+		if alias == "." {
+			continue
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			selector, ok := node.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok || pkg.Name != alias {
+				return true
+			}
+			// Every name a verifier can be reached by: the constructor, the
+			// type (so a declared field or variable is caught as well as a
+			// call), and the methods. A verifier cannot be obtained without
+			// naming one of them through the package it lives in, which is
+			// what makes matching on the name sufficient here — the earlier
+			// rule matched only the call, so declaring the type and calling
+			// a method on the value escaped it.
+			//
+			// Contains, not HasPrefix: the probe below caught that a prefix
+			// rule misses NewVerifier, which is the most ordinary name a
+			// verifier constructor can have. Nothing this package legitimately
+			// names through these imports contains it.
+			if strings.Contains(selector.Sel.Name, "Verif") {
+				reached = append(reached, pkg.Name+"."+selector.Sel.Name)
+			}
+			return true
+		})
+	}
+	return reached
+}
+
+// dotImportedWorkContext is the Work Context package this file dot-imports, if
+// it does.
+func dotImportedWorkContext(file *ast.File) string {
+	for alias, path := range workContextImports(file) {
+		if alias == "." {
+			return path
+		}
+	}
+	return ""
+}
+
+// TestTheVerifierGateCatchesASubpackage runs the gate against the escapes it
+// has actually been shown to miss.
+//
+// The rule matched two import paths exactly, and
+// core/workcontext/conformance — the published conformance kit this suite
+// already uses — is neither of them while exporting Verifier(), which returns
+// core's own *workcontext.Verifier. So the single import that hands this
+// package a working verifier walked past the gate written to refuse exactly
+// that. A gate on an enumerated path is only as good as the enumeration.
+func TestTheVerifierGateCatchesASubpackage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source string
+	}{
+		{
+			"the conformance subpackage under its own name",
+			`package solution
+import "github.com/codefly-dev/core/workcontext/conformance"
+func f() { _ = conformance.Verifier() }`,
+		},
+		{
+			"the conformance subpackage under an alias",
+			`package solution
+import kit "github.com/codefly-dev/core/workcontext/conformance"
+func f() { _ = kit.Verifier() }`,
+		},
+		{
+			"a deeper subpackage nobody has written yet",
+			`package solution
+import "github.com/codefly-dev/sdk-go/workcontext/whatever/next"
+func f() { _ = next.NewVerifier() }`,
+		},
+		{
+			"the package itself, which already failed the gate",
+			`package solution
+import "github.com/codefly-dev/core/workcontext"
+func f() { _ = workcontext.Verifier() }`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), "escape.go", tc.source, 0)
+			if err != nil {
+				t.Fatalf("parse the probe: %v", err)
+			}
+			if reached := verifiersReachedBy(file); len(reached) == 0 {
+				t.Error("the gate did not see a verifier this file reaches, so a file shaped like this could verify a capability here with nothing noticing")
+			}
+		})
+	}
+
+	// And the control: importing the kit without reaching a verifier is not
+	// flagged. conformance_test.go does exactly this — it reads core's
+	// published fixtures — so a gate that refused the import itself would
+	// refuse the thing this suite is built on.
+	file, err := parser.ParseFile(token.NewFileSet(), "fine.go", `package solution
+import "github.com/codefly-dev/core/workcontext/conformance"
+func f() { _ = conformance.Fixtures() }`, 0)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	if reached := verifiersReachedBy(file); len(reached) != 0 {
+		t.Errorf("the gate flagged %v in a file that reaches no verifier: reading core's published fixtures is how this suite gets a capability it did not sign itself", reached)
+	}
+}
+
+// TestATestingTBParameterIsNotAGate records why the seam's refusal is
+// testing.Testing() and not its signature.
+//
+// testing.TB has an unexported method, which stops a type *declaring* the
+// interface — and not a type that EMBEDS it. So a production program can
+// satisfy testing.TB in a few lines, which is what the review's reproducer
+// did, and a function taking one proves nothing about where it was called
+// from.
+func TestATestingTBParameterIsNotAGate(t *testing.T) {
+	var satisfied testing.TB = struct{ testing.TB }{}
+	if satisfied == nil {
+		t.Fatal("unreachable")
+	}
+	// The point is that the line above compiles: a struct embedding testing.TB
+	// is a testing.TB anywhere, including in a deployment.
 }
 
 // workContextImports is the local name each Work Context package is imported
@@ -155,10 +261,18 @@ func workContextImports(file *ast.File) map[string]string {
 	imports := map[string]string{}
 	for _, imported := range file.Imports {
 		path := strings.Trim(imported.Path.Value, `"`)
-		if path != "github.com/codefly-dev/core/workcontext" && path != "github.com/codefly-dev/sdk-go/workcontext" {
+		// Prefix, not equality, so a *subpackage* is matched too. The rule was
+		// written against the two package paths exactly, and
+		// core/workcontext/conformance is neither of them while exporting
+		// Verifier(), which returns core's own *workcontext.Verifier — so the
+		// one import that hands this package a working verifier passed the
+		// gate meant to refuse exactly that. A gate on a path is only as good
+		// as the paths it enumerates, which is the same defect as an
+		// enumerated posture check.
+		if !isWorkContextPath(path) {
 			continue
 		}
-		alias := "workcontext"
+		alias := path[strings.LastIndex(path, "/")+1:]
 		if imported.Name != nil {
 			alias = imported.Name.Name
 		}
@@ -168,6 +282,20 @@ func workContextImports(file *ast.File) map[string]string {
 		imports[alias] = path
 	}
 	return imports
+}
+
+// isWorkContextPath reports whether an import path is a Work Context package or
+// anything beneath one, in either repository that owns one.
+func isWorkContextPath(path string) bool {
+	for _, root := range []string{
+		"github.com/codefly-dev/core/workcontext",
+		"github.com/codefly-dev/sdk-go/workcontext",
+	} {
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot pins the one
@@ -184,12 +312,16 @@ func workContextImports(file *ast.File) map[string]string {
 // The gate is here because the pressure to put it back is real — it is two
 // lines and it makes a consumer's test shorter — and because nothing else
 // notices an exported identifier reappearing.
+// The gate was two shapes too narrow, and both narrowings were about the
+// previous round's removal rather than the property it was removed for. It
+// skipped passthroughtest/ wholesale, and it matched only an exported func with
+// a *receiver* whose name contained "Passthrough" — so passthroughtest.Handler,
+// a plain exported function in a skipped file, was a production-importable path
+// to the same credential-bearing handler. It now reads every call to the seam
+// in the module and requires the calling function to refuse a non-test binary.
 func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.T) {
 	fset := token.NewFileSet()
 	for _, name := range moduleSources(t) {
-		if strings.Contains(name, "passthroughtest") || strings.Contains(name, "internal/seam") {
-			continue
-		}
 		file, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
@@ -197,8 +329,23 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 		for _, decl := range file.Decls {
 			switch declared := decl.(type) {
 			case *ast.FuncDecl:
-				if declared.Name.IsExported() && strings.Contains(declared.Name.Name, "Passthrough") && declared.Recv != nil {
-					t.Errorf("%s exports %s on a receiver: a passthrough built outside Serve skips validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, so it is reached through internal/seam and not by anything a solution can call",
+				if strings.Contains(name, "internal/seam") {
+					continue
+				}
+				// Whoever reaches the seam is an exported path to a handler
+				// holding a real credential, whatever it is called and whether
+				// it hangs off a receiver or not. Inside the root package the
+				// seam is assigned, not called, and Serve's own path is
+				// unexported — so the only callers this can match are the ones
+				// that have to carry the refusal.
+				if !callsThe(declared, "seam", "Passthrough") {
+					continue
+				}
+				if !declared.Name.IsExported() {
+					continue
+				}
+				if !callsThe(declared, "", "mustBeATest") {
+					t.Errorf("%s exports %s, which builds a passthrough through internal/seam without refusing a non-test binary: that handler holds a real execution credential and skips validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, so an exported path to it has to call mustBeATest()",
 						name, declared.Name.Name)
 				}
 			case *ast.GenDecl:
@@ -211,6 +358,33 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 			}
 		}
 	}
+}
+
+// callsThe reports whether fn calls pkg.name, or bare name when pkg is empty.
+func callsThe(fn *ast.FuncDecl, pkg, name string) bool {
+	found := false
+	ast.Inspect(fn, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if pkg == "" {
+			if called, ok := call.Fun.(*ast.Ident); ok && called.Name == name {
+				found = true
+			}
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		qualifier, ok := selector.X.(*ast.Ident)
+		if ok && qualifier.Name == pkg && selector.Sel.Name == name {
+			found = true
+		}
+		return true
+	})
+	return found
 }
 
 // moduleSources is every non-test Go source in this module, which is what both

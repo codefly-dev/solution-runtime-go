@@ -43,6 +43,53 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 	}
 }
 
+// And the read has to happen at boot, not merely be written there.
+//
+// Static reachability is not the claim AGENTS.md makes, and the difference was
+// exploitable without meaning to: a closure *defined* inside loadConfig that
+// reads the environment is in loadConfig's call tree for this gate's purposes
+// while running per handshake, long after validate() has had its say. Two of
+// them existed, resolving the caller and peer admission sets, and the gate
+// reported the boundary intact — the reads were lexically where the rule wanted
+// them and temporally nowhere near it. A value genuinely resolved at boot does
+// not need a closure to do it, so the whole shape is refused rather than
+// inspected for intent.
+func TestNoClosureDefersAnEnvironmentReadPastBoot(t *testing.T) {
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package directory: %v", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			lit, ok := node.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+			ast.Inspect(lit.Body, func(inner ast.Node) bool {
+				call, ok := inner.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if readsEnvironment(call) {
+					t.Errorf("%s:%d defines a function literal that reads the environment: a read inside a closure happens when the closure is called, which is not boot, so validate() never governs it. Resolve the value in loadConfig's own body and carry the result.",
+						name, fset.Position(call.Pos()).Line)
+				}
+				return true
+			})
+			return true
+		})
+	}
+}
+
 // AGENTS.md has to keep saying so. A file that stopped describing the boundary
 // would leave the next agent to infer it from whichever call site they opened
 // first, which is how the serve-time exception came to exist.

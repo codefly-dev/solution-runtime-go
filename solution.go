@@ -52,6 +52,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -316,49 +317,40 @@ type config struct {
 	// identityCertFile, identityKeyFile and trustBundleFile are the workload's
 	// X.509-SVID and the anchor its peers are verified against. The listener
 	// presents the first pair; there is no plain-HTTP listener to fall back to.
-	// mintURLGuessed records that mintURL came from credentialMintPath rather
-	// than from an override, so the boot can say so out loud. **Labelled
-	// stopgap**: the path is this runtime's proposal and the host has not
-	// confirmed it, and a default address is the thing this repository's rules
-	// forbid. The real fix is the host publishing the mint as a resolvable
-	// endpoint role, which belongs to the host and the SDK, not here.
-	mintURLGuessed bool
 
 	identityCertFile, identityKeyFile, trustBundleFile string
-	// allowedCallers is the comma-separated set of identities this listener
-	// admits, as resolved at boot. Authentication says a caller holds a
-	// certificate from the cell's anchor; this says which of them may call,
-	// which is a different question and the one the host's own route admission
-	// answers for everybody else. It is what validate() refuses an empty one
-	// of; what a handshake is judged by is resolveAllowedCallers, below.
-	allowedCallers string
-	// resolveAllowedCallers re-resolves that set, and it is what the listener
-	// actually admits by.
+	// allowedCallersFile is the path to the set of identities this listener
+	// admits, one per line or comma-separated. Authentication says a caller
+	// holds a certificate from the cell's anchor; this says which of them may
+	// call, which is a different question and the one the host's own route
+	// admission answers for everybody else.
 	//
-	// The set was snapshotted at boot, and a snapshot of an admission decision
-	// is the same defect as a snapshotted trust anchor, which this runtime
-	// already re-reads per handshake: removing a compromised consumed module
-	// from the provisioned set left this listener admitting it for the life of
-	// the process, so revocation took a restart somebody had to remember to
-	// perform. It resolves through loadConfig's own reader — the override first,
-	// then the workspace group — and an answer that resolves to nothing refuses
-	// the handshake rather than falling back to the set this process booted
-	// with. The asymmetry is the one peerAnchor records: serving a stale *leaf*
+	// A path, read per handshake, for the reason the trust anchor beside it is
+	// one. A snapshot of an admission decision is the same defect as a
+	// snapshotted trust anchor: removing a compromised consumed module from the
+	// provisioned set would leave this listener admitting it for the life of the
+	// process. Resolving the set through the SDK's value accessor on every
+	// handshake is not live, whatever it looks like — a
+	// configuration *value*, inline or file-carried, is fixed at process start
+	// (sdk-go file_carrier.go reads the file once and keeps it), so
+	// re-resolution returned the boot answer forever and the refusal branch
+	// below was unreachable in any deployment. The file is this process's to
+	// read, like the bundle, which is what makes the claim true instead of
+	// documented.
+	//
+	// The asymmetry is the one peerAnchor records: serving a stale *leaf*
 	// refuses callers who should be let in, judging by a stale *admission* lets
 	// in callers who should be refused.
-	resolveAllowedCallers func() string
-	// platformPeers is the comma-separated set of identities this runtime
+	allowedCallersFile string
+	// platformPeersFile is the path to the set of identities this runtime
 	// accepts *outbound*: the mint and the gateway. It is the mirror of
-	// allowedCallers and it exists for the same reason — every workload in the
-	// cell holds a certificate from the same anchor, so verifying the chain and
-	// the hostname says a destination is some workload the platform issued for,
-	// not that it is the platform. A neighbouring workload holding a
+	// allowedCallersFile and it exists for the same reason — every workload in
+	// the cell holds a certificate from the same anchor, so verifying the chain
+	// and the hostname says a destination is some workload the platform issued
+	// for, not that it is the platform. A neighbouring workload holding a
 	// certificate valid for the gateway's hostname completed this handshake and
 	// was handed the projected token.
-	platformPeers string
-	// resolvePlatformPeers re-resolves that set, per dial, for the same reason
-	// resolveAllowedCallers re-resolves the inbound one.
-	resolvePlatformPeers func() string
+	platformPeersFile string
 	// profile is the configuration profile this process runs under, which the
 	// published contract is keyed by. A deployed environment has a profile of
 	// its own (codefly-dev/core#687, fixed in core v0.7.1), so a contract that
@@ -542,42 +534,46 @@ func loadConfig(ctx context.Context) config {
 		port:       port,
 		gatewayURL: gatewayURL,
 		assetsDir:  env("ASSETS_DIR", "../fe-remote/dist"),
-		// The mint endpoint is on the gateway the composition already resolved,
-		// following the exchange this replaces: a composed solution could not
-		// reach the issuer's internal listener itself, so the gateway brokered
-		// it, and the credential one gateway's host mints is honoured by that
-		// host and no other.
-		//
-		// Whether it stays brokered is NOT settled. The host (the mint's owner)
-		// prefers the workload to post directly to the issuer with its
-		// projected token bound to the issuer's own audience, on the grounds
-		// that a broker inserts a hop whose identity the issuer then has to
-		// tell apart from the pod's — and that the mesh policy which forced
-		// brokering is grantable rather than a constraint to design around.
-		// Neither endpoint exists yet. So this default follows the precedent
-		// rather than asserting the outcome, and the override below is how a
-		// deployment points at whichever one its host actually serves.
-		mintURL:            env(CredentialMintURLEnvironmentVariable, gatewayURL+credentialMintPath),
-		mintURLGuessed:     strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")) == "",
+		// No default, because there is nothing to default to. Whether the mint
+		// stays brokered through the gateway is not settled — the host prefers
+		// the workload to post directly to the issuer with its projected token
+		// bound to the issuer's own audience, and neither endpoint exists yet.
+		// Deriving a path on the resolved gateway and labelling it a guess is
+		// not an answer: this is the address
+		// this runtime POSTs the projected service-account token to, the
+		// strongest statement it can make about which workload it is, and a
+		// guessed address for that is the one thing fail-closed does not
+		// permit. It is refused at boot until something resolves it, which is
+		// how this package already treats a token-exchange URL it cannot pair.
+		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
 		projectedTokenPath: workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey),
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
 		trustBundleFile:    workloadPath(ctx, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey),
-		allowedCallers:     workloadPath(ctx, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityAllowedCallersKey),
-		platformPeers:      workloadPath(ctx, IdentityPlatformPeersEnvironmentVariable, WorkloadIdentityPlatformPeersKey),
-		// Resolved here, where every environment read in this package lives,
-		// and called later: the closure is the value's resolution, so a
-		// handshake re-reads it without a second read site appearing outside
-		// loadConfig. The context is detached from the boot's, which is
-		// cancelled when the boot returns, because this outlives it.
-		resolveAllowedCallers: func() string {
-			return workloadPath(context.WithoutCancel(ctx), IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityAllowedCallersKey)
-		},
-		resolvePlatformPeers: func() string {
-			return workloadPath(context.WithoutCancel(ctx), IdentityPlatformPeersEnvironmentVariable, WorkloadIdentityPlatformPeersKey)
-		},
-		profile:     strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
-		apiConsumes: env(manifest.APIConsumesEnvironmentVariable, ""),
+		allowedCallersFile: workloadPath(ctx, IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityAllowedCallersFileKey),
+		platformPeersFile:  workloadPath(ctx, IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityPlatformPeersFileKey),
+		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
+		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
+	}
+	// Which source answered for the two admission paths, once, at boot. The
+	// override outranks the platform's provisioning by design — an operator
+	// with a deployment the resolver cannot see needs it, as for the other
+	// paths — but admission is the one place where a silent override is a
+	// finding rather than a convenience: it is how a caller set gets widened
+	// with nothing anywhere recording that the platform's own answer was not
+	// the one in force.
+	for _, admission := range []struct{ what, path, override string }{
+		{"allowed callers", cfg.allowedCallersFile, IdentityAllowedCallersFileEnvironmentVariable},
+		{"platform peers", cfg.platformPeersFile, IdentityPlatformPeersFileEnvironmentVariable},
+	} {
+		if admission.path == "" {
+			continue
+		}
+		source := fmt.Sprintf("%s/%s, provisioned by the platform", WorkloadIdentityGroup, admission.what)
+		if strings.TrimSpace(env(admission.override, "")) != "" {
+			source = admission.override + ", an operator override that outranks the platform's own answer"
+		}
+		log.Printf("codefly: %s are read from %q (%s)", admission.what, admission.path, source)
 	}
 	return cfg
 }
@@ -588,13 +584,21 @@ func loadConfig(ctx context.Context) config {
 // key pair its listener presents, and the anchor its peers are verified
 // against.
 //
-// Paths, never material. The values this group carries are file paths, and the
-// files behind them are read by this process — the token on every renewal, the
-// key pair on every handshake. The SDK's own value accessors would be the wrong
-// tool for the material itself: a file-carried configuration value is read once
-// and kept for the life of the process (sdk-go file_carrier.go), which is
-// exactly right for a configuration value and exactly wrong for a projection
-// the platform rotates under a running process.
+// Paths, never material, and no exception: every value this group carries is a
+// file path, and the file behind it is read by this process — the token on every
+// renewal, the key pair and the anchor on every handshake, the two admission
+// sets on every handshake and dial. The SDK's own value accessors would be the
+// wrong tool for any of it: a file-carried configuration value is read once and
+// kept for the life of the process (sdk-go file_carrier.go), which is exactly
+// right for a configuration value and exactly wrong for anything the platform
+// changes under a running process.
+//
+// The two admission sets were the exception, carried as values here and
+// re-resolved through that accessor on every handshake, which looked live and
+// was not: the accessor returns what the process started with, so revoking a
+// caller took a restart while the code and the README both said it did not.
+// Material the platform can change is a path in this group or it is a snapshot
+// pretending otherwise.
 const WorkloadIdentityGroup = "workload-identity"
 
 // The keys of WorkloadIdentityGroup. Each has an explicit environment override
@@ -604,31 +608,40 @@ const (
 	WorkloadIdentityCertFileKey        = "CERT_FILE"
 	WorkloadIdentityKeyFileKey         = "KEY_FILE"
 	WorkloadIdentityTrustBundleFileKey = "TRUST_BUNDLE_FILE"
-	// WorkloadIdentityAllowedCallersKey names the identities allowed to call
-	// this solution, comma-separated. See allowedCallers.
-	WorkloadIdentityAllowedCallersKey = "ALLOWED_CALLERS"
-	// WorkloadIdentityPlatformPeersKey names the identities this runtime will
-	// present its credentials to, comma-separated. See platformPeers.
-	WorkloadIdentityPlatformPeersKey = "PLATFORM_PEERS"
+	// WorkloadIdentityAllowedCallersFileKey names the *file* listing the
+	// identities allowed to call this solution. See allowedCallersFile for why
+	// it is a path and not the list: a provisioned value is fixed at process
+	// start, and an admission decision that cannot narrow while the process
+	// runs is a decision this listener would keep honouring after it was
+	// revoked.
+	WorkloadIdentityAllowedCallersFileKey = "ALLOWED_CALLERS_FILE"
+	// WorkloadIdentityPlatformPeersFileKey names the *file* listing the
+	// identities this runtime will present its credentials to. A path, for the
+	// reason above.
+	WorkloadIdentityPlatformPeersFileKey = "PLATFORM_PEERS_FILE"
 )
 
-// The environment overrides for the four paths above.
+// The environment overrides for the paths above. Each names a file, and
+// loadConfig logs which source answered for the two admission paths — an
+// override that quietly outranked the platform's provisioning was the one way
+// an operator could widen admission without it appearing anywhere.
 const (
 	ProjectedTokenFileEnvironmentVariable      = "CODEFLY__WORKLOAD_TOKEN_FILE"
 	IdentityCertFileEnvironmentVariable        = "CODEFLY__WORKLOAD_IDENTITY_CERT_FILE"
 	IdentityKeyFileEnvironmentVariable         = "CODEFLY__WORKLOAD_IDENTITY_KEY_FILE"
 	IdentityTrustBundleFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE"
-	// IdentityPlatformPeersEnvironmentVariable overrides the identities this
-	// runtime accepts outbound. See WorkloadIdentityPlatformPeersKey.
-	IdentityPlatformPeersEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS"
-	// IdentityAllowedCallersEnvironmentVariable overrides the identities
-	// allowed to call this solution, comma-separated.
-	IdentityAllowedCallersEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS"
+	// IdentityPlatformPeersFileEnvironmentVariable overrides the file listing
+	// the identities this runtime accepts outbound.
+	IdentityPlatformPeersFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS_FILE"
+	// IdentityAllowedCallersFileEnvironmentVariable overrides the file listing
+	// the identities allowed to call this solution.
+	IdentityAllowedCallersFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE"
 )
 
-// CredentialMintURLEnvironmentVariable overrides the host endpoint this runtime
-// mints its execution credential at. Unset, it is credentialMintPath on the
-// gateway the composition resolves.
+// CredentialMintURLEnvironmentVariable is the host endpoint this runtime mints
+// its execution credential at. Required: there is no default, because the
+// address this runtime sends its projected service-account token to is not an
+// address it may assume.
 const CredentialMintURLEnvironmentVariable = "CODEFLY__CREDENTIAL_MINT_URL"
 
 // ContractProfileEnvironmentVariable overrides the configuration profile the
@@ -639,10 +652,11 @@ const CredentialMintURLEnvironmentVariable = "CODEFLY__CREDENTIAL_MINT_URL"
 // machine's — the gap codefly-dev/core#687 named and core v0.7.1 closed.
 const ContractProfileEnvironmentVariable = "CODEFLY__CONTRACT_PROFILE"
 
-// credentialMintPath is where the host mints a workload's execution credential,
-// relative to the gateway — the brokered shape the registration-token exchange
-// this replaces also had. See the comment at its use in loadConfig: the host
-// has not settled brokered-versus-direct, and this is a default, not a claim.
+// credentialMintPath is the path this package's own tests mount their fake mint
+// on. It is NOT a default: nothing in loadConfig derives an address from it,
+// because the host has not settled brokered-versus-direct and a guessed mint
+// address is refused rather than assumed. It exists so the suite's fixtures
+// agree with each other.
 const credentialMintPath = "/platform/_credential"
 
 // workloadPath resolves one of the identity paths above: an explicit
@@ -698,8 +712,8 @@ func (c config) validate() error {
 					required.name, required.value, c.environmentLoadErr)
 			}
 			if required.name == "credential mint URL" {
-				return fmt.Errorf("unresolved credential mint URL %q: it is %s on the gateway the SDK resolves, so an unresolved gateway leaves it empty; set %s explicitly for a host the resolver cannot see",
-					required.value, credentialMintPath, CredentialMintURLEnvironmentVariable)
+				return fmt.Errorf("no credential mint URL resolved: this runtime POSTs the projected service-account token that attests which workload it is to this address, so there is no default for it — a path assumed on the resolved gateway would be sending that attestation to an endpoint nobody published. Set %s to the endpoint this host actually serves. The fix that removes the override is the host publishing its mint as a resolvable endpoint role, which belongs to the host and the SDK rather than here",
+					CredentialMintURLEnvironmentVariable)
 			}
 			return fmt.Errorf("unresolved %s %q: the SDK could not resolve the host endpoint and no explicit override was set", required.name, required.value)
 		}
@@ -726,18 +740,11 @@ func (c config) validate() error {
 		// surprise.
 		log.Printf("codefly: the injected environment did not load cleanly; every SDK-resolved value that is present came from an override: %v", c.environmentLoadErr)
 	}
-	if c.mintURLGuessed {
-		// Said at every boot, deliberately. This runtime POSTs the projected
-		// service-account token that attests which workload it is to this
-		// address, and the address is a path this runtime proposed rather than
-		// one the host published or the SDK resolved — so an operator reading a
-		// failure here should know the destination was assumed before they go
-		// looking at provisioning. An unlabelled default is the one thing this
-		// repository's rules single out, and the label belongs where it is
-		// acted on, not only in a PR description.
-		log.Printf("codefly: this execution's credential will be minted at %q, derived from the resolved gateway and the path %q. The path is the host's published contract but is NOT DEPLOYED yet, so a 404 here means the endpoint does not exist on this host — not that the path is wrong and not that this build was refused. Set %s for a host whose mint is elsewhere.",
-			c.mintURL, credentialMintPath, CredentialMintURLEnvironmentVariable)
-	}
+	// Said at every boot: the operator set this address by hand, because
+	// nothing resolves it yet, so a 404 here is the endpoint not existing on
+	// this host rather than this build being refused.
+	log.Printf("codefly: this execution's credential will be minted at %q, which was set explicitly through %s — no resolver produces it yet, so a 404 here means that endpoint does not exist on this host, not that this build was refused.",
+		c.mintURL, CredentialMintURLEnvironmentVariable)
 	return nil
 }
 
@@ -782,17 +789,36 @@ func (s *Server) validateSources() error {
 	// Who may call is required whatever the identity source is, because it is
 	// not a property of the source: the source says who this workload *is*, and
 	// this says which callers it serves.
-	if len(parsedAllowedCallers(s.cfg.allowedCallers)) == 0 {
-		return fmt.Errorf("no allowed caller identities resolved: this listener verifies a caller's certificate against the cell's trust anchor, which every workload in the cell holds one from — so without this it authenticates callers and authorizes all of them, including the modules this solution consumes, which could then set their own %s and %s and drive mints carrying this workload's attestation. Set %s, or have the platform provision %s/%s (comma-separated identities, e.g. the gateway's)",
-			orgHeader, sessionHeader, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey)
+	if err := s.cfg.requirePath("allowed caller identities", s.cfg.allowedCallersFile,
+		IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityAllowedCallersFileKey); err != nil {
+		return fmt.Errorf("%w — this listener verifies a caller's certificate against the cell's trust anchor, which every workload in the cell holds one from, so without this it authenticates callers and authorizes all of them, including the modules this solution consumes, which could then set their own %s and %s and drive mints carrying this workload's attestation",
+			err, orgHeader, sessionHeader)
 	}
 	// And whom this runtime may present its credentials to, for the same
 	// reason in the other direction. It is required on every path, including a
 	// supplied identity source: a source says who this workload is, not which
 	// destinations are the platform.
-	if len(parsedAllowedCallers(s.cfg.platformPeers)) == 0 {
-		return fmt.Errorf("no platform peer identities resolved: this runtime presents the projected service-account token, the viewer's bearer and its own credential to the mint and the gateway, and verifying their chain and hostname says only that a destination holds a certificate this cell issued — which every workload in the cell does. Without this, a neighbouring workload answering at the gateway's address is handed all three. Set %s, or have the platform provision %s/%s (comma-separated identities, e.g. the gateway's and the mint's)",
-			IdentityPlatformPeersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityPlatformPeersKey)
+	if err := s.cfg.requirePath("platform peer identities", s.cfg.platformPeersFile,
+		IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityPlatformPeersFileKey); err != nil {
+		return fmt.Errorf("%w — this runtime presents the projected service-account token, the viewer's bearer and its own credential to the mint and the gateway, and verifying their chain and hostname says only that a destination holds a certificate this cell issued, which every workload in the cell does. Without this, a neighbouring workload answering at the gateway's address is handed all three",
+			err)
+	}
+	// And both files have to be readable and name somebody *now*. The per-use
+	// readers refuse a handshake over an unreadable set, which is the right
+	// answer while serving and the wrong first symptom at boot: a path nobody
+	// provisioned would otherwise start a listener that refuses every caller
+	// and a client that refuses every dial, and report it as an admission
+	// failure once traffic arrived rather than as the provisioning gap it is.
+	for _, set := range []struct {
+		what   string
+		admits func() ([]string, error)
+	}{
+		{"allowed callers", s.admittedCallers()},
+		{"platform peers", s.admittedPlatform()},
+	} {
+		if _, err := set.admits(); err != nil {
+			return fmt.Errorf("the provisioned %s are not usable at boot: %w", set.what, err)
+		}
 	}
 	return nil
 }
@@ -800,48 +826,66 @@ func (s *Server) validateSources() error {
 // admittedCallers resolves the identities this listener serves, for one
 // handshake, failing closed.
 //
-// A set that resolves to nothing refuses the handshake. It is the same judgement
-// peerAnchor makes about an unreadable trust bundle: the alternative is serving
-// the set this process booted with, which is the staleness this resolution
-// exists to remove, and an admission decision that cannot be resolved is not an
-// admission decision to guess at.
-//
-// A config assembled without loadConfig — every unit test in this package that
-// builds one by hand — carries no resolver, and then the boot-time set is what
-// the handshake uses. Production always carries one: loadConfig sets it beside
-// the value it resolves.
+// A set that resolves to nothing refuses the handshake, and so does a file that
+// cannot be read. It is the same judgement peerAnchor makes about an unreadable
+// trust bundle: the alternative is serving the set this process booted with,
+// which is the staleness this resolution exists to remove, and an admission
+// decision that cannot be resolved is not an admission decision to guess at.
 func (s *Server) admittedCallers() func() ([]string, error) {
-	return resolvedIdentities(s.cfg.resolveAllowedCallers, s.cfg.allowedCallers,
-		fmt.Sprintf("this listener admits no caller identities any more: the provisioned set resolved to nothing, and a listener that cannot resolve whom it serves refuses the handshake rather than serving the set it booted with. Set %s, or have the platform provision %s/%s",
-			IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey))
+	return resolvedIdentities(s.cfg.allowedCallersFile, fmt.Sprintf(
+		"whom this listener admits could not be resolved, so the handshake is refused rather than served against the set this process booted with. Provision %s/%s, or set %s",
+		WorkloadIdentityGroup, WorkloadIdentityAllowedCallersFileKey, IdentityAllowedCallersFileEnvironmentVariable))
 }
 
 // admittedPlatform is admittedCallers for the destinations this runtime dials.
 func (s *Server) admittedPlatform() func() ([]string, error) {
-	return resolvedIdentities(s.cfg.resolvePlatformPeers, s.cfg.platformPeers,
-		fmt.Sprintf("this runtime accepts no platform identities any more: the provisioned set resolved to nothing, and the destinations it holds to that set receive the projected token, the viewer's bearer and this workload's credential. Set %s, or have the platform provision %s/%s",
-			IdentityPlatformPeersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityPlatformPeersKey))
+	return resolvedIdentities(s.cfg.platformPeersFile, fmt.Sprintf(
+		"which destinations count as the platform could not be resolved, and the destinations held to that set receive the projected token, the viewer's bearer and this workload's credential, so the dial is refused. Provision %s/%s, or set %s",
+		WorkloadIdentityGroup, WorkloadIdentityPlatformPeersFileKey, IdentityPlatformPeersFileEnvironmentVariable))
 }
 
-func resolvedIdentities(resolve func() string, booted, empty string) func() ([]string, error) {
+// resolvedIdentities reads an admission set from its file, per call.
+//
+// No caching and no last-good fallback, which is the opposite of how the leaf
+// this workload presents is treated: a leaf that cannot be re-read keeps
+// serving, because the old leaf is this workload's own identity and refusing it
+// only turns away callers who should be let in. An admission set that cannot be
+// re-read has no such safe direction — the set on disk may be narrower than the
+// one in memory, and that is the case this reads per handshake for.
+func resolvedIdentities(path, unresolved string) func() ([]string, error) {
 	return func() ([]string, error) {
-		if resolve == nil {
-			return parsedAllowedCallers(booted), nil
+		if path == "" {
+			return nil, fmt.Errorf("%s", unresolved)
 		}
-		identities := parsedAllowedCallers(resolve())
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s: reading %q: %w", unresolved, path, err)
+		}
+		identities := parsedAllowedCallers(string(content))
 		if len(identities) == 0 {
-			return nil, fmt.Errorf("%s", empty)
+			return nil, fmt.Errorf("%s: %q names none", unresolved, path)
 		}
 		return identities, nil
 	}
 }
 
 // parsedAllowedCallers splits and trims the configured caller identities.
+// A provisioned file is naturally one identity per line and a hand-written
+// override is naturally comma-separated, so both separate, and a comment line
+// is dropped: a set an operator cannot annotate gets annotated anyway, in a
+// place nothing reads.
 func parsedAllowedCallers(raw string) []string {
 	var allowed []string
-	for _, id := range strings.Split(raw, ",") {
-		if trimmed := strings.TrimSpace(id); trimmed != "" {
-			allowed = append(allowed, trimmed)
+	for _, line := range strings.Split(raw, "\n") {
+		// Comments are stripped per line and before the commas are split, so a
+		// commented-out line cannot contribute its tail as an identity.
+		if hash := strings.Index(line, "#"); hash >= 0 {
+			line = line[:hash]
+		}
+		for _, id := range strings.Split(line, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				allowed = append(allowed, trimmed)
+			}
 		}
 	}
 	return allowed
@@ -1022,7 +1066,21 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		return err
 	}
 
-	srv := &http.Server{Handler: mux}
+	watch, err := s.watchInboundTrust()
+	if err != nil {
+		return err
+	}
+	srv := &http.Server{
+		Handler: mux,
+		// See inboundHandshakeTimeout and inboundIdleTimeout: with all of
+		// these unset, a peer that never finishes its ClientHello held a
+		// goroutine and a descriptor for as long as it liked.
+		ReadHeaderTimeout: inboundHandshakeTimeout,
+		IdleTimeout:       inboundIdleTimeout,
+		// And every served connection is held to trust as it is now, not as
+		// it was when the handshake happened.
+		ConnState: watch,
+	}
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -1557,31 +1615,50 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 	// A fresh configuration per connection, so the anchor this runtime judges
 	// the platform by is re-read rather than snapshotted at boot.
 	//
-	// This was the review finding that went unanswered through two rounds, and
-	// the argument against it is one I had already written down for the inbound
-	// direction: judging by a stale anchor admits whoever should be refused,
-	// which is not symmetric with serving a stale leaf. It applies outbound
-	// with more force, not less. The two destinations on the other side of this
+	// Judging by a stale anchor admits whoever should be refused, which is not
+	// symmetric with serving a stale leaf — the inbound argument, and it
+	// applies outbound with more force, not less. The two destinations on the
+	// other side of this
 	// client are the mint and the gateway — they receive the projected
 	// service-account token, the viewer's bearer and this workload's own
 	// credential — so a root removed from the bundle because it was compromised
 	// kept authenticating exactly the parties that are handed everything.
 	//
 	// Reloading per connection is the whole story only if connections do not
-	// outlive the reload, so idle reuse is bounded too (see below): a removed
-	// root takes effect on the next dial, and there is always a next dial
-	// inside that bound.
+	// outlive the reload, so established connections are re-verified too (see
+	// below).
+	//
+	// What is *not* rebuilt per connection is this workload's own leaf source.
+	// Building a whole new SDK reloader per dial, and again per recheck of
+	// every connection, looks like "nothing is snapshotted" and is a
+	// regression: NewCertificateReloader loads
+	// eagerly and returns the error, where a long-lived reloader swallows a
+	// failed re-read and keeps serving the last good pair. So a cert rotated
+	// non-atomically — the certificate written, the key a moment behind —
+	// failed every new dial, and failed every recheck, which closed
+	// established connections whose peers were still perfectly trusted. A
+	// half-written copy of this workload's own key is not a judgement about
+	// the peer, and the two must not share a failure path.
 	peers := s.admittedPlatform()
+	leaf, err := s.outboundLeaf(identityConfig)
+	if err != nil {
+		return nil, err
+	}
+	trust := s.peerTrustAnchor(identityConfig)
 	newConfig := func() (*tls.Config, error) {
-		config, err := s.outboundTLS(identityConfig)
+		anchor, err := trust()
 		if err != nil {
 			return nil, err
+		}
+		config := &tls.Config{
+			MinVersion:           tls.VersionTLS13,
+			RootCAs:              anchor,
+			GetClientCertificate: leaf,
 		}
 		// Held to the frozen principal at presentation, and pointed at the
 		// destinations this runtime is allowed to present it to. Both apply to
 		// a consumer's source and to the projected pair: one of the two paths
-		// carrying a check is not the check, which is how the outbound half of
-		// each of these was missed in the first place.
+		// carrying a check is not the check.
 		if err := holdPresentedCertificate(config, s.principal); err != nil {
 			return nil, err
 		}
@@ -1618,7 +1695,9 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 			_ = raw.Close()
 			return nil, err
 		}
-		return watchOutboundTrust(conn, host, newConfig), nil
+		// Watched on the two inputs that are a judgement about the peer — the
+		// anchor and the admitted set — and on nothing else.
+		return watchOutboundTrust(conn, host, trust, peers), nil
 	}
 	// Pool hygiene, not the trust bound: a connection nothing sends on is
 	// dropped rather than held open indefinitely. What bounds the trust
@@ -1631,31 +1710,41 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 	}, nil
 }
 
-// outboundTLS is the TLS configuration for one dial to the platform, before the
-// principal and peer holds are applied.
-func (s *Server) outboundTLS(identityConfig *tls.Config) (*tls.Config, error) {
+// outboundLeaf is the certificate this runtime presents to the platform,
+// resolved once and re-read by whatever produces it.
+//
+// Once, because the thing that keeps a rotated leaf presented is the reloader's
+// own re-read, not a new reloader: the SDK's swallows a failed or half-written
+// re-read and keeps serving the last good pair (sdk-go tls.go, refresh), which
+// is the property that makes a rotation invisible to a caller. Building a new
+// one per dial threw exactly that away, because the constructor loads eagerly
+// and reports the error instead.
+func (s *Server) outboundLeaf(identityConfig *tls.Config) (func(*tls.CertificateRequestInfo) (*tls.Certificate, error), error) {
 	if s.identity != nil {
 		// A consumer's source: the identity it returned, in both directions,
-		// rather than projected files it never said it uses. Re-derived here so
-		// a source that rotates its anchor is followed.
-		config, err := clientTLSFrom(identityConfig)
+		// rather than projected files it never said it uses. Its own callback
+		// is what gets asked, so a source that rotates is followed.
+		client, err := clientTLSFrom(identityConfig)
 		if err != nil {
 			return nil, fmt.Errorf("configure this workload's outbound identity from the supplied identity source: %w", err)
 		}
-		return config, nil
+		if client.GetClientCertificate != nil {
+			return client.GetClientCertificate, nil
+		}
+		pairs := client.Certificates
+		return func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			if len(pairs) == 0 {
+				return nil, fmt.Errorf("the identity source produces no certificate this runtime can present to the platform")
+			}
+			return &pairs[0], nil
+		}, nil
 	}
-	anchor, err := peerAnchor(s.cfg.trustBundleFile)
-	if err != nil {
-		return nil, fmt.Errorf("configure this workload's outbound trust: %w", err)
-	}
-	// The projected pair, through the SDK's reloader, which is what keeps a
-	// rotated leaf presented outbound as well as inbound.
-	config, err := codefly.ClientTLSConfig(s.cfg.identityCertFile, s.cfg.identityKeyFile, anchor)
+	reloader, err := codefly.NewCertificateReloader(s.cfg.identityCertFile, s.cfg.identityKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's outbound identity from %q/%q: %w — the same pair the listener presents is what names this workload to the platform it calls",
 			s.cfg.identityCertFile, s.cfg.identityKeyFile, err)
 	}
-	return config, nil
+	return reloader.GetClientCertificate, nil
 }
 
 // outboundTrustReloadBound is how long an established platform connection may
@@ -1702,7 +1791,7 @@ const outboundTrustRecheckInterval = time.Second
 // the intended outcome: the alternative is continuing to present this
 // workload's credentials — and the viewer's — to a destination this cell has
 // stopped vouching for.
-func watchOutboundTrust(conn *tls.Conn, host string, fresh func() (*tls.Config, error)) net.Conn {
+func watchOutboundTrust(conn *tls.Conn, host string, trust func() (*x509.CertPool, error), peers func() ([]string, error)) net.Conn {
 	watched := &recheckedConn{Conn: conn, done: make(chan struct{})}
 	go func() {
 		ticker := time.NewTicker(outboundTrustRecheckInterval)
@@ -1712,7 +1801,7 @@ func watchOutboundTrust(conn *tls.Conn, host string, fresh func() (*tls.Config, 
 			case <-watched.done:
 				return
 			case <-ticker.C:
-				if err := peerStillTrusted(conn.ConnectionState(), host, fresh); err != nil {
+				if err := peerStillTrusted(conn.ConnectionState(), host, trust, peers); err != nil {
 					_ = watched.Close()
 					return
 				}
@@ -1739,8 +1828,12 @@ func (c *recheckedConn) Close() error {
 // trust as it is now: the current anchor, the current allowed-peer set, and the
 // current time, which is also how a peer certificate that expired mid-stream
 // stops being accepted.
-func peerStillTrusted(state tls.ConnectionState, host string, fresh func() (*tls.Config, error)) error {
-	config, err := fresh()
+// It takes the anchor and the admitted set, not a whole configuration to
+// rebuild: a recheck that also resolved this workload's own leaf would close a
+// trusted connection over a half-written copy of this process's own key, which
+// is not a statement about the peer at all.
+func peerStillTrusted(state tls.ConnectionState, host string, trust func() (*x509.CertPool, error), peers func() ([]string, error)) error {
+	anchor, err := trust()
 	if err != nil {
 		return err
 	}
@@ -1752,7 +1845,7 @@ func peerStillTrusted(state tls.ConnectionState, host string, fresh func() (*tls
 		intermediates.AddCert(cert)
 	}
 	if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
-		Roots:         config.RootCAs,
+		Roots:         anchor,
 		Intermediates: intermediates,
 		DNSName:       host,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -1760,10 +1853,18 @@ func peerStillTrusted(state tls.ConnectionState, host string, fresh func() (*tls
 		return fmt.Errorf("the platform destination this connection was authenticated against no longer verifies: %w", err)
 	}
 	// And the same identity check a dial makes, since the allowed-peer set is
-	// resolved per dial and a connection older than a change to it would
-	// otherwise keep a de-authorised destination.
-	if config.VerifyConnection != nil {
-		return config.VerifyConnection(state)
+	// read per dial and a connection older than a change to it would otherwise
+	// keep a de-authorised destination.
+	admitted, err := peers()
+	if err != nil {
+		return err
+	}
+	identity, err := oneURIIdentity(state, "platform destination")
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(admitted, identity) {
+		return fmt.Errorf("the established connection's destination %q is no longer one this runtime presents its credentials to", identity)
 	}
 	return nil
 }

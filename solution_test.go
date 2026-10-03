@@ -391,8 +391,12 @@ func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
 		if cfg.gatewayURL != addr {
 			t.Fatalf("gatewayURL = %q, want %q resolved from the current role without an override", cfg.gatewayURL, addr)
 		}
-		if want := addr + credentialMintPath; cfg.mintURL != want {
-			t.Errorf("mintURL = %q, want %q derived from the resolved gateway", cfg.mintURL, want)
+		// And the mint URL is NOT derived from it. A resolved gateway says
+		// where the gateway is, not where the host mints a credential: that
+		// endpoint is unsettled and undeployed, and the address this runtime
+		// POSTs its projected service-account token to is not one to assume.
+		if cfg.mintURL != "" {
+			t.Errorf("mintURL = %q, want empty: a resolved gateway must not produce a mint address, because the attestation this runtime sends there would be going somewhere nobody published", cfg.mintURL)
 		}
 	})
 
@@ -433,6 +437,17 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 			}
 		})
 	}
+}
+
+// identitiesFile writes an admission set to a file and returns its path, which
+// is the form both admission sets are provisioned in: they are read per
+// handshake and per dial, so they have to be something this process can re-read
+// rather than a value fixed when it started.
+func identitiesFile(t *testing.T, identities ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "identities")
+	writeFile(t, path, strings.Join(identities, "\n")+"\n")
+	return path
 }
 
 // writeFile writes content to path, creating parent directories, for building
@@ -1100,7 +1115,7 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers: testGatewayPrincipal}
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -1158,7 +1173,7 @@ func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers: testGatewayPrincipal, gatewayURL: host.URL}
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal), gatewayURL: host.URL}
 	server.principal = testPrincipal
 	outbound, err := server.outboundClient(nil)
 	if err != nil {
@@ -1467,5 +1482,64 @@ func TestWorkContextPrincipalsReportsWhomAccountsIssuedFor(t *testing.T) {
 	}
 	if n := gw.mintCount(); n != 1 {
 		t.Fatalf("minted %d capabilities, want 1: reading the principals reuses the capability", n)
+	}
+}
+
+// optionalIdentitiesFile is identitiesFile, or no path at all for an empty set
+// — the distinction a boot-refusal table needs, since "the platform never
+// provisioned a path" and "the path is there and names nobody" are two
+// different refusals and each has its own row.
+func optionalIdentitiesFile(t *testing.T, identities string) string {
+	t.Helper()
+	if identities == "" {
+		return ""
+	}
+	return identitiesFile(t, identities)
+}
+
+// TestABootWithoutAResolvedMintURLIsRefused: the previous revision derived the
+// mint address from the resolved gateway and labelled the result a guess — the
+// field was literally named mintURLGuessed, the code said the endpoint was "NOT
+// settled" and that "neither endpoint exists yet", and the README and the boot
+// log both said "settled". Both could not be true.
+//
+// This is the address the projected service-account token goes to, which is the
+// strongest statement this process can make about which workload it is. A
+// guessed address for that is what fail-closed forbids, and this package
+// already refuses rather than guesses when it cannot pair a token-exchange URL.
+func TestABootWithoutAResolvedMintURLIsRefused(t *testing.T) {
+	cfg := config{port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("the boot accepted a configuration with no mint URL, so this runtime would POST its projected token to an address nobody resolved")
+	}
+	if !strings.Contains(err.Error(), CredentialMintURLEnvironmentVariable) {
+		t.Errorf("the refusal %q does not name %s, the variable that sets it", err, CredentialMintURLEnvironmentVariable)
+	}
+	// And the refusal must not read as a provisioning gap in the gateway,
+	// which resolved perfectly well.
+	if strings.Contains(err.Error(), "unresolved gateway") {
+		t.Errorf("the refusal %q blames the gateway, which resolved: that sends an operator to inspect endpoint resolution over a value that is simply not set", err)
+	}
+}
+
+// TestNoProductionCodeDerivesTheMintAddress pins the absence. A default address
+// is the thing this repository's rules single out, and the previous one came
+// back as a "labelled stopgap" that the README then described as settled.
+func TestNoProductionCodeDerivesTheMintAddress(t *testing.T) {
+	for _, name := range moduleSources(t) {
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		body := string(source)
+		for _, derived := range []string{"gatewayURL + credentialMintPath", "gatewayURL+credentialMintPath"} {
+			if strings.Contains(body, derived) {
+				t.Errorf("%s derives the credential mint address from the resolved gateway: the gateway's address says where the gateway is, not where this host mints a credential, and the projected token this runtime sends there is not something to address by assumption", name)
+			}
+		}
+		if strings.Contains(body, "mintURLGuessed") {
+			t.Errorf("%s still carries mintURLGuessed: a guessed address for the endpoint this runtime attests itself to is refused now, so there is nothing to label", name)
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -43,13 +44,13 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 		// posture: a listener that verifies every caller in the cell and
 		// admits all of them is a listener with no admission at all, so the
 		// admitted set is provisioned and named when it is absent.
-		{name: "no allowed callers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, peers: testGatewayPrincipal, names: "allowed caller identities", variable: IdentityAllowedCallersEnvironmentVariable},
+		{name: "no allowed callers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, peers: testGatewayPrincipal, names: "allowed caller identities", variable: IdentityAllowedCallersFileEnvironmentVariable},
 		// And the same question outbound. Every workload in the cell holds a
 		// certificate from the same anchor, so a chain and a hostname do not
 		// say a destination is the platform — and outbound is the direction
 		// where being wrong hands over the projected token rather than
 		// accepting a call.
-		{name: "no platform peers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "platform peer identities", variable: IdentityPlatformPeersEnvironmentVariable},
+		{name: "no platform peers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "platform peer identities", variable: IdentityPlatformPeersFileEnvironmentVariable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID})
@@ -61,8 +62,8 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 				identityKeyFile:    tc.key,
 				projectedTokenPath: tc.token,
 				trustBundleFile:    tc.bundle,
-				allowedCallers:     tc.callers,
-				platformPeers:      tc.peers,
+				allowedCallersFile: optionalIdentitiesFile(t, tc.callers),
+				platformPeersFile:  optionalIdentitiesFile(t, tc.peers),
 				profile:            localProfile,
 			}
 			if err := server.cfg.validate(); err != nil {
@@ -129,8 +130,8 @@ func TestASuppliedSourceNeedsNoProvisioningItDoesNotRead(t *testing.T) {
 		// Required whatever the identity source is: the source says who this
 		// workload is, this says which callers it serves — and which
 		// destinations are the platform.
-		allowedCallers: testGatewayPrincipal,
-		platformPeers:  testGatewayPrincipal,
+		allowedCallersFile: identitiesFile(t, testGatewayPrincipal),
+		platformPeersFile:  identitiesFile(t, testGatewayPrincipal),
 	}
 	t.Run("an identity source replaces the projected pair", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{})
@@ -516,7 +517,7 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: downgrading(tc.change)})
-			server.cfg = config{port: freePort(t)}
+			server.cfg = config{port: freePort(t), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 			server.principal = testPrincipal
 			// The two failures listen() returns as one are separated here.
 			// Refusing the *identity* at boot is an acceptable answer — what
@@ -526,6 +527,15 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 			// do with the posture.
 			config, refused := server.serverIdentity()
 			if refused != nil {
+				// A boot refusal is an acceptable answer, but only the right
+				// one. Returning on *any* error made every subtest below pass
+				// the moment serverIdentity failed for an unrelated reason —
+				// an unresolved path, a missing admission file, a mutated
+				// helper — which is the shape that makes a negative test
+				// report success for a cause it never exercised.
+				if !strings.Contains(refused.Error(), "identity source") {
+					t.Fatalf("the boot refused the identity for something other than its posture, so this case never ran: %v", refused)
+				}
 				return
 			}
 			raw, err := net.Listen("tcp", ":"+server.cfg.port)
@@ -565,7 +575,13 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 	// peer trust on every handshake.
 	t.Run("a conforming callback is served", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: conforming})
-		server.cfg = config{port: freePort(t)}
+		// The admitted set is provisioned, because listen() is the production
+		// path and a deployment reaching it has been through validateSources.
+		// Without it this subtest dialled a listener that refused the caller
+		// and read as a success anyway: in TLS 1.3 the client finishes before
+		// it learns whether the server accepted its certificate, so a
+		// server-side refusal is invisible to tls.Dial.
+		server.cfg = config{port: freePort(t), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 		server.principal = testPrincipal
 		ln, err := server.listen()
 		if err != nil {
@@ -787,8 +803,8 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 	t.Setenv(IdentityCertFileEnvironmentVariable, certFile)
 	t.Setenv(IdentityKeyFileEnvironmentVariable, keyFile)
 	t.Setenv(IdentityTrustBundleFileEnvironmentVariable, bundleFile)
-	t.Setenv(IdentityAllowedCallersEnvironmentVariable, testGatewayPrincipal)
-	t.Setenv(IdentityPlatformPeersEnvironmentVariable, testGatewayPrincipal)
+	t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
+	t.Setenv(IdentityPlatformPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
 	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
 	t.Setenv("ASSETS_DIR", t.TempDir())
 
@@ -877,7 +893,7 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
-		trustBundleFile: bundleFile, allowedCallers: testGatewayPrincipal, platformPeers: testGatewayPrincipal}
+		trustBundleFile: bundleFile, allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 
 	config, err := server.serverIdentity()
@@ -900,5 +916,117 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "another-workload") || !strings.Contains(err.Error(), testPrincipal) {
 		t.Errorf("refusal %q does not name both the identity served and this workload's frozen principal", err)
+	}
+}
+
+// TestAPerConnectionAnchorIsNotSnapshottedOutbound: a source carrying a base
+// ClientCAs *and* a per-handshake callback had its anchor read off the base for
+// every outbound dial — one pool, fixed when the source built it — however
+// often the callback re-resolved it.
+//
+// It is the stale-anchor defect this file argues against, surviving in the one
+// source shape the per-connection posture check tells a source to adopt: the
+// refusal for a nil per-connection answer says to carry a usable anchor on the
+// base configuration, so a source following that advice triggered it.
+func TestAPerConnectionAnchorIsNotSnapshottedOutbound(t *testing.T) {
+	boot := newCell(t)
+	current := newCell(t)
+	// The shape under test: a base pool from boot, and a callback that has
+	// since moved on to a different anchor.
+	source := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs:  boot.roots,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: current.roots}, nil
+		},
+	}
+	anchor, err := peerAnchorOf(source)
+	if err != nil {
+		t.Fatalf("peerAnchorOf: %v", err)
+	}
+	if anchor != current.roots {
+		t.Error("the anchor came from the base configuration while the source resolves one per connection: a *x509.CertPool on the base is one object fixed when the source built it, so every outbound dial was judged by the pool this process booted with")
+	}
+
+	// And a nil answer still falls back to the base, which is Go's own
+	// meaning for it — the fallback is the correct half of the old order.
+	deferring := &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		ClientAuth:         tls.RequireAndVerifyClientCert,
+		ClientCAs:          boot.roots,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil },
+	}
+	anchor, err = peerAnchorOf(deferring)
+	if err != nil {
+		t.Fatalf("peerAnchorOf with a nil answer: %v", err)
+	}
+	if anchor != boot.roots {
+		t.Error("a source whose callback answers nil serves its base configuration, so the base pool is its current anchor and must be used")
+	}
+}
+
+// TestASourceCannotReplaceThePostureItIsHeldTo: the posture checks enumerate
+// what a conforming listener must have, which a source can satisfy completely
+// while handing back a configuration whose clock, randomness, session secrets
+// or ticket encoding it controls.
+//
+// Resumption is the sharpest of them: a resumed connection presents no
+// certificate, so a source encoding its own tickets decides who gets in
+// without any check in this file seeing a handshake.
+func TestASourceCannotReplaceThePostureItIsHeldTo(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	conforming := func(t *testing.T) *tls.Config {
+		t.Helper()
+		config, err := projectedIdentity{certFile: certFile, keyFile: keyFile, trustBundleFile: bundleFile}.ServerTLSConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return config
+	}
+	// The control: the shape every case below starts from is accepted.
+	if err := usableServerIdentity(conforming(t)); err != nil {
+		t.Fatalf("the conforming projected configuration was refused, so nothing below is about the field it changes: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		lower func(*tls.Config)
+	}{
+		{"a clock of its own", func(cfg *tls.Config) {
+			cfg.Time = func() time.Time { return time.Unix(0, 0) }
+		}},
+		{"a randomness source of its own", func(cfg *tls.Config) { cfg.Rand = strings.NewReader("not random") }},
+		{"the session secrets written out", func(cfg *tls.Config) { cfg.KeyLogWriter = io.Discard }},
+		{"resumption tickets it encodes", func(cfg *tls.Config) {
+			cfg.WrapSession = func(tls.ConnectionState, *tls.SessionState) ([]byte, error) { return nil, nil }
+		}},
+		{"resumption tickets it decodes", func(cfg *tls.Config) {
+			cfg.UnwrapSession = func([]byte, tls.ConnectionState) (*tls.SessionState, error) { return nil, nil }
+		}},
+		{"no verification at all", func(cfg *tls.Config) { cfg.InsecureSkipVerify = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := conforming(t)
+			tc.lower(config)
+			if err := usableServerIdentity(config); err == nil {
+				t.Error("a configuration that keeps every enumerated requirement and replaces a posture Go owns was accepted: the checks answer whether the description is acceptable, which is not whether the handshake is")
+			}
+		})
+	}
+
+	// And a per-connection answer is held to the same list, not a copy of its
+	// reasoning: the answer replaces the base for that connection.
+	config := conforming(t)
+	config.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		answer := conforming(t)
+		answer.GetConfigForClient = nil
+		answer.KeyLogWriter = io.Discard
+		return answer, nil
+	}
+	holdPerConnectionPosture(config, testPrincipal, func() ([]string, error) { return []string{testGatewayPrincipal}, nil })
+	if _, err := config.GetConfigForClient(&tls.ClientHelloInfo{}); err == nil {
+		t.Error("a per-connection answer that writes out every connection's session secrets was served: the configuration the callback returns replaces the base one, so it is held to the same posture")
 	}
 }

@@ -118,6 +118,7 @@ type Host struct {
 
 // NewHost starts a fake host, closed when the test ends.
 func NewHost(t testing.TB) *Host {
+	mustBeATest()
 	t.Helper()
 	h := &Host{modules: map[string]*httputil.ReverseProxy{}, dir: t.TempDir()}
 	h.server = httptest.NewServer(http.HandlerFunc(h.serveHTTP))
@@ -342,6 +343,7 @@ type Solution struct {
 // modules host routes as the solution's api.consumes: the real handler, and
 // the error Serve would refuse the declaration with at boot.
 func Handler(host *Host, consumes ...solution.ConsumedModule) (http.Handler, error) {
+	mustBeATest()
 	source, err := host.credentialSource()
 	if err != nil {
 		return nil, err
@@ -376,9 +378,34 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 	})
 }
 
+// mustBeATest refuses to build any of this outside a test binary.
+//
+// This package is the one caller Go's internal-package rule lets reach the
+// passthrough seam, and that made it the bypass it was built to close: the root
+// package's exported constructor is gone, but Handler is exported from a package
+// any module can import, so a deployment importing it got the same
+// credential-bearing handler with no validate(), no mTLS boot, no caller
+// allow-list, no ceiling and no authenticated outbound. Taking a testing.TB is
+// not the gate it resembles — testing.TB's unexported method only stops a
+// type *declaring* the interface, and a struct that EMBEDS testing.TB satisfies
+// it in any program, so the signature proves nothing about where the call came
+// from.
+//
+// testing.Testing() does prove it: it is true exactly when the binary was built
+// by `go test`. It was the wrong tool for the root package, where the
+// legitimate caller is production code and only the bypass is a test; it is the
+// right one here, where every legitimate caller is a test and only the bypass
+// is production.
+func mustBeATest() {
+	if !testing.Testing() {
+		panic("passthroughtest is a test seam and this is not a test binary: it builds a handler that holds a real execution credential without validate(), the mTLS boot, the caller allow-list, the published ceiling or authenticated outbound, so a deployment reaching it would serve the viewer's bearer and this workload's credential over whatever it was mounted on. Boot the runtime with solution.Serve instead")
+	}
+}
+
 // Start serves the passthrough for the declaration against host, until the
 // test ends. A declaration Serve would refuse fails the test.
 func Start(t testing.TB, host *Host, consumes ...solution.ConsumedModule) *Solution {
+	mustBeATest()
 	t.Helper()
 	handler, err := Handler(host, consumes...)
 	if err != nil {

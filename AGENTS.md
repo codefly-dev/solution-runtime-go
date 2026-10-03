@@ -44,6 +44,15 @@ rule is the gate, which is a compiler rather than a naming convention;
 `TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot` fails if an
 exported path reappears.
 
+`passthroughtest` is itself importable by any module, so that rule alone did not
+close this: `passthroughtest.Handler` was an exported, production-importable
+path to the same handler, and the gate skipped the package by path while
+matching only receiver methods named `*Passthrough*`. Its constructors now panic
+outside a test binary (`testing.Testing()`), and the gate reads every caller of
+the seam in the module and requires that refusal. A `testing.TB` parameter is
+not a gate: the unexported method stops a type declaring the interface, not one
+embedding it.
+
 ## Boundaries
 
 - Read [README.md](README.md) first. It is the contract this runtime offers its
@@ -92,7 +101,17 @@ exported path reappears.
   material, because a solution serving plain HTTP is refused at the edge instead,
   for a reason only the edge can see. Where the identity comes from is the
   platform's: `IdentitySource` is the hook, and the default reads the pair the
-  platform projects through the SDK's reloader.
+  platform projects through the SDK's reloader. A source's configuration is
+  checked for what it must *have* (a certificate, a TLS 1.3 floor,
+  `RequireAndVerifyClientCert`, a named anchor) **and refused for what it must
+  not replace**: `Time`, `Rand`, `KeyLogWriter`, `WrapSession`, `UnwrapSession`,
+  `InsecureSkipVerify`. Each has a safe zero value, so refusing a non-zero one
+  is exact — and resumption is the sharpest, because a resumed connection
+  presents no certificate, so a source encoding its own tickets admits callers
+  without any check here seeing a handshake. That list is a denylist over a
+  struct this package does not own: it is complete for the Go version in
+  `go.mod` and not by construction, which is why the per-connection answer runs
+  through the same function rather than a copy of its reasoning.
 - The credential is obtained **once**, before the listener exists. A *refusal*
   fails the boot and is never retried — the host is saying this build is not the
   one its presence document approved, which no number of attempts changes, and a
@@ -110,10 +129,19 @@ exported path reappears.
   Location: http://…` the viewer's bearer, their capability and this workload's
   credential in cleartext. Build clients through `Gateway.platformClient`, which
   carries `ErrUseLastResponse`, and leave the transport's origin pin in place.
-- **Peer trust is re-read per connection in BOTH directions.** Inbound, per
-  handshake through `GetConfigForClient`; outbound, per dial through
-  `DialTLSContext` with idle reuse capped, because a pooled connection that
-  never re-dials makes per-dial reloading meaningless. The outbound half went
+- **Peer trust is re-read per connection in BOTH directions, and established
+  connections are re-verified.** Inbound, per handshake through
+  `GetConfigForClient`; outbound, per dial through `DialTLSContext`. Per-dial
+  and per-handshake bound nothing about a connection that already exists, which
+  an idle timeout cannot fix because it only bounds a connection nobody is
+  using: a busy outbound connection answered 31s after its root was removed, and
+  the listener had no recheck, no `IdleTimeout` and no `ReadHeaderTimeout` at
+  all. Both directions now re-verify the established peer against current trust
+  once a second and close what stops verifying. The recheck reads only the
+  anchor and the admitted set — never this workload's own leaf, so a
+  half-written rotation of our own key pair cannot tear down connections whose
+  peers are fine — and the outbound leaf comes from ONE long-lived SDK reloader,
+  which keeps the last good pair; building one per dial threw that away. The outbound half went
   unanswered through two review rounds while the inbound argument — judging by
   a stale anchor admits whoever should be refused — was already written down
   here. It applies harder outbound: those destinations receive the projected
@@ -121,14 +149,24 @@ exported path reappears.
 - **Authentication is not authorisation.** Every workload in the trust domain
   holds a certificate from the same anchor, the consumed modules included, so
   the admitted caller set is provisioned
-  (`workload-identity`/`ALLOWED_CALLERS`) and refused at boot when absent. A
+  (`workload-identity`/`ALLOWED_CALLERS_FILE`) and refused at boot when absent.
+  Both admission sets are **paths this process reads itself**, per handshake and
+  per dial, not configuration values: a value is fixed at process start, so
+  "re-resolved per handshake" through the SDK's accessor returned the boot answer
+  forever while the code and the README both said revocation needed no restart.
+  Anything in `workload-identity` the platform can change is a path or it is a
+  snapshot pretending otherwise. A
   listener that verifies every caller and admits all of them lets a consumed
   module set its own `x-org-id`/`x-session-id` and drive mints under this
   workload's attestation.
 - **A terminal credential refusal ends the process; a transient one does not.**
-  `ErrMintRefused` and `ErrRevoked` at renewal fail `/health` and end `serve`
-  with the reason. `ErrMintUnavailable` must not: it is transient by
-  construction and exiting on it is a crash loop. The boot and the run have to
+  `ErrMintRefused` at renewal fails `/health` and ends `serve` with the reason.
+  `ErrMintUnavailable` must not: it is transient by construction and exiting on
+  it is a crash loop. `ErrRevoked` is not in either set, and three review rounds
+  found this file still saying it was: the mint client does not return it at all
+  (see `credential.go`) — it comes back from a *callee* rejecting a capability
+  this runtime minted for a viewer, where it is a 409 on that request and no
+  statement about this execution's own credential. The boot and the run have to
   classify these the same way — they did not, and the result was a solution
   answering 503 forever while reporting itself healthy.
 - **Fail closed, with no exception for a counterpart's current state.** A mint
@@ -165,10 +203,9 @@ exported path reappears.
 
 ## How to behave when something does not work
 
-Fleet standard, governed by the handbook's agent-context track
-([obin-ai/handbook#68](https://github.com/obin-ai/handbook/issues/68)). These
-are not style preferences; each is a rule an agent broke at real cost, and this
-repository is the runtime that cost was measured against.
+Fleet standard. These are not style preferences; each is a rule an agent broke
+at real cost, and this repository is the runtime that cost was measured
+against.
 
 1. **A gap in the tooling is a bug in the tooling** — never a reason to reach
    around it. Not as a "workaround", not "just this once", not "until the verb
@@ -196,15 +233,19 @@ repository is the runtime that cost was measured against.
    at the place that owns the behaviour, or a *hack*. A hack does not become a
    fix by working, by being small, by being local, or by the real fix belonging
    to core, the SDK or the host.
-4. **Never hardcode what the system resolves.** This package resolves every
-   address, port and secret through the SDK; the single `localhost` literal in
-   it is the self upstream's listen-address fallback, built from the *resolved*
-   port and refused by `validate()` in a deployed runtime context. Both token-exchange URLs
-   are derived from their register URLs by swapping the path suffix, which is
-   why an override that drops the documented suffix cannot be paired and is
-   refused at boot rather than guessed at. If you are typing an address, a port
-   or a credential, you are encoding something true only on your machine for the
-   next ten minutes.
+4. **Never hardcode what the system resolves, and never guess what it cannot.**
+   This package resolves every address, port and secret through the SDK; the
+   single `localhost` literal in it is the self upstream's listen-address
+   fallback, built from the *resolved* port and refused by `validate()` in a
+   deployed runtime context. The credential mint URL has **no default**: it is
+   the address the projected service-account token goes to, nothing resolves it
+   yet, and a derived path on the resolved gateway was carried for two rounds as
+   a "labelled stopgap" while the README described it as settled — a guess a
+   label does not make safe. It is refused at boot until something resolves it.
+   If you are typing an address, a port or a credential, you are encoding
+   something true only on your machine for the next ten minutes; if you are
+   deriving one the owner has not published, you are encoding a guess about
+   somebody else's deployment.
 5. **Diagnose, do not pattern-match.** "It started working when I set X" is not
    a diagnosis — set X back and confirm it breaks. Do not trust an error message
    before checking it: in the session above, *"the provisioned secret does not

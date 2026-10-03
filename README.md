@@ -92,32 +92,43 @@ the SDK-resolved value is the default.
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
-| Credential mint URL | `<gateway>/platform/_credential`. Must be `https`. The path is the **host's published contract**, settled but **not yet deployed**, so every boot logs where it will mint and a 404 there means the endpoint does not exist on that host — not that the path is wrong and not that this build was refused | `CODEFLY__CREDENTIAL_MINT_URL` |
+| Credential mint URL | **not resolved — required explicitly.** Must be `https`. Nothing derives it: whether the host mints through the gateway or the workload posts straight to the issuer is unsettled and neither endpoint is deployed, and this is the address the projected service-account token goes to, so an assumed one is refused at boot. Every boot logs where it will mint, and a 404 there means that endpoint does not exist on that host — not that this build was refused | `CODEFLY__CREDENTIAL_MINT_URL` (**required**) |
 | Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
-| Allowed callers | `workload-identity`/`ALLOWED_CALLERS` — **required**, comma-separated identities (normally the gateway's). Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS` |
-| Platform peers | `workload-identity`/`PLATFORM_PEERS` — **required**, comma-separated identities (the gateway's, the mint's). The mirror of `ALLOWED_CALLERS`: chain and hostname say a destination holds a certificate this cell issued, which every workload does, so the destinations this runtime presents credentials to are provisioned too | `CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS` |
+| Allowed callers | `workload-identity`/`ALLOWED_CALLERS_FILE` — **required**, a **path** to a file of identities, one per line (normally the gateway's); re-read per handshake. Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE` |
+| Platform peers | `workload-identity`/`PLATFORM_PEERS_FILE` — **required**, a **path** to a file of identities (the gateway's, the mint's); re-read per dial and per connection check. The mirror of `ALLOWED_CALLERS_FILE`: chain and hostname say a destination holds a certificate this cell issued, which every workload does, so the destinations this runtime presents credentials to are provisioned too | `CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 
-`ALLOWED_CALLERS` and `PLATFORM_PEERS` are the only ones of these that are
-values rather than paths, and they are the only two the process re-resolves
-while it runs: they are admission decisions, and an admission decision read once
-at boot cannot narrow. Removing a compromised identity from either set takes
-effect on the next handshake or the next connection check, not on the next
-restart. A set that resolves to nothing refuses rather than falling back to the
-set the process booted with.
-The other `workload-identity` values are **paths, never material**. The files
-behind them are read by this process — the token at every mint, the key pair at
-every handshake — so the SDK's value accessors would be the wrong tool for the
-material itself: a file-carried configuration value is read once and kept for
-the life of the process, which is right for a configuration value and wrong for
-a projection the platform rotates underneath one.
+Every `workload-identity` value is a **path, never material**, the two
+admission sets included — and that is what makes them live. They are admission
+decisions, and an admission decision read once at boot cannot narrow: removing a
+compromised identity from either file takes effect on the next handshake, the
+next dial and the next connection check, with no restart. A set that resolves to
+nothing, or that cannot be read, **refuses** rather than falling back to the set
+the process booted with.
+
+> They were configuration *values* until round four of review, re-resolved on
+> every handshake through the SDK's accessor — which does not work and this
+> README claimed it did. A configuration value, inline or file-carried, is fixed
+> at process start (the SDK reads the file once and keeps it, `file_carrier.go`),
+> so the re-resolution returned the boot answer for the life of the process, the
+> refusal branch was unreachable in any deployment, and revoking a caller
+> silently needed a restart. They are paths now, read by this process like the
+> trust anchor beside them, which is the only form that can be what was
+> documented.
+
+The files behind these paths are read by this process — the token at every mint,
+the key pair and the anchor at every handshake, the two admission sets at every
+handshake and dial — so the SDK's value accessors are the wrong tool for any of
+it: a file-carried configuration value is read once and kept for the life of the
+process, which is right for a configuration value and wrong for anything the
+platform changes underneath one.
 
 The three `module-authority` values are read through the SDK's authority reader
 and **frozen**: the credential this process holds is sealed to the values it was
@@ -209,7 +220,23 @@ anchor is a boot refusal naming the value; an unusable one fails the handshake
 rather than falling back, because judging callers by a stale anchor lets in who
 should be refused, which is not symmetric with serving a stale leaf. Peer trust
 is re-read **per handshake**, so removing a compromised root from the bundle
-stops it authenticating callers without a restart.
+stops it authenticating new callers without a restart.
+
+And every **established** connection is re-verified too, once a second, in both
+directions — the caller's chain against the current anchor and the current
+admitted set, the platform's against the same. Re-reading trust per handshake
+bounds nothing about a connection that has already handshaken: a caller removed
+from the admitted set, or whose issuing root was pulled, kept the keep-alive
+connection it already held and kept being served on it, and so did an outbound
+connection carrying a request every 100ms. An idle timeout cannot bound a
+connection that is never idle. A connection whose peer stops verifying is closed
+— busy or idle, request or stream — and nothing else closes it: a failure to
+re-read *this* workload's own key pair is not a judgement about the peer and
+leaves established connections alone. The listener also sets a handshake and
+header deadline and an idle timeout, so a peer that connects and then stalls
+mid-`ClientHello` no longer holds a goroutine and a descriptor indefinitely;
+neither bounds a whole request, because a declared long-running stream is
+conforming traffic.
 
 **No credential-bearing request follows a redirect, and none leaves the
 gateway's own origin.** Go copies a request's headers onto a redirected one and
@@ -539,9 +566,11 @@ credential's expiry dictates. A credential that cannot currently be obtained is
 503 and nothing ends; a refusal is 503 **and** ends the process.
 
 So `/health` answers 200 while this process can do its job, and **503 once the
-issuer has refused this execution's credential for good** — `ErrMintRefused` or
-`ErrRevoked` at renewal, which are judgements about this execution that no retry
-changes. The process then stops serving and returns that reason, for the
+issuer has refused this execution's credential for good** — `ErrMintRefused` at
+renewal, which is a judgement about this execution that no retry changes.
+(`ErrRevoked` is not one of these: it never comes back from the mint, only from
+a callee rejecting a capability this runtime minted for a viewer, which is a 409
+on that request.) The process then stops serving and returns that reason, for the
 orchestrator to restart it against the delivery as it stands. An unconditional
 200 was wrong in exactly the case the probe exists for: the boot already treats a
 refusal as terminal, while at renewal the same judgement reached a page as
@@ -890,10 +919,18 @@ over plaintext and answered 200, with the viewer's bearer and this workload's
 own credential on the wire. Supplying a credential source, which a deployment
 does, defeated the "no source, nothing to mint with" mitigation. It is reached
 through `internal/seam` now, which Go's internal-package rule keeps inside this
-module: `passthroughtest` can call it and nothing a solution imports can. The
-fake host is still plaintext and still has no contract, and those are now
-properties of this module's own tests rather than of an API. A consumer that
-called `PassthroughHandler` directly uses `passthroughtest.Handler` instead.
+module. The fake host is still plaintext and still has no contract, and those
+are now properties of this module's own tests rather than of an API. A consumer
+that called `PassthroughHandler` directly uses `passthroughtest.Handler`
+instead.
+
+`passthroughtest` itself is importable by any module, so its own constructors
+**panic outside a test binary** (`testing.Testing()`). Taking a `testing.TB` is
+not the gate it resembles: `testing.TB`'s unexported method stops a type
+*declaring* the interface, not a type that embeds it, so a few lines of
+production code satisfy it. `testing.Testing()` is wrong for the root package —
+where the legitimate caller is production code — and exactly right here, where
+every legitimate caller is a test.
 
 ### Generated messages in a response
 

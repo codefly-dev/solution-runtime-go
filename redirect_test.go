@@ -282,7 +282,7 @@ func TestOutboundTrustIsReReadPerConnection(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeers: testGatewayPrincipal}
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {

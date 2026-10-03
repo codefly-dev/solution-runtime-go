@@ -395,10 +395,10 @@ func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, key
 	// as the caller. Holding a certificate from the cell's anchor is not the
 	// same as being a caller this solution serves, so the admitted set is
 	// provisioned rather than derived from the anchor.
-	t.Setenv(IdentityAllowedCallersEnvironmentVariable, testGatewayPrincipal)
+	t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
 	// And whom this runtime may present credentials to: the same identity, for
 	// the mirror-image reason. The fake host serves under it.
-	t.Setenv(IdentityPlatformPeersEnvironmentVariable, testGatewayPrincipal)
+	t.Setenv(IdentityPlatformPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
 	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
 	// A test that serves assets provisions the directory before booting, since
 	// a boot's configuration is read by the serving goroutine and must not be
