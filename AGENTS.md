@@ -116,6 +116,15 @@ embedding it.
   are sealed with is the same capability as encoding them — and
   `SetSessionTicketKeys` is the one hole a check cannot close, because it is a
   method and the keys it installs cannot be read back off the configuration.
+- **This listener does not resume TLS sessions, and that is a control rather
+  than a check.** A resumed connection presents no certificate, so anything
+  able to forge a ticket is admitted as whoever it was issued to — demonstrated
+  end to end with a source-supplied ticket key, against a listener whose
+  posture checks all passed. A denylist cannot close it (`SetSessionTicketKeys`
+  installs keys that cannot be read back), so `SessionTicketsDisabled` is set on
+  the served configuration and on every per-connection clone. Where a property
+  cannot be verified on a value a consumer hands over, take it rather than
+  inspect it.
 - **A source's anchor is asked for, never fabricated.** A consumer source that
   resolves its anchor per handshake implements `PeerAnchorSource`; one that can
   only answer through a `GetConfigForClient` call is refused at boot, because
@@ -162,6 +171,12 @@ embedding it.
   holds a certificate from the same anchor, the consumed modules included, so
   the admitted caller set is provisioned
   (`workload-identity`/`ALLOWED_CALLERS_FILE`) and refused at boot when absent.
+  Outbound there is **one set per destination** (`MINT_PEERS_FILE`,
+  `GATEWAY_PEERS_FILE`): the mint and the gateway are two parties, and a single
+  set spanning both authorises each to stand in for the other at the other's
+  address — the mint being the one that receives the projected token. A dial to
+  a third address has no set and is refused, because this runtime talks to
+  exactly two destinations.
   An admission set answered by **both** the env override and the platform's
   provisioning is refused rather than ranked — two sources for one
   authorization fact, which is the stance the SDK already takes on a value
@@ -296,7 +311,7 @@ test -z "$(gofmt -l .)"
 Go comes from `go.mod` (1.27). Nothing else is needed: no Docker, no
 credentials, no running composition.
 
-- The suite is fast (a few seconds) and hermetic: the host's mint, its gateway
+- The suite takes about a minute under `-race` and is hermetic: the host's mint, its gateway
   and accounts are all `httptest` servers on `127.0.0.1`, the workload identity
   is a key pair the test generates into a temp directory, and a stand-in
   capability is minted by **core's** authority from core's published fixture

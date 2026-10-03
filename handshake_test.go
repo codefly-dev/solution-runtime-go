@@ -729,18 +729,49 @@ func TestABusyConnectionDoesNotOutliveTheTrustThatAuthenticatedIt(t *testing.T) 
 	}
 }
 
-// staysUsable keeps one connection busy for d and fails if a request stops
-// succeeding. It is the survive-control for every recheck test here.
+// staysUsable keeps ONE connection busy for d and fails if a request stops
+// succeeding — or if the connection underneath is replaced.
+//
+// Counting connections is the half that was missing, and without it the control
+// proves much less than it looks: net/http re-dials transparently, so a recheck
+// that closed every connection once a second kept every request succeeding and
+// satisfied this. The defect would have been invisible in exactly the test
+// written to rule it out.
 func staysUsable(t *testing.T, client *http.Client, url string, d time.Duration) {
 	t.Helper()
+	// Any connection dialled after the first request is a replacement.
+	//
+	// Counting non-reused dials outright is not enough: the caller may already
+	// hold a connection, so the first request contributes nothing, and a
+	// recheck closing it once would then look like the single dial a fresh
+	// client makes. Replacements are counted from after the first observation,
+	// which is the only way to tell "nothing changed" from "it was replaced".
+	var seen, replaced atomic.Int64
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if seen.Add(1) > 1 && !info.Reused {
+				replaced.Add(1)
+			}
+		},
+	}
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(url)
+		request, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(request)
 		if err != nil {
 			t.Fatalf("a request failed while trust was intact, so nothing this test goes on to assert is about trust being withdrawn: %v", err)
 		}
 		_ = resp.Body.Close()
 		time.Sleep(outboundTrustRecheckInterval / 20)
+	}
+	if got := replaced.Load(); got > 0 {
+		t.Fatalf("the connection was replaced %d times over %s while trust was intact: it is being closed and re-dialled underneath, which keeps every request succeeding and makes the recheck's own behaviour invisible", got, d)
+	}
+	if seen.Load() < 2 {
+		t.Fatalf("only %d requests were observed over %s, which is too few for the replacement check to mean anything", seen.Load(), d)
 	}
 }
 
@@ -1199,27 +1230,49 @@ func TestAnEstablishedCallerDoesNotOutliveTheTrustThatAdmittedIt(t *testing.T) {
 	}
 }
 
-// TestTheListenerBoundsAStalledPeer: with no timeouts at all, a peer that
-// completes a TCP connect and then says nothing holds a goroutine and a
-// descriptor indefinitely, and each ClientHello costs a read of the trust
-// bundle — the cheap half of which is the peer's.
+// TestTheListenerBoundsAStalledPeer drives the stall through the production
+// server, because the constants are not the thing under test.
+//
+// The previous version asserted the constants and then built an http.Server of
+// its own with them set, so removing ReadHeaderTimeout from serve() — the only
+// place that wires them — left it passing. A test that configures the thing it
+// is checking is checking its own literals.
 func TestTheListenerBoundsAStalledPeer(t *testing.T) {
-	if inboundHandshakeTimeout <= 0 {
-		t.Fatal("the listener sets no handshake or header deadline, so a peer that stalls mid-ClientHello is bounded by nothing")
-	}
-	if inboundIdleTimeout <= 0 {
-		t.Fatal("the listener sets no idle timeout, so a keep-alive connection nobody uses is never dropped")
-	}
-	// And neither of the two that would cut a conforming long-running stream.
-	// A declared stream may run to MaxStreamDurationLimit, so bounding the
-	// whole body would refuse conforming traffic to answer a question the
-	// recheck already answers without refusing any.
-	srv := &http.Server{ReadHeaderTimeout: inboundHandshakeTimeout, IdleTimeout: inboundIdleTimeout}
-	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 {
-		t.Error("the listener bounds the whole request or response, which cuts a declared long-running stream that is conforming")
-	}
+	// Neither of the two that would cut a conforming long-running stream. A
+	// declared stream may run to MaxStreamDurationLimit, so bounding the whole
+	// body would refuse conforming traffic to answer a question the recheck
+	// answers without refusing any.
 	if inboundHandshakeTimeout >= MaxStreamDurationLimit {
-		t.Errorf("the handshake deadline %s is not shorter than the longest declared stream %s, so it is not bounding anything", inboundHandshakeTimeout, MaxStreamDurationLimit)
+		t.Fatalf("the handshake deadline %s is not shorter than the longest declared stream %s, so it is not bounding anything", inboundHandshakeTimeout, MaxStreamDurationLimit)
+	}
+
+	mint := newHostMint(t, &hostMint{})
+	solution := boot(t, New(Manifest{ID: testSolutionID}), mint)
+
+	// A peer that completes the TCP connect and then sends half a ClientHello
+	// and nothing else. It presents no certificate and never will.
+	raw, err := net.Dial("tcp", strings.TrimPrefix(solution.base, "https://"))
+	if err != nil {
+		t.Fatalf("connect to the booted listener: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	// A TLS record header claiming a handshake, then silence.
+	if _, err := raw.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x40}); err != nil {
+		t.Fatalf("write a partial ClientHello: %v", err)
+	}
+
+	// The server has to end it. Without a deadline it holds the goroutine and
+	// the descriptor for as long as the peer likes, and every hello costs a
+	// read of the trust bundle.
+	_ = raw.SetReadDeadline(time.Now().Add(inboundHandshakeTimeout + 5*time.Second))
+	var buf [1]byte
+	_, err = raw.Read(buf[:])
+	if err == nil {
+		t.Fatal("the listener answered a peer that sent half a ClientHello")
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("a peer that stalled mid-ClientHello was still connected after %s: with no handshake or header deadline on the booted server it holds a goroutine and a file descriptor for as long as it likes, and each attempt costs a read of the trust bundle",
+			inboundHandshakeTimeout)
 	}
 }
 
@@ -1770,4 +1823,112 @@ func TestEachDestinationHasItsOwnAuthorizationSet(t *testing.T) {
 			t.Errorf("the refusal %q does not say the address has no set, so it may be refusing for some other reason", err)
 		}
 	})
+}
+
+// TestOneReaderDoesNotFallBackToItsLastGoodAnswer: the admission reader must
+// refuse an unusable file even after it has successfully read a usable one.
+//
+// Every case in TestAnAdmissionSetIsNeitherCachedNorDefaulted builds a fresh
+// reader, so no good read ever precedes the bad one — and a reader that cached
+// its last good answer and served it whenever a later read failed passed all of
+// them. That fallback is precisely the staleness this whole mechanism exists to
+// remove: an admission set that cannot be re-read has no safe direction,
+// because the set on disk may be narrower than the one in memory.
+func TestOneReaderDoesNotFallBackToItsLastGoodAnswer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identities")
+	writeFile(t, path, testGatewayPrincipal+"\n")
+	admits := resolvedIdentities(path, "unresolved")
+
+	// A good read first, so a cache would have something to fall back to.
+	got, err := admits()
+	if err != nil {
+		t.Fatalf("a usable set was refused: %v", err)
+	}
+	if len(got) != 1 || got[0] != testGatewayPrincipal {
+		t.Fatalf("resolved %v, want %q", got, testGatewayPrincipal)
+	}
+
+	for _, tc := range []struct {
+		name string
+		then func(t *testing.T)
+	}{
+		{"the file is emptied", func(t *testing.T) { writeFile(t, path, "\n") }},
+		{"the file is removed", func(t *testing.T) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"the file is replaced by a directory", func(t *testing.T) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Restored for each case, so each one is a good read followed by
+			// this bad one on the *same* reader.
+			_ = os.RemoveAll(path)
+			writeFile(t, path, testGatewayPrincipal+"\n")
+			if _, err := admits(); err != nil {
+				t.Fatalf("the restored set was refused: %v", err)
+			}
+			tc.then(t)
+			if got, err := admits(); err == nil {
+				t.Errorf("the reader resolved %v after a good read followed by an unusable file: it is serving a remembered answer, which is the staleness this mechanism exists to remove", got)
+			}
+		})
+	}
+}
+
+// TestAFreshDialFollowsTheProvisionedPeerSet is the per-dial half, and the one
+// an established connection hides.
+//
+// TestAnEstablishedConnectionFollowsTheProvisionedPeerSet keeps a connection
+// busy, so the recheck can carry it: a runtime that snapshotted the set when
+// the client was built but still rechecked established connections passed it.
+// This makes a genuinely new dial after the set changes, with nothing
+// established to recheck.
+func TestAFreshDialFollowsTheProvisionedPeerSet(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	host := newPlatformHost(t, c, testGatewayPrincipal)
+	provisioned := identitiesFile(t, testGatewayPrincipal)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		mintPeersFile:    provisioned,
+		gatewayPeersFile: provisioned,
+		mintURL:          host.URL + credentialMintPath}
+	server.principal = testPrincipal
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
+	}
+
+	resp, err := client.Get(host.URL + credentialMintPath)
+	if err != nil {
+		t.Fatalf("the provisioned destination was refused: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// The destination is removed, and every connection to it is dropped, so
+	// the next request must dial afresh and the recheck has nothing to carry.
+	writeFile(t, provisioned, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
+	transport.CloseIdleConnections()
+
+	resp, err = client.Get(host.URL + credentialMintPath)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("a fresh dial was made to a destination removed from the provisioned set: the set has to be read per dial, not captured when the client was built")
+	}
+	if !strings.Contains(err.Error(), testGatewayPrincipal) {
+		t.Errorf("the refusal %q does not name the identity that answered", err)
+	}
 }

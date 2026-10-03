@@ -98,14 +98,15 @@ the SDK-resolved value is the default.
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
 | Allowed callers | `workload-identity`/`ALLOWED_CALLERS_FILE` — **required**, a **path** to a file of identities, one per line (normally the gateway's); re-read per handshake. Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE` |
-| Platform peers | `workload-identity`/`PLATFORM_PEERS_FILE` — **required**, a **path** to a file of identities (the gateway's, the mint's); re-read per dial and per connection check. The mirror of `ALLOWED_CALLERS_FILE`: chain and hostname say a destination holds a certificate this cell issued, which every workload does, so the destinations this runtime presents credentials to are provisioned too | `CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS_FILE` |
+| Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per dial and per connection check | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
+| Gateway peer | `workload-identity`/`GATEWAY_PEERS_FILE` — **required**, same shape. One set **per destination**: the mint and the gateway are two parties, and a single set spanning both authorises each to stand in for the other at the other's address — and the mint is the destination that receives the projected service-account token. A dial to an address that is neither has no set and is refused | `CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 
-Every `workload-identity` value is a **path, never material**, the two
+Every `workload-identity` value is a **path, never material**, the three
 admission sets included — and that is what makes them live. They are admission
 decisions, and an admission decision read once at boot cannot narrow: removing a
 compromised identity from either file takes effect on the next handshake, the
@@ -272,6 +273,35 @@ without resolving it, and for admission the cost of picking wrong is admitting a
 caller. The other `workload-identity` paths still take the override first: the
 worst case there is this process reading its own material from elsewhere.
 
+**This listener does not resume TLS sessions.** A resumed connection presents
+**no certificate** — the peer is accepted on a ticket — and this listener's
+whole model is that a caller's certificate names them and the provisioned set
+decides whether that name may call. So anything able to forge a ticket is able
+to be admitted as whoever it was issued to. A review demonstrated it: with a
+source-supplied ticket key, a client holding only that key and an admitted
+caller's ticket resumed as that caller, presenting nothing, and the per-second
+recheck then re-verified the stolen certificate and kept the connection open.
+A denylist could not close that, because `SetSessionTicketKeys` installs keys
+that cannot be read back off the configuration — so resumption is turned off on
+the configuration served and on every per-connection answer. It costs one round
+trip on a reconnect.
+
+**An admission entry must be a whole line.** The file is read per handshake and
+per dial, so it is read while the platform may be rewriting it: a file caught
+mid-write truncated an entry, and the truncation was admitted as an identity of
+its own (`…/sa/gateway-internal` read as `…/sa/gateway`, admitting a caller the
+set never named). A file that does not end in a newline is refused, every entry
+must be a SPIFFE ID, control characters and a byte-order mark are refused, and
+the file is capped at 64 KiB because it is re-read once a second per established
+connection in each direction.
+
+**A credential-bearing URL carries a destination and nothing else.** Userinfo, a
+query and a fragment are refused at boot on both the gateway and the mint:
+credentials in a URL are a secret that gets logged and, for userinfo, that
+net/http strips before the request is sent, so it is disclosed and never used.
+Both URLs are logged through `url.Redacted()` with the query dropped regardless,
+because a log line is the wrong place to depend on a check that runs elsewhere.
+
 **No credential-bearing request follows a redirect, and none leaves the
 gateway's own origin.** Go copies a request's headers onto a redirected one and
 strips only `Authorization`, `WWW-Authenticate` and `Cookie`; a 307 re-sends the
@@ -291,7 +321,7 @@ service-account token, the viewer's bearer and this workload's own credential, s
 a root removed because it was compromised must stop authenticating them without a
 restart. Each dial builds its own configuration — and each
 established connection re-verifies the peer it already has, once a second,
-against the current anchor and the current `PLATFORM_PEERS_FILE` set, closing it when
+against the current anchor and the current the destination's own provisioned set, closing it when
 that stops holding.
 
 The recheck is there because the idle cap it replaces was not a bound. An
@@ -310,7 +340,7 @@ chain and the hostname says the cell issued a certificate for the address this
 runtime dialled, which every workload in the cell holds one of — a neighbouring
 workload answering at the gateway's address under a valid certificate was handed
 the projected token, the viewer's bearer and this workload's credential. So the
-peer's own SPIFFE ID must be in `PLATFORM_PEERS_FILE`. The outbound leaf is held to
+peer's own SPIFFE ID must be in that destination's provisioned set. The outbound leaf is held to
 the frozen principal too, at the moment it is presented, which matters because
 on the default path it comes from a second reloader over the same files as the
 listener's.

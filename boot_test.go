@@ -387,8 +387,8 @@ func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, key
 
 	t.Setenv("PORT", freePort(t))
 	t.Setenv("GATEWAY_URL", mint.URL)
-	// At the path the runtime derives from a resolved gateway, so a test sees
-	// the same URL shape a deployment does.
+	// Set explicitly, as a deployment must: nothing derives a mint address
+	// from the resolved gateway, because the projected token goes there.
 	t.Setenv(CredentialMintURLEnvironmentVariable, mint.URL+credentialMintPath)
 	t.Setenv(ProjectedTokenFileEnvironmentVariable, tokenFile)
 	t.Setenv(IdentityCertFileEnvironmentVariable, certFile)
