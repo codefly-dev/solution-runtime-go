@@ -2,6 +2,7 @@ package solution
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -243,5 +244,79 @@ func TestASameOriginRedirectIsNotFollowedEither(t *testing.T) {
 	}
 	if len(hops.paths) != 1 {
 		t.Errorf("the mint made %d requests (%v), want exactly 1: the 307 must end the exchange", len(hops.paths), hops.paths)
+	}
+}
+
+// TestOutboundTrustIsReReadPerConnection is the finding that went unanswered
+// through two review rounds, and the argument against it was one I had already
+// written down for the other direction.
+//
+// Inbound, peer trust is re-read per handshake so that removing a compromised
+// root takes effect without a restart, on the stated grounds that judging by a
+// stale anchor admits whoever should be refused — which is not symmetric with
+// serving a stale leaf. Outbound the anchor was read once, into the client's
+// RootCAs at boot. It applies with more force there, not less: the two
+// destinations on the other side of that client are the mint and the gateway,
+// and they receive the projected service-account token, the viewer's bearer and
+// this workload's own credential. A root removed because it was compromised
+// kept authenticating exactly the parties that are handed everything.
+//
+// The test replaces the bundle's contents with an unrelated anchor and asserts
+// the next connection fails to verify the platform — no restart, no new client.
+func TestOutboundTrustIsReReadPerConnection(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	// A platform endpoint served under the cell's anchor, requiring the
+	// caller's certificate, which is what the real mint does.
+	host := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "yes"})
+	}))
+	host.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{*c.identity(t, testGatewayPrincipal)},
+		ClientCAs:    c.roots,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+	host.StartTLS()
+	t.Cleanup(host.Close)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
+	server.principal = testPrincipal
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+
+	// Control: the platform is reachable while its root is in the bundle.
+	resp, err := client.Get(host.URL + "/platform/_credential")
+	if err != nil {
+		t.Fatalf("the platform was not reachable with its own root in the bundle: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// The root is removed and replaced by an unrelated one — the shape of a
+	// revocation: the bundle still parses, and no longer contains the issuer of
+	// the certificate the platform presents.
+	unrelated, _, _ := issueAnchor(t)
+	writeFile(t, bundleFile, string(unrelated))
+
+	// Idle connections would otherwise answer from the pool without a
+	// handshake, which is why per-dial reloading is only half the fix.
+	client.CloseIdleConnections()
+
+	if resp, err := client.Get(host.URL + "/platform/_credential"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("the platform still authenticated after its root was removed from the bundle: outbound trust was snapshotted at boot, so revoking a root would need a restart — and this client carries the projected token, the viewer's bearer and this workload's credential")
+	}
+
+	// And the bound exists, so a connection cannot outlive the reload
+	// indefinitely even without CloseIdleConnections.
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("outbound transport is %T", client.Transport)
+	}
+	if transport.IdleConnTimeout == 0 || transport.IdleConnTimeout > outboundTrustReloadBound {
+		t.Errorf("idle connections live for %s: per-dial reloading bounds nothing without a bound on reuse", transport.IdleConnTimeout)
 	}
 }

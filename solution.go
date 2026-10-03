@@ -687,7 +687,7 @@ func (c config) validate() error {
 		// looking at provisioning. An unlabelled default is the one thing this
 		// repository's rules single out, and the label belongs where it is
 		// acted on, not only in a PR description.
-		log.Printf("codefly: STOPGAP — this execution's credential will be minted at %q, derived from the resolved gateway and the path %q that this runtime assumes rather than one the host published or the SDK resolved. Set %s for a host whose mint is elsewhere, and treat a 404 here as the path being wrong rather than this build being refused.",
+		log.Printf("codefly: this execution's credential will be minted at %q, derived from the resolved gateway and the path %q. The path is the host's published contract but is NOT DEPLOYED yet, so a 404 here means the endpoint does not exist on this host — not that the path is wrong and not that this build was refused. Set %s for a host whose mint is elsewhere.",
 			c.mintURL, credentialMintPath, CredentialMintURLEnvironmentVariable)
 	}
 	return nil
@@ -957,14 +957,51 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 // 200 then invites the host to keep routing to a binding that answers 503 to
 // everything, and the probe is the only channel this runtime has to say
 // otherwise — it does not push liveness, so it has to answer honestly.
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := s.terminalErr.Load(); err != nil {
 		// Named, not detailed: a probe is not a place to put the issuer's text.
 		http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
 		return
 	}
+	// The probe asks the credential, rather than only reporting a refusal some
+	// *other* request happened to discover.
+	//
+	// Renewal is lazy by design — the client renews when a caller asks for the
+	// credential — so a solution that serves only ViewerBearer routes, plain
+	// handlers and assets never asks, and therefore never learns that the
+	// issuer has stopped approving this build. It would keep answering 200 and
+	// keep serving, with the refusal arriving only if some request eventually
+	// needed a capability. That is the same "serves nothing, looks alive" shape
+	// one layer out, and the probe is the one channel this runtime has.
+	//
+	// Asking is cheap and is not a heartbeat: the client holds one credential
+	// and hands the same one back until its renewal point, so this is a
+	// mutex and a comparison except at the renewal the credential's own expiry
+	// dictates. Nothing here runs on a timer this runtime chose.
+	if s.credential != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), healthCredentialTimeout)
+		defer cancel()
+		if _, err := s.credential.Credential(ctx); err != nil {
+			if terminalCredentialFailure(err) {
+				// Records it, which also ends the process: a refused build is
+				// not something to re-discover on the next probe.
+				s.credentialRefused(err)
+				http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
+				return
+			}
+			// Transient: the issuer cannot answer right now. Still unhealthy —
+			// this process cannot act for a viewer until it can — but it is not
+			// a judgement, so nothing ends.
+			http.Error(w, "this execution's credential cannot currently be obtained", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 }
+
+// healthCredentialTimeout bounds what a probe will wait for the credential, so
+// a hung issuer makes the probe fail rather than parking it.
+const healthCredentialTimeout = 2 * time.Second
 
 // credentialRefused records a judgement the issuer will not reverse.
 func (s *Server) credentialRefused(err error) {
@@ -1422,36 +1459,103 @@ func newPlatformTransport() *http.Transport {
 // that prove who this workload is, and the theft would look like an ordinary
 // successful request.
 func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error) {
-	var config *tls.Config
-	if s.identity == nil {
-		// The projected pair, through the SDK's reloader, which is what keeps a
-		// rotated leaf presented outbound as well as inbound.
+	// A fresh configuration per connection, so the anchor this runtime judges
+	// the platform by is re-read rather than snapshotted at boot.
+	//
+	// This was the review finding that went unanswered through two rounds, and
+	// the argument against it is one I had already written down for the inbound
+	// direction: judging by a stale anchor admits whoever should be refused,
+	// which is not symmetric with serving a stale leaf. It applies outbound
+	// with more force, not less. The two destinations on the other side of this
+	// client are the mint and the gateway — they receive the projected
+	// service-account token, the viewer's bearer and this workload's own
+	// credential — so a root removed from the bundle because it was compromised
+	// kept authenticating exactly the parties that are handed everything.
+	//
+	// Reloading per connection is the whole story only if connections do not
+	// outlive the reload, so idle reuse is bounded too (see below): a removed
+	// root takes effect on the next dial, and there is always a next dial
+	// inside that bound.
+	newConfig := func() (*tls.Config, error) {
+		if s.identity != nil {
+			// A consumer's source: the identity it returned, in both
+			// directions, rather than projected files it never said it uses.
+			// Re-derived here so a source that rotates its anchor is followed.
+			config, err := clientTLSFrom(identityConfig)
+			if err != nil {
+				return nil, fmt.Errorf("configure this workload's outbound identity from the supplied identity source: %w", err)
+			}
+			return config, nil
+		}
 		anchor, err := peerAnchor(s.cfg.trustBundleFile)
 		if err != nil {
 			return nil, fmt.Errorf("configure this workload's outbound trust: %w", err)
 		}
-		config, err = codefly.ClientTLSConfig(s.cfg.identityCertFile, s.cfg.identityKeyFile, anchor)
+		// The projected pair, through the SDK's reloader, which is what keeps a
+		// rotated leaf presented outbound as well as inbound.
+		config, err := codefly.ClientTLSConfig(s.cfg.identityCertFile, s.cfg.identityKeyFile, anchor)
 		if err != nil {
 			return nil, fmt.Errorf("configure this workload's outbound identity from %q/%q: %w — the same pair the listener presents is what names this workload to the platform it calls",
 				s.cfg.identityCertFile, s.cfg.identityKeyFile, err)
 		}
-	} else {
-		// A consumer's source: the identity it returned, in both directions,
-		// rather than projected files it never said it uses.
-		derived, err := clientTLSFrom(identityConfig)
-		if err != nil {
-			return nil, fmt.Errorf("configure this workload's outbound identity from the supplied identity source: %w", err)
+		// And held to the frozen principal, which the default path never was:
+		// the listener's leaf is checked, but this is a *second* reloader over
+		// the same files, so a pair that rotated to another workload's identity
+		// was presented to the host by the client while the listener refused
+		// it. One of the two checks running is not the check.
+		if err := clientPresentsThisWorkload(config, s.principal); err != nil {
+			return nil, err
 		}
-		config = derived
+		return config, nil
 	}
+	// Refused at boot rather than at the first dial: a configuration this
+	// runtime cannot build is a boot failure, not a mint that fails later.
+	if _, err := newConfig(); err != nil {
+		return nil, err
+	}
+
 	transport := newPlatformTransport()
-	transport.TLSClientConfig = config
+	// No TLSClientConfig: every connection builds its own below, and leaving a
+	// snapshot here would be the bug this function exists to avoid.
+	transport.TLSClientConfig = nil
+	transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		config, err := newConfig()
+		if err != nil {
+			return nil, err
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		config = config.Clone()
+		config.ServerName = host
+		raw, err := (&net.Dialer{Timeout: platformRequestTimeout}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		conn := tls.Client(raw, config)
+		if err := conn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+	// A connection that lives forever never re-dials, so per-dial reloading
+	// would bound nothing. This is the staleness window for outbound trust,
+	// stated as a number rather than left to the pool's defaults.
+	transport.IdleConnTimeout = outboundTrustReloadBound
 	return &http.Client{
 		Timeout:       platformRequestTimeout,
 		Transport:     transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}, nil
 }
+
+// outboundTrustReloadBound is how long an established platform connection may
+// be reused, and therefore the longest a removed trust root can still be the
+// basis of an outbound connection. Peer trust is re-read on every dial; this is
+// what guarantees there is another dial.
+const outboundTrustReloadBound = 30 * time.Second
 
 // platformRequestTimeout bounds one request this runtime makes on its own
 // behalf, end to end, so a host that accepts a request and never answers
@@ -1662,7 +1766,35 @@ func (g *Gateway) withinPublishedCeiling(audience string, scopes []Scope) error 
 	if g.ceilings == nil {
 		return nil
 	}
+	// An ask for nothing is refused rather than waved through.
+	//
+	// Both shapes reached the mint: ForModule with no scopes at all, and a
+	// Scope naming a kind with no actions. The loop below simply had nothing to
+	// check in either case, so the ceiling was satisfied by construction — and
+	// what accounts does with an empty authorityScopes is its decision, not a
+	// decision this runtime gets to leave to it. A capability minted for "no
+	// stated authority" is either useless or the issuer's defaults, and
+	// neither is a thing a reviewer approved in this contract.
+	if len(scopes) == 0 {
+		return fmt.Errorf("this solution asked %q for a capability with no scopes at all: name the authority the call needs, since a mint for nothing is either useless or whatever the issuer decides to grant, and the published ceiling cannot govern either: %w",
+			audience, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution asked for a capability with no stated authority"})
+	}
+	for _, scope := range scopes {
+		if len(scope.Actions) == 0 {
+			return fmt.Errorf("this solution asked %q for resource kind %q with no actions: an action-less scope states no authority and is inside every ceiling by construction: %w",
+				audience, scope.ResourceKind, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution asked for a scope with no actions"})
+		}
+	}
 	ceiling, declared := g.ceilings[audience]
+	// A declared audience with an empty ceiling is a module this solution
+	// publishes as minting nothing — a ViewerBearer binding carries a nil
+	// ceiling and still sat in this map, so ForModule minted real authority for
+	// the one kind of module the contract says mints none. The contract and the
+	// mint disagreeing is the whole defect class this check exists for.
+	if declared && len(ceiling) == 0 {
+		return fmt.Errorf("this solution asked %q for authority, and its published contract declares that module with no ceiling at all — it is called with the viewer's bearer and mints nothing, so there is no authority to ask for: %w",
+			audience, &ClientError{StatusCode: http.StatusForbidden, Message: "that module is called with the viewer's bearer and holds no minted authority"})
+	}
 	if !declared {
 		return fmt.Errorf("this solution asked %q for authority, and its published contract names no binding for that audience: declare it — the contract is what the host derives this solution's authority from, so an audience missing from it is authority nobody approved: %w",
 			audience, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution holds no binding for that module"})

@@ -293,10 +293,6 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // own — the handler maps it to a 503 through relayedError, since the condition
 // is this process's and one renewal fixes it — and no capability is minted
 // under an attribution nobody can check.
-func attestWorkload(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string) error {
-	return attestWorkloadReporting(ctx, source, report, request, id, nil)
-}
-
 // attestWorkloadReporting is attestWorkload with somewhere to report a
 // *terminal* failure, which is the half the first round got wrong.
 //
@@ -317,13 +313,12 @@ func attestWorkload(ctx context.Context, source CredentialSource, report *attest
 // orchestrator restarts it against the delivery as it now stands — which is
 // where a build the host no longer approves gets resolved, and it is not here.
 func attestWorkloadReporting(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string, terminal func(error)) error {
-	if source == nil && terminal == nil {
-		return fmt.Errorf("%w: this solution holds no credential source, so it cannot attest which module is asking", ErrNotAttested)
-	}
 	if source == nil {
 		// No source at all is a programming error on a path that mints: every
 		// boot opens one, and a consumer that supplied its own supplied a
 		// source. Refused rather than treated as "nothing to attest with".
+		// (There were two of these branches, identical, one guarded by a
+		// condition that made the second unreachable.)
 		return fmt.Errorf("%w: this solution holds no credential source, so it cannot attest which module is asking", ErrNotAttested)
 	}
 	credential, err := source.Credential(ctx)
@@ -392,16 +387,26 @@ func (r *attestationReport) recovered(id string) {
 // terminalCredentialFailure reports whether the issuer's answer is a judgement
 // no retry can change.
 //
-// ErrMintRefused is the host saying this build is not the one its presence
-// document approved. ErrRevoked is live state having moved under a credential
-// that was sound when it was minted — an installation revision, a principal's
-// epoch, a build incarnation. Both are decisions about *this* execution, and
-// the only thing that resolves either is a new delivery and a new process.
+// ErrMintRefused only, and the correction is worth recording because the
+// previous revision got it from the wrong direction. It also treated ErrRevoked
+// as terminal here, on the reasoning that live state moving under a sound
+// credential is as final as a refused build. Two things are wrong with that:
+// the mint client does not return ErrRevoked at all (it comes back from a
+// *callee* that was shown a capability sealed to state that has moved), and the
+// SDK's own contract for it is a refresh and one retry — so treating it as
+// terminal would have ended the process on a condition the client is built to
+// recover from, if the path had ever been reachable. It was not, which is why
+// no test noticed; a dead branch that would do the wrong thing if it ever woke
+// up is worse than no branch.
+//
+// A callee's ErrRevoked is handled where it actually arrives: the far end
+// answers 409 with the installation headers, and the capability is dropped from
+// the cache so the next call mints (see supersededCapability).
 //
 // Everything else, ErrMintUnavailable above all, is transient by construction
 // and must not end the process: an issuer that cannot reach its own policy log
 // is an issuer behaving correctly, and exiting on it would turn a dependency
 // blip into a crash loop.
 func terminalCredentialFailure(err error) bool {
-	return errors.Is(err, workcontext.ErrMintRefused) || errors.Is(err, workcontext.ErrRevoked)
+	return errors.Is(err, workcontext.ErrMintRefused)
 }

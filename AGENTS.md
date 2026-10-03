@@ -99,6 +99,14 @@ on `Server.PassthroughHandler`, the handler `Serve` mounts.
   Location: http://…` the viewer's bearer, their capability and this workload's
   credential in cleartext. Build clients through `Gateway.platformClient`, which
   carries `ErrUseLastResponse`, and leave the transport's origin pin in place.
+- **Peer trust is re-read per connection in BOTH directions.** Inbound, per
+  handshake through `GetConfigForClient`; outbound, per dial through
+  `DialTLSContext` with idle reuse capped, because a pooled connection that
+  never re-dials makes per-dial reloading meaningless. The outbound half went
+  unanswered through two review rounds while the inbound argument — judging by
+  a stale anchor admits whoever should be refused — was already written down
+  here. It applies harder outbound: those destinations receive the projected
+  token, the viewer's bearer and this workload's credential.
 - **Authentication is not authorisation.** Every workload in the trust domain
   holds a certificate from the same anchor, the consumed modules included, so
   the admitted caller set is provisioned

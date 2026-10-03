@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -117,5 +118,27 @@ func TestAHandlerPathCredentialFailureDisclosesNothing(t *testing.T) {
 				t.Error("the message says nothing at all: a page still needs to know whose problem it is")
 			}
 		})
+	}
+}
+
+// TestATransportFailureDoesNotNameTheDestination is the disclosure that got
+// past the sentinel mapping by a different route.
+//
+// *url.Error carries the URL it was dialling in Error(), so a mint or gateway
+// call that could not connect reached the browser as a 502 naming an internal
+// address — the same leak the credential sentinels were mapped to stop, arriving
+// through the untyped fallthrough and not matched by any of them.
+func TestATransportFailureDoesNotNameTheDestination(t *testing.T) {
+	const internal = "https://gateway.internal.svc.cluster.local:42152"
+	err := &url.Error{Op: "Post", URL: internal + "/platform/_credential", Err: errors.New("dial tcp 10.0.0.5:42152: connect: connection refused")}
+	status, message := handlerErrorResponse(fmt.Errorf("mint: %w", err))
+	if status != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", status)
+	}
+	if strings.Contains(message, "internal") || strings.Contains(message, "10.0.0.5") {
+		t.Errorf("the message handed to the browser names an internal destination:\n%s", message)
+	}
+	if message == "" {
+		t.Error("the message says nothing at all")
 	}
 }

@@ -3,7 +3,6 @@ package solution
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	corework "github.com/codefly-dev/core/workcontext"
@@ -411,7 +410,7 @@ func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
 // TestLoadConfigResolvesHostByRole proves the host gateway resolves by service
 // role alone, independent of the host module's workspace name: loadConfig
 // resolves it with no CODEFLY_HOST_MODULE override whether the host module is
-// the current saas (auth-gateway service), the pre-rename saas-starter
+// the current host module (auth-gateway service), a pre-rename one
 // (auth-sidecar), or any other name a solution composes it under (codefly-dev/core#382).
 func TestLoadConfigResolvesHostByRole(t *testing.T) {
 	const gatewayAddr = "https://gateway:42152"
@@ -421,7 +420,7 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 		gateway string
 	}{
 		{"a host module named saas", "SAAS", "AUTH_GATEWAY"},
-		{"a host module named saas-starter", "SAAS_STARTER", "AUTH_GATEWAY"},
+		{"a host module under a pre-rename name", "SAAS_STARTER", "AUTH_GATEWAY"},
 		{"any other name a solution composes it under", "SOME_OTHER_HOST", "AUTH_GATEWAY"},
 	}
 	for _, tc := range cases {
@@ -1101,6 +1100,7 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
+	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
 		t.Fatalf("outboundClient: %v", err)
@@ -1112,17 +1112,25 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	switch {
 	case transport.Proxy != nil:
 		t.Error("the outbound client carries a proxy")
-	case transport.TLSClientConfig == nil:
-		t.Fatal("the outbound client has no TLS configuration: it would verify the platform against the image's system roots")
-	case transport.TLSClientConfig.RootCAs == nil:
-		t.Error("the outbound client verifies the platform against no projected anchor")
-	case transport.TLSClientConfig.GetClientCertificate == nil:
-		t.Error("the outbound client presents no identity, so the platform cannot tell this workload from anything else that reached it")
-	case transport.TLSClientConfig.MinVersion != tls.VersionTLS13:
-		t.Errorf("the outbound client's floor is 0x%04x, want TLS 1.3", transport.TLSClientConfig.MinVersion)
+	case transport.DialTLSContext == nil:
+		t.Fatal("the outbound client has no per-connection dialler, so its trust is whatever was snapshotted at boot")
+	case transport.TLSClientConfig != nil:
+		t.Error("the outbound transport carries a snapshotted TLS configuration: peer trust must be built per connection, or a removed root keeps authenticating the platform")
+	case transport.IdleConnTimeout == 0 || transport.IdleConnTimeout > outboundTrustReloadBound:
+		t.Errorf("idle connections live for %s, so per-dial reloading bounds nothing: want at most %s", transport.IdleConnTimeout, outboundTrustReloadBound)
 	}
 	if client.CheckRedirect == nil {
 		t.Error("the outbound client follows redirects: net/http copies every header but three across hosts, so a Location would be handed this workload's credentials")
+	}
+	// A pair that rotated to another workload's identity must not be presented
+	// to the platform, which the default path never checked: the listener's
+	// leaf was held to the principal and this second reloader over the same
+	// files was not.
+	rival, rivalKey, _, _, _ := workloadIdentity(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
+	writeFile(t, certFile, readFile(t, rival))
+	writeFile(t, keyFile, readFile(t, rivalKey))
+	if _, err := server.outboundClient(nil); err == nil {
+		t.Error("an outbound client was built presenting a leaf issued for another workload")
 	}
 	// A boot with no trust anchor cannot build one at all, which is the same
 	// refusal the listener makes.

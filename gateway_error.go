@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -92,6 +93,15 @@ func handlerErrorResponse(err error) (int, string) {
 		return http.StatusServiceUnavailable, "this solution cannot currently act for the viewer against the module"
 	case errors.Is(err, workcontext.ErrUnsealed), errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
 		return http.StatusBadGateway, "this solution could not present a usable credential for the module"
+	}
+	// A transport failure carries the URL it was dialling. *url.Error puts the
+	// destination in Error(), so a mint or gateway call that could not connect
+	// reached the browser as a 502 naming an internal address — the same
+	// disclosure the sentinels above were mapped to stop, arriving by a
+	// different route and not caught by matching on them.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return http.StatusBadGateway, "this solution could not reach the platform"
 	}
 	// Preserve the existing untyped-handler contract. Callers must not put
 	// private details in ordinary errors returned to the runtime.

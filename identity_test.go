@@ -682,15 +682,22 @@ func TestASuppliedSourceBootsAndStaysAuthenticatedOutbound(t *testing.T) {
 		if !ok {
 			t.Fatalf("outbound transport is %T, want *http.Transport", server.outbound.Transport)
 		}
+		if transport.DialTLSContext == nil {
+			t.Fatal("the outbound client has no per-connection dialler, so its trust is snapshotted")
+		}
+		// What that dialler builds, checked directly: identity and anchor from
+		// the supplied source, floor at 1.3.
+		built, err := clientTLSFrom(server.identityConfig)
+		if err != nil {
+			t.Fatalf("derive the outbound configuration from the supplied source: %v", err)
+		}
 		switch {
-		case transport.TLSClientConfig == nil:
-			t.Fatal("the outbound client has no TLS configuration")
-		case transport.TLSClientConfig.RootCAs == nil:
+		case built.RootCAs == nil:
 			t.Error("the outbound client verifies the platform against system roots, not the anchor the supplied source named")
-		case transport.TLSClientConfig.GetClientCertificate == nil && len(transport.TLSClientConfig.Certificates) == 0:
+		case built.GetClientCertificate == nil && len(built.Certificates) == 0:
 			t.Error("the outbound client presents no identity, so the platform cannot tell this workload from anything else that reached it")
-		case transport.TLSClientConfig.MinVersion != tls.VersionTLS13:
-			t.Errorf("the outbound floor is 0x%04x, want TLS 1.3", transport.TLSClientConfig.MinVersion)
+		case built.MinVersion != tls.VersionTLS13:
+			t.Errorf("the outbound floor is 0x%04x, want TLS 1.3", built.MinVersion)
 		}
 		// And the gateway a handler is handed carries it, rather than the
 		// unauthenticated fallback.

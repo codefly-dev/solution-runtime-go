@@ -650,3 +650,7 @@ func getStatus(t *testing.T, client *http.Client, target string) int {
 // module the passthrough fixtures declare. The key is a wire contract
 // (manifest.APIConsumesEnvironmentVariable).
 const consumesThings = `[{"id":"thingstore.things","module":"thingstore","service":"things","endpoint":"rest","protocol":"rest","as":"things"}]`
+
+// consumesThingsAndBearer adds a module called with the viewer's bearer, which
+// mints nothing — the case a ceiling must refuse an ask for.
+const consumesThingsAndBearer = `[{"id":"thingstore.things","module":"thingstore","service":"things","endpoint":"rest","protocol":"rest","as":"things"},{"id":"pagestore.pages","module":"pagestore","service":"pages","endpoint":"rest","protocol":"rest","as":"pages"}]`

@@ -92,7 +92,7 @@ the SDK-resolved value is the default.
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
-| Credential mint URL | `<gateway>/platform/_credential`. Must be `https`. **Labelled stopgap**: the path is this runtime's proposal, not one the host published or the SDK resolves, so a boot that falls back to it says so in its log. Treat a 404 here as the path being wrong, not this build being refused | `CODEFLY__CREDENTIAL_MINT_URL` |
+| Credential mint URL | `<gateway>/platform/_credential`. Must be `https`. The path is the **host's published contract**, settled but **not yet deployed**, so every boot logs where it will mint and a 404 there means the endpoint does not exist on that host — not that the path is wrong and not that this build was refused | `CODEFLY__CREDENTIAL_MINT_URL` |
 | Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
@@ -139,8 +139,8 @@ attests nothing.
 The host it plugs into is named by Codefly-convention **service roles**, not by
 its workspace module name: the runtime discovers the single module that owns the
 gateway role — from the injected endpoint carriers when deployed, or the
-workspace on disk when run locally — so a solution composing the host as `saas`,
-`saas-starter`, or any other name resolves identically (codefly-dev/core#382).
+workspace on disk when run locally — so a solution composing the host under any
+module name resolves identically (codefly-dev/core#382).
 The role is overridable: `CODEFLY_HOST_GATEWAY` (default `auth-gateway`). There
 is no fallback to the pre-v0.0.49 `auth-sidecar` role: a composition exposing
 only that one is a composition to re-render, and an unresolved current gateway
@@ -216,6 +216,17 @@ the TLS configuration that protects the first one. Every client is therefore
 built with `ErrUseLastResponse` (a 3xx is reported, never taken), and the
 transport refuses any destination that is not the gateway's origin, so a client
 built later without the policy is still stopped.
+
+**Outbound trust is re-read per connection, not snapshotted at boot** — the same
+rule as inbound, for the same reason, and it applies with more force: the two
+destinations on the other side of that client receive the projected
+service-account token, the viewer's bearer and this workload's own credential, so
+a root removed because it was compromised must stop authenticating them without a
+restart. Each dial builds its own configuration, and idle connections are capped
+(30s) so there is always another dial — per-connection reloading bounds nothing
+if a connection can live forever. The outbound leaf is held to the frozen
+principal too, which matters because on the default path it comes from a second
+reloader over the same files as the listener's.
 
 The same identity goes out. Every platform request — the mint, and every call a
 handler's gateway makes — presents this workload's X.509-SVID and verifies the
@@ -464,7 +475,16 @@ majors), `/.well-known/module-contract` (the authority contract above) and
 `/health`. Publishing is not announcing — nothing is pushed, and answering
 makes this solution present to nobody.
 
-`/health` answers 200 while this process can do its job, and **503 once the
+`/health` **asks the credential** rather than reporting only what some other
+request happened to discover. Renewal is lazy by design, so a solution serving
+only ViewerBearer routes, plain handlers and assets would otherwise never ask and
+never learn that the issuer had stopped approving its build. Asking is not a
+heartbeat: the client holds one credential and returns the same one until its own
+renewal point, so a probe is a mutex and a comparison except at the renewal the
+credential's expiry dictates. A credential that cannot currently be obtained is
+503 and nothing ends; a refusal is 503 **and** ends the process.
+
+So `/health` answers 200 while this process can do its job, and **503 once the
 issuer has refused this execution's credential for good** — `ErrMintRefused` or
 `ErrRevoked` at renewal, which are judgements about this execution that no retry
 changes. The process then stops serving and returns that reason, for the

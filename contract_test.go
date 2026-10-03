@@ -437,3 +437,130 @@ func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
 		})
 	}
 }
+
+// TestTheCeilingRefusesAsksThatStateNoAuthority closes three ways past the
+// ceiling that a third reviewer found: the check governed what was asked for
+// and not whether anything was asked for.
+//
+//   - ForModule with no scopes, and a Scope naming a kind with no actions, both
+//     satisfied every ceiling by construction, because the loop had nothing to
+//     check. What accounts does with an empty authorityScopes is its decision,
+//     and leaving it there is this runtime declining to govern the one thing
+//     its contract claims to govern.
+//   - a ViewerBearer audience carries a nil ceiling and still sat in the map,
+//     so a declared lookup succeeded and ForModule minted real authority for
+//     the one kind of module the contract publishes as minting none.
+func TestTheCeilingRefusesAsksThatStateNoAuthority(t *testing.T) {
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
+	mint := newHostMint(t, &hostMint{})
+	type ask struct {
+		audience string
+		scopes   []Scope
+	}
+	var attempted ask
+	var mintErr error
+	solution := boot(t, New(Manifest{ID: testSolutionID}).
+		Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}).
+		Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
+			_, mintErr = gw.ForModule(ctx, attempted.audience, attempted.scopes...)
+			return map[string]string{"ok": "yes"}, nil
+		}), mint)
+
+	for _, tc := range []struct {
+		name string
+		ask  ask
+		says string
+	}{
+		{"no scopes at all", ask{"things", nil}, "no scopes at all"},
+		{"a scope with no actions", ask{"things", []Scope{{ResourceKind: "things"}}}, "no actions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			attempted, mintErr = tc.ask, nil
+			before := len(mint.observedStartTasks())
+
+			request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("authorization", "Bearer viewer")
+			request.Header.Set(orgHeader, "org-1")
+			request.Header.Set(sessionHeader, "session-1")
+			resp, err := solution.client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+
+			if mintErr == nil {
+				t.Fatalf("ForModule(%q, %+v) minted: an ask the published ceiling cannot govern must be refused locally", tc.ask.audience, tc.ask.scopes)
+			}
+			if !strings.Contains(mintErr.Error(), tc.says) {
+				t.Errorf("refusal %q does not say %q", mintErr, tc.says)
+			}
+			if got := len(mint.observedStartTasks()) - before; got != 0 {
+				t.Errorf("the host was asked for %d viewer mint(s), want 0", got)
+			}
+			var clientErr *ClientError
+			if !errors.As(mintErr, &clientErr) || clientErr.StatusCode != http.StatusForbidden {
+				t.Errorf("refusal carries %T, want a ClientError with 403", mintErr)
+			}
+		})
+	}
+}
+
+// TestAViewerBearerAudienceCannotBeMintedFor is the third way past the ceiling,
+// tested where the shape is reachable: a ViewerBearer binding carries a nil
+// ceiling and still sat in the map a gateway is given, so the `declared` lookup
+// succeeded and ForModule minted real authority for the one kind of module the
+// published contract says mints none.
+//
+// Driven through resolveContract and gatewayFor rather than a boot, because the
+// passthrough validator has its own requirements for a declared module's
+// methods and they are not what is under test here.
+func TestAViewerBearerAudienceCannotBeMintedFor(t *testing.T) {
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	server := New(Manifest{ID: testSolutionID}).
+		Consumes(passthroughModule(), ConsumedModule{As: "pages", ViewerBearer: true}).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}})
+	server.cfg.profile = localProfile
+	server.cfg.gatewayURL = gw.URL
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolveContract: %v", err)
+	}
+	server.contract = contract
+	// The binding is published, with the flag and no ceiling.
+	var published bool
+	for _, binding := range contract.Bindings {
+		if binding.Audience == "pages" {
+			published = true
+			if len(binding.Ceiling) != 0 {
+				t.Errorf("the ViewerBearer binding publishes a ceiling of %+v, want none", binding.Ceiling)
+			}
+		}
+	}
+	if !published {
+		t.Fatal("the ViewerBearer module is not in the published contract at all")
+	}
+
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	_, err = server.gatewayFor(header).ForModule(context.Background(), "pages",
+		Scope{ResourceKind: "pages", Actions: []string{"read"}})
+	if err == nil {
+		t.Fatal("ForModule minted authority for a module the contract publishes as minting none")
+	}
+	if !strings.Contains(err.Error(), "no ceiling at all") {
+		t.Errorf("refusal %q does not say the module has no ceiling", err)
+	}
+	if got := len(gw.observedMints()); got != 0 {
+		t.Errorf("observed %d mints for a ViewerBearer audience, want 0", got)
+	}
+}

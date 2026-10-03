@@ -569,7 +569,14 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 		terminal bool
 	}{
 		{"the host refuses this build", fmt.Errorf("mint: %w", workcontext.ErrMintRefused), true},
-		{"the state the credential is sealed to has moved", fmt.Errorf("mint: %w", workcontext.ErrRevoked), true},
+		// NOT terminal, and the earlier revision of this test asserted the
+		// opposite. ErrRevoked does not come back from the mint at all — it is
+		// a *callee* refusing a capability sealed to state that has moved — and
+		// the SDK's contract for it is a refresh and one retry. Ending the
+		// process on it would be ending on a condition the client recovers
+		// from. It is handled where it arrives: the far end's 409 drops the
+		// capability so the next call mints.
+		{"a capability a callee says is superseded", fmt.Errorf("mint: %w", workcontext.ErrRevoked), false},
 		// The control, and the reason this is not just "exit on any error": an
 		// issuer that cannot reach its own policy log is behaving correctly,
 		// and exiting on it turns a dependency blip into a crash loop.
@@ -580,9 +587,12 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 			server := New(Manifest{ID: testSolutionID}).Credential(refusingSource{err: tc.err})
 			server.cfg.gatewayURL = gw.URL
 
-			// Health is honest before anything has failed.
-			if status, _ := healthStatus(t, server); status != http.StatusOK {
-				t.Fatalf("health = %d before any failure, want 200", status)
+			// Health asks the credential, so with a source that refuses it is
+			// already unhealthy before any request — which is the point of
+			// C5: a solution serving no module calls must not look alive while
+			// the issuer has stopped approving its build.
+			if status, _ := healthStatus(t, server); status != http.StatusServiceUnavailable {
+				t.Errorf("health = %d while the credential cannot be obtained, want 503: the probe is the only channel this runtime has, and lazy renewal means nothing else may ever ask", status)
 			}
 
 			header := http.Header{}
@@ -615,13 +625,24 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 					t.Error("the reason this process is ending was not recorded, so its exit would say nothing")
 				}
 			} else {
-				if status != http.StatusOK {
-					t.Errorf("health = %d while the issuer is merely unavailable, want 200: this is transient and exiting on it is a crash loop", status)
+				// Unhealthy, because this process cannot act for a viewer
+				// until the credential can be obtained — but NOT ending, which
+				// is the distinction that matters: the host stops routing to
+				// it, and it recovers when the issuer does. Exiting here would
+				// turn a dependency blip into a crash loop.
+				if status != http.StatusServiceUnavailable {
+					t.Errorf("health = %d while the credential cannot be obtained, want 503", status)
+				}
+				if strings.Contains(body, "refused") {
+					t.Errorf("the probe says %q, which reads as a judgement on this build: this condition is transient", body)
 				}
 				select {
 				case <-server.credentialRefusedC():
 					t.Error("the process was ended on a transient condition")
 				default:
+				}
+				if server.terminalErr.Load() != nil {
+					t.Error("a transient condition was recorded as the reason this process is ending")
 				}
 			}
 		})
@@ -634,4 +655,34 @@ func healthStatus(t *testing.T, server *Server) (int, string) {
 	recorder := httptest.NewRecorder()
 	server.handleHealth(recorder, httptest.NewRequest(http.MethodGet, HealthPath, nil))
 	return recorder.Code, recorder.Body.String()
+}
+
+// TestHealthIsHonestAboutTheCredential is the other direction of C5, so the
+// check above is not just a probe that always fails: a process holding a
+// current credential is healthy, and one that holds none at all (a server built
+// outside a boot) does not pretend to consult one.
+func TestHealthIsHonestAboutTheCredential(t *testing.T) {
+	t.Run("a current credential is healthy", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{})
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+		server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+		if status, body := healthStatus(t, server); status != http.StatusOK {
+			t.Errorf("health = %d (%s) with a credential the issuer mints, want 200", status, body)
+		}
+		// And asking did not turn the probe into a mint per probe.
+		for range 5 {
+			healthStatus(t, server)
+		}
+		if got := mint.count(); got != 1 {
+			t.Errorf("six probes produced %d mints, want 1: the client holds one credential and the probe must not become a heartbeat", got)
+		}
+	})
+
+	t.Run("no credential source at all", func(t *testing.T) {
+		server := New(Manifest{ID: testSolutionID})
+		if status, _ := healthStatus(t, server); status != http.StatusOK {
+			t.Errorf("health = %d on a server with no credential source, want 200: there is nothing to consult, and a gateway built outside a boot mints nothing anyway", status)
+		}
+	})
 }
