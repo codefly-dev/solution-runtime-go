@@ -1181,7 +1181,7 @@ func TestAnEstablishedCallerDoesNotOutliveTheTrustThatAdmittedIt(t *testing.T) {
 			callersFile := identitiesFile(t, testGatewayPrincipal)
 
 			server := New(Manifest{ID: testSolutionID})
-			server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
+			server.cfg = config{port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile,
 				trustBundleFile: bundleFile, allowedCallersFile: callersFile}
 			server.principal = testPrincipal
 
@@ -1595,7 +1595,7 @@ func TestTheInboundWatchStartsAtAuthentication(t *testing.T) {
 	callersFile := identitiesFile(t, testGatewayPrincipal)
 
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
+	server.cfg = config{port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile,
 		trustBundleFile: bundleFile, allowedCallersFile: callersFile}
 	server.principal = testPrincipal
 	ln, err := server.listen()

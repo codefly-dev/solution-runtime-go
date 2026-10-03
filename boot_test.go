@@ -385,7 +385,11 @@ func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, key
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected-token")
 
-	t.Setenv("PORT", freePort(t))
+	// Bound here and handed to whichever Server this test boots, so the port is
+	// never released between being chosen and being served on.
+	ln, port := boundPort(t)
+	provideListener(t, ln)
+	t.Setenv("PORT", port)
 	t.Setenv("GATEWAY_URL", mint.URL)
 	// Set explicitly, as a deployment must: nothing derives a mint address
 	// from the resolved gateway, because the projected token goes there.
@@ -420,7 +424,7 @@ func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 	caller, roots := bootEnvironment(t, mint)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	ln, err := server.start(ctx)
+	ln, err := takeListener(server).start(ctx)
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -470,7 +474,7 @@ func bootFailsWithin(t *testing.T, server *Server, mint *hostMint, within time.D
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		ln, err := server.start(context.Background())
+		ln, err := takeListener(server).start(context.Background())
 		done <- outcome{ln, err}
 	}()
 	select {
@@ -653,73 +657,27 @@ func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
 	}
 }
 
-// freePort is a port nothing is listening on: the kernel picks one and it is
-// released immediately. The runtime refuses port 0 — a kernel-assigned port is
-// a solution nobody can route to — so a test that wants an ephemeral port has
-// to name a real one.
-func freePort(t *testing.T) string {
+// boundPort binds a listener and returns it with its port, so a test hands the
+// *listener* to the boot rather than a port number.
+//
+// This replaces a helper that bound :0, read the port, closed the socket and
+// returned the number — a time-of-check/time-of-use race against everything
+// else in this suite asking the OS for an ephemeral port, and the cause of the
+// intermittent `bind: address already in use` failures that appeared in a
+// different test each run. A retry narrowed the window and could not close it:
+// the port is released by construction. Nothing is released here.
+func boundPort(t *testing.T) (net.Listener, string) {
 	t.Helper()
-	// Bind, read the port, close, hand it over — which is a time-of-check /
-	// time-of-use race, and it is the one that produced the intermittent
-	// failures this suite was reporting as an unexplained flake: a test booted
-	// and got `bind: address already in use`, in a different test each time.
-	// Between the close here and the boot's own bind, anything else asking the
-	// OS for an ephemeral port can be handed this one, and this suite stands up
-	// httptest servers constantly.
-	//
-	// Two things narrow it: a port handed out once in this process is never
-	// handed out again, and the port is re-bound immediately before being
-	// returned to confirm it is still free. Neither makes it impossible — only
-	// never closing the listener would, and the boot has to bind it — so the
-	// retry is what covers the rest.
-	for attempt := range 20 {
-		ln, err := net.Listen("tcp", ":0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, port, err := net.SplitHostPort(ln.Addr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := ln.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if handedOutPort(port) {
-			continue
-		}
-		// Still free for the bind the boot will actually make, which is on all
-		// interfaces (`:port`) and not on loopback: 127.0.0.1:P being free
-		// does not mean :P is, and checking the wrong one is how this helper
-		// handed out ports that then failed to bind.
-		again, err := net.Listen("tcp", ":"+port)
-		if err != nil {
-			continue
-		}
-		if err := again.Close(); err != nil {
-			t.Fatal(err)
-		}
-		_ = attempt
-		return port
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("could not find a free port that had not already been handed out")
-	return ""
-}
-
-var (
-	handedOutMu    sync.Mutex
-	handedOutPorts = map[string]bool{}
-)
-
-// handedOutPort records a port and reports whether it had been handed out
-// before, so no two tests in this process are given the same one.
-func handedOutPort(port string) bool {
-	handedOutMu.Lock()
-	defer handedOutMu.Unlock()
-	if handedOutPorts[port] {
-		return true
+	t.Cleanup(func() { _ = ln.Close() })
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	handedOutPorts[port] = true
-	return false
+	return ln, port
 }
 
 // getStatus GETs target through client and returns the status.
@@ -869,7 +827,7 @@ func TestABootRefusesAPlaintextMintBeforeSendingTheToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := New(Manifest{ID: testSolutionID})
-	ln, err := server.start(ctx)
+	ln, err := takeListener(server).start(ctx)
 	if ln != nil {
 		_ = ln.Close()
 	}
@@ -898,7 +856,7 @@ func TestServeEndsOnATerminalCredentialRefusal(t *testing.T) {
 	defer cancel()
 
 	server := New(Manifest{ID: testSolutionID})
-	ln, err := server.start(ctx)
+	ln, err := takeListener(server).start(ctx)
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -940,7 +898,7 @@ func TestTheMintIsConfiguredWithTheFrozenAuthority(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := New(Manifest{ID: testSolutionID})
-	ln, err := server.start(ctx)
+	ln, err := takeListener(server).start(ctx)
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -1028,4 +986,39 @@ func withoutWorkloadValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
+}
+
+// provideListener parks a bound listener for the Server this test is about to
+// boot, and takeListener collects it.
+//
+// A package-level handoff because the environment is how a boot learns its
+// port and the Server does not exist yet when bootIdentity runs. Safe without
+// locking: every test here calls t.Setenv, which forbids t.Parallel, so they
+// run one at a time.
+var parkedListener net.Listener
+
+func provideListener(t *testing.T, ln net.Listener) {
+	t.Helper()
+	parkedListener = ln
+	t.Cleanup(func() { parkedListener = nil })
+}
+
+// takeListener gives the server the listener bootIdentity bound, if there is
+// one. A test that provisioned its environment some other way gets nil and the
+// boot binds for itself.
+func takeListener(server *Server) *Server {
+	if parkedListener != nil {
+		server.boundListener = parkedListener
+		parkedListener = nil
+	}
+	return server
+}
+
+// listenOn binds a listener for this server and returns its port, for a test
+// that drives listen() directly rather than booting.
+func listenOn(t *testing.T, server *Server) string {
+	t.Helper()
+	ln, port := boundPort(t)
+	server.boundListener = ln
+	return port
 }

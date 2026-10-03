@@ -175,9 +175,12 @@ func (s *Server) listen() (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	ln, err := net.Listen("tcp", ":"+s.cfg.port)
-	if err != nil {
-		return nil, err
+	ln := s.boundListener
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", ":"+s.cfg.port); err != nil {
+			return nil, err
+		}
 	}
 	// The per-connection recheck is installed on the *server*, not here: see
 	// watchInboundTrust. A listener that wrapped its connections would hide

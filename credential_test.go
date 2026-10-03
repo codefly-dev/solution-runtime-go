@@ -921,7 +921,7 @@ func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
 	defer cancel()
 
 	server := New(Manifest{ID: testSolutionID}).Credential(handing)
-	if _, err := server.start(ctx); err != nil {
+	if _, err := takeListener(server).start(ctx); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
 
@@ -1269,7 +1269,7 @@ func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := New(Manifest{ID: testSolutionID}).Credential(handing)
-	if _, err := server.start(ctx); err != nil {
+	if _, err := takeListener(server).start(ctx); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
 	asksAtBoot := handing.count()

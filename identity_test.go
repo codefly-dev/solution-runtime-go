@@ -186,7 +186,7 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: tc.config})
-			server.cfg = config{port: freePort(t)}
+			server.cfg = config{port: listenOn(t, server)}
 			server.principal = testPrincipal
 			ln, err := server.listen()
 			if ln != nil {
@@ -203,7 +203,7 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 
 	t.Run("a source that reaches the posture is accepted", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: usable})
-		server.cfg = config{port: freePort(t)}
+		server.cfg = config{port: listenOn(t, server)}
 		server.principal = testPrincipal
 		ln, err := server.listen()
 		if err != nil {
@@ -221,7 +221,7 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 func TestAListenerIsHeldToItsOwnFrozenPrincipal(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
+	server.cfg = config{port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
 	server.principal = testPrincipal
 	ln, err := server.listen()
 	if ln != nil {
@@ -548,7 +548,7 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: downgrading(tc.change)})
-			server.cfg = config{port: freePort(t), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+			server.cfg = config{port: listenOn(t, server), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 			server.principal = testPrincipal
 			// The two failures listen() returns as one are separated here.
 			// Refusing the *identity* at boot is an acceptable answer — what
@@ -569,11 +569,13 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 				}
 				return
 			}
-			raw, err := net.Listen("tcp", ":"+server.cfg.port)
-			if err != nil {
-				t.Fatalf("bind a listener to handshake against: %v", err)
-			}
-			ln := tls.NewListener(raw, config)
+			// The listener this server was handed, not a second bind of the
+			// same port. The distinction the comment above cares about — a
+			// boot that refuses the identity versus a test that could not
+			// bind — is kept and sharpened: the bind happened in boundPort,
+			// which fails the test outright, so reaching here means a
+			// listener exists and only the posture is in question.
+			ln := tls.NewListener(server.boundListener, config)
 			defer func() { _ = ln.Close() }()
 			serve(t, ln)
 
@@ -612,7 +614,7 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 		// and read as a success anyway: in TLS 1.3 the client finishes before
 		// it learns whether the server accepted its certificate, so a
 		// server-side refusal is invisible to tls.Dial.
-		server.cfg = config{port: freePort(t), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+		server.cfg = config{port: listenOn(t, server), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 		server.principal = testPrincipal
 		ln, err := server.listen()
 		if err != nil {
@@ -717,7 +719,7 @@ func TestASuppliedSourceBootsAndStaysAuthenticatedOutbound(t *testing.T) {
 			Identity(suppliedIdentity{certFile: certFile, keyFile: keyFile, bundleFile: bundleFile})
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		ln, err := server.start(ctx)
+		ln, err := takeListener(server).start(ctx)
 		if err != nil {
 			t.Fatalf("a boot supplying only Identity(...) was refused: %v\nthe supplied source says where the identity comes from, so the projected files are provisioning this boot does not read", err)
 		}
@@ -748,7 +750,7 @@ func TestASuppliedSourceBootsAndStaysAuthenticatedOutbound(t *testing.T) {
 			Credential(mintClientVia(t, mint.URL+credentialMintPath, tokenFile, viaCell))
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		ln, err := server.start(ctx)
+		ln, err := takeListener(server).start(ctx)
 		if err != nil {
 			t.Fatalf("a boot supplying both sources was refused: %v", err)
 		}
@@ -800,7 +802,7 @@ func TestAMismatchedLeafIsRefusedBeforeTheMint(t *testing.T) {
 
 	// Not bootFails: that helper re-provisions the environment, which would
 	// replace the mismatched leaf with a matching one and assert nothing.
-	ln, err := New(Manifest{ID: testSolutionID}).start(context.Background())
+	ln, err := takeListener(New(Manifest{ID: testSolutionID})).start(context.Background())
 	if ln != nil {
 		_ = ln.Close()
 	}
@@ -839,7 +841,7 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 	authorityValues(t)
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected-token")
-	t.Setenv("PORT", freePort(t))
+	func() { ln, port := boundPort(t); provideListener(t, ln); t.Setenv("PORT", port) }()
 	t.Setenv("GATEWAY_URL", mint.URL)
 	t.Setenv(CredentialMintURLEnvironmentVariable, mint.URL+credentialMintPath)
 	t.Setenv(ProjectedTokenFileEnvironmentVariable, tokenFile)
@@ -859,7 +861,7 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 		reached <- struct{}{}
 		return map[string]string{"ok": "yes"}, nil
 	})
-	ln, err := server.start(ctx)
+	ln, err := takeListener(server).start(ctx)
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -936,7 +938,7 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
+	server.cfg = config{port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile,
 		trustBundleFile: bundleFile, allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
 		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal

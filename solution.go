@@ -316,6 +316,19 @@ type Server struct {
 	credentialAskErr     error
 	credentialHeld       workcontext.Credential
 	credentialQuietUntil time.Time
+	// boundListener is a listener this process was handed instead of binding
+	// one itself. Nil in every deployment: the port comes from the SDK and
+	// listen() binds it.
+	//
+	// It exists because a test harness cannot hand over a free *port* without
+	// a race. Binding :0, reading the number and closing the socket leaves a
+	// window in which anything else asking the OS for an ephemeral port can be
+	// given the same one — and this suite stands up httptest servers
+	// constantly, so it was given it, intermittently, in a different test each
+	// time. Narrowing the window with a retry was the previous attempt and
+	// could not close it. Handing over the listener removes the window
+	// entirely, because nothing is ever released.
+	boundListener net.Listener
 	// handshakeTimeout overrides platformHandshakeTimeout, for a test that
 	// would otherwise spend the real one. Unset means the constant, as
 	// firstMintWindow does for the credential window.
