@@ -1347,3 +1347,150 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 		t.Error("an ambiguous conflict was recorded as a judgement about this build")
 	}
 }
+
+// TestAViewersMintGoesThroughTheOneController: the viewer's mint called the
+// source directly, so the single-flight, the backoff and the held-credential
+// fallback governed every path except the one that mints most.
+//
+// The controller is only a controller if it owns every acquisition.
+func TestAViewersMintGoesThroughTheOneController(t *testing.T) {
+	fabricator := newHostMint(t, &hostMint{})
+	held := mintedCredential(t, fabricator, "held")
+	source := &unavailableAfter{credential: held, after: 1}
+
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	server := New(Manifest{ID: testSolutionID}).
+		Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}).
+		Credential(source)
+	server.cfg.profile = localProfile
+	server.cfg.gatewayURL = gw.URL
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolveContract: %v", err)
+	}
+	server.contract, server.contractResolved = contract, true
+
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	mintFor := func(t *testing.T) error {
+		t.Helper()
+		_, err := server.gatewayFor(header).ForModule(context.Background(), "things",
+			Scope{ResourceKind: "things", Actions: []string{"read"}})
+		return err
+	}
+
+	// The first mint takes the credential, which stays valid for a while.
+	if err := mintFor(t); err != nil {
+		t.Fatalf("the first viewer mint was refused: %v", err)
+	}
+
+	// The issuer now fails. Forty viewers arrive, and every one of them is a
+	// mint for a *different* task, so the capability cache does not absorb
+	// them — only the controller can.
+	const viewers = 40
+	for i := range viewers {
+		header.Set(sessionHeader, fmt.Sprintf("session-%d", i))
+		if err := mintFor(t); err != nil {
+			t.Fatalf("viewer %d was refused while this process held a credential valid until %s: %v",
+				i, held.ExpiresAt().UTC().Format(time.RFC3339), err)
+		}
+	}
+	if got := source.count(); got > 4 {
+		t.Errorf("the credential source was reached %d times for %d viewer mints: the viewer's mint is acquiring outside the controller, so the backoff and the held-credential fallback do not apply to the path that mints most", got, viewers)
+	}
+}
+
+// TestTheBackoffAppliesWhenNothingIsHeld: the quiet window was consulted only
+// when a credential WAS in hand, so the one state that should ask least —
+// nothing held, issuer failing — asked on every request. The branch meant to
+// back off was the branch that hammered.
+func TestTheBackoffAppliesWhenNothingIsHeld(t *testing.T) {
+	// Fails every time, and holds nothing.
+	source := &unavailableAfter{after: 0}
+	server := New(Manifest{ID: testSolutionID}).Credential(source)
+
+	const callers = 30
+	for range callers {
+		if err := server.actingForAViewer(context.Background()); err == nil {
+			t.Fatal("a route acted for a viewer with no credential at all")
+		}
+	}
+	if got := source.count(); got > 3 {
+		t.Errorf("the source was asked %d times for %d calls with nothing held: each ask that finds a credential due mints, so the state with no credential is the one that must ask least, not most", got, callers)
+	}
+}
+
+// TestAWaiterReadsItsOwnFlightsResult: waiters read the server's current state
+// rather than the flight they waited on, so a caller could act on a later
+// flight's answer — or on none, if the next flight had already cleared the
+// fields.
+func TestAWaiterReadsItsOwnFlightsResult(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	first := mintedCredential(t, mint, "first")
+	second := mintedCredential(t, mint, "second")
+	if first.Token() == second.Token() {
+		t.Fatal("this test needs two distinguishable credentials")
+	}
+
+	// Slow, so every caller lands on the SAME flight. With an instant source
+	// several flights happen and different answers are correct, which is why
+	// the first version of this test was asserting something untrue.
+	source := &slowHandingSource{
+		handing: &handingSource{credentials: []workcontext.Credential{first, second}},
+		after:   300 * time.Millisecond,
+	}
+	server := New(Manifest{ID: testSolutionID}).Credential(source)
+
+	// Many callers on one flight: every one of them must come back with that
+	// flight's credential, not with whatever a later flight stored.
+	const callers = 16
+	var wg sync.WaitGroup
+	got := make([]string, callers)
+	start := make(chan struct{})
+	for i := range callers {
+		wg.Add(1)
+		go func(at int) {
+			defer wg.Done()
+			<-start
+			credential, err := server.credentialWithin(context.Background(), 5*time.Second)
+			if err == nil {
+				got[at] = credential.Token()
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for at, token := range got {
+		if token == "" {
+			t.Fatalf("caller %d came back with no credential at all: it read shared state a later flight had already cleared", at)
+		}
+	}
+	// One flight, so one answer.
+	for at, token := range got {
+		if token != got[0] {
+			t.Errorf("caller %d came back with a different credential from caller 0, though both waited on the same flight: waiters are reading the server's current state rather than the result of the flight they waited on", at)
+		}
+	}
+}
+
+// slowHandingSource is handingSource with a delay, so concurrent callers all
+// join one flight.
+type slowHandingSource struct {
+	handing *handingSource
+	after   time.Duration
+}
+
+func (s *slowHandingSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	select {
+	case <-time.After(s.after):
+	case <-ctx.Done():
+		return workcontext.Credential{}, ctx.Err()
+	}
+	return s.handing.Credential(ctx)
+}

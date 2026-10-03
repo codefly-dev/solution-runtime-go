@@ -2121,3 +2121,59 @@ func TestACallersIdentityComesFromTheBytesItSigned(t *testing.T) {
 		t.Fatalf("an admitted caller was refused: %s", outcome.reason())
 	}
 }
+
+// TestAdmissionRunsBeforeASourcesOwnVerifier: re-parsing the leaf's Raw after a
+// source's verifier has run is narrower, not sound — Raw is a field on the same
+// mutable object, so a verifier that rewrites it hands the admission check
+// attacker-chosen bytes.
+//
+// The only sound answer is to decide admission on the chain as the handshake
+// left it, before anything a source supplied has been given the chance to touch
+// it.
+func TestAdmissionRunsBeforeASourcesOwnVerifier(t *testing.T) {
+	c := newCell(t)
+	approved := c.identity(t, testPrincipal)
+	rival := c.identity(t, rivalPrincipal)
+	admittedLeaf := c.identity(t, testGatewayPrincipal)
+	// The DER of a certificate that IS admitted, which a verifier can swap in.
+	admittedDER := admittedLeaf.Certificate[0]
+
+	var ran atomic.Int64
+	base := serverConfigFor(t, approved, c)
+	base.VerifyConnection = func(state tls.ConnectionState) error {
+		ran.Add(1)
+		if len(state.PeerCertificates) == 0 {
+			return nil
+		}
+		// Rewrite the raw bytes themselves, which is what defeats a re-parse.
+		state.PeerCertificates[0].Raw = admittedDER
+		return nil
+	}
+
+	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	outcome := servedTo(t, config, rival, "")
+	if !outcome.refused() {
+		t.Fatal("a caller outside the admitted set was served because the source's verifier replaced the leaf's raw DER with an admitted certificate's: re-parsing Raw is not a defence when the verifier that runs first can rewrite Raw, so the admission has to run before it")
+	}
+	if reason := outcome.reason(); !strings.Contains(reason, rivalPrincipal) {
+		t.Errorf("the refusal %q does not name the identity the handshake actually authenticated", reason)
+	}
+
+	// The control: an admitted caller is served — and the source's own verifier
+	// runs on it, because it is composed and not discarded. For the rival above
+	// it never ran at all, which is the ordering working: the admission refused
+	// before anything else was handed the chain.
+	if outcome := servedTo(t, config, admittedLeaf, ""); outcome.refused() {
+		t.Fatalf("an admitted caller was refused: %s", outcome.reason())
+	}
+	if ran.Load() == 0 {
+		t.Error("the source's own VerifyConnection was never called even for an admitted caller: running the admission first must not mean dropping the source's check")
+	}
+}

@@ -1782,3 +1782,63 @@ func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
 		}
 	})
 }
+
+// TestTheEnvironmentLoadErrorReachesTheRefusals: three refusals and a boot log
+// exist to tell "the SDK resolved nothing" apart from "loading the injected
+// environment failed first", and a signature refactor dropped the value they
+// read, so all of them reported the former.
+//
+// That is the exact mistake validate() was written to stop making: its own
+// comment records that a single generic message sent an operator to inspect
+// endpoint resolution over a variable they had broken themselves.
+func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
+	loadErr := errors.New("the injected carriers could not be read")
+
+	t.Run("loadConfig carries it onto the configuration", func(t *testing.T) {
+		cfg := loadConfig(context.Background(), loadErr)
+		if cfg.environmentLoadErr == nil {
+			t.Fatal("loadConfig dropped the environment-load error, so every refusal below reads as absent provisioning rather than as an environment that never loaded")
+		}
+	})
+
+	t.Run("an unresolved destination says which it is", func(t *testing.T) {
+		cfg := config{port: "8080", profile: localProfile, environmentLoadErr: loadErr}
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("a configuration with no gateway was accepted")
+		}
+		if !strings.Contains(err.Error(), "injected environment failed first") {
+			t.Errorf("the refusal %q does not say the environment never loaded, so it sends an operator to inspect provisioning that may well be in place", err)
+		}
+	})
+
+	t.Run("a missing path says which it is", func(t *testing.T) {
+		cfg := config{environmentLoadErr: loadErr}
+		err := cfg.requirePath("workload identity certificate", "", "OVERRIDE", "CERT_FILE")
+		if err == nil {
+			t.Fatal("an unresolved path was accepted")
+		}
+		if !strings.Contains(err.Error(), "environment failed first") {
+			t.Errorf("the refusal %q does not distinguish an unprovisioned path from an environment that never loaded", err)
+		}
+	})
+}
+
+// TestAUsernameCredentialIsNotLogged: url.Redacted() masks the password and
+// keeps the username, so a token carried as a username — which is how a great
+// many of them are carried — came through the redaction intact.
+func TestAUsernameCredentialIsNotLogged(t *testing.T) {
+	for _, raw := range []string{
+		"https://s3cr3t-token@mint.cell/platform/_credential",
+		"https://s3cr3t-token:@mint.cell/platform/_credential",
+		"https://user:s3cr3t-token@mint.cell/platform/_credential",
+	} {
+		if got := redactedURL(raw); strings.Contains(got, "s3cr3t-token") {
+			t.Errorf("redactedURL(%q) = %q, which still carries the secret: Redacted() only masks the password", raw, got)
+		}
+		// And it still says where, or it is useless in a log.
+		if got := redactedURL(raw); !strings.Contains(got, "mint.cell") {
+			t.Errorf("redactedURL(%q) = %q, which no longer names the destination", raw, got)
+		}
+	}
+}
