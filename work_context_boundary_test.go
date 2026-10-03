@@ -433,8 +433,7 @@ func renderedType(expr ast.Expr) string {
 func seamCallGraph(t *testing.T) (reaches, refuses map[string]bool) {
 	t.Helper()
 	fset := token.NewFileSet()
-	calls := map[string][]string{}
-	reaches, refuses = map[string]bool{}, map[string]bool{}
+	var files []*ast.File
 	for _, name := range moduleSources(t) {
 		if strings.Contains(name, "internal/seam") {
 			continue
@@ -443,6 +442,17 @@ func seamCallGraph(t *testing.T) (reaches, refuses map[string]bool) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		files = append(files, file)
+	}
+	return seamReachability(files)
+}
+
+// seamReachability is seamCallGraph over files already parsed, so a probe can
+// supply its own.
+func seamReachability(files []*ast.File) (reaches, refuses map[string]bool) {
+	calls := map[string][]string{}
+	reaches, refuses = map[string]bool{}, map[string]bool{}
+	for _, file := range files {
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
@@ -546,4 +556,49 @@ func moduleSources(t *testing.T) []string {
 		t.Fatalf("found %d sources to gate, which cannot be right: a gate that reads nothing passes", len(sources))
 	}
 	return sources
+}
+
+// TestTheSeamGateFollowsIndirection: the rule matched only a function calling
+// seam.Passthrough *directly*, so an exported wrapper one hop away passed it —
+// and one hop of indirection is the first thing anyone writes.
+func TestTheSeamGateFollowsIndirection(t *testing.T) {
+	parse := func(t *testing.T, source string) []*ast.File {
+		t.Helper()
+		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
+		if err != nil {
+			t.Fatalf("parse the probe: %v", err)
+		}
+		return []*ast.File{file}
+	}
+
+	t.Run("an exported path one hop from the seam is seen", func(t *testing.T) {
+		reaches, refuses := seamReachability(parse(t, `package solution
+func ExportedIndirect() (http.Handler, error) { return viaHelper() }
+func viaHelper() (http.Handler, error) { return seam.Passthrough(nil, "", "") }`))
+		if !reaches["ExportedIndirect"] {
+			t.Error("the gate did not see that ExportedIndirect reaches the seam: it delegates, so a rule matching only direct callers reports an exported path to a credential-bearing handler as if it were not one")
+		}
+		if refuses["ExportedIndirect"] {
+			t.Error("the gate thinks ExportedIndirect refuses a non-test binary, which nothing in it does")
+		}
+	})
+
+	t.Run("a refusal one hop away is seen too", func(t *testing.T) {
+		// Or the gate would flag a path that is in fact guarded, and a rule
+		// that cries wolf gets relaxed rather than obeyed.
+		_, refuses := seamReachability(parse(t, `package solution
+func Guarded() (http.Handler, error) { return guard() }
+func guard() (http.Handler, error) { mustBeATest(); return seam.Passthrough(nil, "", "") }`))
+		if !refuses["Guarded"] {
+			t.Error("the gate did not see that Guarded refuses a non-test binary through its helper")
+		}
+	})
+
+	t.Run("a function that reaches nothing is not flagged", func(t *testing.T) {
+		reaches, _ := seamReachability(parse(t, `package solution
+func Unrelated() error { return nil }`))
+		if reaches["Unrelated"] {
+			t.Error("the gate flagged a function that does not reach the seam")
+		}
+	})
 }
