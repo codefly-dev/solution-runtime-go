@@ -409,6 +409,38 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		// An exported struct carrying a servable field is the same re-exposure
+		// with a type in the way: `type Mounted struct { Handler http.Handler }`
+		// returned from an exported method hands out exactly what a direct
+		// result would, and a gate reading only result types walks past it.
+		for _, decl := range file.Decls {
+			declared, ok := decl.(*ast.GenDecl)
+			if !ok || strings.Contains(name, "passthroughtest") || strings.Contains(name, "internal/seam") {
+				continue
+			}
+			for _, spec := range declared.Specs {
+				typed, ok := spec.(*ast.TypeSpec)
+				if !ok || !typed.Name.IsExported() {
+					continue
+				}
+				structure, ok := typed.Type.(*ast.StructType)
+				if !ok || structure.Fields == nil {
+					continue
+				}
+				for _, field := range structure.Fields.List {
+					rendered := renderedType(field.Type)
+					if !servable[rendered] && !servesHTTP(field.Type) {
+						continue
+					}
+					for _, fieldName := range field.Names {
+						if fieldName.IsExported() {
+							t.Errorf("%s exports the type %s with a servable field %s %s: a struct is not a gate, and handing one out hands out the handler inside it",
+								name, typed.Name.Name, fieldName.Name, rendered)
+						}
+					}
+				}
+			}
+		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || !fn.Name.IsExported() || fn.Type.Results == nil {

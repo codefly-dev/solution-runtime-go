@@ -1290,38 +1290,60 @@ func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
 	}
 }
 
-// TestASupersededCredentialIsNotRestoredByTheNextAsk: dropping the belief was
-// immediately reversible.
+// TestNothingIsInferredFromAConflictOnAViewersMint replaces the two rounds
+// spent building around a signal that was never sound.
 //
-// The SDK's client re-mints only at its renewal lead, so the next ask returns
-// the same credential the host just refused — and storing it restored the belief
-// that it was honoured, undone by the very credential that triggered the
-// invalidation.
-func TestASupersededCredentialIsNotRestoredByTheNextAsk(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
+// A 409 on a viewer's mint may mean the credential this workload presented is
+// superseded, or it may mean that viewer lacks the authority they asked for.
+// The host does not distinguish the two. A hook that dropped this process's
+// belief on that answer, plus a remembered token so the drop would stick,
+// turned one viewer's missing permission into a process-wide refusal to act for
+// anybody — an escalating response to an ambiguous signal, which is worse than
+// no response: before, a 409 cost that one call; after, it cost the process.
+func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
+	// The host refuses every mint with a conflict, which is what a viewer
+	// lacking authority looks like from here.
+	// Refuses the viewer's mint for want of authority, which is exactly the
+	// answer that cannot be told apart from "the credential you presented is
+	// superseded".
+	gw := newModuleGateway(t, http.StatusOK, `{}`)
+	gw.deny = "read"
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
-	// The real client, so the cache behaves as it does in production: the same
-	// credential comes back until its renewal lead.
-	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+	mint := newHostMint(t, &hostMint{})
 
+	server := New(Manifest{ID: testSolutionID}).
+		Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}).
+		Credential(mintClientFor(t, mint.URL, tokenFile))
+	server.cfg.profile = localProfile
+	server.cfg.gatewayURL = gw.URL
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolveContract: %v", err)
+	}
+	server.contract, server.contractResolved = contract, true
+
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
+		Scope{ResourceKind: "things", Actions: []string{"read"}}); err == nil {
+		t.Fatal("a mint refused with a conflict was reported as a success")
+	}
+
+	// That refusal cost the viewer their call and nothing else: this process
+	// still holds its credential and still acts for everybody else.
+	if _, ok := server.heldCredential(); !ok {
+		t.Error("a conflict on one viewer's mint dropped this process's own credential: the host does not say whether the conflict is about this workload's authority or that viewer's, so inferring the former makes one viewer's missing permission a process-wide outage")
+	}
 	if err := server.actingForAViewer(context.Background()); err != nil {
-		t.Fatalf("a route was refused with a fresh credential in hand: %v", err)
+		t.Errorf("this process stopped acting for viewers after one ambiguous conflict: %v", err)
 	}
-	held, _ := server.heldCredential()
-	if held.Token() == "" {
-		t.Fatal("nothing was held after a successful ask")
-	}
-
-	// The host says this credential is no longer honoured.
-	server.executionCredentialSuperseded()
-	if _, ok := server.heldCredential(); ok {
-		t.Fatal("the superseded credential is still held")
-	}
-
-	// The next ask returns the same one. The belief must not come back.
-	_ = server.actingForAViewer(context.Background())
-	if again, ok := server.heldCredential(); ok && again.Token() == held.Token() {
-		t.Error("the superseded credential was held again after the next ask returned it: the SDK re-mints only at its renewal lead, so the invalidation is undone by the very credential that triggered it unless the token is remembered")
+	if server.terminalErr.Load() != nil {
+		t.Error("an ambiguous conflict was recorded as a judgement about this build")
 	}
 }

@@ -165,8 +165,13 @@ func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Crede
 	a.mu.Lock()
 	renewed := a.last != "" && credential.Token() != a.last
 	a.mu.Unlock()
-	// And again after, for drift that landed during the ask itself.
-	if renewed {
+	// And again after, unconditionally — for drift that landed during the ask
+	// itself, including the FIRST credential and an ask that returned the one
+	// already held. Gating this on the token changing meant a drift arriving
+	// mid-ask was not noticed until some later renewal happened to produce a
+	// different token.
+	_ = renewed
+	{
 		if err := a.authority.Recheck(ctx); err != nil {
 			return workcontext.Credential{}, fmt.Errorf("%w: this execution's credential was renewed while an authority-bearing value had drifted from the one this process froze at boot: %w",
 				workcontext.ErrMintRefused, err)
@@ -400,6 +405,16 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // own — the handler maps it to a 503 through relayedError, since the condition
 // is this process's and one renewal fixes it — and no capability is minted
 // under an attribution nobody can check.
+// credentialAcquirer obtains this execution's credential through the one
+// controller that governs every acquisition.
+//
+// A function rather than the CredentialSource itself, because this path used to
+// hold the source and call it directly — so the single-flight, the backoff and
+// the held-credential fallback that every other caller goes through did not
+// apply to the viewer's mint, which is the hottest path there is. One
+// controller means one controller.
+type credentialAcquirer func(context.Context) (workcontext.Credential, error)
+
 // attestWorkloadReporting is attestWorkload with somewhere to report a
 // *terminal* failure, which is the half that is easy to get backwards.
 //
@@ -419,8 +434,8 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // host's own probe takes the binding out, and serve returns non-zero so the
 // orchestrator restarts it against the delivery as it now stands — which is
 // where a build the host no longer approves gets resolved, and it is not here.
-func attestWorkloadReporting(ctx context.Context, source CredentialSource, report *attestationReport, request *http.Request, id string, terminal func(error)) error {
-	if source == nil {
+func attestWorkloadReporting(ctx context.Context, acquire credentialAcquirer, report *attestationReport, request *http.Request, id string, terminal func(error)) error {
+	if acquire == nil {
 		// No source at all is a programming error on a path that mints: every
 		// boot opens one, and a consumer that supplied its own supplied a
 		// source. Refused rather than treated as "nothing to attest with".
@@ -428,7 +443,7 @@ func attestWorkloadReporting(ctx context.Context, source CredentialSource, repor
 		// condition that made the second unreachable.)
 		return fmt.Errorf("%w: this solution holds no credential source, so it cannot attest which module is asking", ErrNotAttested)
 	}
-	credential, err := source.Credential(ctx)
+	credential, err := acquire(ctx)
 	if err != nil {
 		report.say(id, "refusing to mint for a viewer: this execution's credential could not be obtained: "+err.Error())
 		if terminal != nil && terminalCredentialFailure(err) {

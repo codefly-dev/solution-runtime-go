@@ -454,12 +454,29 @@ func admitOnly(config *tls.Config, allowed func() ([]string, error)) {
 	theirs := config.VerifyConnection
 	mine := verifyCaller(allowed)
 	config.VerifyConnection = func(state tls.ConnectionState) error {
-		if theirs != nil {
-			if err := theirs(state); err != nil {
-				return err
-			}
+		// OURS FIRST, and the order is the fix rather than a preference.
+		//
+		// It used to run the source's check first, on the grounds that a
+		// caller its rules refuse should be refused for its reason. But
+		// tls.ConnectionState carries *pointers* to the parsed chain, so a
+		// source's verifier running first can edit the certificate this
+		// admission then reads — rewriting the leaf's URI SANs to claim an
+		// admitted identity was demonstrated getting a rival caller in.
+		// Re-parsing the leaf's Raw afterwards does not fix it either: Raw is
+		// a field on the same mutable object, so a verifier that rewrites it
+		// hands this check attacker-chosen bytes.
+		//
+		// The only sound answer is to decide admission on the chain as the
+		// handshake left it, before anything else has been given the chance to
+		// touch it. The cost is that a source's own refusal reason now comes
+		// second, which is cosmetic beside the alternative.
+		if err := mine(state); err != nil {
+			return err
 		}
-		return mine(state)
+		if theirs != nil {
+			return theirs(state)
+		}
+		return nil
 	}
 }
 
@@ -534,16 +551,18 @@ func oneURIIdentity(state tls.ConnectionState, side string) (string, error) {
 	if len(state.PeerCertificates) == 0 {
 		return "", fmt.Errorf("refusing a %s that presented no certificate", side)
 	}
-	// From the raw DER, parsed here, not from the *x509.Certificate the
-	// handshake left in the state.
+	// From the raw DER, parsed here — and, just as importantly, read *before*
+	// any verifier a source supplied has run (see admitOnly).
 	//
-	// That object is reachable by a source's own VerifyPeerCertificate and
-	// VerifyConnection, both of which run on the same connection and are handed
-	// pointers to it — and a source that rewrites leaf.URIs there was
-	// demonstrated having a rival caller admitted, with the per-second recheck
-	// then reading the same mutated leaf and agreeing. The bytes the peer
-	// actually signed are the only thing that cannot be edited between the
-	// handshake and this check.
+	// Both halves are needed and neither is sufficient. tls.ConnectionState
+	// hands out pointers to the parsed chain, so a source's verifier can
+	// rewrite the leaf's URI SANs to claim an admitted identity, which was
+	// demonstrated getting a rival caller in. Re-parsing Raw defends against
+	// a verifier that edits the *parsed* fields; it does not defend against one
+	// that edits Raw itself, because that is a field on the same object. What
+	// makes this sound is running before any of them, on the chain the
+	// handshake authenticated; the re-parse then guarantees the identity comes
+	// from the certificate's own bytes rather than from a cache beside them.
 	leaf, err := x509.ParseCertificate(state.PeerCertificates[0].Raw)
 	if err != nil {
 		return "", fmt.Errorf("refusing a %s whose certificate cannot be parsed from the bytes it presented: %w", side, err)
