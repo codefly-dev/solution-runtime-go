@@ -53,16 +53,7 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 		t.Fatalf("core published %d fixtures; the kit is 21, so this test is reading a trimmed set", len(fixtures))
 	}
 
-	// What each outcome means for a *carrier*, as opposed to a verifier.
-	//
-	// The division is Core's, read off its own classification rather than
-	// decided here: the two sentinels below are properties of the bytes in
-	// hand, so the moment to find them out is before a request is sent;
-	// ErrRevoked is a judgement against live state, which a carrier has no way
-	// to make and must not appear to; ErrInvalid spans both — a token that is
-	// not two base64 segments is visibly broken, while a tampered payload or an
-	// unknown key is a signature judgement.
-	var carried, refusedHere, mustNotJudge, eitherWay int
+	var carriedCount, refusedCount int
 	for _, fixture := range fixtures {
 		t.Run(fixture.Name, func(t *testing.T) {
 			// Through *this package's* boundary, not the SDK's.
@@ -77,10 +68,15 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 			// the cache the way a mint would, and a real request is made.
 			request, err := carryThroughThisRuntime(t, fixture.Token)
 
-			switch {
-			case fixture.Outcome == corework.OutcomeAccepted:
+			side, classified := boundary[fixture.Name]
+			if !classified {
+				t.Fatalf("core publishes a fixture this test does not classify (%s: %s). Decide which side of the carriage boundary its refusal belongs to and say so in `boundary`: a fixture nobody classified used to land in a bucket that accepted either answer, which is eight of twenty-one fixtures asserting nothing.",
+					fixture.Name, fixture.Reason)
+			}
+			switch side {
+			case carried:
 				if err != nil {
-					t.Fatalf("the carrier refused an accepted fixture (%s): %v", fixture.Reason, err)
+					t.Fatalf("the carrier refused %s (%s) with %v: %s", fixture.Name, fixture.Reason, err, side.why())
 				}
 				if got := request.Header.Get(workcontext.HeaderName); got != fixture.Token {
 					t.Error("the capability did not reach the request header")
@@ -88,52 +84,112 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 				if request.Header.Get(workcontext.InstallationIDHeaderName) == "" {
 					t.Error("the installation the capability is sealed to did not travel beside it")
 				}
-				carried++
+				carriedCount++
 
-			case errors.Is(fixture.Err, corework.ErrUnsealed), errors.Is(fixture.Err, corework.ErrNotACoreToken):
-				// The carrier's own responsibility. A capability with no
-				// readable seal must not be put on a request at all: refused at
-				// the far end it would name an installation mismatch for a
-				// capability that never named an installation.
+			case refusedHere:
 				if err == nil {
-					t.Fatalf("the carrier accepted %s (%s): this is a property of the bytes in hand, so the refusal belongs here", fixture.Name, fixture.Reason)
+					t.Fatalf("the carrier accepted %s (%s): %s", fixture.Name, fixture.Reason, side.why())
 				}
-				if !errors.Is(err, fixture.Err) {
-					t.Errorf("the carrier refused %s with %v, want Core's own %v — a refusal for the wrong reason is a different guarantee, and these two sentinels are deliberately not reachable from one errors.Is branch",
-						fixture.Name, err, fixture.Err)
+				// With one of Core's sentinels, never an error of this
+				// package's own: the classification is Core's, and a refusal
+				// this runtime invented a taxonomy for is the beginning of the
+				// second implementation this module is gated against.
+				if !errors.Is(err, corework.ErrInvalid) && !errors.Is(err, corework.ErrUnsealed) && !errors.Is(err, corework.ErrNotACoreToken) {
+					t.Errorf("the carrier refused %s with %v, which is none of Core's sentinels for a capability it cannot read", fixture.Name, err)
 				}
-				refusedHere++
-
-			case errors.Is(fixture.Err, corework.ErrRevoked):
-				// Live state moved under a sound capability. The carrier holds
-				// none of the issuer's sources, so it cannot know — and a
-				// carrier that refused these would be claiming a strength it
-				// does not have, which is the silent downgrade this whole
-				// single-implementation effort exists to end.
-				if err != nil {
-					t.Errorf("the carrier refused %s (%s) with %v: that judgement needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold",
-						fixture.Name, fixture.Reason, err)
-				}
-				mustNotJudge++
-
-			default:
-				// ErrInvalid spans visibly-broken bytes and signature
-				// judgements. Either answer is correct; refusing for some other
-				// reason is not.
-				if err != nil && !errors.Is(err, corework.ErrInvalid) && !errors.Is(err, corework.ErrUnsealed) {
-					t.Errorf("the carrier refused %s with an error of its own (%v): the refusal of %s is Core's to classify", fixture.Name, err, fixture.Reason)
-				}
-				eitherWay++
+				refusedCount++
 			}
 		})
 	}
 
-	if carried == 0 || refusedHere == 0 || mustNotJudge == 0 {
-		t.Errorf("the kit exercised carried=%d refused-here=%d must-not-judge=%d: all three have to be non-zero or this test is checking one side of the boundary",
-			carried, refusedHere, mustNotJudge)
+	if carriedCount == 0 || refusedCount == 0 {
+		t.Errorf("the kit exercised carried=%d refused-here=%d: both have to be non-zero or this test is checking one side of the boundary",
+			carriedCount, refusedCount)
 	}
-	t.Logf("core's kit through the carrier: %d carried, %d refused here (unsealed / not-a-core-token), %d carried because only a verifier may judge them, %d either way (ErrInvalid)",
-		carried, refusedHere, mustNotJudge, eitherWay)
+	if carriedCount+refusedCount != len(fixtures) {
+		t.Errorf("classified %d of %d fixtures", carriedCount+refusedCount, len(fixtures))
+	}
+}
+
+// carriage is which side of this runtime's boundary a fixture's refusal belongs
+// to.
+type carriage int
+
+const (
+	// carried: the capability goes on the request. Either it is sound, or
+	// judging it needs something this runtime does not hold.
+	carried carriage = iota
+	// refusedHere: the capability never goes on a request, because what is
+	// wrong with it is a property of the bytes in hand.
+	refusedHere
+)
+
+func (c carriage) why() string {
+	if c == carried {
+		return "that judgement needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold — and a carrier that refused it would be claiming a strength it does not have, which is the silent downgrade this single-implementation effort exists to end"
+	}
+	return "this is a property of the bytes in hand, so the moment to find it out is before a request is sent: refused at the far end it would name an installation mismatch for a capability that never named an installation"
+}
+
+// boundary classifies every fixture Core publishes, by name, from Core's own
+// stated reason for each.
+//
+// It is a table and not a rule because the previous version was a rule with a
+// default branch, and the default accepted *either* answer for the eight
+// fixtures Core refuses as ErrInvalid — a bucket spanning "not two base64
+// segments", which this runtime must catch, and "one byte of the payload
+// changed", which only a signature can catch. Eight of twenty-one fixtures
+// therefore asserted nothing, and a reviewer showed the committed test passing
+// with the runtime's carriage validation removed.
+//
+// The division itself is unchanged and is Core's: what is visible in the bytes
+// is refused here, and what needs the issuer's four sources is carried.
+var boundary = map[string]carriage{
+	// Sound capabilities. They travel.
+	"session":             carried,
+	"operation":           carried,
+	"delegated":           carried,
+	"delegated-operation": carried,
+	"grant":               carried,
+
+	// Not the token shape at all: no separator, nothing after it, a payload
+	// that is not base64, or nothing. Visible without a key, so this runtime
+	// refuses them rather than sending a request that cannot succeed.
+	"empty-token":     refusedHere,
+	"no-separator":    refusedHere,
+	"separator-only":  refusedHere,
+	"payload-not-b64": refusedHere,
+
+	// No readable seal. The carrier has to put the installation beside the
+	// capability, and a capability that names none cannot be carried — Core
+	// calls the one with a partial seal invalid and this runtime calls it
+	// unsealed, which is the same refusal reached one field earlier.
+	"missing-seal":              refusedHere,
+	"seal-without-installation": refusedHere,
+
+	// A genuinely signed token in another encoding. Refused as a foreign format
+	// before any signature is considered, which is the diagnosis Core's own
+	// fixture exists to protect.
+	"foreign-encoding": refusedHere,
+
+	// Signature judgements. A tampered payload and a key the verifier does not
+	// hold are indistinguishable from a sound capability without the issuer's
+	// keys, and an audience is a claim inside the payload — this runtime holds
+	// none of what it would take to say so, and the far end says so for a
+	// living.
+	"tampered-payload": carried,
+	"unknown-key":      carried,
+	"another-audience": carried,
+
+	// Live state moved under a sound capability: an installation revision, a
+	// build incarnation, a principal epoch, a binding revision. Judging these
+	// is exactly what a carrier cannot do.
+	"stale-installation-revision":  carried,
+	"future-installation-revision": carried,
+	"unknown-installation":         carried,
+	"stale-build-incarnation":      carried,
+	"stale-principal-epoch":        carried,
+	"wrong-binding-revision":       carried,
 }
 
 // carryThroughThisRuntime drives one capability through this package's carriage

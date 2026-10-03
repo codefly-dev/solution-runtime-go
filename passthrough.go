@@ -15,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/solution/manifest"
 	"github.com/codefly-dev/sdk-go/workcontext"
+	"github.com/codefly-dev/solution-runtime-go/internal/seam"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -307,35 +308,40 @@ func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 	return nil
 }
 
-// PassthroughEnvironment is what Serve resolves from the composition for the
-// passthrough, supplied instead by a caller of PassthroughHandler.
-type PassthroughEnvironment struct {
-	// GatewayURL is the host gateway every call goes through: the Work Context
-	// mint and the consumed modules' /v1/<as> prefixes.
-	GatewayURL string
-	// Consumes is the solution's api.consumes projection, which Serve reads
-	// from CODEFLY__API_CONSUMES. Every declared module must be in it.
-	Consumes []manifest.ConsumedAPI
+// init registers the passthrough seam for package passthroughtest, which is the
+// only caller that can reach it: internal/seam is importable inside this module
+// and nowhere else.
+func init() {
+	seam.Passthrough = passthroughSeam
 }
 
-// PassthroughHandler is the consumed-module passthrough exactly as Serve
-// serves it — the declaration checked by the same boot check, mounted by the
-// same code at PassthroughPathPrefix — against an environment the caller
-// supplies instead of the one Serve resolves. Nothing else of the solution is
-// served, and nothing registers anywhere.
+// passthroughSeam is what Server.PassthroughHandler used to be, minus the
+// "exported" part.
 //
-// It exists for tests: package passthroughtest builds on it, with a fake host
-// standing in for the gateway. A solution serves with Serve, which overwrites
-// the environment set here when it resolves its own.
-func (s *Server) PassthroughHandler(env PassthroughEnvironment) (http.Handler, error) {
+// Exported, it was a production bypass: a solution could build a usable
+// credential-bearing handler that had skipped validate(), the mTLS boot, the
+// caller allow-list, the published ceiling and authenticated outbound, and a
+// deployment calling it completed a viewer mint and a module call over
+// plaintext, 200, with the viewer's bearer and this workload's own credential
+// on the wire. Supplying a credential source — which a real deployment does —
+// defeated the "no source, nothing to mint with" mitigation it relied on. Fail
+// closed admits no exception for a shape that exists to make testing
+// convenient, so the shape moved behind the compiler instead: see
+// internal/seam.
+//
+// What it builds is otherwise unchanged, and deliberately so — it is the
+// declaration checked by the same boot check and mounted by the same code at
+// PassthroughPathPrefix, so a consumer's test serves what Serve serves. Serve
+// overwrites the environment set here when it resolves its own.
+func passthroughSeam(server any, gatewayURL, consumesJSON string) (http.Handler, error) {
+	s, ok := server.(*Server)
+	if !ok {
+		return nil, fmt.Errorf("the passthrough seam was handed a %T rather than a solution server", server)
+	}
 	if len(s.consumed) == 0 {
 		return nil, fmt.Errorf("solution %q declares no consumed modules (Consumes)", s.manifest.ID)
 	}
-	projection, err := json.Marshal(env.Consumes)
-	if err != nil {
-		return nil, err
-	}
-	s.cfg.gatewayURL, s.cfg.apiConsumes = env.GatewayURL, string(projection)
+	s.cfg.gatewayURL, s.cfg.apiConsumes = gatewayURL, consumesJSON
 	routes, err := s.validatePassthrough()
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)

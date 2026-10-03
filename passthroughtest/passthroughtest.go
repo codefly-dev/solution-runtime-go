@@ -38,6 +38,7 @@ import (
 	"github.com/codefly-dev/core/solution/manifest"
 	"github.com/codefly-dev/sdk-go/workcontext"
 	solution "github.com/codefly-dev/solution-runtime-go"
+	"github.com/codefly-dev/solution-runtime-go/internal/seam"
 )
 
 // startTaskProcedure is the accounts procedure the gateway routes a Work
@@ -188,14 +189,19 @@ const workloadMintPath = "/platform/_credential"
 // mintWorkload answers the solution's own mint: one credential per execution,
 // sealed to this fake host's installation.
 func (h *Host) mintWorkload(w http.ResponseWriter, r *http.Request) {
+	// The sequence is copied under the lock and the copy is what names the
+	// task: reading h.workloadMints again after unlocking is a read of shared
+	// state that concurrent mints race on, which the race detector reports with
+	// thirty-two of them in flight.
 	h.mu.Lock()
 	h.workloadMints++
+	execution := h.workloadMints
 	h.mu.Unlock()
 	token, _, err := standInAuthority().Start(r.Context(), corework.StartInput{
 		TenantID:           corework.FixtureTenant,
 		OwnerPrincipalID:   corework.FixturePrincipal,
 		OwnerPrincipalKind: "human",
-		TaskID:             fmt.Sprintf("passthroughtest-execution-%d", h.workloadMints),
+		TaskID:             fmt.Sprintf("passthroughtest-execution-%d", execution),
 		Audience:           WorkloadAudience,
 		OrganizationID:     corework.FixtureOrganization,
 		InstallationID:     corework.FixtureInstallation,
@@ -343,7 +349,15 @@ func Handler(host *Host, consumes ...solution.ConsumedModule) (http.Handler, err
 	server := solution.New(solution.Manifest{ID: "passthroughtest"}).
 		Consumes(consumes...).
 		Credential(source)
-	return server.PassthroughHandler(solution.PassthroughEnvironment{GatewayURL: host.URL(), Consumes: host.consumes()})
+	projection, err := json.Marshal(host.consumes())
+	if err != nil {
+		return nil, err
+	}
+	// Through internal/seam, because building a credential-bearing handler
+	// without the boot is no longer something the runtime's public API can do:
+	// exported, that constructor was a production bypass, and this package is
+	// the one caller Go's internal-package rule still lets reach it.
+	return seam.Passthrough(server, host.URL(), string(projection))
 }
 
 // credentialSource is the solution's own execution credential, obtained from

@@ -98,14 +98,20 @@ the SDK-resolved value is the default.
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
 | Allowed callers | `workload-identity`/`ALLOWED_CALLERS` — **required**, comma-separated identities (normally the gateway's). Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS` |
+| Platform peers | `workload-identity`/`PLATFORM_PEERS` — **required**, comma-separated identities (the gateway's, the mint's). The mirror of `ALLOWED_CALLERS`: chain and hostname say a destination holds a certificate this cell issued, which every workload does, so the destinations this runtime presents credentials to are provisioned too | `CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
-| Deployed or local | `CODEFLY__RUNTIME_CONTEXT`, injected by Codefly: `native`/`nix`/`container`/`free` (or unset) is a local run, anything else (a GitOps render's `kubernetes`) a deployment | — |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 
-`ALLOWED_CALLERS` is the only one of these that is a value rather than a path.
+`ALLOWED_CALLERS` and `PLATFORM_PEERS` are the only ones of these that are
+values rather than paths, and they are the only two the process re-resolves
+while it runs: they are admission decisions, and an admission decision read once
+at boot cannot narrow. Removing a compromised identity from either set takes
+effect on the next handshake or the next connection check, not on the next
+restart. A set that resolves to nothing refuses rather than falling back to the
+set the process booted with.
 The other `workload-identity` values are **paths, never material**. The files
 behind them are read by this process — the token at every mint, the key pair at
 every handshake — so the SDK's value accessors would be the wrong tool for the
@@ -222,11 +228,31 @@ rule as inbound, for the same reason, and it applies with more force: the two
 destinations on the other side of that client receive the projected
 service-account token, the viewer's bearer and this workload's own credential, so
 a root removed because it was compromised must stop authenticating them without a
-restart. Each dial builds its own configuration, and idle connections are capped
-(30s) so there is always another dial — per-connection reloading bounds nothing
-if a connection can live forever. The outbound leaf is held to the frozen
-principal too, which matters because on the default path it comes from a second
-reloader over the same files as the listener's.
+restart. Each dial builds its own configuration — and each
+established connection re-verifies the peer it already has, once a second,
+against the current anchor and the current `PLATFORM_PEERS` set, closing it when
+that stops holding.
+
+The recheck is there because the idle cap it replaces was not a bound. An
+inactivity timeout bounds a connection nobody is using; a connection carrying a
+request every 100ms never becomes idle, and one was demonstrated still answering
+31 seconds after its server's root was removed from the bundle, over a single
+handshake. A stream is the same shape by construction, held open for as long as
+its declared `MaxStreamDuration` allows. Re-verifying rather than imposing a
+maximum connection age is deliberate: a maximum age would cut a conforming
+30-minute stream to answer a question that can be answered without cutting it,
+since the chain the peer presented is already in hand. A peer that no longer
+verifies loses the connection, in flight or idle, stream or request.
+
+**And the destination is authorised, not just authenticated.** Verifying the
+chain and the hostname says the cell issued a certificate for the address this
+runtime dialled, which every workload in the cell holds one of — a neighbouring
+workload answering at the gateway's address under a valid certificate was handed
+the projected token, the viewer's bearer and this workload's credential. So the
+peer's own SPIFFE ID must be in `PLATFORM_PEERS`. The outbound leaf is held to
+the frozen principal too, at the moment it is presented, which matters because
+on the default path it comes from a second reloader over the same files as the
+listener's.
 
 The same identity goes out. Every platform request — the mint, and every call a
 handler's gateway makes — presents this workload's X.509-SVID and verifies the
@@ -236,13 +262,27 @@ whatever the image's system roots hold, and without a client certificate it
 cannot tell this workload from anything else that reached it. Nothing is
 proxied, and no redirect is followed.
 
-**The leaf is held to the frozen principal.** The pair the platform projects and
-the principal it provisioned are two facts nothing else in the boot compares, so
-the boot compares them: the SPIFFE ID in the leaf's URI SAN must equal
+**The certificate served is the certificate checked.** The pair the platform
+projects and the principal it provisioned are two facts nothing else compares,
+so this runtime compares them: the SPIFFE ID in the leaf's URI SAN must equal
 `module-authority/PRINCIPAL`. A pair projected for a neighbouring workload — the
 wrong Secret mounted, a Certificate issued for another service — would otherwise
 be served happily, and the mismatch would surface at whatever verifies this
 destination, as a refusal naming neither file.
+
+The comparison is made on the pair a handshake actually selected, not on a
+sample. A boot-time check that called `GetCertificate` once and approved the
+configuration was demonstrated passing four configurations that then served
+another workload's leaf: a callback keyed on the server name answering a probe
+and a real hello differently, a `NameToCertificate` map, a static
+`Certificates[0]` that Go reaches without consulting the callback at all when
+the caller sends no SNI, and a `tls.Certificate.Leaf` that did not describe its
+own DER. So the selection surface is narrowed to one certificate (a
+`NameToCertificate` map or a list of several is refused — a workload has one
+X.509-SVID), the DER is parsed rather than `Leaf` believed, and the callback is
+wrapped so that what it returns for this handshake is what is compared. A
+boot-time refusal remains, asked with the empty hello a peer addressed by IP
+really sends, and it can only refuse a boot — never approve one.
 
 Every one of those applies to a consumer-supplied `IdentitySource` too, checked
 on what it returns: a certificate, a TLS 1.3 floor, and a caller it
@@ -259,8 +299,12 @@ workload's leaf. This is the documented shape here rather than an odd one: the
 projected source uses that callback to re-read peer trust. So each returned
 configuration is held to the same posture and the same frozen principal, and one
 below it fails that handshake instead of serving it weakened. A callback that
-returns `nil` is Go's "serve the base configuration", which was already checked,
-and passes through.
+returns `nil` is Go's "serve the base configuration", and passes through only
+when that base really satisfies the posture on its own: a source answering for
+one hello and not another was otherwise serving a listener that requires a
+caller's certificate and verifies it against the host's system roots, which is
+mutual TLS in every log line and a client certificate from any public CA
+admitted.
 
 ## One credential per execution
 
@@ -354,9 +398,19 @@ Core's verifier requires four live sources — the authorization revision,
 replay, grants and seals — and refuses everything without them, deliberately,
 so the strongest check in the model cannot become the easiest to skip. A
 solution runtime holds none of those: it is the party presenting a capability,
-not the party deciding on one. So there is no verifier here to configure and no
-conformance kit for this package to run; a change that adds one has to answer
-where those four sources come from.
+not the party deciding on one. So there is no verifier here to configure, and a
+change that adds one has to answer where those four sources come from.
+
+Core's conformance kit is still run, through the boundary this package does own:
+all 21 fixtures are offered to the carrier, and each one's refusal is attributed
+to a side. A capability whose bytes are visibly not a capability — no separator,
+an unreadable payload, no seal, another encoding — is refused here, before a
+request is sent, with Core's own sentinel. A tampered payload, an unknown key,
+an audience in the payload and every sealed value the issuer has moved past are
+carried, because judging them needs those four sources and a carrier that
+refused them would be claiming a strength it does not have. The classification
+is per fixture, so a fixture Core adds fails the test until somebody decides
+which side it belongs to.
 
 Both halves are pinned by `work_context_boundary_test.go`, which fails on a
 signing primitive, on a `WorkContext`-named type or function of this package's
@@ -802,7 +856,7 @@ message of it).
 execution's credential and listens with this workload's identity, so a solution
 cannot run its own passthrough in a test through it. Package
 `github.com/codefly-dev/solution-runtime-go/passthroughtest` serves the real
-passthrough — `Server.PassthroughHandler`, the handler `Serve` mounts, behind
+passthrough — the handler `Serve` mounts, behind
 the same boot check — over an `httptest` server, against a fake host:
 
 ```go
@@ -826,6 +880,20 @@ authority each method mints, the fields that reach the page, stream bounds and
 cancellation. It never proves that a real host admits the solution, that
 accounts grants the scopes, or that the real module answers its binding the way
 the test's stand-in does.
+
+**This seam is reachable only from here.** `Server.PassthroughHandler` was
+exported until this change, and that made it a production bypass: a solution
+could build a usable, credential-bearing handler that had skipped `validate()`,
+the mTLS boot, the caller allow-list, the published ceiling and authenticated
+outbound — a deployment calling it completed a viewer mint and a module call
+over plaintext and answered 200, with the viewer's bearer and this workload's
+own credential on the wire. Supplying a credential source, which a deployment
+does, defeated the "no source, nothing to mint with" mitigation. It is reached
+through `internal/seam` now, which Go's internal-package rule keeps inside this
+module: `passthroughtest` can call it and nothing a solution imports can. The
+fake host is still plaintext and still has no contract, and those are now
+properties of this module's own tests rather than of an API. A consumer that
+called `PassthroughHandler` directly uses `passthroughtest.Handler` instead.
 
 ### Generated messages in a response
 

@@ -179,11 +179,11 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 	if err := usableServerIdentity(config); err != nil {
 		return nil, err
 	}
-	if err := presentsThisWorkload(config, s.principal); err != nil {
+	if err := holdServedCertificate(config, s.principal); err != nil {
 		return nil, err
 	}
-	admitOnly(config, parsedAllowedCallers(s.cfg.allowedCallers))
-	holdPerConnectionPosture(config, s.principal, parsedAllowedCallers(s.cfg.allowedCallers))
+	admitOnly(config, s.admittedCallers())
+	holdPerConnectionPosture(config, s.principal, s.admittedCallers())
 	s.identityConfig = config
 	return config, nil
 }
@@ -207,10 +207,7 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 // absent (validateSources) — not derived from the anchor, which is exactly the
 // set that is too wide. The comparison is the SPIFFE ID in the leaf's URI SAN,
 // the same thing the listener's own identity is held to.
-func admitOnly(config *tls.Config, allowed []string) {
-	if len(allowed) == 0 {
-		return
-	}
+func admitOnly(config *tls.Config, allowed func() ([]string, error)) {
 	// Composed, not overwritten. A source may have its own VerifyConnection —
 	// a mesh CA checking its own claims, a consumer enforcing something this
 	// runtime knows nothing about — and assigning over it silently deleted a
@@ -230,32 +227,82 @@ func admitOnly(config *tls.Config, allowed []string) {
 }
 
 // verifyCaller is the check itself, so it can be applied to a per-connection
-// configuration as well as the base one.
-func verifyCaller(allowed []string) func(tls.ConnectionState) error {
+// configuration as well as the base one. The set is resolved per handshake, not
+// captured: see config.resolveAllowedCallers.
+func verifyCaller(allowed func() ([]string, error)) func(tls.ConnectionState) error {
 	return func(state tls.ConnectionState) error {
-		if len(state.PeerCertificates) == 0 {
-			return fmt.Errorf("refusing a caller that presented no certificate")
+		admitted, err := allowed()
+		if err != nil {
+			return err
 		}
-		leaf := state.PeerCertificates[0]
-		// Exactly one URI SAN, because that is what a SPIFFE certificate has.
-		// Accepting "any SAN that matches" lets a leaf naming several
-		// identities be admitted on whichever one is convenient, and a leaf
-		// naming several is not a SPIFFE identity at all — the one it would be
-		// held to elsewhere is unknowable from here.
-		if len(leaf.URIs) != 1 {
-			return fmt.Errorf("refusing a caller whose certificate names %d URI identities: a SPIFFE certificate names exactly one, and a leaf naming several could be admitted on whichever happens to match",
-				len(leaf.URIs))
+		identity, err := oneURIIdentity(state, "caller")
+		if err != nil {
+			return err
 		}
-		if slices.Contains(allowed, leaf.URIs[0].String()) {
+		if slices.Contains(admitted, identity) {
 			return nil
 		}
-		{
-			// The refusal names what arrived, not the allowed set: a caller is
-			// not told who else may call.
-			return fmt.Errorf("refusing a caller whose identity %s is not one this solution admits: it holds a certificate from this cell's anchor, which is not the same as being a caller this solution serves — see %s and %s/%s",
-				presentedIdentities(uriStrings(leaf.URIs)), IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey)
-		}
+		// The refusal names what arrived, not the allowed set: a caller is not
+		// told who else may call.
+		return fmt.Errorf("refusing a caller whose identity %q is not one this solution admits: it holds a certificate from this cell's anchor, which is not the same as being a caller this solution serves — see %s and %s/%s",
+			identity, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityAllowedCallersKey)
 	}
+}
+
+// admitOnlyPlatform is admitOnly for the destinations this runtime dials: the
+// mint and the gateway.
+//
+// Verifying the chain and the hostname answers "did this cell issue the
+// certificate at this address", which every workload in the cell satisfies —
+// and a workload holding a certificate valid for the gateway's hostname
+// completed this handshake and was handed the projected service-account token,
+// the viewer's bearer and this workload's own credential. Authentication is not
+// authorisation outbound either, and outbound is the direction where being
+// wrong means handing the credentials over rather than accepting a call.
+//
+// Composed over whatever the configuration already verifies, never assigned
+// over it, for the reason admitOnly records.
+func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
+	theirs := config.VerifyConnection
+	config.VerifyConnection = func(state tls.ConnectionState) error {
+		if theirs != nil {
+			if err := theirs(state); err != nil {
+				return err
+			}
+		}
+		peers, err := expected()
+		if err != nil {
+			return err
+		}
+		identity, err := oneURIIdentity(state, "platform destination")
+		if err != nil {
+			return err
+		}
+		if slices.Contains(peers, identity) {
+			return nil
+		}
+		return fmt.Errorf("refusing to present this workload's credentials to %q: it holds a certificate from this cell's anchor for the address this runtime dialled, which is not the same as being the platform — see %s and %s/%s",
+			identity, IdentityPlatformPeersEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityPlatformPeersKey)
+	}
+}
+
+// oneURIIdentity is the SPIFFE ID a verified peer presented.
+//
+// Exactly one URI SAN, because that is what a SPIFFE certificate has. Accepting
+// "any SAN that matches" lets a leaf naming several identities be admitted on
+// whichever one is convenient, and a leaf naming several is not a SPIFFE
+// identity at all — the one it would be held to elsewhere is unknowable from
+// here.
+func oneURIIdentity(state tls.ConnectionState, side string) (string, error) {
+	if len(state.PeerCertificates) == 0 {
+		return "", fmt.Errorf("refusing a %s that presented no certificate", side)
+	}
+	leaf := state.PeerCertificates[0]
+	if len(leaf.URIs) != 1 {
+		return "", fmt.Errorf("refusing a %s whose certificate names %d URI identities: a SPIFFE certificate names exactly one, and a leaf naming several could be accepted on whichever happens to match",
+			side, len(leaf.URIs))
+	}
+	return leaf.URIs[0].String(), nil
 }
 
 // uriStrings renders a leaf's URI SANs for a refusal.
@@ -280,7 +327,7 @@ func peerAnchorOf(config *tls.Config) (*x509.CertPool, error) {
 		return config.ClientCAs, nil
 	}
 	if config.GetConfigForClient != nil {
-		answer, err := config.GetConfigForClient(&tls.ClientHelloInfo{ServerName: "localhost"})
+		answer, err := config.GetConfigForClient(&tls.ClientHelloInfo{})
 		if err != nil {
 			return nil, fmt.Errorf("resolve the trust anchor this workload verifies the platform against: %w", err)
 		}
@@ -308,7 +355,13 @@ func clientTLSFrom(config *tls.Config) (*tls.Config, error) {
 	case config.GetCertificate != nil:
 		get := config.GetCertificate
 		client.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			return get(&tls.ClientHelloInfo{ServerName: "localhost"})
+			// An empty hello, not a synthetic name. "localhost" is a server
+			// name nothing in a cell dials by, and a source keyed on it
+			// answered the probe with one identity and the real handshake with
+			// another; an empty ServerName is what a peer addressed by IP
+			// actually sends. Whatever comes back is held to the principal by
+			// holdPresentedCertificate below, at the moment it is presented.
+			return get(&tls.ClientHelloInfo{})
 		}
 	case len(config.Certificates) > 0:
 		client.Certificates = config.Certificates
@@ -392,34 +445,38 @@ func usableServerIdentity(config *tls.Config) error {
 // the posture fails that handshake rather than serving it weakened — the caller
 // that happens to arrive is not what is in question, the configuration the
 // listener would answer anyone with is.
-func holdPerConnectionPosture(config *tls.Config, principal string, allowed []string) {
-	// A source with no per-connection callback still rotates its leaf — the
-	// whole reason GetCertificate exists — and the boot checked only the leaf
-	// that was current then. A rotation landing a certificate for another
-	// workload (the wrong Secret replaced, a mesh CA re-issuing under a changed
-	// identity) would then be served for the life of the process, with the one
-	// check that would have caught it having run before the file changed. So
-	// the leaf is re-held to the frozen principal as it is served.
-	if serve := config.GetCertificate; serve != nil {
-		config.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			pair, err := serve(hello)
-			if err != nil {
-				return nil, err
-			}
-			if err := pairPresentsThisWorkload(pair, principal); err != nil {
-				return nil, err
-			}
-			return pair, nil
-		}
-	}
+func holdPerConnectionPosture(config *tls.Config, principal string, allowed func() ([]string, error)) {
+	// The base configuration's own certificate is already held at use by
+	// holdServedCertificate, which serverIdentity calls first — a rotation
+	// landing a certificate for another workload is refused as it is served,
+	// not as it was at boot. This function used to wrap GetCertificate a second
+	// time for that, and the duplicate quietly made the real wrapper
+	// untestable: a mutation that disabled it left the copy here passing every
+	// certificate-selection test, so the check this file argues for could have
+	// been broken with nothing to notice.
 	inner := config.GetConfigForClient
 	if inner == nil {
 		return
 	}
+	// Whether the base configuration stands on its own, decided here rather
+	// than at the handshake: a callback is allowed to answer nil, which is
+	// Go's "serve the base configuration", and the base was only admitted at
+	// boot *because* a callback would resolve the anchor per handshake. A
+	// source that answered nil for the hello that actually arrived therefore
+	// served a configuration requiring a caller's certificate against no
+	// anchor at all — system roots — while every check in this file had
+	// passed. A conditional nil answer was demonstrated doing exactly that.
+	baseStandsAlone := config.ClientCAs != nil
 	config.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		answer, err := inner(hello)
-		if err != nil || answer == nil {
-			return answer, err
+		if err != nil {
+			return nil, err
+		}
+		if answer == nil {
+			if !baseStandsAlone {
+				return nil, fmt.Errorf("the identity source answered this handshake with nothing, which serves its base configuration — and that one names no trust anchor to verify a caller against (ClientCAs is nil), so Go would accept a client certificate from any public CA. A source that resolves the anchor per handshake has to resolve it for every handshake, or carry a usable one on the configuration it returned at boot")
+			}
+			return nil, nil
 		}
 		if err := usableServerIdentity(answer); err != nil {
 			return nil, fmt.Errorf("the identity source answered this handshake with a configuration below the posture its boot configuration was held to: %w", err)
@@ -429,9 +486,6 @@ func holdPerConnectionPosture(config *tls.Config, principal string, allowed []st
 		// has to mean resolved, not deferred again to system roots.
 		if answer.ClientCAs == nil {
 			return nil, fmt.Errorf("the identity source answered this handshake with a configuration that requires a caller's certificate but names no trust anchor (ClientCAs is nil): Go would verify it against this host's system roots, accepting a client certificate from any public CA")
-		}
-		if err := presentsThisWorkload(answer, principal); err != nil {
-			return nil, err
 		}
 		// Who may call is re-imposed too: a source's callback that returned a
 		// configuration without it would serve that connection admitting every
@@ -444,13 +498,49 @@ func holdPerConnectionPosture(config *tls.Config, principal string, allowed []st
 		// handshake may be reading, which is both a data race and a violation
 		// of the rule that a configuration in use is not modified.
 		admitted := answer.Clone()
+		// Held to the frozen principal here, on the clone, and not by probing
+		// the answer: a per-connection answer selects its own certificate, and
+		// an answer whose GetCertificate returned the approved leaf for a
+		// synthetic probe and another workload's for the hello that actually
+		// arrived was demonstrated completing the handshake as the other
+		// workload. holdServedCertificate wraps that selection instead.
+		if err := holdServedCertificate(admitted, principal); err != nil {
+			return nil, fmt.Errorf("the identity source answered this handshake with a configuration whose certificate is not this workload's: %w", err)
+		}
 		admitOnly(admitted, allowed)
 		return admitted, nil
 	}
 }
 
-// presentsThisWorkload refuses a listener whose leaf is not the identity this
-// process froze at boot.
+// holdServedCertificate rewrites config so that whichever certificate a
+// handshake actually selects is this workload's.
+//
+// The check this replaces read one certificate and approved a configuration:
+// it called GetCertificate with a synthetic hello naming "localhost", parsed
+// what came back, compared it to the frozen principal, and left the
+// configuration alone. Every part of that is a different certificate from the
+// one a caller is served, and four separate shapes were demonstrated serving a
+// neighbouring workload's leaf through a configuration that had passed:
+//
+//   - a source keyed on SNI answered the synthetic "localhost" probe with the
+//     approved leaf and the real (no-SNI, IP-addressed) hello with another —
+//     the probe is a name nothing in a cell dials by;
+//   - NameToCertificate selected a second certificate by name;
+//   - the base configuration carried GetCertificate returning the approved leaf
+//     *and* a static Certificates[0] that was not, and Go consults
+//     GetCertificate only when there is a certificate list to fall back from or
+//     an SNI name to key on (crypto/tls, (*Config).getCertificate) — so a
+//     caller addressing this pod by IP was served the static one, unprobed. The
+//     SDK's own ServerTLSConfig documents that trap and sets GetCertificate
+//     alone for exactly this reason; a consumer's source need not;
+//   - tls.Certificate.Leaf described the approved identity while the DER beside
+//     it described another. Leaf is a parse cache the holder fills in, not the
+//     bytes the handshake sends.
+//
+// So nothing here trusts a probe. The selection surface is narrowed to one
+// certificate, a static one is checked as itself, and the callback is wrapped
+// so the pair *it returns for this handshake* is what gets compared — the
+// certificate is validated at use and the validated pair is what is served.
 //
 // The principal is an authority-bearing value the platform provisioned and this
 // process read once; the leaf is what callers actually see. Nothing else in the
@@ -458,43 +548,111 @@ func holdPerConnectionPosture(config *tls.Config, principal string, allowed []st
 // Secret mounted, a Certificate issued for a neighbouring service — would be
 // served happily, and the mismatch would surface at whatever verifies the
 // destination's identity, as a refusal naming neither file.
-//
-// The comparison is the SPIFFE ID in a URI SAN, which is what names a workload
-// in this model (a presence document's expected identity is one). A leaf
-// carrying none, or none that matches, is refused here.
-func presentsThisWorkload(config *tls.Config, principal string) error {
+func holdServedCertificate(config *tls.Config, principal string) error {
 	if principal == "" {
 		// Nothing to hold the leaf to. openAuthority runs before listen on
 		// every path, so this is a programming error rather than a
 		// deployment's, and it fails rather than skipping the check.
 		return fmt.Errorf("this listener has no frozen principal to hold its own certificate to: the authority-bearing values must be read before the listener is built")
 	}
-	leaf, err := servedLeaf(config)
-	if err != nil {
+	if err := oneCertificateToChooseFrom(config, "this listener"); err != nil {
 		return err
 	}
-	return leafPresentsThisWorkload(leaf, principal)
+	// A static certificate is reachable whatever else is set, so it is checked
+	// as itself rather than through a callback that may not be consulted.
+	if len(config.Certificates) == 1 {
+		if err := pairPresentsThisWorkload(&config.Certificates[0], principal); err != nil {
+			return err
+		}
+	}
+	if serve := config.GetCertificate; serve != nil {
+		config.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			pair, err := serve(hello)
+			if err != nil {
+				return nil, err
+			}
+			if pair == nil {
+				// Go's documented "nothing for this hello, use the list",
+				// which was checked above or does not exist.
+				return nil, nil
+			}
+			if err := pairPresentsThisWorkload(pair, principal); err != nil {
+				return nil, err
+			}
+			return pair, nil
+		}
+		// And asked once now, so a misprovisioned boot is refused at boot
+		// rather than at every handshake — which also keeps the ordering this
+		// check exists for: serverIdentity runs before the first outbound act,
+		// so a pair issued for a neighbouring workload is caught before the
+		// projected token has been presented to anyone under it.
+		//
+		// The hello is empty, which is not a synthetic name but the hello a
+		// peer addressing this pod by IP actually sends — the previous check
+		// made one up ("localhost") and a source keyed on it answered the probe
+		// and the real handshake differently. And it can only *refuse* a boot,
+		// never approve one: a source that cannot answer an empty hello is left
+		// to the wrapper above, which is where the guarantee is.
+		if pair, err := serve(&tls.ClientHelloInfo{}); err == nil && pair != nil {
+			if err := pairPresentsThisWorkload(pair, principal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(config.Certificates) == 1 {
+		return nil
+	}
+	return fmt.Errorf("the identity source produces its certificate per connection (GetConfigForClient only), so the identity this listener presents cannot be held to this workload's: return a configuration with GetCertificate or Certificates as well")
 }
 
-// pairPresentsThisWorkload is presentsThisWorkload for one certificate rather
-// than a configuration, so a leaf resolved per handshake is held to the same
-// rule as the one checked at boot.
+// oneCertificateToChooseFrom refuses a configuration that selects between
+// several certificates.
+//
+// A workload has one X.509-SVID. A configuration offering a choice is one whose
+// served identity is decided at handshake time — by the name a caller sends, by
+// which chain happens to be compatible with their signature algorithms — and
+// "the one that was checked" is then a property of the caller rather than of
+// this configuration. Narrowing the surface is what makes validating at use
+// complete instead of validating whichever branch a test happened to take.
+func oneCertificateToChooseFrom(config *tls.Config, side string) error {
+	if config.NameToCertificate != nil {
+		return fmt.Errorf("the identity source selects %s's certificate by server name (NameToCertificate): this workload has exactly one identity, and a configuration that chooses between several serves whichever the caller's name selects, not the one held to the frozen principal", side)
+	}
+	if len(config.Certificates) > 1 {
+		return fmt.Errorf("the identity source offers %s %d certificates to choose from: a workload has one X.509-SVID, and with several Go selects one at handshake time by name and by what the caller supports, so the certificate checked is not the certificate served",
+			side, len(config.Certificates))
+	}
+	return nil
+}
+
+// pairPresentsThisWorkload holds one certificate — the exact pair a handshake
+// selected — to the frozen principal.
 func pairPresentsThisWorkload(pair *tls.Certificate, principal string) error {
 	if pair == nil || len(pair.Certificate) == 0 {
 		return fmt.Errorf("the identity source produced an empty certificate chain for this handshake")
 	}
-	leaf := pair.Leaf
-	if leaf == nil {
-		parsed, err := x509.ParseCertificate(pair.Certificate[0])
-		if err != nil {
-			return fmt.Errorf("the certificate this handshake would be answered with cannot be parsed: %w", err)
-		}
-		leaf = parsed
+	// The DER that will be sent, never pair.Leaf.
+	//
+	// Leaf is a parse cache its holder fills in and nothing keeps it honest: a
+	// pair carrying the approved identity in Leaf and another workload's
+	// certificate in Certificate[0] was demonstrated passing this check and
+	// completing a handshake as the other workload. The bytes on the wire are
+	// the identity; a struct field describing them is a claim. Parsing costs a
+	// few microseconds per handshake, which is the same trade this file already
+	// makes to re-read the trust anchor.
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return fmt.Errorf("the certificate this handshake would be answered with cannot be parsed: %w", err)
 	}
 	return leafPresentsThisWorkload(leaf, principal)
 }
 
 // leafPresentsThisWorkload is the comparison itself.
+//
+// The comparison is the SPIFFE ID in a URI SAN, which is what names a workload
+// in this model (a presence document's expected identity is one). A leaf
+// carrying none, or none that matches, is refused.
 func leafPresentsThisWorkload(leaf *x509.Certificate, principal string) error {
 	// Exactly one, for the same reason a caller's is: a leaf naming several
 	// identities is not a SPIFFE identity, and holding it to "one of them
@@ -503,10 +661,10 @@ func leafPresentsThisWorkload(leaf *x509.Certificate, principal string) error {
 		return nil
 	}
 	if len(leaf.URIs) > 1 {
-		return fmt.Errorf("the certificate this listener would present names %d URI identities (%s): a SPIFFE certificate names exactly one, and this workload cannot be held to a leaf that claims several",
+		return fmt.Errorf("the certificate this workload would present names %d URI identities (%s): a SPIFFE certificate names exactly one, and this workload cannot be held to a leaf that claims several",
 			len(leaf.URIs), strings.Join(uriStrings(leaf.URIs), ", "))
 	}
-	return fmt.Errorf("the certificate this listener would present names %s, and this workload's frozen principal is %q (%s/%s): a pair projected for another workload would otherwise be served, and the mismatch would surface at whatever verifies this destination rather than here",
+	return fmt.Errorf("the certificate this workload would present names %s, and its frozen principal is %q (%s/%s): a pair projected for another workload would otherwise be served, and the mismatch would surface at whatever verifies this destination rather than here",
 		presentedIdentities(uriStrings(leaf.URIs)), principal, AuthorityGroup, AuthorityPrincipalKey)
 }
 
@@ -519,36 +677,8 @@ func presentedIdentities(uris []string) string {
 	return "the identities [" + strings.Join(uris, ", ") + "]"
 }
 
-// servedLeaf is the certificate a handshake would be answered with, parsed.
-func servedLeaf(config *tls.Config) (*x509.Certificate, error) {
-	var pair *tls.Certificate
-	switch {
-	case config.GetCertificate != nil:
-		served, err := config.GetCertificate(&tls.ClientHelloInfo{ServerName: "localhost"})
-		if err != nil {
-			return nil, fmt.Errorf("the identity source could not produce the certificate this listener would present: %w", err)
-		}
-		pair = served
-	case len(config.Certificates) > 0:
-		pair = &config.Certificates[0]
-	default:
-		return nil, fmt.Errorf("the identity source produces its certificate per connection (GetConfigForClient only), so the identity this listener presents cannot be checked at boot: return a configuration with GetCertificate or Certificates as well")
-	}
-	if pair == nil || len(pair.Certificate) == 0 {
-		return nil, fmt.Errorf("the identity source produced an empty certificate chain")
-	}
-	if pair.Leaf != nil {
-		return pair.Leaf, nil
-	}
-	leaf, err := x509.ParseCertificate(pair.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("the certificate this listener would present cannot be parsed: %w", err)
-	}
-	return leaf, nil
-}
-
-// clientPresentsThisWorkload holds an *outbound* configuration's certificate to
-// the frozen principal.
+// holdPresentedCertificate holds an *outbound* configuration's certificate to
+// the frozen principal, at the moment it is presented.
 //
 // The listener's leaf was checked and the client's was not, on the default path
 // where they come from two separate reloaders over the same files. So a pair
@@ -556,19 +686,48 @@ func servedLeaf(config *tls.Config) (*x509.Certificate, error) {
 // and the gateway by this client while the listener refused to serve it — the
 // check existed, ran on one of the two things it had to cover, and the half it
 // missed is the half that talks to the party holding the projected token.
-func clientPresentsThisWorkload(config *tls.Config, principal string) error {
+//
+// Then the check it grew was a *preflight*: it called GetClientCertificate
+// once, compared what came back, and left the source's own callback installed
+// for the handshake. Rotating the files between the two was demonstrated
+// presenting the other workload's leaf successfully — the same check/use gap as
+// the inbound side, and the reason this wraps the callback rather than calling
+// it. What a dial presents is what gets compared.
+func holdPresentedCertificate(config *tls.Config, principal string) error {
 	if principal == "" {
 		return fmt.Errorf("this workload's outbound client has no frozen principal to hold its own certificate to: the authority-bearing values must be read before any outbound act")
 	}
-	switch {
-	case config.GetClientCertificate != nil:
-		pair, err := config.GetClientCertificate(&tls.CertificateRequestInfo{})
-		if err != nil {
-			return fmt.Errorf("the identity source could not produce the certificate this runtime would present to the platform: %w", err)
+	if err := oneCertificateToChooseFrom(config, "this workload's outbound client"); err != nil {
+		return err
+	}
+	if len(config.Certificates) == 1 {
+		if err := pairPresentsThisWorkload(&config.Certificates[0], principal); err != nil {
+			return err
 		}
-		return pairPresentsThisWorkload(pair, principal)
-	case len(config.Certificates) > 0:
-		return pairPresentsThisWorkload(&config.Certificates[0], principal)
+	}
+	if get := config.GetClientCertificate; get != nil {
+		config.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			pair, err := get(info)
+			if err != nil {
+				return nil, fmt.Errorf("the identity source could not produce the certificate this runtime presents to the platform: %w", err)
+			}
+			if err := pairPresentsThisWorkload(pair, principal); err != nil {
+				return nil, err
+			}
+			return pair, nil
+		}
+		// Refused at boot as well, for the reason holdServedCertificate
+		// records: a mismatch found at the first dial is a mismatch found after
+		// the projected token has gone out under it.
+		if pair, err := get(&tls.CertificateRequestInfo{}); err == nil && pair != nil {
+			if err := pairPresentsThisWorkload(pair, principal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(config.Certificates) == 1 {
+		return nil
 	}
 	return fmt.Errorf("this workload's outbound client would present no certificate, so the platform cannot tell this workload from anything else that reached it")
 }

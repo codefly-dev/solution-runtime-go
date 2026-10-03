@@ -106,19 +106,110 @@ func TestThisRuntimeVerifiesNothing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			selector, ok := node.(*ast.SelectorExpr)
-			if !ok {
-				return true
+		// Whatever the file calls them.
+		//
+		// This matched the identifiers "workcontext" and "corework", which is
+		// the import name those packages happen to get here and not a property
+		// of anything: a compilable non-test file importing core under a third
+		// alias and calling Verify on the verifier it built passed this gate
+		// untouched. The alias is now read off the import declaration, which is
+		// the only place it can come from.
+		for alias, path := range workContextImports(file) {
+			if alias == "." {
+				// A dot-import makes every name in that package unqualified, so
+				// nothing below could find them. It is also not a style this
+				// package uses anywhere.
+				t.Errorf("%s dot-imports %s: the names a verifier is built from would then be unqualified, which this gate cannot see and a reader cannot either", name, path)
+				continue
 			}
-			if selector.Sel.Name == "Verify" || selector.Sel.Name == "NewVerifier" {
-				if pkg, ok := selector.X.(*ast.Ident); ok && (pkg.Name == "workcontext" || pkg.Name == "corework") {
-					t.Errorf("%s verifies a capability (%s.%s): a verifier needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold. It presents its own credential and lets the component that holds them decide.",
+			ast.Inspect(file, func(node ast.Node) bool {
+				selector, ok := node.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				pkg, ok := selector.X.(*ast.Ident)
+				if !ok || pkg.Name != alias {
+					return true
+				}
+				// Every name a verifier can be reached by: the constructor, the
+				// type (so a declared field or variable is caught as well as a
+				// call), and the methods. A verifier cannot be obtained without
+				// naming one of them through the package it lives in, which is
+				// what makes matching on the name sufficient here — the earlier
+				// rule matched only the call, so declaring the type and calling
+				// a method on the value escaped it.
+				if strings.HasPrefix(selector.Sel.Name, "Verif") {
+					t.Errorf("%s names %s.%s: verifying a capability needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold. It presents its own credential and lets the component that holds them decide.",
 						name, pkg.Name, selector.Sel.Name)
 				}
+				return true
+			})
+		}
+	}
+}
+
+// workContextImports is the local name each Work Context package is imported
+// under in one file, which is what the gate above has to match on rather than
+// the name this package happens to use.
+func workContextImports(file *ast.File) map[string]string {
+	imports := map[string]string{}
+	for _, imported := range file.Imports {
+		path := strings.Trim(imported.Path.Value, `"`)
+		if path != "github.com/codefly-dev/core/workcontext" && path != "github.com/codefly-dev/sdk-go/workcontext" {
+			continue
+		}
+		alias := "workcontext"
+		if imported.Name != nil {
+			alias = imported.Name.Name
+		}
+		if alias == "_" {
+			continue
+		}
+		imports[alias] = path
+	}
+	return imports
+}
+
+// TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot pins the one
+// API this round removed.
+//
+// Server.PassthroughHandler was exported, and that made a usable
+// credential-bearing handler reachable without validate(), the mTLS boot, the
+// caller allow-list, the published ceiling or authenticated outbound: a
+// deployment calling it completed a viewer mint and a module call over
+// plaintext and answered 200, with the viewer's bearer and this workload's own
+// credential on the wire. It is reachable from package passthroughtest through
+// internal/seam now, which Go's internal-package rule keeps inside this module.
+//
+// The gate is here because the pressure to put it back is real — it is two
+// lines and it makes a consumer's test shorter — and because nothing else
+// notices an exported identifier reappearing.
+func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.T) {
+	fset := token.NewFileSet()
+	for _, name := range moduleSources(t) {
+		if strings.Contains(name, "passthroughtest") || strings.Contains(name, "internal/seam") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			switch declared := decl.(type) {
+			case *ast.FuncDecl:
+				if declared.Name.IsExported() && strings.Contains(declared.Name.Name, "Passthrough") && declared.Recv != nil {
+					t.Errorf("%s exports %s on a receiver: a passthrough built outside Serve skips validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, so it is reached through internal/seam and not by anything a solution can call",
+						name, declared.Name.Name)
+				}
+			case *ast.GenDecl:
+				for _, spec := range declared.Specs {
+					typed, ok := spec.(*ast.TypeSpec)
+					if ok && typed.Name.Name == "PassthroughEnvironment" {
+						t.Errorf("%s exports PassthroughEnvironment, the argument of the constructor this change removed", name)
+					}
+				}
 			}
-			return true
-		})
+		}
 	}
 }
 

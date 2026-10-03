@@ -31,7 +31,18 @@ the repository root, consumed as the Go module
 `github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag, plus
 `passthroughtest`, the test seam a consumer runs the root package's passthrough
 under against a fake host. It holds no runtime behaviour of its own: it builds
-on `Server.PassthroughHandler`, the handler `Serve` mounts.
+on the handler `Serve` mounts, reached through `internal/seam`.
+
+**That seam is not public API, and must not become one again.**
+`Server.PassthroughHandler` was exported, and a deployment calling it completed
+a viewer mint and a module call over plaintext, 200, having skipped
+`validate()`, the mTLS boot, the caller allow-list, the ceiling and
+authenticated outbound — with the viewer's bearer and this workload's own
+credential on the wire, and supplying a credential source defeated the "no
+source, nothing to mint with" mitigation it relied on. Go's internal-package
+rule is the gate, which is a compiler rather than a naming convention;
+`TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot` fails if an
+exported path reappears.
 
 ## Boundaries
 

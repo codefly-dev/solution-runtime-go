@@ -31,18 +31,25 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 		token    string
 		bundle   string
 		callers  string
+		peers    string
 		names    string
 		variable string
 	}{
-		{name: "no certificate", key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "certificate", variable: IdentityCertFileEnvironmentVariable},
-		{name: "no private key", cert: certFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "private key", variable: IdentityKeyFileEnvironmentVariable},
-		{name: "no trust anchor", cert: certFile, key: keyFile, token: "t", callers: testGatewayPrincipal, names: "trust anchor", variable: IdentityTrustBundleFileEnvironmentVariable},
-		{name: "no projected token", cert: certFile, key: keyFile, bundle: bundleFile, callers: testGatewayPrincipal, names: "projected service-account token", variable: ProjectedTokenFileEnvironmentVariable},
+		{name: "no certificate", peers: testGatewayPrincipal, key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "certificate", variable: IdentityCertFileEnvironmentVariable},
+		{name: "no private key", peers: testGatewayPrincipal, cert: certFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "private key", variable: IdentityKeyFileEnvironmentVariable},
+		{name: "no trust anchor", peers: testGatewayPrincipal, cert: certFile, key: keyFile, token: "t", callers: testGatewayPrincipal, names: "trust anchor", variable: IdentityTrustBundleFileEnvironmentVariable},
+		{name: "no projected token", peers: testGatewayPrincipal, cert: certFile, key: keyFile, bundle: bundleFile, callers: testGatewayPrincipal, names: "projected service-account token", variable: ProjectedTokenFileEnvironmentVariable},
 		// Not material this workload presents, but the other half of the
 		// posture: a listener that verifies every caller in the cell and
 		// admits all of them is a listener with no admission at all, so the
 		// admitted set is provisioned and named when it is absent.
-		{name: "no allowed callers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, names: "allowed caller identities", variable: IdentityAllowedCallersEnvironmentVariable},
+		{name: "no allowed callers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, peers: testGatewayPrincipal, names: "allowed caller identities", variable: IdentityAllowedCallersEnvironmentVariable},
+		// And the same question outbound. Every workload in the cell holds a
+		// certificate from the same anchor, so a chain and a hostname do not
+		// say a destination is the platform — and outbound is the direction
+		// where being wrong hands over the projected token rather than
+		// accepting a call.
+		{name: "no platform peers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "platform peer identities", variable: IdentityPlatformPeersEnvironmentVariable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID})
@@ -55,6 +62,7 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 				projectedTokenPath: tc.token,
 				trustBundleFile:    tc.bundle,
 				allowedCallers:     tc.callers,
+				platformPeers:      tc.peers,
 				profile:            localProfile,
 			}
 			if err := server.cfg.validate(); err != nil {
@@ -119,8 +127,10 @@ func TestASuppliedSourceNeedsNoProvisioningItDoesNotRead(t *testing.T) {
 		mintURL:    "https://gateway:42152" + credentialMintPath,
 		profile:    localProfile,
 		// Required whatever the identity source is: the source says who this
-		// workload is, this says which callers it serves.
+		// workload is, this says which callers it serves — and which
+		// destinations are the platform.
 		allowedCallers: testGatewayPrincipal,
+		platformPeers:  testGatewayPrincipal,
 	}
 	t.Run("an identity source replaces the projected pair", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{})
@@ -231,8 +241,8 @@ func TestAListenerIsHeldToItsOwnFrozenPrincipal(t *testing.T) {
 		stripped.GetCertificate = nil
 		stripped.GetConfigForClient = nil
 		stripped.Certificates = []tls.Certificate{{Certificate: [][]byte{selfSignedWithoutURI(t)}}}
-		if err := presentsThisWorkload(stripped, testPrincipal); err == nil || !strings.Contains(err.Error(), "no URI identity at all") {
-			t.Errorf("presentsThisWorkload = %v, want a refusal distinguishing no identity from the wrong one", err)
+		if err := holdServedCertificate(stripped, testPrincipal); err == nil || !strings.Contains(err.Error(), "no URI identity at all") {
+			t.Errorf("holdServedCertificate = %v, want a refusal distinguishing no identity from the wrong one", err)
 		}
 	})
 }
@@ -391,7 +401,7 @@ func readFile(t *testing.T, path string) string {
 // into this file, and it is the same argument the rest of the cutover is built
 // on: boot-time approval is not authorization at use.
 //
-// usableServerIdentity and presentsThisWorkload read the configuration a source
+// usableServerIdentity and holdServedCertificate read the configuration a source
 // returns at boot. Go hands each handshake to GetConfigForClient when one is
 // set, and the configuration that callback returns replaces the base one for
 // that connection. So a source could conform at boot, pass every other check
@@ -508,12 +518,21 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: downgrading(tc.change)})
 			server.cfg = config{port: freePort(t)}
 			server.principal = testPrincipal
-			ln, err := server.listen()
-			if err != nil {
-				// Refusing at boot is an acceptable answer too; what must not
-				// happen is a handshake served under the lowered posture.
+			// The two failures listen() returns as one are separated here.
+			// Refusing the *identity* at boot is an acceptable answer — what
+			// must not happen is a handshake served under the lowered posture —
+			// but failing to *bind* is this test not running, and returning on
+			// it made every subtest below pass for a reason that has nothing to
+			// do with the posture.
+			config, refused := server.serverIdentity()
+			if refused != nil {
 				return
 			}
+			raw, err := net.Listen("tcp", ":"+server.cfg.port)
+			if err != nil {
+				t.Fatalf("bind a listener to handshake against: %v", err)
+			}
+			ln := tls.NewListener(raw, config)
 			defer func() { _ = ln.Close() }()
 			serve(t, ln)
 
@@ -552,6 +571,7 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listen refused the projected source's own per-connection shape: %v", err)
 		}
+		// This one may fail for a bind, and says so rather than skipping.
 		defer func() { _ = ln.Close() }()
 		serve(t, ln)
 
@@ -768,6 +788,7 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 	t.Setenv(IdentityKeyFileEnvironmentVariable, keyFile)
 	t.Setenv(IdentityTrustBundleFileEnvironmentVariable, bundleFile)
 	t.Setenv(IdentityAllowedCallersEnvironmentVariable, testGatewayPrincipal)
+	t.Setenv(IdentityPlatformPeersEnvironmentVariable, testGatewayPrincipal)
 	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
 	t.Setenv("ASSETS_DIR", t.TempDir())
 
@@ -856,7 +877,7 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
-		trustBundleFile: bundleFile, allowedCallers: testGatewayPrincipal}
+		trustBundleFile: bundleFile, allowedCallers: testGatewayPrincipal, platformPeers: testGatewayPrincipal}
 	server.principal = testPrincipal
 
 	config, err := server.serverIdentity()

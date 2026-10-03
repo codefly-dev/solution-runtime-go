@@ -1099,7 +1099,8 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		platformPeers: testGatewayPrincipal}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -1137,6 +1138,47 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	server.cfg.trustBundleFile = ""
 	if _, err := server.outboundClient(nil); err == nil {
 		t.Error("an outbound client was built with no projected anchor to verify the platform against")
+	}
+}
+
+// TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport is the leg the
+// test above was missing, and a reviewer showed it: everything there inspects
+// the client outboundClient *returns*, and the defect this file's comments are
+// about was the gateway handed to a handler not carrying it. Deleting
+// gatewayFor's one assignment left every assertion above passing while a
+// handler's reads went out over the unauthenticated fallback.
+//
+// So this drives the production gateway client at a platform host that requires
+// a caller's certificate, and asks the host who called. The answer has to be
+// this workload.
+func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	host := newPlatformHost(t, c, testGatewayPrincipal)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		platformPeers: testGatewayPrincipal, gatewayURL: host.URL}
+	server.principal = testPrincipal
+	outbound, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	server.outbound = outbound
+
+	gateway := server.gatewayFor(http.Header{"authorization": {"Bearer viewer"}})
+	resp, err := gateway.HTTPClient().Get(host.URL + "/v1/things/search")
+	if err != nil {
+		t.Fatalf("a handler's gateway could not reach a platform host that requires this workload's certificate: %v\n"+
+			"a gateway that does not carry the boot's transport dials the platform as an anonymous client", err)
+	}
+	_ = resp.Body.Close()
+	called := host.called()
+	if len(called) == 0 {
+		t.Fatal("the platform host recorded no caller")
+	}
+	if called[0] != testPrincipal {
+		t.Errorf("the platform saw a request from %q, want this workload's own %q", called[0], testPrincipal)
 	}
 }
 
