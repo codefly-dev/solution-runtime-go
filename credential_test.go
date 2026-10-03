@@ -1494,3 +1494,70 @@ func (s *slowHandingSource) Credential(ctx context.Context) (workcontext.Credent
 	}
 	return s.handing.Credential(ctx)
 }
+
+// driftingSource changes an authority-bearing value while it is being asked,
+// so the drift lands after the pre-ask recheck and before the answer is used.
+type driftingSource struct {
+	credential workcontext.Credential
+	drift      func()
+	once       sync.Once
+}
+
+func (d *driftingSource) Credential(context.Context) (workcontext.Credential, error) {
+	d.once.Do(d.drift)
+	return d.credential, nil
+}
+
+// TestDriftDuringAnAskIsCaughtAfterIt is the half the pre-ask recheck cannot
+// cover, and the half the post-check was skipping.
+//
+// The post-check was gated on the token changing, so it ran only on a renewal
+// that produced a different credential. A drift landing *during* the ask — and
+// a first credential, and an ask that returned the one already held — all went
+// unchecked until some later renewal happened to change the token.
+func TestDriftDuringAnAskIsCaughtAfterIt(t *testing.T) {
+	fabricator := newHostMint(t, &hostMint{})
+	held := mintedCredential(t, fabricator, "held")
+
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The authority is intact when the ask begins and drifts while it runs, so
+	// the pre-ask recheck passes and only the one after it can refuse.
+	drifted := make(chan struct{})
+	source := &driftingSource{
+		credential: held,
+		drift: func() {
+			t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
+				"spiffe://codefly.test/ns/solutions/sa/somebody-else")
+			_ = codefly.LoadEnvironmentVariables()
+			close(drifted)
+		},
+	}
+
+	server := New(Manifest{ID: testSolutionID})
+	server.authority = authorityFor(t, ctx)
+	server.credential = heldToTheFrozenAuthority(source, server.authority)
+
+	_, err := server.credential.Credential(ctx)
+	<-drifted
+	if err == nil {
+		t.Fatal("a credential obtained while an authority-bearing value drifted mid-ask was handed over: the recheck before the ask cannot see a drift that lands after it, so the one after the ask is what catches this — and gating that on the token changing means a first credential, an unchanged one, and a mid-ask drift all go unchecked")
+	}
+	if !errors.Is(err, workcontext.ErrMintRefused) {
+		t.Errorf("the refusal %v is not reported as a judgement, so the boot and the run would classify it differently", err)
+	}
+}
+
+// authorityFor is this process's frozen authority, read through the SDK the way
+// a boot reads it.
+func authorityFor(t *testing.T, ctx context.Context) *codefly.Authority {
+	t.Helper()
+	server := New(Manifest{ID: testSolutionID})
+	if err := server.openAuthority(ctx); err != nil {
+		t.Fatalf("open the authority: %v", err)
+	}
+	return server.authority
+}

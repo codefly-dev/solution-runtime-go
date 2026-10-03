@@ -451,6 +451,14 @@ func attestWorkloadReporting(ctx context.Context, acquire credentialAcquirer, re
 		}
 		return fmt.Errorf("%w: %w", ErrNotAttested, err)
 	}
+	// Defence in depth, and unreachable by design since round seven: a
+	// credential reaching here has passed usableCredential, which requires a
+	// non-empty token and a non-empty seal — and a credential with those came
+	// from a mint, so its token parses and Attach succeeds. No test can
+	// distinguish this branch any more, which is why no test claims to; it is
+	// kept because it does the right thing if the invariant above ever stops
+	// holding, unlike the ErrRevoked branch this package deleted for doing the
+	// wrong thing while dead.
 	if err := credential.Attach(request); err != nil {
 		report.say(id, "refusing to mint for a viewer: this execution's credential could not be presented: "+err.Error())
 		return fmt.Errorf("%w: %w", ErrNotAttested, err)
