@@ -313,6 +313,10 @@ type Server struct {
 	// the source does not respond inside the route's bound: see
 	// credentialWithin.
 	credentialValidUntil atomic.Int64
+	// handshakeTimeout overrides platformHandshakeTimeout, for a test that
+	// would otherwise spend the real one. Unset means the constant, as
+	// firstMintWindow does for the credential window.
+	handshakeTimeout time.Duration
 	// attestation throttles what a failed attestation says (see attestWorkload).
 	attestation attestationReport
 	// outbound is the authenticated client this boot makes platform requests
@@ -1904,7 +1908,11 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 		// a stream was bounded by the method's declared MaxStreamDuration (up
 		// to thirty minutes) or by nothing at all. A handshake is not a
 		// stream: it completes in milliseconds or the peer is not answering.
-		handshake, cancelHandshake := context.WithTimeout(ctx, platformHandshakeTimeout)
+		bound := s.handshakeTimeout
+		if bound == 0 {
+			bound = platformHandshakeTimeout
+		}
+		handshake, cancelHandshake := context.WithTimeout(ctx, bound)
 		defer cancelHandshake()
 		conn := tls.Client(raw, config)
 		if err := conn.HandshakeContext(handshake); err != nil {

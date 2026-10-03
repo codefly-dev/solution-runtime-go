@@ -1426,3 +1426,138 @@ func mentionsTheCertificate(err error) bool {
 	}
 	return false
 }
+
+// TestTheOutboundHandshakeIsBoundedWhateverTheCallerPassed: a custom
+// DialTLSContext takes net/http out of the handshake, so
+// Transport.TLSHandshakeTimeout does nothing and the only bound left is the
+// caller's context.
+//
+// That is adequate for an ordinary request and wrong where it matters:
+// Gateway.HTTPClient carries streams and therefore sets no client timeout on
+// purpose, so a dial made for a stream was bounded by the method's declared
+// MaxStreamDuration — up to thirty minutes — or by nothing at all. This dials
+// with a context carrying no deadline at all, against a peer that accepts TCP
+// and never speaks TLS.
+func TestTheOutboundHandshakeIsBoundedWhateverTheCallerPassed(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+
+	// A black hole: it accepts and says nothing, which is what a peer doing
+	// this deliberately looks like.
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = silent.Close() }()
+	go func() {
+		for {
+			conn, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			// Held open, never answered.
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	server.handshakeTimeout = 750 * time.Millisecond
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
+	}
+
+	dialled := make(chan error, 1)
+	go func() {
+		// context.Background(): no deadline, which is what a stream's dial can
+		// carry.
+		conn, err := transport.DialTLSContext(context.Background(), "tcp", silent.Addr().String())
+		if conn != nil {
+			_ = conn.Close()
+		}
+		dialled <- err
+	}()
+	select {
+	case err := <-dialled:
+		if err == nil {
+			t.Fatal("the dial succeeded against a peer that never spoke TLS")
+		}
+	case <-time.After(10 * server.handshakeTimeout):
+		t.Fatalf("the handshake was still running %s after a dial with no deadline on its context: the custom dialler means net/http does not bound it and TLSHandshakeTimeout does nothing, so a dial made for a stream is bounded by the stream's duration or by nothing",
+			10*server.handshakeTimeout)
+	}
+}
+
+// TestTheInboundWatchStartsAtAuthentication: the watch covered the connection
+// from the first *request*, which is later than authentication. A caller could
+// complete its handshake, have its issuing root pulled, and sit unwatched for
+// as long as the header deadline allows.
+//
+// This caller authenticates and then sends nothing at all, which is the window
+// in question.
+func TestTheInboundWatchStartsAtAuthentication(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, caller, roots := c.workload(t, testPrincipal)
+	callersFile := identitiesFile(t, testGatewayPrincipal)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
+		trustBundleFile: bundleFile, allowedCallersFile: callersFile}
+	server.principal = testPrincipal
+	ln, err := server.listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	watch, err := server.watchInboundTrust()
+	if err != nil {
+		t.Fatalf("watchInboundTrust: %v", err)
+	}
+	srv := &http.Server{
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+		ReadHeaderTimeout: inboundHandshakeTimeout,
+		IdleTimeout:       inboundIdleTimeout,
+		ConnState:         watch,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() { _ = srv.Close() }()
+
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+		RootCAs: roots, Certificates: []tls.Certificate{*caller},
+		MinVersion: tls.VersionTLS13, ServerName: "localhost",
+	})
+	if err != nil {
+		t.Fatalf("an admitted caller could not connect: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.Handshake(); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// Authenticated, and not one byte of a request sent. The platform now
+	// removes this caller.
+	writeFile(t, callersFile, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
+
+	// Well inside the header deadline, which is what would otherwise be the
+	// only thing to end this connection.
+	deadline := 5 * inboundTrustRecheckInterval
+	if deadline >= inboundHandshakeTimeout {
+		t.Fatalf("this test needs to finish inside the header deadline (%s) to mean anything", inboundHandshakeTimeout)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(deadline))
+	var buf [1]byte
+	_, err = conn.Read(buf[:])
+	if err == nil {
+		t.Fatal("the server sent something on a connection that made no request")
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("a caller that authenticated and then sent nothing was still connected %s after its admission was withdrawn: the watch begins at the first request, so the whole pre-request window is unwatched", deadline)
+	}
+}

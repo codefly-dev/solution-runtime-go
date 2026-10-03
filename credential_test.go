@@ -789,3 +789,171 @@ func TestAPlainHandlerStillServesWithAnApprovedCredential(t *testing.T) {
 		t.Fatalf("a handler answered %d while this process holds an approved credential, want 200: %s", recorder.Code, recorder.Body.String())
 	}
 }
+
+// slowCredentialSource answers, eventually. It is the shape of an issuer that
+// is reachable and not responding.
+type slowCredentialSource struct {
+	after      time.Duration
+	credential workcontext.Credential
+}
+
+func (s slowCredentialSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	select {
+	case <-time.After(s.after):
+		return s.credential, nil
+	case <-ctx.Done():
+		return workcontext.Credential{}, ctx.Err()
+	}
+}
+
+// TestARouteIsNotParkedByASlowCredentialSource: the bound on asking for the
+// credential has to be imposed outside the SDK's client, because a context does
+// not reach what blocks.
+//
+// The mint client takes a sync.Mutex and holds it across the network mint, and
+// sync.Mutex.Lock ignores contexts — so a caller arriving during a slow renewal
+// waits on the lock for as long as the renewal takes, whatever deadline it
+// passed in. That made the two-second health deadline advisory, and it would
+// have made every route's credential check park behind one slow issuer, which
+// is a worse failure than the one the check was added for.
+func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
+	slow := slowCredentialSource{after: 30 * time.Second}
+
+	t.Run("with no credential in hand, the route refuses promptly", func(t *testing.T) {
+		server := New(Manifest{ID: testSolutionID}).Credential(slow)
+		started := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- server.actingForAViewer(context.Background()) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("the route acted for a viewer without this process holding a credential")
+			}
+			if !errors.Is(err, ErrCredentialUnavailable) {
+				t.Errorf("the route refused with %v, want one wrapping %v", err, ErrCredentialUnavailable)
+			}
+			if elapsed := time.Since(started); elapsed > 20*routeCredentialTimeout {
+				t.Errorf("the route took %s to answer for a %s bound: the deadline it passes in does not reach the lock the source holds", elapsed, routeCredentialTimeout)
+			}
+		case <-time.After(20 * routeCredentialTimeout):
+			t.Fatalf("the route was still waiting %s after a %s bound: every request would park behind one slow issuer", 20*routeCredentialTimeout, routeCredentialTimeout)
+		}
+	})
+
+	// And the other half, which is why a timeout does not simply refuse:
+	// renewal begins while a valid credential is still held, so a slow renewal
+	// must not 503 every viewer.
+	t.Run("with an unexpired credential in hand, the route proceeds", func(t *testing.T) {
+		server := New(Manifest{ID: testSolutionID}).Credential(slow)
+		server.credentialValidUntil.Store(time.Now().Add(time.Hour).UnixNano())
+		done := make(chan error, 1)
+		go func() { done <- server.actingForAViewer(context.Background()) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("a route was refused while this process holds a credential valid for another hour and the source is merely slow: %v", err)
+			}
+		case <-time.After(20 * routeCredentialTimeout):
+			t.Fatal("the route parked despite holding a valid credential")
+		}
+	})
+
+	// An expired one is not "in hand" at all.
+	t.Run("with an expired credential, the route refuses", func(t *testing.T) {
+		server := New(Manifest{ID: testSolutionID}).Credential(slow)
+		server.credentialValidUntil.Store(time.Now().Add(-time.Minute).UnixNano())
+		done := make(chan error, 1)
+		go func() { done <- server.actingForAViewer(context.Background()) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Error("a route acted for a viewer on an expired credential")
+			}
+		case <-time.After(20 * routeCredentialTimeout):
+			t.Fatal("the route parked")
+		}
+	})
+}
+
+// TestEverySourceIsHeldToTheFrozenAuthority: a supplied credential source
+// replaces the mint client, and with it every option mintOptions carries —
+// including the Authority the SDK rechecks before each renewal. So the one
+// guarantee that stops a drifted authority value being re-sealed into a new
+// credential applied to the platform path only, while this package's
+// documentation promises it of the process.
+func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
+	// Two different credentials, so the second ask reads as a renewal: the
+	// token is the generation. They come from a plain-HTTP fake host of this
+	// test's own, because the boot's mint is served under the cell's anchor and
+	// this is only a way to obtain two real sealed credentials to hand out.
+	// Three: the boot consumes the first, the control renewal the second, and
+	// the ask after the drift the third.
+	fabricator := newHostMint(t, &hostMint{})
+	handing := &handingSource{credentials: []workcontext.Credential{
+		mintedCredential(t, fabricator, "first"),
+		mintedCredential(t, fabricator, "second"),
+		mintedCredential(t, fabricator, "third"),
+	}}
+
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := New(Manifest{ID: testSolutionID}).Credential(handing)
+	if _, err := server.start(ctx); err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	// The control: with the authority as this process froze it, a renewal is
+	// handed over.
+	if _, err := server.credential.Credential(ctx); err != nil {
+		t.Fatalf("a renewal was refused while the authority had not drifted: %v", err)
+	}
+
+	// Now an authority-bearing value drifts under the running process, and the
+	// next renewal must be refused rather than re-sealed against it.
+	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
+		"spiffe://codefly.test/ns/solutions/sa/somebody-else")
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := server.credential.Credential(ctx)
+	if err == nil {
+		t.Fatal("a renewal proceeded after an authority-bearing value drifted from the one this process froze: that renewal is the one moment the drift would be laundered into a differently-sealed credential")
+	}
+	if !errors.Is(err, workcontext.ErrMintRefused) {
+		t.Errorf("the refusal %v is not reported as a judgement, so the boot and the run would classify it differently", err)
+	}
+}
+
+// handingSource hands out a prepared sequence of credentials, so a second ask
+// reads as a renewal.
+type handingSource struct {
+	mu          sync.Mutex
+	credentials []workcontext.Credential
+	at          int
+}
+
+func (h *handingSource) Credential(context.Context) (workcontext.Credential, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	credential := h.credentials[h.at]
+	if h.at < len(h.credentials)-1 {
+		h.at++
+	}
+	return credential, nil
+}
+
+// mintedCredential is one credential from the fake host, so a test can hand out
+// a real sealed one rather than a zero value.
+func mintedCredential(t *testing.T, mint *hostMint, projection string) workcontext.Credential {
+	t.Helper()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, projection)
+	credential, err := mintClientFor(t, mint.URL, tokenFile).Credential(context.Background())
+	if err != nil {
+		t.Fatalf("mint a credential for the test: %v", err)
+	}
+	return credential
+}
