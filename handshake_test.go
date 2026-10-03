@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -994,14 +996,20 @@ func TestAnEstablishedConnectionFollowsTheProvisionedPeerSet(t *testing.T) {
 // TestALeafReadFailureDoesNotCloseATrustedConnection: the recheck may only
 // close a connection over a judgement about the PEER.
 //
-// The previous revision rebuilt the whole outbound configuration on every
-// recheck, this workload's own certificate included, and closed the connection
-// on any error from it. So a rotation of this pod's own key pair that was not
-// atomic — the certificate replaced, the key a moment behind — made
-// X509KeyPair fail and tore down every established platform connection,
-// streams included, while every peer on them was still perfectly trusted. The
-// SDK's reloader exists to swallow exactly that and keep the last good pair;
-// building a new one per recheck threw the property away.
+// Rebuilding the whole outbound configuration on every recheck, this workload's
+// own certificate included, and closing the connection on any error from it,
+// means a rotation of this pod's own key pair that is not atomic — the
+// certificate replaced, the key a moment behind — makes X509KeyPair fail and
+// tears down every established platform connection, streams included, while
+// every peer on them is still perfectly trusted. The SDK's reloader exists to
+// swallow exactly that and keep the last good pair; building a new one per
+// recheck throws the property away.
+//
+// It counts CONNECTIONS, not successful requests. Asserting that requests keep
+// working cannot see this defect at all: the recheck closes the connection and
+// net/http immediately dials another, which succeeds, so every request
+// succeeds while the connection underneath is being torn down and replaced
+// once a second. Two mutants lived in that gap.
 func TestALeafReadFailureDoesNotCloseATrustedConnection(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
@@ -1015,18 +1023,47 @@ func TestALeafReadFailureDoesNotCloseATrustedConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("outboundClient: %v", err)
 	}
-	resp, err := client.Get(host.URL + credentialMintPath)
-	if err != nil {
-		t.Fatalf("the platform was not reachable with its own root in the bundle: %v", err)
+
+	var dials atomic.Int64
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if !info.Reused {
+				dials.Add(1)
+			}
+		},
 	}
-	_ = resp.Body.Close()
+	get := func(t *testing.T) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace),
+			http.MethodGet, host.URL+credentialMintPath, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("a request failed while the peer was trusted throughout: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	get(t)
+	if dials.Load() != 1 {
+		t.Fatalf("the first request took %d connections, want 1", dials.Load())
+	}
 
 	// A rotation caught halfway: this workload's certificate is replaced by
 	// something that does not pair with the key on disk. Nothing about the
 	// peer has changed.
 	writeFile(t, certFile, "-----BEGIN CERTIFICATE-----\nhalf a rotation\n-----END CERTIFICATE-----\n")
 
-	staysUsable(t, client, host.URL+credentialMintPath, 3*outboundTrustRecheckInterval)
+	deadline := time.Now().Add(3 * outboundTrustRecheckInterval)
+	for time.Now().Before(deadline) {
+		get(t)
+		time.Sleep(outboundTrustRecheckInterval / 10)
+	}
+	if redialled := dials.Load(); redialled != 1 {
+		t.Errorf("the established connection was replaced %d times while its peer stayed trusted: a half-written copy of this workload's own key pair is not a judgement about the peer, and the recheck must not share a failure path with it", redialled-1)
+	}
 }
 
 // TestAnEstablishedCallerDoesNotOutliveTheTrustThatAdmittedIt is the inbound

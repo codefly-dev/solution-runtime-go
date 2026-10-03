@@ -55,6 +55,11 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 // not need a closure to do it, so the whole shape is refused rather than
 // inspected for intent.
 func TestNoClosureDefersAnEnvironmentReadPastBoot(t *testing.T) {
+	// Indirectly too. The closures this gate exists to catch did not call
+	// os.Getenv: they called workloadPath, which calls env, which does — so a
+	// rule that looked only for a direct read would have passed the exact code
+	// it was written for. A probe below pins that.
+	readers := parsePackage(t).environmentReachers()
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -69,23 +74,134 @@ func TestNoClosureDefersAnEnvironmentReadPastBoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			lit, ok := node.(*ast.FuncLit)
+		for _, line := range deferredEnvironmentReads(fset, file, readers) {
+			t.Errorf("%s:%d defines a function literal that reads the environment: a read inside a closure happens when the closure is called, which is not boot, so validate() never governs it. Resolve the value in loadConfig's own body and carry the result.",
+				name, line)
+		}
+	}
+}
+
+// deferredEnvironmentReads is every environment read inside a function literal
+// in one file, by line.
+//
+// Separated from the test so the gate can be run against a file the test
+// writes. A gate that only ever sees conforming code reports success whether
+// or not it works, which is how the shape it exists to catch got in.
+func deferredEnvironmentReads(fset *token.FileSet, file *ast.File, readers map[string]bool) []int {
+	var lines []int
+	ast.Inspect(file, func(node ast.Node) bool {
+		lit, ok := node.(*ast.FuncLit)
+		if !ok {
+			return true
+		}
+		ast.Inspect(lit.Body, func(inner ast.Node) bool {
+			call, ok := inner.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
-			ast.Inspect(lit.Body, func(inner ast.Node) bool {
-				call, ok := inner.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if readsEnvironment(call) {
-					t.Errorf("%s:%d defines a function literal that reads the environment: a read inside a closure happens when the closure is called, which is not boot, so validate() never governs it. Resolve the value in loadConfig's own body and carry the result.",
-						name, fset.Position(call.Pos()).Line)
-				}
+			if readsEnvironment(call) {
+				lines = append(lines, fset.Position(call.Pos()).Line)
 				return true
-			})
+			}
+			if callee, ok := calleeName(call); ok && readers[callee] {
+				lines = append(lines, fset.Position(call.Pos()).Line)
+			}
 			return true
+		})
+		return true
+	})
+	return lines
+}
+
+// environmentReachers is the package's configuration resolvers: the functions
+// that read the environment themselves, and the ones whose whole job is to call
+// those (workloadPath over env).
+//
+// One hop, not the transitive closure. The closure marks most of the package —
+// enough of it that this gate failed two function literals doing nothing but
+// holding a certificate to a principal — and a rule with false positives gets
+// relaxed rather than obeyed. One hop is what the shape under test needed: the
+// closures called workloadPath, which calls env, which reads. A resolver added
+// later is caught the same way, because a new resolver reading the environment
+// is itself a direct reader.
+func (p pkgFuncs) environmentReachers() map[string]bool {
+	reaches := map[string]bool{}
+	for name := range p.reads {
+		reaches[name] = true
+	}
+	for caller, callees := range p.calls {
+		for _, callee := range callees {
+			if p.reads[callee] {
+				reaches[caller] = true
+				break
+			}
+		}
+	}
+	return reaches
+}
+
+// TestTheClosureGateCatchesTheShapeThatEvadedIt runs the gate against the two
+// closures that passed the boundary check while reading the environment per
+// handshake — they resolved the caller and peer admission sets — and against
+// the conforming shape, so the gate is not simply refusing every closure.
+func TestTheClosureGateCatchesTheShapeThatEvadedIt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source string
+		caught bool
+	}{
+		{
+			"the admission-set resolver as it was written",
+			`package solution
+func loadConfig() config {
+	return config{
+		resolveAllowedCallers: func() string {
+			return workloadPath(ctx, IdentityAllowedCallersEnvironmentVariable, WorkloadIdentityAllowedCallersKey)
+		},
+	}
+}`,
+			true,
+		},
+		{
+			"a closure reading the environment directly",
+			`package solution
+func f() func() string {
+	return func() string { return os.Getenv("ANYTHING") }
+}`,
+			true,
+		},
+		{
+			"a closure that reads a file, which is what a live value needs",
+			`package solution
+func f() func() ([]byte, error) {
+	return func() ([]byte, error) { return os.ReadFile(path) }
+}`,
+			false,
+		},
+		{
+			"a read in a function body, where boot can govern it",
+			`package solution
+func loadConfig() config {
+	return config{port: env("PORT", "")}
+}`,
+			false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "probe.go", tc.source, 0)
+			if err != nil {
+				t.Fatalf("parse the probe: %v", err)
+			}
+			// The helpers the real closures reached the environment through.
+			found := len(deferredEnvironmentReads(fset, file, map[string]bool{"workloadPath": true, "env": true})) > 0
+			if found != tc.caught {
+				if tc.caught {
+					t.Error("the gate did not see an environment read deferred into a closure, so a value read per handshake can be written as if it were resolved at boot")
+				} else {
+					t.Error("the gate flagged a closure that reads no environment: resolving a value from a file per use is how a live value is supposed to work here, and refusing it would refuse the fix")
+				}
+			}
 		})
 	}
 }

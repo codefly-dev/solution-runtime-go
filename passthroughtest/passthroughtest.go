@@ -396,8 +396,14 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 // legitimate caller is production code and only the bypass is a test; it is the
 // right one here, where every legitimate caller is a test and only the bypass
 // is production.
-func mustBeATest() {
-	if !testing.Testing() {
+func mustBeATest() { refuseOutsideTest(testing.Testing()) }
+
+// refuseOutsideTest takes the answer rather than asking for it, so the refusal
+// itself is reachable from a test. Written as one function reading
+// testing.Testing() directly, the only branch that matters is the one no test
+// can enter — a mutation that neutered it left every gate here passing.
+func refuseOutsideTest(isTest bool) {
+	if !isTest {
 		panic("passthroughtest is a test seam and this is not a test binary: it builds a handler that holds a real execution credential without validate(), the mTLS boot, the caller allow-list, the published ceiling or authenticated outbound, so a deployment reaching it would serve the viewer's bearer and this workload's credential over whatever it was mounted on. Boot the runtime with solution.Serve instead")
 	}
 }
