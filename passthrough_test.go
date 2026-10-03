@@ -3,6 +3,7 @@ package solution
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -397,4 +398,78 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 	if _, err := InterfaceArtifact(t.TempDir(), InterfaceInfo{}, nil); err == nil {
 		t.Fatal("a backend with no service manifest rendered a version")
 	}
+}
+
+// TestAViewerBearerRouteRefusesToActWithoutACredential: a ViewerBearer route
+// mints nothing, so it asked the credential for nothing — and it was therefore
+// the one route that kept forwarding the viewer's bearer to the gateway after
+// the issuer refused this build.
+//
+// The credential is what authorises this process to act for a viewer, not
+// merely what it mints with. A route that forwards a viewer's bearer under a
+// withdrawn credential is acting without authority, whatever it does not mint.
+func TestAViewerBearerRouteRefusesToActWithoutACredential(t *testing.T) {
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	bearerOnly := ConsumedModule{
+		As:           "pages",
+		ViewerBearer: true,
+		Methods:      []ConsumedMethod{{Name: "/things.v1.Things/Search", Response: MustFieldMask(thingMessage("Thing"), "entry_id", "big")}},
+	}
+	build := func(t *testing.T, source CredentialSource) (*Server, passthroughRoute) {
+		t.Helper()
+		server := New(Manifest{ID: testSolutionID}).Consumes(bearerOnly)
+		if source != nil {
+			server.Credential(source)
+		}
+		server.cfg.profile = localProfile
+		server.cfg.gatewayURL = gw.URL
+		route := passthroughRoute{module: bearerOnly, method: bearerOnly.Methods[0]}
+		return server, route
+	}
+
+	header := http.Header{}
+	header.Set("authorization", "Bearer viewer")
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+
+	t.Run("a refused build", func(t *testing.T) {
+		server, route := build(t, failingCredentialSource{
+			err: fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused),
+		})
+		if _, err := server.authorize(context.Background(), route, header, nil); err == nil {
+			t.Fatal("a ViewerBearer route acted for a viewer while this execution's credential was refused: it forwards that viewer's bearer to the gateway under an authority the issuer has withdrawn")
+		}
+	})
+
+	t.Run("an issuer that cannot answer", func(t *testing.T) {
+		server, route := build(t, failingCredentialSource{
+			err: fmt.Errorf("%w: the issuer cannot reach its own dependencies", workcontext.ErrMintUnavailable),
+		})
+		if _, err := server.authorize(context.Background(), route, header, nil); err == nil {
+			t.Fatal("a ViewerBearer route acted for a viewer while this execution's credential could not be obtained")
+		}
+	})
+
+	// The survive-control: with a credential the issuer approves, the same
+	// route authorises normally. Without this, a route refusing everything
+	// passes both cases above.
+	t.Run("an approved credential", func(t *testing.T) {
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+		mint := newHostMint(t, &hostMint{})
+		server, route := build(t, mintClientFor(t, mint.URL, tokenFile))
+		if _, err := server.authorize(context.Background(), route, header, nil); err != nil {
+			t.Fatalf("a ViewerBearer route was refused while this process holds an approved credential: %v", err)
+		}
+	})
+
+	// And a server with no credential source at all still serves: a solution
+	// that mints nothing and declares nothing to mint with is a valid shape,
+	// and the ask is only about a source that exists and is failing.
+	t.Run("no credential source declared", func(t *testing.T) {
+		server, route := build(t, nil)
+		if _, err := server.authorize(context.Background(), route, header, nil); err != nil {
+			t.Fatalf("a ViewerBearer route was refused on a solution that declares no credential source: %v", err)
+		}
+	})
 }

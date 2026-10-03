@@ -568,3 +568,64 @@ func TestAViewerBearerAudienceCannotBeMintedFor(t *testing.T) {
 		t.Errorf("observed %d mints for a ViewerBearer audience, want 0", got)
 	}
 }
+
+// TestAnEmptyManifestIdCannotDisableTheCeiling: the ceiling applied only when
+// the resolved contract carried a solution id, and the solution id is
+// Manifest.ID — so the field that identifies the solution doubled as the
+// sentinel for "a boot resolved this contract". An empty id left the ceiling
+// switched off while every other part of the boot reported success, and
+// ForModule asking for no scopes against an undeclared audience reached the
+// host as a viewer mint.
+//
+// Two independent reasons it cannot recur: the ceiling is keyed on its own
+// flag, and an empty id is refused at boot. A value that is also a sentinel
+// has one, and which one it is depends on a caller.
+func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
+	t.Run("an empty id is refused at boot", func(t *testing.T) {
+		err := Manifest{ID: ""}.validateSurfaces()
+		if err == nil {
+			t.Fatal("a manifest with no id was accepted: it is what the presence document names this solution by, what the published contract reports, and what every refusal here identifies this process as")
+		}
+		if !strings.Contains(err.Error(), "Manifest.ID") {
+			t.Errorf("the refusal %q does not name the field that fixes it", err)
+		}
+		// And whitespace is not an id either.
+		if err := (Manifest{ID: "   "}).validateSurfaces(); err == nil {
+			t.Error("a manifest whose id is whitespace was accepted")
+		}
+	})
+
+	// The one that matters: even reaching the state by hand, the ceiling is
+	// still governing, because it no longer reads an id to decide.
+	t.Run("the ceiling governs a resolved contract with no id", func(t *testing.T) {
+		gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+		server := New(Manifest{ID: ""}).
+			Consumes(passthroughModule()).
+			Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+				localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+			}})
+		server.cfg.profile = localProfile
+		server.cfg.gatewayURL = gw.URL
+		contract, err := server.resolveContract()
+		if err != nil {
+			t.Fatalf("resolveContract: %v", err)
+		}
+		if contract.Solution != "" {
+			t.Fatalf("this test needs a resolved contract carrying no solution id, got %q", contract.Solution)
+		}
+		server.contract = contract
+		server.contractResolved = true
+
+		header := http.Header{}
+		header.Set("authorization", "Bearer viewer")
+		header.Set(orgHeader, "org-1")
+		header.Set(sessionHeader, "session-1")
+		_, err = server.gatewayFor(header).ForModule(context.Background(), "undeclared")
+		if err == nil {
+			t.Fatal("an ask for an audience the contract does not declare was minted for, on a contract carrying no solution id: the ceiling has to be keyed on whether a boot resolved it, not on a field that happens to be non-empty")
+		}
+		if got := len(gw.observedMints()); got != 0 {
+			t.Errorf("observed %d mints outside the published ceiling, want 0", got)
+		}
+	})
+}

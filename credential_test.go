@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -697,4 +698,94 @@ func TestHealthIsHonestAboutTheCredential(t *testing.T) {
 			t.Errorf("health = %d on a server with no credential source, want 200: there is nothing to consult, and a gateway built outside a boot mints nothing anyway", status)
 		}
 	})
+}
+
+// failingCredentialSource answers every ask with one error, which is how a
+// refused build and an unreachable issuer both look from a route's point of
+// view.
+type failingCredentialSource struct{ err error }
+
+func (f failingCredentialSource) Credential(context.Context) (workcontext.Credential, error) {
+	return workcontext.Credential{}, f.err
+}
+
+// TestAPlainHandlerRefusesToActWithoutACredential: a plain handler mints
+// nothing, which is exactly why it was the route that never consulted the
+// credential — and it still receives a gateway carrying the viewer's bearer.
+// With the credential refused, a booted server kept answering 200 and kept
+// forwarding that bearer, with the credential consulted zero times.
+//
+// handleHealth already made this argument in full and it was applied to the
+// probe alone: the probe answered honestly while the routes carried on.
+func TestAPlainHandlerRefusesToActWithoutACredential(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		ends  bool
+		names error
+	}{
+		{
+			"a refused build",
+			fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused),
+			true, ErrCredentialRefused,
+		},
+		{
+			"an issuer that cannot answer",
+			fmt.Errorf("%w: the issuer cannot reach its own dependencies", workcontext.ErrMintUnavailable),
+			false, ErrCredentialUnavailable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reached atomic.Int64
+			server := New(Manifest{ID: testSolutionID}).
+				Credential(failingCredentialSource{err: tc.err})
+			handler := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+				reached.Add(1)
+				return map[string]string{"ok": "yes"}, nil
+			})
+
+			request := httptest.NewRequest(http.MethodGet, "/thing", nil)
+			request.Header.Set("authorization", "Bearer viewer")
+			recorder := httptest.NewRecorder()
+			handler(recorder, request)
+
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Errorf("the handler answered %d while this process held no approved credential, want 503: it would forward the viewer's bearer to the gateway under an authority the issuer has withdrawn", recorder.Code)
+			}
+			if got := reached.Load(); got != 0 {
+				t.Errorf("the handler body ran %d times, want 0: the refusal has to come before anything acts for the viewer", got)
+			}
+			if body := recorder.Body.String(); !strings.Contains(body, "credential") {
+				t.Errorf("the 503 body %q does not say the credential is why", body)
+			}
+			// Terminal and transient stay distinguishable: conflating them was
+			// a review blocker in both directions.
+			if err := server.actingForAViewer(context.Background()); !errors.Is(err, tc.names) {
+				t.Errorf("the route's refusal is %v, want one wrapping %v", err, tc.names)
+			}
+			if ended := server.terminalErr.Load() != nil; ended != tc.ends {
+				t.Errorf("the process ending = %v, want %v: a judgement about this build ends it, an issuer that cannot answer right now does not", ended, tc.ends)
+			}
+		})
+	}
+}
+
+// TestAPlainHandlerStillServesWithAnApprovedCredential is the survive-control.
+// Without it, a route that refuses everything unconditionally passes the test
+// above.
+func TestAPlainHandlerStillServesWithAnApprovedCredential(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+	handler := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+		return map[string]string{"ok": "yes"}, nil
+	})
+	request := httptest.NewRequest(http.MethodGet, "/thing", nil)
+	request.Header.Set("authorization", "Bearer viewer")
+	recorder := httptest.NewRecorder()
+	handler(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("a handler answered %d while this process holds an approved credential, want 200: %s", recorder.Code, recorder.Body.String())
+	}
 }

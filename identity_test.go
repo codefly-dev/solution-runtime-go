@@ -1030,3 +1030,58 @@ func TestASourceCannotReplaceThePostureItIsHeldTo(t *testing.T) {
 		t.Error("a per-connection answer that writes out every connection's session secrets was served: the configuration the callback returns replaces the base one, so it is held to the same posture")
 	}
 }
+
+// TestASourcesConfigurationIsNotMutated: serverIdentity wraps GetCertificate,
+// composes over VerifyConnection and wraps GetConfigForClient — all writes —
+// and it did them to the configuration the source handed back.
+//
+// A source is under no obligation to return a fresh one. Returning a
+// configuration it builds once and keeps is the ordinary way to write a source,
+// and then those writes land on a value another handshake may be reading, and a
+// second resolution wraps the wrapper. holdPerConnectionPosture says exactly
+// this about a per-connection answer, in those words, and this function did the
+// thing that comment forbids one level up.
+func TestASourcesConfigurationIsNotMutated(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	shared, err := projectedIdentity{certFile: certFile, keyFile: keyFile, trustBundleFile: bundleFile}.ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := struct {
+		verify   bool
+		perConn  bool
+		getCert  bool
+		numCerts int
+	}{
+		verify:   shared.VerifyConnection != nil,
+		perConn:  shared.GetConfigForClient != nil,
+		getCert:  shared.GetCertificate != nil,
+		numCerts: len(shared.Certificates),
+	}
+
+	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: shared})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	if config == shared {
+		t.Fatal("serverIdentity returned the source's own configuration: everything it applies is a write, so the source's value is being modified while it may be in use elsewhere")
+	}
+	if (shared.VerifyConnection != nil) != before.verify {
+		t.Error("the source's VerifyConnection was written: the admission check belongs on this runtime's copy, not on the value the source keeps")
+	}
+	if (shared.GetConfigForClient != nil) != before.perConn {
+		t.Error("the source's GetConfigForClient was wrapped in place")
+	}
+	if (shared.GetCertificate != nil) != before.getCert || len(shared.Certificates) != before.numCerts {
+		t.Error("the source's certificate selection was rewritten in place")
+	}
+	// And the copy this runtime serves does carry the checks, or the test
+	// above is satisfied by a runtime that applies nothing at all.
+	if config.VerifyConnection == nil {
+		t.Error("the configuration this listener serves carries no caller admission")
+	}
+}
