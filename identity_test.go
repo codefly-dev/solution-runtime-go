@@ -833,3 +833,44 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 		})
 	}
 }
+
+// TestARotatedLeafIsStillHeldToTheFrozenPrincipal closes the half of the
+// leaf check that only ran at boot.
+//
+// A source with no per-connection callback still rotates its leaf — that is what
+// GetCertificate is for, and the projected pair is deliberately short-lived. The
+// principal check ran once, against whatever was current then, so a rotation
+// landing a certificate for a *different* workload (the wrong Secret replaced, a
+// mesh CA re-issuing under a changed identity) would be served for the life of
+// the process, with the one check that would have caught it having run before
+// the file changed.
+func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
+		trustBundleFile: bundleFile, allowedCallers: testGatewayPrincipal}
+	server.principal = testPrincipal
+
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("the boot refused a conforming pair: %v", err)
+	}
+	if _, err := config.GetCertificate(&tls.ClientHelloInfo{ServerName: "localhost"}); err != nil {
+		t.Fatalf("the leaf current at boot was refused: %v", err)
+	}
+
+	// The projection is replaced with a pair for another workload, under the
+	// same anchor so nothing else about it is wrong.
+	rivalCert, rivalKey, _, _, _ := c.workload(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
+	writeFile(t, certFile, readFile(t, rivalCert))
+	writeFile(t, keyFile, readFile(t, rivalKey))
+
+	_, err = config.GetCertificate(&tls.ClientHelloInfo{ServerName: "localhost"})
+	if err == nil {
+		t.Fatal("a leaf issued for another workload was served after rotation: the principal check only ran at boot, against a file that has since changed")
+	}
+	if !strings.Contains(err.Error(), "another-workload") || !strings.Contains(err.Error(), testPrincipal) {
+		t.Errorf("refusal %q does not name both the identity served and this workload's frozen principal", err)
+	}
+}

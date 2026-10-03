@@ -369,6 +369,25 @@ func usableServerIdentity(config *tls.Config) error {
 // that happens to arrive is not what is in question, the configuration the
 // listener would answer anyone with is.
 func holdPerConnectionPosture(config *tls.Config, principal string, allowed []string) {
+	// A source with no per-connection callback still rotates its leaf — the
+	// whole reason GetCertificate exists — and the boot checked only the leaf
+	// that was current then. A rotation landing a certificate for another
+	// workload (the wrong Secret replaced, a mesh CA re-issuing under a changed
+	// identity) would then be served for the life of the process, with the one
+	// check that would have caught it having run before the file changed. So
+	// the leaf is re-held to the frozen principal as it is served.
+	if serve := config.GetCertificate; serve != nil {
+		config.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			pair, err := serve(hello)
+			if err != nil {
+				return nil, err
+			}
+			if err := pairPresentsThisWorkload(pair, principal); err != nil {
+				return nil, err
+			}
+			return pair, nil
+		}
+	}
 	inner := config.GetConfigForClient
 	if inner == nil {
 		return
@@ -422,17 +441,36 @@ func presentsThisWorkload(config *tls.Config, principal string) error {
 	if err != nil {
 		return err
 	}
+	return leafPresentsThisWorkload(leaf, principal)
+}
+
+// pairPresentsThisWorkload is presentsThisWorkload for one certificate rather
+// than a configuration, so a leaf resolved per handshake is held to the same
+// rule as the one checked at boot.
+func pairPresentsThisWorkload(pair *tls.Certificate, principal string) error {
+	if pair == nil || len(pair.Certificate) == 0 {
+		return fmt.Errorf("the identity source produced an empty certificate chain for this handshake")
+	}
+	leaf := pair.Leaf
+	if leaf == nil {
+		parsed, err := x509.ParseCertificate(pair.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("the certificate this handshake would be answered with cannot be parsed: %w", err)
+		}
+		leaf = parsed
+	}
+	return leafPresentsThisWorkload(leaf, principal)
+}
+
+// leafPresentsThisWorkload is the comparison itself.
+func leafPresentsThisWorkload(leaf *x509.Certificate, principal string) error {
 	for _, uri := range leaf.URIs {
 		if uri.String() == principal {
 			return nil
 		}
 	}
-	presented := make([]string, 0, len(leaf.URIs))
-	for _, uri := range leaf.URIs {
-		presented = append(presented, uri.String())
-	}
 	return fmt.Errorf("the certificate this listener would present names %s, and this workload's frozen principal is %q (%s/%s): a pair projected for another workload would otherwise be served, and the mismatch would surface at whatever verifies this destination rather than here",
-		presentedIdentities(presented), principal, AuthorityGroup, AuthorityPrincipalKey)
+		presentedIdentities(uriStrings(leaf.URIs)), principal, AuthorityGroup, AuthorityPrincipalKey)
 }
 
 // presentedIdentities renders what a leaf does name, so a refusal distinguishes
