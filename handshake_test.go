@@ -180,6 +180,7 @@ func (s shapeShifter) apply(config *tls.Config) {
 	switch {
 	case s.byName:
 		config.Certificates = []tls.Certificate{*s.approved, *s.rival}
+		//nolint:staticcheck // Deliberately sets the deprecated field, to prove the listener refuses a source that does.
 		config.NameToCertificate = map[string]*tls.Certificate{"localhost": s.rival}
 	case s.staticRivalBeside:
 		config.Certificates = []tls.Certificate{*s.rival, *s.approved}
@@ -551,13 +552,13 @@ func newPlatformHost(t *testing.T, c *cell, identity string) *platformHost {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "yes"})
 	}))
-	host.Server.TLS = &tls.Config{
+	host.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{*c.identity(t, identity)},
 		ClientCAs:    c.roots,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
-	host.Server.StartTLS()
+	host.StartTLS()
 	t.Cleanup(host.Close)
 	return host
 }
@@ -1694,6 +1695,7 @@ func TestAResumedConnectionCannotBeAdmittedWithoutACertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	//nolint:staticcheck // Deliberately sets the deprecated field, to prove the refusal fires.
 	keyed.SessionTicketKey = [32]byte{7}
 	if err := usableServerIdentity(keyed); err == nil {
 		t.Error("a source fixing its own resumption ticket key was accepted: anyone holding that key can forge a ticket this listener resumes, and a resumed connection presents no certificate")

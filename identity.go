@@ -769,6 +769,7 @@ func unsubvertedPosture(config *tls.Config) error {
 		set       bool
 	}{
 		{"Time", "certificate expiry and validity are judged against this clock, so a source supplying one decides that an expired certificate is current", config.Time != nil},
+		//nolint:staticcheck // Reading a deprecated field is the point: this refuses a source that set it. Naming it keeps the reference compile-checked, which reflection by field name would not — and a security check that stops working silently when a field is renamed is the one outcome worse than the warning.
 		{"Rand", "the handshake's key material comes from this reader, so a source supplying one decides how guessable this connection's secrets are", config.Rand != nil},
 		{"KeyLogWriter", "the session secrets of every connection are written here in the clear, which is a decryption key for the traffic this listener exists to protect", config.KeyLogWriter != nil},
 		{"WrapSession", "resumption tickets are encoded by this, and a resumed connection presents no certificate, so a source encoding its own tickets admits callers without a handshake this package sees", config.WrapSession != nil},
@@ -790,6 +791,7 @@ func unsubvertedPosture(config *tls.Config) error {
 		// key they are sealed with. A chosen key is the same capability with
 		// fewer lines — anyone holding it can forge a ticket this listener
 		// accepts — and the denylist named only the callbacks.
+		//nolint:staticcheck // As above: deprecated is why it is refused, and the reference stays compile-checked.
 		{"SessionTicketKey", "resumption tickets are sealed with a key the source chose, and anyone holding it can forge a ticket this listener resumes without any certificate being presented", config.SessionTicketKey != [32]byte{}},
 		// SetSessionTicketKeys installs keys that cannot be read back off the
 		// configuration, so no entry here can catch it. That hole is closed by
@@ -999,6 +1001,7 @@ func holdServedCertificate(config *tls.Config, principal string) error {
 // this configuration. Narrowing the surface is what makes validating at use
 // complete instead of validating whichever branch a test happened to take.
 func oneCertificateToChooseFrom(config *tls.Config, side string) error {
+	//nolint:staticcheck // Deprecated and still consulted by crypto/tls whenever more than one certificate is configured, which is exactly the case this refuses. Not reading it would reinstate the bug.
 	if config.NameToCertificate != nil {
 		return fmt.Errorf("the identity source selects %s's certificate by server name (NameToCertificate): this workload has exactly one identity, and a configuration that chooses between several serves whichever the caller's name selects, not the one held to the frozen principal", side)
 	}

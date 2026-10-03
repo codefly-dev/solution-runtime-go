@@ -38,7 +38,7 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return map[string]string{"answer": "ok"}, nil
 	})
 	for _, bearer := range []string{"", "Bearer viewer"} {

@@ -1090,6 +1090,7 @@ func TestASourceCannotReplaceThePostureItIsHeldTo(t *testing.T) {
 		{"a clock of its own", func(cfg *tls.Config) {
 			cfg.Time = func() time.Time { return time.Unix(0, 0) }
 		}},
+		//nolint:staticcheck // Deliberately sets the deprecated field, to prove the refusal fires.
 		{"a randomness source of its own", func(cfg *tls.Config) { cfg.Rand = strings.NewReader("not random") }},
 		{"the session secrets written out", func(cfg *tls.Config) { cfg.KeyLogWriter = io.Discard }},
 		{"resumption tickets it encodes", func(cfg *tls.Config) {
@@ -1100,6 +1101,7 @@ func TestASourceCannotReplaceThePostureItIsHeldTo(t *testing.T) {
 		}},
 		{"no verification at all", func(cfg *tls.Config) { cfg.InsecureSkipVerify = true }},
 		{"a resumption ticket key of its own", func(cfg *tls.Config) {
+			//nolint:staticcheck // Deliberately sets the deprecated field, to prove the refusal fires.
 			cfg.SessionTicketKey = [32]byte{1}
 		}},
 	} {

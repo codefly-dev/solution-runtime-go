@@ -552,11 +552,6 @@ func send[T any](ch chan T, value T) {
 	}
 }
 
-// consumesDocuments is the api.consumes projection core surfaces to a running
-// backend for the notes→documents federation. The literal key is
-// manifest.APIConsumesEnvironmentVariable (a wire contract).
-const consumesDocuments = `[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`
-
 // --- Work Context ---
 
 // mintRequest is what the accounts StartTask RPC received: the ask itself, plus

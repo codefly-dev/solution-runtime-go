@@ -3,11 +3,14 @@ package solution
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/codefly-dev/sdk-go/workcontext"
 	"testing"
@@ -78,8 +81,7 @@ func TestACredentialBearingRequestIsNeverRedirected(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := newTrap(t)
-			var gw *httptest.Server
-			gw = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if tc.redirect(r) {
 					// 307 keeps the method and re-sends the body, which is the
 					// worst case: the mint's own payload is replayed too.
@@ -298,6 +300,14 @@ func TestOutboundTrustIsReReadPerConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the platform was not reachable with its own root in the bundle: %v", err)
 	}
+	// Drained, not just closed. net/http returns a connection to the pool only
+	// once its body is consumed, so closing an unread body leaves the
+	// connection in no defined state for the CloseIdleConnections below —
+	// which was a flake, not a subtlety: when the connection had not yet
+	// become idle there was nothing to close, the next request reused it, and
+	// the reused connection answered without a handshake. The test then
+	// reported that revoking a root does nothing, intermittently.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 
 	// The root is removed and replaced by an unrelated one — the shape of a
@@ -310,8 +320,24 @@ func TestOutboundTrustIsReReadPerConnection(t *testing.T) {
 	// handshake, which is why per-dial reloading is only half the fix.
 	client.CloseIdleConnections()
 
-	if resp, err := client.Get(host.URL + "/platform/_credential"); err == nil {
+	// And the second request has to actually dial, or it is testing nothing:
+	// a reused connection skips the handshake and would pass this whether
+	// trust was re-read or not. httptrace says which happened.
+	var reused atomic.Bool
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { reused.Store(info.Reused) },
+	}
+	request, err := http.NewRequestWithContext(
+		httptrace.WithClientTrace(context.Background(), trace),
+		http.MethodGet, host.URL+"/platform/_credential", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := client.Do(request); err == nil {
 		_ = resp.Body.Close()
+		if reused.Load() {
+			t.Fatal("the second request was served on a connection that was already open, so it never handshook and this test asserted nothing: the control's connection had not returned to the pool when CloseIdleConnections ran")
+		}
 		t.Fatal("the platform still authenticated after its root was removed from the bundle: outbound trust was snapshotted at boot, so revoking a root would need a restart — and this client carries the projected token, the viewer's bearer and this workload's credential")
 	}
 

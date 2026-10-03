@@ -1188,7 +1188,7 @@ func readAdmissionFile(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	content, err := io.ReadAll(io.LimitReader(file, admissionFileLimit+1))
 	if err != nil {
 		return "", err
@@ -1460,7 +1460,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		case <-ctx.Done():
 		case <-s.credentialRefusedC():
 		}
-		srv.Close()
+		_ = srv.Close()
 	}()
 
 	log.Printf("solution %q listening on :%s (gateway=%s, profile=%s)", s.manifest.ID, s.cfg.port, redactedURL(s.cfg.gatewayURL), s.cfg.profile)
@@ -2082,7 +2082,9 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 // keep one connection.
 func drainAndClose(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	resp.Body.Close()
+	// Discarded deliberately: the response is already read and the caller has
+	// what it came for, so a close failure changes nothing it could act on.
+	_ = resp.Body.Close()
 }
 
 // Gateway is a client bound to the caller's bearer. It exposes an HTTP client
@@ -2708,11 +2710,10 @@ type workContextScope struct {
 func workContextScopes(scopes []Scope) []workContextScope {
 	wire := make([]workContextScope, len(scopes))
 	for i, scope := range scopes {
-		wire[i] = workContextScope{
-			ResourceKind: scope.ResourceKind,
-			Actions:      scope.Actions,
-			ResourceIDs:  scope.ResourceIDs,
-		}
+		// A conversion, not a field-by-field copy: the two types have the
+		// same shape by construction, and spelling the fields out meant a
+		// field added to Scope would silently stop travelling.
+		wire[i] = workContextScope(scope)
 	}
 	return wire
 }

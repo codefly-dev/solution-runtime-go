@@ -84,7 +84,7 @@ func TestAssetsAreServedWithTheRightCachePolicy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GET %s: %v", tc.path, err)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != tc.status {
 				t.Fatalf("status %d, want %d", resp.StatusCode, tc.status)
 			}
@@ -113,7 +113,7 @@ func TestTheAssetsOfAnEmbeddedBuildAreServedFromTheBinary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET the embedded manifest: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status %d, want 200 served from the binary with no assets directory on disk", resp.StatusCode)
 	}
@@ -133,7 +133,7 @@ func readServed(t *testing.T, solution *booted, path string, into any) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET %s = %d, want 200", path, resp.StatusCode)
 	}

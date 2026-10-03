@@ -246,12 +246,11 @@ func f() { _ = conformance.Fixtures() }`, 0)
 // did, and a function taking one proves nothing about where it was called
 // from.
 func TestATestingTBParameterIsNotAGate(t *testing.T) {
+	// The point is that this line compiles: a struct embedding testing.TB is a
+	// testing.TB anywhere, including in a deployment, so a function taking one
+	// proves nothing about where it was called from.
 	var satisfied testing.TB = struct{ testing.TB }{}
-	if satisfied == nil {
-		t.Fatal("unreachable")
-	}
-	// The point is that the line above compiles: a struct embedding testing.TB
-	// is a testing.TB anywhere, including in a deployment.
+	_ = satisfied
 }
 
 // workContextImports is the local name each Work Context package is imported

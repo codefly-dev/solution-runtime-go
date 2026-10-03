@@ -139,13 +139,13 @@ func (m *hostMint) serveTLS(t *testing.T, c *cell) {
 	t.Helper()
 	m.Close()
 	m.Server = httptest.NewUnstartedServer(http.HandlerFunc(m.serve))
-	m.Server.TLS = &tls.Config{
+	m.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{*c.identity(t, testGatewayPrincipal)},
 		ClientCAs:    c.roots,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
-	m.Server.StartTLS()
+	m.StartTLS()
 	t.Cleanup(m.Close)
 }
 
@@ -523,7 +523,7 @@ func TestBootMintsExactlyOnceAndServesOverTLS(t *testing.T) {
 	// control is the TLS health check above, which the same port answers 200.
 	plain, err := http.Get("http://" + solution.base[len("https://"):] + HealthPath)
 	if err == nil {
-		defer plain.Body.Close()
+		defer func() { _ = plain.Body.Close() }()
 		if plain.StatusCode == http.StatusOK {
 			t.Error("plain HTTP was served: the listener presents this workload's identity and there is no plain-HTTP listener")
 		}
@@ -635,7 +635,7 @@ func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", ContractPath, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var published effectiveContract
 	if err := json.NewDecoder(resp.Body).Decode(&published); err != nil {
 		t.Fatalf("decode contract: %v", err)
@@ -687,7 +687,7 @@ func getStatus(t *testing.T, client *http.Client, target string) int {
 	if err != nil {
 		t.Fatalf("GET %s: %v", target, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode
 }
 
@@ -695,10 +695,6 @@ func getStatus(t *testing.T, client *http.Client, target string) int {
 // module the passthrough fixtures declare. The key is a wire contract
 // (manifest.APIConsumesEnvironmentVariable).
 const consumesThings = `[{"id":"thingstore.things","module":"thingstore","service":"things","endpoint":"rest","protocol":"rest","as":"things"}]`
-
-// consumesThingsAndBearer adds a module called with the viewer's bearer, which
-// mints nothing — the case a ceiling must refuse an ask for.
-const consumesThingsAndBearer = `[{"id":"thingstore.things","module":"thingstore","service":"things","endpoint":"rest","protocol":"rest","as":"things"},{"id":"pagestore.pages","module":"pagestore","service":"pages","endpoint":"rest","protocol":"rest","as":"pages"}]`
 
 // TestTheBootedListenerDropsACallerItNoLongerAdmits drives the production
 // serve() path, which is the only place the per-connection watch is installed.
