@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	corework "github.com/codefly-dev/core/workcontext"
 	"io"
@@ -1542,4 +1543,59 @@ func TestNoProductionCodeDerivesTheMintAddress(t *testing.T) {
 			t.Errorf("%s still carries mintURLGuessed: a guessed address for the endpoint this runtime attests itself to is refused now, so there is nothing to label", name)
 		}
 	}
+}
+
+// TestTwoAdmissionSourcesAreRefusedRatherThanRanked: an admission set answered
+// by both an operator override and the platform's provisioning is two sources
+// for one authorization fact. The previous revision logged which one won, which
+// reports the conflict without resolving it — whichever this process picked, the
+// other is a decision somebody made that is not in force, and for admission
+// being wrong admits a caller.
+//
+// It is the stance the SDK already takes on the same question: a value
+// delivered inline and by file carrier is refused as two sources for one fact.
+func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
+	base := func(t *testing.T) config {
+		t.Helper()
+		return config{
+			port: "8080", gatewayURL: "https://gateway:42152",
+			mintURL: "https://gateway:42152" + credentialMintPath,
+			profile: localProfile,
+		}
+	}
+
+	t.Run("an override alone is accepted", func(t *testing.T) {
+		cfg := base(t)
+		cfg.allowedCallersFile = identitiesFile(t, testGatewayPrincipal)
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("an override with no provisioning behind it was refused: %v", err)
+		}
+	})
+
+	t.Run("both answering is refused, naming both", func(t *testing.T) {
+		cfg := base(t)
+		// Simulated at the boundary the resolver produces, because a test
+		// cannot make the SDK's workspace configuration answer: what is under
+		// test is that validate() refuses rather than ranks.
+		cfg.admissionConflict = errors.New("the allowed callers are answered twice: CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE names \"/a\" and the platform provisioned workload-identity/ALLOWED_CALLERS_FILE as \"/b\"")
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("a boot accepted an admission set answered by two sources: ranking them silently is how a caller set gets widened with nothing recording that the platform's decision was not in force")
+		}
+		if !strings.Contains(err.Error(), "answered twice") {
+			t.Errorf("the refusal %q does not say the set has two answers", err)
+		}
+		// And it is reported before every other provisioning message, or it
+		// reads as ordinary advice next to them.
+		cfg.port = "not-a-port"
+		if again := cfg.validate(); again == nil || !strings.Contains(again.Error(), "answered twice") {
+			t.Errorf("with another refusal also pending, validate reported %v: the conflicting-authorization refusal is the one that says a decision is not in force", again)
+		}
+	})
+
+	t.Run("the resolver finds no conflict with no override set", func(t *testing.T) {
+		if err := conflictingAdmissionSources(context.Background()); err != nil {
+			t.Errorf("a conflict was reported with no override set: %v", err)
+		}
+	})
 }

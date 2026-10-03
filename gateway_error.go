@@ -86,7 +86,10 @@ func handlerErrorResponse(err error) (int, string) {
 	switch {
 	// ErrRevoked first: ErrNotAttested wraps it when a renewal is refused
 	// because the state the credential is sealed to has moved, and the first
-	// matching branch is what the page is told.
+	// matching branch is what the page is told. It arrives from a *callee* or
+	// from a renewal, never from the mint client itself, and it is not terminal
+	// — the SDK's contract for it is a refresh and a retry (see
+	// terminalCredentialFailure).
 	case errors.Is(err, workcontext.ErrRevoked):
 		return http.StatusConflict, "the authority this solution presented has been superseded; the call was not made"
 	case errors.Is(err, ErrNotAttested):

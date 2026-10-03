@@ -112,6 +112,54 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	return client, nil
 }
 
+// heldToTheFrozenAuthority rechecks the authority whenever a source hands back
+// a credential that is not the one it handed back last.
+//
+// A changed token is a renewal, which is the moment that matters: the host is
+// the authority for the principal, the mint audience and the projection
+// audience, and a value that drifted after boot must not be re-sealed into a
+// new credential. Checking on the *change* rather than on every call keeps this
+// a comparison on the hot path.
+//
+// A drifted authority is terminal, and reported as a refusal rather than as an
+// unavailable mint: nothing about it gets better by asking again.
+func heldToTheFrozenAuthority(source CredentialSource, authority *codefly.Authority) CredentialSource {
+	if authority == nil {
+		// No frozen authority to recheck against. Every booted path has one —
+		// openAuthority runs before this — so this is the unit-test shape, and
+		// wrapping it would only hide the absence.
+		return source
+	}
+	return &authorityHeldSource{inner: source, authority: authority}
+}
+
+type authorityHeldSource struct {
+	inner     CredentialSource
+	authority *codefly.Authority
+	mu        sync.Mutex
+	last      string
+}
+
+func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	credential, err := a.inner.Credential(ctx)
+	if err != nil {
+		return credential, err
+	}
+	a.mu.Lock()
+	renewed := a.last != "" && credential.Token() != a.last
+	a.mu.Unlock()
+	if renewed {
+		if err := a.authority.Recheck(ctx); err != nil {
+			return workcontext.Credential{}, fmt.Errorf("%w: this execution's credential was renewed while an authority-bearing value had drifted from the one this process froze at boot: %w",
+				workcontext.ErrMintRefused, err)
+		}
+	}
+	a.mu.Lock()
+	a.last = credential.Token()
+	a.mu.Unlock()
+	return credential, nil
+}
+
 // mintOptions is how this runtime asks the SDK's mint client for a credential.
 //
 // A function of its own so it can be read in a test. Every field here is a
@@ -176,6 +224,18 @@ func (s *Server) openCredential(ctx context.Context) error {
 		}
 		s.credential = source
 	}
+	// Whatever the source is, the authority recheck is this runtime's promise
+	// and not the source's.
+	//
+	// A supplied source replaces the mint client, and with it every option
+	// mintOptions carries — including Authority, which the SDK rechecks before
+	// each renewal. So the one guarantee that exists to stop a drifted
+	// authority value being laundered into a differently-sealed credential
+	// applied to the platform path only, while this package's own
+	// documentation promises it of the process. Wrapping here makes the promise
+	// true of every source, and it costs the platform source nothing: the SDK
+	// does it too, and a recheck of three frozen values is a comparison.
+	s.credential = heldToTheFrozenAuthority(s.credential, s.authority)
 	window := s.firstMintWindow
 	if window == 0 {
 		window = firstMintWait

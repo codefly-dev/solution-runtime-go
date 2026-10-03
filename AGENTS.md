@@ -111,7 +111,19 @@ embedding it.
   without any check here seeing a handshake. That list is a denylist over a
   struct this package does not own: it is complete for the Go version in
   `go.mod` and not by construction, which is why the per-connection answer runs
-  through the same function rather than a copy of its reasoning.
+  through the same function rather than a copy of its reasoning. `SessionTicketKey`
+  is on that list for the same reason as the callbacks — choosing the key tickets
+  are sealed with is the same capability as encoding them — and
+  `SetSessionTicketKeys` is the one hole a check cannot close, because it is a
+  method and the keys it installs cannot be read back off the configuration.
+- **A source's anchor is asked for, never fabricated.** A consumer source that
+  resolves its anchor per handshake implements `PeerAnchorSource`; one that can
+  only answer through a `GetConfigForClient` call is refused at boot, because
+  obtaining the anchor would mean passing a `ClientHelloInfo` nobody sent — the
+  same synthetic-probe defect this cutover was blocked on for certificates, and
+  worse, since an anchor has no check behind it. The outbound *certificate* is
+  still taken through an empty hello, which is sound only because the frozen
+  principal hold catches a wrong answer at the moment it is presented.
 - The credential is obtained **once**, before the listener exists. A *refusal*
   fails the boot and is never retried — the host is saying this build is not the
   one its presence document approved, which no number of attempts changes, and a
@@ -150,6 +162,12 @@ embedding it.
   holds a certificate from the same anchor, the consumed modules included, so
   the admitted caller set is provisioned
   (`workload-identity`/`ALLOWED_CALLERS_FILE`) and refused at boot when absent.
+  An admission set answered by **both** the env override and the platform's
+  provisioning is refused rather than ranked — two sources for one
+  authorization fact, which is the stance the SDK already takes on a value
+  delivered inline and by carrier. The other paths in that group still take the
+  override first, because the worst case there is this process reading its own
+  material from somewhere else, not admitting a caller.
   Both admission sets are **paths this process reads itself**, per handshake and
   per dial, not configuration values: a value is fixed at process start, so
   "re-resolved per handshake" through the SDK's accessor returned the boot answer

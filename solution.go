@@ -308,6 +308,11 @@ type Server struct {
 	terminal     chan struct{}
 	terminalOnce sync.Once
 	terminalErr  atomic.Pointer[error]
+	// credentialValidUntil is when the credential this process last obtained
+	// expires, in Unix nanoseconds. It is what decides a route's answer when
+	// the source does not respond inside the route's bound: see
+	// credentialWithin.
+	credentialValidUntil atomic.Int64
 	// attestation throttles what a failed attestation says (see attestWorkload).
 	attestation attestationReport
 	// outbound is the authenticated client this boot makes platform requests
@@ -369,6 +374,9 @@ type config struct {
 	// refuses callers who should be let in, judging by a stale *admission* lets
 	// in callers who should be refused.
 	allowedCallersFile string
+	// admissionConflict is set when both an override and the platform answered
+	// for an admission set. See conflictingAdmissionSources.
+	admissionConflict error
 	// platformPeersFile is the path to the set of identities this runtime
 	// accepts *outbound*: the mint and the gateway. It is the mirror of
 	// allowedCallersFile and it exists for the same reason — every workload in
@@ -582,27 +590,47 @@ func loadConfig(ctx context.Context) config {
 		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 	}
-	// Which source answered for the two admission paths, once, at boot. The
-	// override outranks the platform's provisioning by design — an operator
-	// with a deployment the resolver cannot see needs it, as for the other
-	// paths — but admission is the one place where a silent override is a
-	// finding rather than a convenience: it is how a caller set gets widened
-	// with nothing anywhere recording that the platform's own answer was not
-	// the one in force.
-	for _, admission := range []struct{ what, path, override string }{
-		{"allowed callers", cfg.allowedCallersFile, IdentityAllowedCallersFileEnvironmentVariable},
-		{"platform peers", cfg.platformPeersFile, IdentityPlatformPeersFileEnvironmentVariable},
+	// Two sources for one authorization fact are refused, not ranked.
+	//
+	// Every other path here takes the override first and the provisioned value
+	// second, which is right for a path: an operator with a deployment the
+	// resolver cannot see needs the escape hatch, and the worst case is this
+	// process reading its own material from somewhere else. Admission is not
+	// that. An override that silently outranks the platform's answer is how a
+	// caller set gets widened with nothing recording that the platform's
+	// decision was not the one in force — and logging which one won, which is
+	// what the previous revision did, reports the conflict without resolving
+	// it.
+	//
+	// So: either source may answer, and both answering is an error naming
+	// both. It is the stance the SDK already takes on the same question — a
+	// value delivered inline and by file carrier is "two sources for one fact
+	// and are refused" (file_carrier.go) — applied to the one kind of value
+	// where being wrong admits a caller.
+	cfg.admissionConflict = conflictingAdmissionSources(ctx)
+	return cfg
+}
+
+// conflictingAdmissionSources is the error validate() reports when an
+// admission set is answered by both an operator override and the platform's
+// provisioning.
+func conflictingAdmissionSources(ctx context.Context) error {
+	for _, admission := range []struct{ what, override, key string }{
+		{"allowed callers", IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityAllowedCallersFileKey},
+		{"platform peers", IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityPlatformPeersFileKey},
 	} {
-		if admission.path == "" {
+		overridden := strings.TrimSpace(env(admission.override, ""))
+		if overridden == "" {
 			continue
 		}
-		source := fmt.Sprintf("%s/%s, provisioned by the platform", WorkloadIdentityGroup, admission.what)
-		if strings.TrimSpace(env(admission.override, "")) != "" {
-			source = admission.override + ", an operator override that outranks the platform's own answer"
+		provisioned, _ := codefly.For(ctx).WorkspaceConfiguration(WorkloadIdentityGroup, admission.key)
+		if strings.TrimSpace(provisioned) == "" {
+			continue
 		}
-		log.Printf("codefly: %s are read from %q (%s)", admission.what, admission.path, source)
+		return fmt.Errorf("the %s are answered twice: %s names %q and the platform provisioned %s/%s as %q. An authorization decision with two sources is refused rather than ranked — whichever this process picked, the other is a decision somebody made that is not in force. Unset the override, or remove the provisioning",
+			admission.what, admission.override, overridden, WorkloadIdentityGroup, admission.key, strings.TrimSpace(provisioned))
 	}
-	return cfg
+	return nil
 }
 
 // WorkloadIdentityGroup is the workspace configuration group through which the
@@ -720,6 +748,12 @@ func workloadPath(ctx context.Context, override, key string) string {
 // failed first", because one generic message sent an operator to inspect
 // endpoint resolution over a variable they had broken themselves.
 func (c config) validate() error {
+	// First, because it is the one refusal that says a decision somebody made
+	// is not the one in force, and every other message below would read as
+	// ordinary provisioning advice next to it.
+	if c.admissionConflict != nil {
+		return c.admissionConflict
+	}
 	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
 	}
@@ -1160,13 +1194,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// mutex and a comparison except at the renewal the credential's own expiry
 	// dictates. Nothing here runs on a timer this runtime chose.
 	if s.credential != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), healthCredentialTimeout)
-		defer cancel()
-		if _, err := s.credential.Credential(ctx); err != nil {
-			if terminalCredentialFailure(err) {
-				// Records it, which also ends the process: a refused build is
-				// not something to re-discover on the next probe.
-				s.credentialRefused(err)
+		// Through credentialWithin, so the deadline is real: passing a context
+		// to the SDK's client does not bound it, because what blocks is a
+		// mutex held across the mint.
+		if _, err := s.credentialWithin(r.Context(), healthCredentialTimeout); err != nil {
+			if errors.Is(err, ErrCredentialRefused) {
 				http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
 				return
 			}
@@ -1179,6 +1211,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 }
+
+const routeCredentialTimeout = 500 * time.Millisecond
 
 // healthCredentialTimeout bounds what a probe will wait for the credential, so
 // a hung issuer makes the probe fail rather than parking it.
@@ -1212,20 +1246,74 @@ func (s *Server) actingForAViewer(ctx context.Context) error {
 	if s.credential == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, healthCredentialTimeout)
-	defer cancel()
-	if _, err := s.credential.Credential(ctx); err != nil {
-		if terminalCredentialFailure(err) {
-			// Records it, which also ends the process: the first route to
-			// discover a refused build is as good a place to learn it as the
-			// probe, and better than the next one.
-			s.credentialRefused(err)
-			return fmt.Errorf("%w: %w", ErrCredentialRefused, err)
-		}
-		return fmt.Errorf("%w: %w", ErrCredentialUnavailable, err)
-	}
-	return nil
+	_, err := s.credentialWithin(ctx, routeCredentialTimeout)
+	return err
 }
+
+// credentialWithin asks for this execution's credential and never waits longer
+// than d, whatever the source does.
+//
+// The bound has to be imposed here, because a context does not reach the thing
+// that blocks. The SDK's mint client takes a sync.Mutex and holds it across the
+// network mint (workcontext/mint.go, Credential), and sync.Mutex.Lock ignores
+// contexts — so a caller arriving during a slow renewal waits on the lock for
+// as long as the renewal takes, and the deadline it passed in bounds nothing.
+// That made the two-second health deadline advisory, and it would have made
+// every route's credential check park behind one slow issuer, which is a worse
+// failure than the one the check was added for.
+//
+// The ask runs on a context detached from the caller's, deliberately: a request
+// that gives up should not cancel a mint that other callers are waiting for,
+// and the SDK caches the result, so the work is not wasted. It is bounded by
+// its own deadline rather than by the caller's.
+//
+// On a timeout, the credential this process already holds decides. Refusing
+// outright would turn a slow renewal — which happens while a perfectly valid
+// credential is still in hand, since renewal starts inside a lead before expiry
+// — into a 503 for every viewer.
+func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (workcontext.Credential, error) {
+	type answer struct {
+		credential workcontext.Credential
+		err        error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		asked, cancel := context.WithTimeout(context.WithoutCancel(ctx), platformRequestTimeout)
+		defer cancel()
+		credential, err := s.credential.Credential(asked)
+		if err == nil {
+			s.credentialValidUntil.Store(credential.ExpiresAt().UnixNano())
+		}
+		answered <- answer{credential, err}
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case got := <-answered:
+		if got.err != nil {
+			if terminalCredentialFailure(got.err) {
+				// Records it, which also ends the process: the first caller to
+				// discover a refused build is as good a place to learn it as
+				// the probe, and better than the next one.
+				s.credentialRefused(got.err)
+				return got.credential, fmt.Errorf("%w: %w", ErrCredentialRefused, got.err)
+			}
+			return got.credential, fmt.Errorf("%w: %w", ErrCredentialUnavailable, got.err)
+		}
+		return got.credential, nil
+	case <-timer.C:
+		if until := s.credentialValidUntil.Load(); until > 0 && time.Now().UnixNano() < until {
+			// A credential is in hand and has not expired. The ask continues
+			// in the background and the next caller gets its result.
+			return workcontext.Credential{}, nil
+		}
+		return workcontext.Credential{}, fmt.Errorf("%w: it did not answer within %s", ErrCredentialUnavailable, d)
+	}
+}
+
+// routeCredentialTimeout bounds what a route acting for a viewer will wait for
+// the credential. Short, because the answer is almost always a comparison
+// against one already held, and a route is not the place to wait out a mint.
 
 // ErrCredentialRefused and ErrCredentialUnavailable are why a route refused to
 // act for a viewer: a judgement about this build, or an issuer that cannot
@@ -1236,6 +1324,27 @@ var (
 	ErrCredentialRefused     = errors.New("this execution's credential has been refused and will not be renewed, so this process will not act for a viewer")
 	ErrCredentialUnavailable = errors.New("this execution's credential cannot currently be obtained, so this process will not act for a viewer")
 )
+
+// executionCredentialSuperseded drops this process's belief that the credential
+// it holds is still honoured.
+//
+// What it does not do is force a new one, and that is the honest limit. The
+// SDK's mint client caches one credential and re-mints only once it enters its
+// own renewal lead (workcontext/mint.go, dueForRenewalLocked); it exposes no
+// way to invalidate what it holds. So a credential superseded *before* that
+// lead keeps being handed back, and every call presenting it is refused until
+// the lead arrives. The two things that would close that are a host answer that
+// distinguishes "the credential you presented is superseded" from "the viewer
+// lacks that authority", and a way to tell the mint client to forget what it
+// cached — neither of which is this repository's to add.
+//
+// A renewal refused because the sealed state moved is a different case and
+// already recovers: the SDK's contract for it is a refresh and a retry, this
+// runtime classifies it as transient rather than terminal, and the next ask
+// mints afresh.
+func (s *Server) executionCredentialSuperseded() {
+	s.credentialValidUntil.Store(0)
+}
 
 // credentialRefused records a judgement the issuer will not reverse.
 func (s *Server) credentialRefused(err error) {
@@ -1493,6 +1602,10 @@ type Gateway struct {
 	// terminal reports a credential failure the issuer will not reverse, so the
 	// process can stop claiming to be healthy. Nil outside a boot.
 	terminal func(error)
+	// superseded is called when the host refuses a mint with a conflict, which
+	// is how it answers a credential sealed to state that has moved. See
+	// Server.executionCredentialSuperseded.
+	superseded func()
 	// ceilings is the published contract's ceiling per audience, which every
 	// ForModule ask is held to. Non-nil exactly when a contract was resolved,
 	// which only a boot does; a derived gateway inherits it, so chaining
@@ -1516,7 +1629,7 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
 	gw.workload, gw.id, gw.report = s.credential, s.manifest.ID, &s.attestation
-	gw.terminal = s.credentialRefused
+	gw.terminal, gw.superseded = s.credentialRefused, s.executionCredentialSuperseded
 	// The ceiling this process published, carried onto the gateway a handler
 	// gets, so what it mints is held to what the contract claims. Resolved
 	// contracts only, read off the flag the boot sets — see contractResolved
@@ -1778,8 +1891,23 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 		if err != nil {
 			return nil, err
 		}
+		// The handshake carries its own deadline, independent of whatever the
+		// caller's context says.
+		//
+		// A custom DialTLSContext takes net/http out of the handshake entirely:
+		// it calls customDialTLS and never reaches addTLS, so
+		// Transport.TLSHandshakeTimeout — inherited as 10s from
+		// DefaultTransport — silently does nothing, and the only bound left is
+		// the request context's. That is adequate for an ordinary request and
+		// wrong exactly where it matters: Gateway.HTTPClient carries streams
+		// and therefore sets no client timeout on purpose, so a dial made for
+		// a stream was bounded by the method's declared MaxStreamDuration (up
+		// to thirty minutes) or by nothing at all. A handshake is not a
+		// stream: it completes in milliseconds or the peer is not answering.
+		handshake, cancelHandshake := context.WithTimeout(ctx, platformHandshakeTimeout)
+		defer cancelHandshake()
 		conn := tls.Client(raw, config)
-		if err := conn.HandshakeContext(ctx); err != nil {
+		if err := conn.HandshakeContext(handshake); err != nil {
 			_ = raw.Close()
 			return nil, err
 		}
@@ -1812,7 +1940,7 @@ func (s *Server) outboundLeaf(identityConfig *tls.Config) (func(*tls.Certificate
 		// A consumer's source: the identity it returned, in both directions,
 		// rather than projected files it never said it uses. Its own callback
 		// is what gets asked, so a source that rotates is followed.
-		client, err := clientTLSFrom(identityConfig)
+		client, err := clientTLSFrom(s.identity, identityConfig)
 		if err != nil {
 			return nil, fmt.Errorf("configure this workload's outbound identity from the supplied identity source: %w", err)
 		}
@@ -1835,10 +1963,14 @@ func (s *Server) outboundLeaf(identityConfig *tls.Config) (func(*tls.Certificate
 	return reloader.GetClientCertificate, nil
 }
 
-// outboundTrustReloadBound is how long an established platform connection may
-// be used, and therefore the longest a removed trust root can still be the
-// basis of an outbound connection. Peer trust is re-read on every dial; this is
-// what guarantees there is another dial.
+// outboundTrustReloadBound is how long a connection nobody is using is kept in
+// the pool. Pool hygiene, nothing more.
+//
+// It used to be described as the bound on outbound trust staleness, and it was
+// not one: an inactivity timeout bounds only a connection that goes inactive,
+// so a connection carrying traffic was never dropped and the documented window
+// held for a quiet process only. What bounds the trust decision is
+// outboundTrustRecheckInterval below.
 const outboundTrustReloadBound = 30 * time.Second
 
 // outboundTrustRecheckInterval bounds how long an established platform
@@ -1956,6 +2088,12 @@ func peerStillTrusted(state tls.ConnectionState, host string, trust func() (*x50
 	}
 	return nil
 }
+
+// platformHandshakeTimeout bounds one outbound TLS handshake, on its own,
+// because the custom dialler means nothing else does. It is deliberately not
+// derived from platformRequestTimeout: a request may legitimately be long (a
+// declared stream), and a handshake never is.
+const platformHandshakeTimeout = 10 * time.Second
 
 // platformRequestTimeout bounds one request this runtime makes on its own
 // behalf, end to end, so a host that accepts a request and never answers
@@ -2296,6 +2434,17 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 			Message string `json:"message"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
+		// A conflict is how a credential sealed to state that has moved is
+		// refused. It is NOT read as a judgement about this build, and not as
+		// proof that this workload's credential specifically is the stale part
+		// — the host does not distinguish that from a viewer's authority in
+		// this answer, and inventing the distinction would be guessing at
+		// somebody else's protocol. What it does is drop this process's
+		// assumption that the credential it holds is still honoured, so the
+		// next route asks the source instead of proceeding on a cached belief.
+		if resp.StatusCode == http.StatusConflict && g.superseded != nil {
+			g.superseded()
+		}
 		return "", time.Time{}, &WorkContextRefusal{
 			Audience: ask.Audience, StatusCode: resp.StatusCode, Code: refusal.Code, Message: refusal.Message,
 		}

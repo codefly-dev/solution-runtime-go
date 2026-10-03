@@ -637,8 +637,20 @@ func serve(t *testing.T, ln net.Listener) {
 // property under test and not on verifying the host.
 type suppliedIdentity struct{ certFile, keyFile, bundleFile string }
 
+func (c suppliedIdentity) inner() projectedIdentity {
+	return projectedIdentity{certFile: c.certFile, keyFile: c.keyFile, trustBundleFile: c.bundleFile}
+}
+
 func (c suppliedIdentity) ServerTLSConfig() (*tls.Config, error) {
-	return projectedIdentity{certFile: c.certFile, keyFile: c.keyFile, trustBundleFile: c.bundleFile}.ServerTLSConfig()
+	return c.inner().ServerTLSConfig()
+}
+
+// PeerAnchor is delegated too, and a consumer wrapping a source has to do the
+// same: this source resolves its anchor per handshake, which is the right
+// shape, and that is exactly the shape that has to be able to answer what the
+// anchor currently is rather than be probed with a handshake nobody made.
+func (c suppliedIdentity) PeerAnchor() (*x509.CertPool, error) {
+	return c.inner().PeerAnchor()
 }
 
 // TestASuppliedSourceBootsAndStaysAuthenticatedOutbound drives the two bugs a
@@ -723,7 +735,7 @@ func TestASuppliedSourceBootsAndStaysAuthenticatedOutbound(t *testing.T) {
 		}
 		// What that dialler builds, checked directly: identity and anchor from
 		// the supplied source, floor at 1.3.
-		built, err := clientTLSFrom(server.identityConfig)
+		built, err := clientTLSFrom(server.identity, server.identityConfig)
 		if err != nil {
 			t.Fatalf("derive the outbound configuration from the supplied source: %v", err)
 		}
@@ -919,51 +931,90 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	}
 }
 
-// TestAPerConnectionAnchorIsNotSnapshottedOutbound: a source carrying a base
-// ClientCAs *and* a per-handshake callback had its anchor read off the base for
-// every outbound dial — one pool, fixed when the source built it — however
-// often the callback re-resolved it.
+// anchorAnnouncingIdentity is a source that says what its anchor is, which is
+// the only sound way for one that rotates to be re-checkable.
+type anchorAnnouncingIdentity struct {
+	config *tls.Config
+	anchor func() *x509.CertPool
+}
+
+func (a anchorAnnouncingIdentity) ServerTLSConfig() (*tls.Config, error) { return a.config, nil }
+func (a anchorAnnouncingIdentity) PeerAnchor() (*x509.CertPool, error)   { return a.anchor(), nil }
+
+// TestASourcesAnchorIsAskedForAndNeverFabricated covers both halves of how a
+// consumer's anchor is obtained, which pull in opposite directions.
 //
-// It is the stale-anchor defect this file argues against, surviving in the one
-// source shape the per-connection posture check tells a source to adopt: the
-// refusal for a nil per-connection answer says to carry a usable anchor on the
-// base configuration, so a source following that advice triggered it.
-func TestAPerConnectionAnchorIsNotSnapshottedOutbound(t *testing.T) {
+// A *x509.CertPool carried on the base configuration is one object fixed when
+// the source built it, so a source that rotates its anchor had every peer
+// judged by the pool this process booted with. The previous answer to that was
+// to call the source's GetConfigForClient with a fabricated ClientHelloInfo and
+// read the pool off the answer — which is the blocker this cutover already has
+// a name for: a source keyed on the hello answers a synthetic probe with one
+// thing and the real handshake with another, demonstrably. Trading a stale
+// anchor for a forged one is not a fix.
+//
+// So the source is asked directly, and a source that can only answer through a
+// handshake is refused.
+func TestASourcesAnchorIsAskedForAndNeverFabricated(t *testing.T) {
 	boot := newCell(t)
 	current := newCell(t)
-	// The shape under test: a base pool from boot, and a callback that has
-	// since moved on to a different anchor.
-	source := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs:  boot.roots,
-		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
-			return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: current.roots}, nil
-		},
-	}
-	anchor, err := peerAnchorOf(source)
-	if err != nil {
-		t.Fatalf("peerAnchorOf: %v", err)
-	}
-	if anchor != current.roots {
-		t.Error("the anchor came from the base configuration while the source resolves one per connection: a *x509.CertPool on the base is one object fixed when the source built it, so every outbound dial was judged by the pool this process booted with")
-	}
 
-	// And a nil answer still falls back to the base, which is Go's own
-	// meaning for it — the fallback is the correct half of the old order.
-	deferring := &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		ClientAuth:         tls.RequireAndVerifyClientCert,
-		ClientCAs:          boot.roots,
-		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil },
-	}
-	anchor, err = peerAnchorOf(deferring)
-	if err != nil {
-		t.Fatalf("peerAnchorOf with a nil answer: %v", err)
-	}
-	if anchor != boot.roots {
-		t.Error("a source whose callback answers nil serves its base configuration, so the base pool is its current anchor and must be used")
-	}
+	t.Run("a source that announces its anchor is followed", func(t *testing.T) {
+		announced := boot.roots
+		source := anchorAnnouncingIdentity{
+			config: &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: boot.roots},
+			anchor: func() *x509.CertPool { return announced },
+		}
+		anchor, err := peerAnchorFrom(source, source.config)
+		if err != nil {
+			t.Fatalf("peerAnchorFrom: %v", err)
+		}
+		if anchor != boot.roots {
+			t.Fatal("the announced anchor was not used")
+		}
+		// It rotates, and nothing is rebuilt.
+		announced = current.roots
+		anchor, err = peerAnchorFrom(source, source.config)
+		if err != nil {
+			t.Fatalf("peerAnchorFrom after the rotation: %v", err)
+		}
+		if anchor != current.roots {
+			t.Error("the anchor came from the base configuration after the source rotated: a pool on the base is fixed when the source built it, so every peer would be judged by the one this process booted with")
+		}
+	})
+
+	t.Run("a source carrying only a base anchor uses it", func(t *testing.T) {
+		config := &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: boot.roots}
+		anchor, err := peerAnchorFrom(staticIdentity{config: config}, config)
+		if err != nil {
+			t.Fatalf("peerAnchorFrom: %v", err)
+		}
+		if anchor != boot.roots {
+			t.Error("a source that carries its anchor on the configuration it returned had it ignored")
+		}
+	})
+
+	t.Run("a per-handshake anchor with no way to ask for it is refused", func(t *testing.T) {
+		// The shape that used to be answered with a fabricated hello: the pool
+		// exists only inside the callback's answer.
+		config := &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+				return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: current.roots}, nil
+			},
+		}
+		anchor, err := peerAnchorFrom(staticIdentity{config: config}, config)
+		if err == nil {
+			t.Fatal("an anchor was obtained from a source that can only answer through a handshake: the only way to get one is to fabricate a ClientHelloInfo, and a source keyed on the hello answers a probe and a real handshake differently — which is the blocker this runtime was already held up on, one field along")
+		}
+		if anchor != nil {
+			t.Error("a refusal returned a pool anyway")
+		}
+		if !strings.Contains(err.Error(), "PeerAnchor") {
+			t.Errorf("the refusal %q does not name the interface that fixes it", err)
+		}
+	})
 }
 
 // TestASourceCannotReplaceThePostureItIsHeldTo: the posture checks enumerate
@@ -1006,6 +1057,9 @@ func TestASourceCannotReplaceThePostureItIsHeldTo(t *testing.T) {
 			cfg.UnwrapSession = func([]byte, tls.ConnectionState) (*tls.SessionState, error) { return nil, nil }
 		}},
 		{"no verification at all", func(cfg *tls.Config) { cfg.InsecureSkipVerify = true }},
+		{"a resumption ticket key of its own", func(cfg *tls.Config) {
+			cfg.SessionTicketKey = [32]byte{1}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			config := conforming(t)

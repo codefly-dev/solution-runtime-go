@@ -200,7 +200,7 @@ that completes no handshake reports a TLS error naming nothing to every caller.
 workload in the trust domain holds a certificate from the same anchor —
 including the modules this solution consumes — so verifying one answers "did the
 platform issue this identity", not "may this caller call me". The admitted set
-is therefore declared and provisioned (`workload-identity`/`ALLOWED_CALLERS`)
+is therefore declared and provisioned (`workload-identity`/`ALLOWED_CALLERS_FILE`)
 and the boot is refused when it is absent, naming the value; the comparison is
 the SPIFFE ID in the caller's URI SAN. Without it a consumed module could call a
 handler or a passthrough route directly, bypassing the admission the host
@@ -238,6 +238,40 @@ mid-`ClientHello` no longer holds a goroutine and a descriptor indefinitely;
 neither bounds a whole request, because a declared long-running stream is
 conforming traffic.
 
+**A consumer's `IdentitySource` that resolves its anchor per handshake must
+implement `PeerAnchorSource`.** Re-verifying an established caller, and
+verifying the platform this runtime dials, both need the anchor *as it is now* —
+and if the only way to get it is the source's `GetConfigForClient`, the runtime
+would have to call it with a `ClientHelloInfo` nobody sent. That is the defect
+this cutover was already blocked on one field along: a source keyed on the hello
+answers a synthetic probe with one thing and the real handshake with another,
+demonstrably. So the source is asked directly —
+`PeerAnchor() (*x509.CertPool, error)` — and one that can only answer through a
+handshake is refused at boot. A source that carries its anchor on the
+configuration it returns needs nothing extra, but that pool is fixed when the
+source built it, so a source that *rotates* its anchor has to implement the
+interface for the rotation to be seen. The projected source implements it.
+
+The same fabrication is still used for the outbound **certificate**, and that is
+sound for a reason worth stating: whatever comes back is held to the frozen
+principal at the moment it is presented, so a source answering differently from
+the real handshake is caught by that hold. An anchor has no check behind it — it
+*is* the check.
+
+**An outbound TLS handshake carries its own 10-second deadline.** A custom
+`DialTLSContext` takes `net/http` out of the handshake, so
+`Transport.TLSHandshakeTimeout` does nothing and the only bound would be the
+caller's context — which is right for a request and wrong for the one place it
+matters, since the client that carries streams sets no timeout on purpose. A
+handshake is not a stream.
+
+**An admission set answered twice is refused, not ranked.** The env override and
+the platform's provisioning are two sources for one authorization fact; if both
+answer, the boot fails naming both. Logging which one won reports the conflict
+without resolving it, and for admission the cost of picking wrong is admitting a
+caller. The other `workload-identity` paths still take the override first: the
+worst case there is this process reading its own material from elsewhere.
+
 **No credential-bearing request follows a redirect, and none leaves the
 gateway's own origin.** Go copies a request's headers onto a redirected one and
 strips only `Authorization`, `WWW-Authenticate` and `Cookie`; a 307 re-sends the
@@ -257,7 +291,7 @@ service-account token, the viewer's bearer and this workload's own credential, s
 a root removed because it was compromised must stop authenticating them without a
 restart. Each dial builds its own configuration — and each
 established connection re-verifies the peer it already has, once a second,
-against the current anchor and the current `PLATFORM_PEERS` set, closing it when
+against the current anchor and the current `PLATFORM_PEERS_FILE` set, closing it when
 that stops holding.
 
 The recheck is there because the idle cap it replaces was not a bound. An
@@ -276,7 +310,7 @@ chain and the hostname says the cell issued a certificate for the address this
 runtime dialled, which every workload in the cell holds one of — a neighbouring
 workload answering at the gateway's address under a valid certificate was handed
 the projected token, the viewer's bearer and this workload's credential. So the
-peer's own SPIFFE ID must be in `PLATFORM_PEERS`. The outbound leaf is held to
+peer's own SPIFFE ID must be in `PLATFORM_PEERS_FILE`. The outbound leaf is held to
 the frozen principal too, at the moment it is presented, which matters because
 on the default path it comes from a second reloader over the same files as the
 listener's.

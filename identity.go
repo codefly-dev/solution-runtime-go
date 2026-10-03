@@ -39,6 +39,28 @@ type IdentitySource interface {
 	ServerTLSConfig() (*tls.Config, error)
 }
 
+// PeerAnchorSource is an IdentitySource that can say what its current trust
+// anchor is, asked directly.
+//
+// Optional, and the only sound way for a source that resolves its anchor per
+// handshake to be re-checkable. The alternative this replaces was to call the
+// source's GetConfigForClient with a *fabricated* ClientHelloInfo and read the
+// pool off the answer — which is the defect this whole cutover was blocked on
+// one layer along: a source keyed on the hello answers a synthetic probe with
+// one thing and the real handshake with another, and that was demonstrated
+// serving a neighbouring workload's certificate. The same trick is worse for an
+// anchor than for a certificate. A certificate obtained through a fabricated
+// hello is still held to the frozen principal at the moment it is presented, so
+// a wrong answer is caught; an anchor *is* the thing that catches wrong
+// answers, and nothing downstream checks it.
+//
+// A source that resolves its anchor per handshake and does not implement this
+// is refused at boot, because there is then nothing to re-verify an established
+// caller against that this runtime could obtain honestly.
+type PeerAnchorSource interface {
+	PeerAnchor() (*x509.CertPool, error)
+}
+
 // Identity sets where the listener's workload identity comes from, replacing
 // the platform projection the workload-identity configuration group names.
 // Chainable.
@@ -60,6 +82,14 @@ func (s *Server) Identity(source IdentitySource) *Server {
 // then fails every handshake, with the issuer reporting nothing wrong.
 type projectedIdentity struct {
 	certFile, keyFile, trustBundleFile string
+}
+
+// PeerAnchor reads the projected bundle, now. It is what makes this source
+// re-checkable: the anchor it serves with is resolved per handshake, so asking
+// the configuration for it would mean fabricating a handshake, and this answers
+// the question directly instead. See PeerAnchorSource.
+func (p projectedIdentity) PeerAnchor() (*x509.CertPool, error) {
+	return peerAnchor(p.trustBundleFile)
 }
 
 func (p projectedIdentity) ServerTLSConfig() (*tls.Config, error) {
@@ -187,8 +217,9 @@ const inboundIdleTimeout = 30 * time.Second
 // which is what makes a removed root take effect on both halves at once.
 func (s *Server) peerTrustAnchor(identityConfig *tls.Config) func() (*x509.CertPool, error) {
 	if s.identity != nil {
+		source := s.identity
 		return func() (*x509.CertPool, error) {
-			anchor, err := peerAnchorOf(identityConfig)
+			anchor, err := peerAnchorFrom(source, identityConfig)
 			if err != nil {
 				return nil, fmt.Errorf("resolve the anchor this workload verifies its peers against, from the supplied identity source: %w", err)
 			}
@@ -231,7 +262,14 @@ func (s *Server) watchInboundTrust() (func(net.Conn, http.ConnState), error) {
 	var watching sync.Map
 	return func(conn net.Conn, state http.ConnState) {
 		switch state {
-		case http.StateActive:
+		// StateNew, not StateActive: the watch begins when the connection is
+		// accepted, so it covers the connection from the moment it is
+		// authenticated. StateActive is the first point a *request* has been
+		// read, which is later — a caller could complete its handshake,
+		// have its issuing root pulled, and sit inside the header deadline
+		// unwatched. The recheck loop waits for the handshake itself rather
+		// than for traffic.
+		case http.StateNew:
 			tlsConn, ok := conn.(*tls.Conn)
 			if !ok {
 				return
@@ -258,6 +296,14 @@ func recheckCaller(conn *tls.Conn, done <-chan struct{}, trust func() (*x509.Cer
 		case <-done:
 			return
 		case <-ticker.C:
+			// Until the handshake completes there is no peer chain to judge,
+			// and an unhandshaken connection is not a caller who should be
+			// refused — it is bounded by the handshake deadline instead. This
+			// is why the watch can start at accept: it waits for
+			// authentication rather than for the first request.
+			if !conn.ConnectionState().HandshakeComplete {
+				continue
+			}
 			if err := callerStillAdmitted(conn.ConnectionState(), trust, admitted); err != nil {
 				_ = conn.Close()
 				return
@@ -487,40 +533,33 @@ func uriStrings(uris []*url.URL) []string {
 	return rendered
 }
 
-// peerAnchorOf is the pool a resolved server configuration verifies its callers
-// against — the same pool this runtime verifies the *platform* against when it
-// dials out, which is what makes one identity object serve both directions.
+// peerAnchorFrom is the pool this runtime verifies its peers against, for a
+// consumer-supplied source, resolved without fabricating a handshake.
 //
-// A source may carry it on the configuration or resolve it per handshake (the
-// projected one does the latter, so a removed root takes effect without a
-// restart), so both are read here. usableServerIdentity has already refused a
-// configuration that has neither.
+// The order is: ask the source (PeerAnchorSource), then the anchor it carried
+// on the configuration it returned. There is no third option, and in
+// particular there is no asking GetConfigForClient with a hello nobody sent —
+// see PeerAnchorSource for why that is unsound for an anchor specifically.
 //
-// The per-connection answer is asked FIRST, and the base pool is the fallback.
-// The other order looks equivalent and is not: a *x509.CertPool on the base
-// configuration is one object fixed when the source built it, so a source
-// carrying a base pool *and* a callback had its anchor snapshotted at boot for
-// every outbound dial, however often the callback was re-resolving it. That is
-// the stale-anchor defect this file argues against, surviving in the one source
-// shape the per-connection posture check tells a source to adopt — the refusal
-// for a nil answer says to set ClientCAs on the base, so following the advice
-// was what triggered it.
-func peerAnchorOf(config *tls.Config) (*x509.CertPool, error) {
-	if config.GetConfigForClient != nil {
-		answer, err := config.GetConfigForClient(&tls.ClientHelloInfo{})
+// Preferring the hook over the base pool is what keeps a rotating source's
+// anchor live: a *x509.CertPool on the base configuration is one object fixed
+// when the source built it, so a source that rotates its anchor and carries a
+// base pool had every peer judged by the pool this process booted with.
+func peerAnchorFrom(source IdentitySource, config *tls.Config) (*x509.CertPool, error) {
+	if asked, ok := source.(PeerAnchorSource); ok {
+		anchor, err := asked.PeerAnchor()
 		if err != nil {
-			return nil, fmt.Errorf("resolve the trust anchor this workload verifies the platform against: %w", err)
+			return nil, fmt.Errorf("the identity source could not say what trust anchor its peers are verified against: %w", err)
 		}
-		if answer != nil && answer.ClientCAs != nil {
-			return answer.ClientCAs, nil
+		if anchor == nil {
+			return nil, fmt.Errorf("the identity source answered PeerAnchor with no pool, so there is nothing to verify a peer against")
 		}
+		return anchor, nil
 	}
-	// A nil answer is Go's "serve the base", so the base pool is this source's
-	// current anchor rather than a stale one.
 	if config.ClientCAs != nil {
 		return config.ClientCAs, nil
 	}
-	return nil, fmt.Errorf("the identity source names no trust anchor, so there is nothing to verify the platform against when this runtime dials it: an https URL alone is checked against this host's system roots, which cannot tell the platform from anything holding a public certificate")
+	return nil, fmt.Errorf("the identity source resolves its trust anchor per handshake and does not implement PeerAnchorSource, so this runtime cannot obtain the anchor to re-verify an established caller — or to verify the platform it dials — without asking the source through a handshake nobody made. Carry the anchor on the configuration ServerTLSConfig returns, or implement PeerAnchor() (*x509.CertPool, error)")
 }
 
 // clientTLSFrom derives the configuration this runtime dials the platform with
@@ -530,8 +569,8 @@ func peerAnchorOf(config *tls.Config) (*x509.CertPool, error) {
 // so a rotated leaf is presented outbound as well — snapshotting it here would
 // mean the listener served a fresh leaf while the mint presented an expired one,
 // and the failure would name neither.
-func clientTLSFrom(config *tls.Config) (*tls.Config, error) {
-	anchor, err := peerAnchorOf(config)
+func clientTLSFrom(source IdentitySource, config *tls.Config) (*tls.Config, error) {
+	anchor, err := peerAnchorFrom(source, config)
 	if err != nil {
 		return nil, err
 	}
@@ -540,12 +579,18 @@ func clientTLSFrom(config *tls.Config) (*tls.Config, error) {
 	case config.GetCertificate != nil:
 		get := config.GetCertificate
 		client.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			// An empty hello, not a synthetic name. "localhost" is a server
-			// name nothing in a cell dials by, and a source keyed on it
-			// answered the probe with one identity and the real handshake with
-			// another; an empty ServerName is what a peer addressed by IP
-			// actually sends. Whatever comes back is held to the principal by
-			// holdPresentedCertificate below, at the moment it is presented.
+			// An empty hello. There is no real one to pass: this is the
+			// *client* side, where no ClientHelloInfo exists at all, and the
+			// source's only certificate callback is the server-side one.
+			//
+			// Sound here, unlike for an anchor, and the difference is worth
+			// stating because the same fabrication is a blocker one field
+			// along: whatever comes back is held to the frozen principal by
+			// holdPresentedCertificate, at the moment it is presented, so a
+			// source that answers this differently from the real handshake is
+			// caught by that hold. An anchor has no such check behind it —
+			// it *is* the check — which is why peerAnchorFrom refuses to
+			// obtain one this way and asks PeerAnchorSource instead.
 			return get(&tls.ClientHelloInfo{})
 		}
 	case len(config.Certificates) > 0:
@@ -637,6 +682,21 @@ func unsubvertedPosture(config *tls.Config) error {
 		{"WrapSession", "resumption tickets are encoded by this, and a resumed connection presents no certificate, so a source encoding its own tickets admits callers without a handshake this package sees", config.WrapSession != nil},
 		{"UnwrapSession", "resumption tickets are decoded by this, with the same consequence as WrapSession", config.UnwrapSession != nil},
 		{"InsecureSkipVerify", "the peer's certificate chain is not verified at all", config.InsecureSkipVerify},
+		// The ticket *keys*, not just the ticket callbacks. Resumption is the
+		// sharpest of these because a resumed connection presents no
+		// certificate, and a source can reach it two ways: by encoding the
+		// tickets itself (WrapSession/UnwrapSession, above) or by choosing the
+		// key they are sealed with. A chosen key is the same capability with
+		// fewer lines — anyone holding it can forge a ticket this listener
+		// accepts — and the denylist named only the callbacks.
+		{"SessionTicketKey", "resumption tickets are sealed with a key the source chose, and anyone holding it can forge a ticket this listener resumes without any certificate being presented", config.SessionTicketKey != [32]byte{}},
+		// And the opposite setting, for the opposite reason: a source that
+		// disables resumption is not lowering the posture, so it is allowed —
+		// but a source that leaves it on while controlling the keys is, and
+		// SetSessionTicketKeys is a method rather than a field, so the keys it
+		// installs cannot be read back off the configuration. That is the one
+		// hole here a check cannot close, which is why it is written down
+		// rather than implied.
 	} {
 		if field.set {
 			return fmt.Errorf("the identity source returned a TLS configuration that sets %s: %s. Leave it unset and Go's own is used — this listener's posture is not a thing a source may replace, only a thing it may satisfy", field.name, field.why)
