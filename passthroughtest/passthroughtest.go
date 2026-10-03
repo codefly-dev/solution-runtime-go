@@ -451,20 +451,21 @@ func capability(seed string) string {
 var (
 	capabilityMu       sync.Mutex
 	issuedCapabilities = map[string]string{}
-	standInAuthorityV  *corework.Authority
 )
 
 // standInAuthority is core's minter, configured from core's fixture identities.
-func standInAuthority() *corework.Authority {
-	if standInAuthorityV == nil {
-		_, key := corework.FixtureKeyPair()
-		standInAuthorityV = &corework.Authority{
-			Issuer:    corework.FixtureIssuer,
-			KeyID:     corework.FixtureKeyID,
-			Key:       key,
-			Revisions: corework.FixtureRevisions(),
-			Seals:     corework.FixtureSeals(),
-		}
+//
+// Built once through sync.OnceValue rather than on a nil check: the check was a
+// data race, reached from the fake host's mint handler and from capability() at
+// the same time, so a consumer running this seam under -race could fail in a
+// file they do not own, for a reason that has nothing to do with their test.
+var standInAuthority = sync.OnceValue(func() *corework.Authority {
+	_, key := corework.FixtureKeyPair()
+	return &corework.Authority{
+		Issuer:    corework.FixtureIssuer,
+		KeyID:     corework.FixtureKeyID,
+		Key:       key,
+		Revisions: corework.FixtureRevisions(),
+		Seals:     corework.FixtureSeals(),
 	}
-	return standInAuthorityV
-}
+})

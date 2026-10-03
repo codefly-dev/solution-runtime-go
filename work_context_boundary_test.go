@@ -4,7 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -28,16 +28,8 @@ import (
 // the one capability-shaped JSON this package does touch, the mint endpoint's
 // HTTP bodies, lives in the SDK client and not here.
 func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package directory: %v", err)
-	}
 	fset := token.NewFileSet()
-	for _, entry := range entries {
-		name := entry.Name()
-		if filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
+	for _, name := range moduleSources(t) {
 		file, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
@@ -45,8 +37,19 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 		for _, imported := range file.Imports {
 			path := strings.Trim(imported.Path.Value, `"`)
 			switch path {
-			case "crypto/ed25519", "crypto/ecdsa", "crypto/hmac":
+			case "crypto/ed25519", "crypto/ecdsa", "crypto/hmac", "crypto/rsa", "crypto/ed25519/internal/edwards25519":
 				t.Errorf("%s imports %s: signing a capability is core's, and a runtime that can sign one is a second implementation waiting to happen. Carry the credential the mint client hands you.",
+					name, path)
+			}
+			// A JOSE or raw-segment path reaches the same place by another
+			// road: the 3,532 lines that had to be deleted were a payload
+			// struct, a signer, a verifier and an error taxonomy, and none of
+			// them needed crypto/ed25519 by name.
+			switch {
+			case strings.HasPrefix(path, "golang.org/x/crypto"),
+				strings.Contains(path, "go-jose"), strings.Contains(path, "jwt"),
+				strings.Contains(path, "jws"), strings.Contains(path, "jwk"):
+				t.Errorf("%s imports %s: a second signed encoding beside core's is what this boundary exists to prevent, and it does not have to be spelled crypto/ed25519 to be one.",
 					name, path)
 			}
 		}
@@ -97,16 +100,8 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 // judgement without the issuer's four sources is the silent downgrade this
 // single-implementation rule exists to prevent.
 func TestThisRuntimeVerifiesNothing(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package directory: %v", err)
-	}
 	fset := token.NewFileSet()
-	for _, entry := range entries {
-		name := entry.Name()
-		if filepath.Ext(name) != ".go" || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
+	for _, name := range moduleSources(t) {
 		file, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
@@ -125,4 +120,42 @@ func TestThisRuntimeVerifiesNothing(t *testing.T) {
 			return true
 		})
 	}
+}
+
+// moduleSources is every non-test Go source in this module, which is what both
+// gates above read.
+//
+// They read only the root directory until now, and passthroughtest/ is where a
+// capability is actually signed — with core's published fixture key, which is
+// the right way to do it and exactly the file a second implementation would
+// grow in, since it is the one place already holding a signing key. A gate that
+// does not look at the directory most likely to break it is a gate that reports
+// success for the wrong reason.
+func moduleSources(t *testing.T) []string {
+	t.Helper()
+	var sources []string
+	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			// Nothing generated and nothing vendored: those are not this
+			// repository's declarations to answer for.
+			if name := entry.Name(); path != "." && (name == "vendor" || strings.HasPrefix(name, ".")) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) == ".go" && !strings.HasSuffix(path, "_test.go") {
+			sources = append(sources, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk module sources: %v", err)
+	}
+	if len(sources) < 2 {
+		t.Fatalf("found %d sources to gate, which cannot be right: a gate that reads nothing passes", len(sources))
+	}
+	return sources
 }

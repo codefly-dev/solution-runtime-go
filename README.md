@@ -92,7 +92,7 @@ the SDK-resolved value is the default.
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
-| Credential mint URL | `<gateway>/platform/_credential`. Must be `https` | `CODEFLY__CREDENTIAL_MINT_URL` |
+| Credential mint URL | `<gateway>/platform/_credential`. Must be `https`. **Labelled stopgap**: the path is this runtime's proposal, not one the host published or the SDK resolves, so a boot that falls back to it says so in its log. Treat a 404 here as the path being wrong, not this build being refused | `CODEFLY__CREDENTIAL_MINT_URL` |
 | Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |

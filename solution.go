@@ -315,6 +315,14 @@ type config struct {
 	// identityCertFile, identityKeyFile and trustBundleFile are the workload's
 	// X.509-SVID and the anchor its peers are verified against. The listener
 	// presents the first pair; there is no plain-HTTP listener to fall back to.
+	// mintURLGuessed records that mintURL came from credentialMintPath rather
+	// than from an override, so the boot can say so out loud. **Labelled
+	// stopgap**: the path is this runtime's proposal and the host has not
+	// confirmed it, and a default address is the thing this repository's rules
+	// forbid. The real fix is the host publishing the mint as a resolvable
+	// endpoint role, which belongs to the host and the SDK, not here.
+	mintURLGuessed bool
+
 	identityCertFile, identityKeyFile, trustBundleFile string
 	// allowedCallers is the comma-separated set of identities this listener
 	// admits. Authentication says a caller holds a certificate from the cell's
@@ -520,6 +528,7 @@ func loadConfig(ctx context.Context) config {
 		// rather than asserting the outcome, and the override below is how a
 		// deployment points at whichever one its host actually serves.
 		mintURL:            env(CredentialMintURLEnvironmentVariable, gatewayURL+credentialMintPath),
+		mintURLGuessed:     strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")) == "",
 		projectedTokenPath: workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey),
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
@@ -668,6 +677,18 @@ func (c config) validate() error {
 		// empty, and it has to be said once rather than inferred from the next
 		// surprise.
 		log.Printf("codefly: the injected environment did not load cleanly; every SDK-resolved value that is present came from an override: %v", c.environmentLoadErr)
+	}
+	if c.mintURLGuessed {
+		// Said at every boot, deliberately. This runtime POSTs the projected
+		// service-account token that attests which workload it is to this
+		// address, and the address is a path this runtime proposed rather than
+		// one the host published or the SDK resolved — so an operator reading a
+		// failure here should know the destination was assumed before they go
+		// looking at provisioning. An unlabelled default is the one thing this
+		// repository's rules single out, and the label belongs where it is
+		// acted on, not only in a PR description.
+		log.Printf("codefly: STOPGAP — this execution's credential will be minted at %q, derived from the resolved gateway and the path %q that this runtime assumes rather than one the host published or the SDK resolved. Set %s for a host whose mint is elsewhere, and treat a 404 here as the path being wrong rather than this build being refused.",
+			c.mintURL, credentialMintPath, CredentialMintURLEnvironmentVariable)
 	}
 	return nil
 }
