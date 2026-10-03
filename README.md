@@ -99,7 +99,7 @@ the SDK-resolved value is the default.
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
 | Allowed callers | `workload-identity`/`ALLOWED_CALLERS_FILE` — **required**, a **path** to a file of identities, one per line (normally the gateway's); re-read per handshake. Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE` |
 | Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per dial and per connection check | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
-| Gateway peer | `workload-identity`/`GATEWAY_PEERS_FILE` — **required**, same shape. One set **per destination**: the mint and the gateway are two parties, and a single set spanning both authorises each to stand in for the other at the other's address — and the mint is the destination that receives the projected service-account token. A dial to an address that is neither has no set and is refused | `CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE` |
+| Gateway peer | `workload-identity`/`GATEWAY_PEERS_FILE` — **required**, same shape. One set **per destination**: the mint and the gateway are two parties, and a single set spanning both authorises each to stand in for the other at the other's address — and the mint is the destination that receives the projected service-account token. A dial to an address that is neither has no set and is refused. When the two are at the **same** host and port — the brokered shape — a dial there cannot be attributed to one of them, so it is held to the **intersection** of both sets, and an empty intersection is refused at boot | `CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
@@ -239,8 +239,8 @@ mid-`ClientHello` no longer holds a goroutine and a descriptor indefinitely;
 neither bounds a whole request, because a declared long-running stream is
 conforming traffic.
 
-**A consumer's `IdentitySource` that resolves its anchor per handshake must
-implement `PeerAnchorSource`.** Re-verifying an established caller, and
+**A consumer's `IdentitySource` that sets `GetConfigForClient` must implement
+`PeerAnchorSource`** — whatever it carries on the base configuration. Re-verifying an established caller, and
 verifying the platform this runtime dials, both need the anchor *as it is now* —
 and if the only way to get it is the source's `GetConfigForClient`, the runtime
 would have to call it with a `ClientHelloInfo` nobody sent. That is the defect
@@ -248,10 +248,20 @@ this cutover was already blocked on one field along: a source keyed on the hello
 answers a synthetic probe with one thing and the real handshake with another,
 demonstrably. So the source is asked directly —
 `PeerAnchor() (*x509.CertPool, error)` — and one that can only answer through a
-handshake is refused at boot. A source that carries its anchor on the
-configuration it returns needs nothing extra, but that pool is fixed when the
-source built it, so a source that *rotates* its anchor has to implement the
-interface for the rotation to be seen. The projected source implements it.
+handshake is refused at boot. Carrying a pool on the base as well does not
+answer it: that pool is one object fixed when the source built it, so it would
+freeze the anchor this process judges by while the callback went on resolving a
+fresh one — which is exactly what happened when the refusal only fired on a nil
+base pool. A source with no callback at all may carry its anchor on the
+configuration and needs nothing extra. The projected source implements the
+interface.
+
+Nor may a source set `VerifyPeerCertificate`: it is handed the parsed chain this
+runtime reads the caller's identity from, and it runs first, so a source that
+rewrote the leaf's URI SANs decided who was admitted. The identity is read from
+a fresh parse of the raw DER regardless — the bytes the peer signed are the only
+thing that cannot be edited between the handshake and the check — and the field
+is refused as well.
 
 The same fabrication is still used for the outbound **certificate**, and that is
 sound for a reason worth stating: whatever comes back is held to the frozen

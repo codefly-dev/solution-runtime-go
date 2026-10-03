@@ -192,6 +192,16 @@ embedding it.
   listener that verifies every caller and admits all of them lets a consumed
   module set its own `x-org-id`/`x-session-id` and drive mints under this
   workload's attestation.
+- **Nothing mints per request.** One credential per execution plus the renewals
+  its own expiry dictates, and that has to survive the checks added in front of
+  it: a route gate that asked the source on every viewer request turned a
+  503-ing issuer into one audited mint per request, which is worse than the
+  heartbeat this runtime deleted, because the heartbeat at least minted on a
+  timer. Acquisition is single-flight with a backoff, a credential already in
+  hand and unexpired serves while the issuer is unavailable, and a terminal
+  answer is recorded **where the answer lands** rather than by whichever caller
+  was still waiting — the ask is detached, so it can finish with nobody
+  listening.
 - **A terminal credential refusal ends the process; a transient one does not.**
   `ErrMintRefused` at renewal fails `/health` and ends `serve` with the reason.
   `ErrMintUnavailable` must not: it is transient by construction and exiting on
