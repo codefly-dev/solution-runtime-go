@@ -1541,23 +1541,42 @@ func TestTheInboundWatchStartsAtAuthentication(t *testing.T) {
 		t.Fatalf("handshake: %v", err)
 	}
 
-	// Authenticated, and not one byte of a request sent. The platform now
-	// removes this caller.
+	// Authenticated, and not one byte of a request sent.
+	//
+	// The control runs first, and it is also what makes the withdrawal below
+	// unambiguous: while admission holds, this connection stays open across
+	// several recheck intervals. Withdrawing immediately after tls.Dial raced
+	// the server's own side of the handshake — the client finishes before the
+	// server has evaluated admission, so the server read the *new* file and
+	// refused the handshake, and the test passed on "bad certificate" whether
+	// the watch worked or not.
+	stillOpen := func(t *testing.T) bool {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(inboundTrustRecheckInterval / 4))
+		var buf [1]byte
+		_, err := conn.Read(buf[:])
+		return errors.Is(err, os.ErrDeadlineExceeded)
+	}
+	settle := time.Now().Add(2 * inboundTrustRecheckInterval)
+	for time.Now().Before(settle) {
+		if !stillOpen(t) {
+			t.Fatal("the connection was closed while this caller was still admitted, so nothing below is about the withdrawal")
+		}
+	}
+
+	// The platform now removes this caller.
 	writeFile(t, callersFile, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
 
 	// Well inside the header deadline, which is what would otherwise be the
 	// only thing to end this connection.
-	deadline := 5 * inboundTrustRecheckInterval
-	if deadline >= inboundHandshakeTimeout {
+	deadline := time.Now().Add(5 * inboundTrustRecheckInterval)
+	if 5*inboundTrustRecheckInterval >= inboundHandshakeTimeout {
 		t.Fatalf("this test needs to finish inside the header deadline (%s) to mean anything", inboundHandshakeTimeout)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(deadline))
-	var buf [1]byte
-	_, err = conn.Read(buf[:])
-	if err == nil {
-		t.Fatal("the server sent something on a connection that made no request")
+	for time.Now().Before(deadline) {
+		if !stillOpen(t) {
+			return // closed, which is the point
+		}
 	}
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("a caller that authenticated and then sent nothing was still connected %s after its admission was withdrawn: the watch begins at the first request, so the whole pre-request window is unwatched", deadline)
-	}
+	t.Fatalf("a caller that authenticated and then sent nothing was still connected %s after its admission was withdrawn: the watch begins at the first request, so the whole pre-request window is unwatched", 5*inboundTrustRecheckInterval)
 }
