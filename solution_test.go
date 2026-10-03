@@ -8,6 +8,7 @@ import (
 	"fmt"
 	corework "github.com/codefly-dev/core/workcontext"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1664,8 +1665,16 @@ func TestAnAdmissionFileIsReadWholeOrRefused(t *testing.T) {
 
 	t.Run("a file too large to re-read every second is refused", func(t *testing.T) {
 		big := strings.Repeat(gateway+"\n", (admissionFileLimit/(len(gateway)+1))+16)
-		if got, err := read(t, big); err == nil {
-			t.Errorf("resolved %d identities from a file over the limit: this is read on every handshake, every dial, and once a second per established connection in each direction", len(got))
+		got, err := read(t, big)
+		if err == nil {
+			t.Fatalf("resolved %d identities from a file over the limit: this is read on every handshake, every dial, and once a second per established connection in each direction", len(got))
+		}
+		// And refused BY THE CAP. Without this the case passes for the wrong
+		// reason: the reader stops at the limit, so the last line it sees is a
+		// fragment and the whole-line rule refuses it — which means removing
+		// the cap entirely left this green.
+		if !strings.Contains(err.Error(), "larger than") {
+			t.Errorf("the refusal %q is not about the file's size, so this case does not cover the cap", err)
 		}
 	})
 
@@ -1703,8 +1712,6 @@ func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
 		})
 	}
 
-	// And the log redacts regardless, because a log line is the wrong place to
-	// depend on a check that runs elsewhere.
 	for _, tc := range []struct{ raw, hidden string }{
 		{"https://ops:s3cr3t@mint.cell/x", "s3cr3t"},
 		{"https://mint.cell/x?token=s3cr3t", "s3cr3t"},
@@ -1713,4 +1720,29 @@ func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
 			t.Errorf("redactedURL(%q) = %q, which still carries the secret", tc.raw, got)
 		}
 	}
+
+	// And the boot log actually uses it. Asserting on the helper alone left
+	// the *call site* free to pass the raw URL, which is where the secret was
+	// being written — the helper being correct is not the property.
+	t.Run("the boot log carries no secret", func(t *testing.T) {
+		var captured bytes.Buffer
+		log.SetOutput(&captured)
+		t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+		cfg := config{port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile,
+			mintURL: "https://ops:s3cr3t-password@mint.cell/platform/_credential"}
+		// validate() refuses this URL, and the log line still must not carry
+		// the secret: the refusal and the logging are independent, which is
+		// the whole reason the log redacts regardless.
+		_ = cfg.validate()
+		cfg.mintURL = "https://mint.cell/platform/_credential"
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("a conforming configuration was refused: %v", err)
+		}
+		cfg.mintURL = "https://ops:s3cr3t-password@mint.cell/platform/_credential"
+		cfg.logResolved()
+		if got := captured.String(); strings.Contains(got, "s3cr3t-password") {
+			t.Errorf("the boot log carries the secret from the mint URL:\n%s", got)
+		}
+	})
 }

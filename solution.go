@@ -854,6 +854,17 @@ func (c config) validate() error {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
 			c.profile, err, ContractProfileEnvironmentVariable)
 	}
+	c.logResolved()
+	return nil
+}
+
+// logResolved says once, at boot, what this process resolved.
+//
+// A function of its own so what it writes can be read in a test. The redaction
+// is the property, and asserting on the helper that does it left the call site
+// free to pass the raw URL — which is where the secret was actually being
+// written.
+func (c config) logResolved() {
 	if c.environmentLoadErr != nil {
 		// Everything above resolved, so the load failure cost nothing this boot
 		// needs — but it is still the reason a later SDK read may come back
@@ -864,12 +875,12 @@ func (c config) validate() error {
 	// Said at every boot: the operator set this address by hand, because
 	// nothing resolves it yet, so a 404 here is the endpoint not existing on
 	// this host rather than this build being refused.
-	// Redacted, always. validate() refuses userinfo and a query above, so there
+	//
+	// Redacted, always. validate() refuses userinfo and a query, so there
 	// should be nothing to hide — and a log line is the wrong place to depend
 	// on a check that runs elsewhere.
 	log.Printf("codefly: this execution's credential will be minted at %q, which was set explicitly through %s — no resolver produces it yet, so a 404 here means that endpoint does not exist on this host, not that this build was refused.",
 		redactedURL(c.mintURL), CredentialMintURLEnvironmentVariable)
-	return nil
 }
 
 // redactedURL is a URL as it may appear in a log: url.Redacted() replaces a
