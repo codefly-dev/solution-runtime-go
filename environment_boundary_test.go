@@ -78,6 +78,10 @@ func TestNoClosureDefersAnEnvironmentReadPastBoot(t *testing.T) {
 			t.Errorf("%s:%d defines a function literal that reads the environment: a read inside a closure happens when the closure is called, which is not boot, so validate() never governs it. Resolve the value in loadConfig's own body and carry the result.",
 				name, line)
 		}
+		for _, line := range environmentValuesEscaping(fset, file, readers) {
+			t.Errorf("%s:%d takes a reference to a configuration resolver without calling it: a method value or a function value is the same deferred read as a closure, with none of the syntax, so it happens whenever the value is called rather than at boot.",
+				name, line)
+		}
 	}
 }
 
@@ -110,6 +114,53 @@ func deferredEnvironmentReads(fset *token.FileSet, file *ast.File, readers map[s
 		})
 		return true
 	})
+	return lines
+}
+
+// environmentValuesEscaping is every *reference* to a configuration resolver
+// that is taken without being called — a method value or a function value,
+// which is the same deferred read as a closure with none of the syntax.
+//
+// `cfg.resolve = s.readTheSet` reads the environment whenever `resolve` is
+// called, and the closure gate sees no function literal at all. A review drove
+// exactly that shape past both gates.
+func environmentValuesEscaping(fset *token.FileSet, file *ast.File, readers map[string]bool) []int {
+	var lines []int
+	ast.Inspect(file, func(node ast.Node) bool {
+		// A call's own Fun is a call, not an escaping reference.
+		if call, ok := node.(*ast.CallExpr); ok {
+			ast.Inspect(call.Fun, func(ast.Node) bool { return false })
+			for _, arg := range call.Args {
+				lines = append(lines, referencedReaders(fset, arg, readers)...)
+			}
+			return true
+		}
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, rhs := range assign.Rhs {
+			lines = append(lines, referencedReaders(fset, rhs, readers)...)
+		}
+		return true
+	})
+	return lines
+}
+
+// referencedReaders is the lines at which expr names a reader without calling
+// it.
+func referencedReaders(fset *token.FileSet, expr ast.Expr, readers map[string]bool) []int {
+	var lines []int
+	switch named := expr.(type) {
+	case *ast.Ident:
+		if readers[named.Name] {
+			lines = append(lines, fset.Position(named.Pos()).Line)
+		}
+	case *ast.SelectorExpr:
+		if readers[named.Sel.Name] {
+			lines = append(lines, fset.Position(named.Pos()).Line)
+		}
+	}
 	return lines
 }
 
@@ -167,6 +218,27 @@ func loadConfig() config {
 			`package solution
 func f() func() string {
 	return func() string { return os.Getenv("ANYTHING") }
+}`,
+			true,
+		},
+		{
+			"the SDK accessor called directly in a closure, the exact N1 shape",
+			`package solution
+func loadConfig() config {
+	return config{
+		resolve: func() string {
+			v, _ := codefly.For(ctx).WorkspaceConfiguration("workload-identity", "ALLOWED_CALLERS")
+			return v
+		},
+	}
+}`,
+			true,
+		},
+		{
+			"codefly.Environment() in a closure",
+			`package solution
+func f() func() string {
+	return func() string { return codefly.Environment() }
 }`,
 			true,
 		},
@@ -309,11 +381,28 @@ func readsEnvironment(call *ast.CallExpr) bool {
 	if !ok {
 		return false
 	}
-	pkg, ok := selector.X.(*ast.Ident)
-	if !ok || pkg.Name != "os" {
-		return false
+	// os.Getenv and friends.
+	if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "os" {
+		switch selector.Sel.Name {
+		case "Getenv", "LookupEnv", "Environ":
+			return true
+		}
 	}
-	return selector.Sel.Name == "Getenv" || selector.Sel.Name == "LookupEnv" || selector.Sel.Name == "Environ"
+	// And the SDK's own readers, which is the gap that mattered: the rule
+	// matched only `os.*`, so a closure calling
+	// codefly.For(ctx).WorkspaceConfiguration(...) passed — and that is the
+	// *precise* shape of the defect the whole round-four finding was about.
+	// A gate that misses the exact code it was written for is worse than no
+	// gate, because it reports the boundary intact.
+	switch selector.Sel.Name {
+	case "WorkspaceConfiguration", "Environment", "Endpoint", "Secret":
+		return true
+	}
+	// Not LoadEnvironmentVariables: that is the loader, and start() calling it
+	// before loadConfig is the documented shape rather than a read to govern.
+	// Not For() either — it returns the query; the read is the accessor called
+	// on it, which the names above cover.
+	return false
 }
 
 // calleeName is the called function's own name, whether it is called plainly
@@ -327,4 +416,77 @@ func calleeName(call *ast.CallExpr) (string, bool) {
 		return fn.Sel.Name, true
 	}
 	return "", false
+}
+
+// TestTheGateCatchesAReaderTakenAsAValue: a method value or a function value is
+// the same deferred read as a closure, with none of the syntax — and a review
+// drove exactly that past both gates.
+func TestTheGateCatchesAReaderTakenAsAValue(t *testing.T) {
+	readers := map[string]bool{"workloadPath": true, "env": true, "readTheSet": true}
+	for _, tc := range []struct {
+		name   string
+		source string
+		caught bool
+	}{
+		{
+			"a method value assigned for later",
+			`package solution
+func (s *Server) wire() {
+	s.cfg.resolve = s.readTheSet
+}`,
+			true,
+		},
+		{
+			"a function value assigned for later",
+			`package solution
+func wire() config {
+	c := config{}
+	c.resolve = workloadPath
+	return c
+}`,
+			true,
+		},
+		{
+			"a reader passed as an argument, to be called later",
+			`package solution
+func wire() {
+	hold(workloadPath)
+}`,
+			true,
+		},
+		{
+			"calling it, which is a read at boot and fine",
+			`package solution
+func loadConfig() config {
+	return config{port: env("PORT", "")}
+}`,
+			false,
+		},
+		{
+			"assigning its result, which is also fine",
+			`package solution
+func loadConfig() config {
+	c := config{}
+	c.port = workloadPath(ctx, "A", "B")
+	return c
+}`,
+			false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "probe.go", tc.source, 0)
+			if err != nil {
+				t.Fatalf("parse the probe: %v", err)
+			}
+			found := len(environmentValuesEscaping(fset, file, readers)) > 0
+			if found != tc.caught {
+				if tc.caught {
+					t.Error("the gate did not see a configuration resolver taken as a value: it is called whenever the value is called, which is not boot, and no function literal appears for the closure gate to find")
+				} else {
+					t.Error("the gate flagged a resolver that is called rather than referenced, which is a read at boot and exactly what the rule wants")
+				}
+			}
+		})
+	}
 }

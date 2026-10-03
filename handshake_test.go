@@ -285,7 +285,8 @@ func TestTheCertificateServedIsTheCertificateChecked(t *testing.T) {
 			shape := tc.shape
 			shape.approved, shape.rival, shape.roots = approved, rival, c.roots
 			server := New(Manifest{ID: testSolutionID}).Identity(shape)
-			server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+			server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
+				gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 			server.principal = testPrincipal
 
 			config, err := server.serverIdentity()
@@ -321,7 +322,8 @@ func TestTheCertificateServedIsTheCertificateChecked(t *testing.T) {
 		// case above, which is not a listener.
 		shape := shapeShifter{approved: approved, rival: rival, roots: c.roots}
 		server := New(Manifest{ID: testSolutionID}).Identity(shape)
-		server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
+			gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 		server.principal = testPrincipal
 		config, err := server.serverIdentity()
 		if err != nil {
@@ -350,7 +352,8 @@ func TestANilPerConnectionAnswerCannotDropTheTrustAnchor(t *testing.T) {
 	caller := c.identity(t, testGatewayPrincipal)
 
 	server := New(Manifest{ID: testSolutionID}).Identity(conditionalAnchor{approved: approved, roots: c.roots})
-	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
 	if err != nil {
@@ -417,7 +420,8 @@ func TestTheAdmittedCallerSetIsResolvedPerHandshake(t *testing.T) {
 	server := New(Manifest{ID: testSolutionID}).Identity(shapeShifter{approved: approved, roots: c.roots})
 	server.cfg = config{
 		allowedCallersFile: provisioned,
-		platformPeersFile:  identitiesFile(t, testGatewayPrincipal),
+		mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile:   identitiesFile(t, testGatewayPrincipal),
 	}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
@@ -467,14 +471,14 @@ func TestTheProvisionedCallerSetIsReadThroughLoadConfig(t *testing.T) {
 	callers := identitiesFile(t, testGatewayPrincipal)
 	t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, callers)
 	peers := identitiesFile(t, testGatewayPrincipal)
-	t.Setenv(IdentityPlatformPeersFileEnvironmentVariable, peers)
+	t.Setenv(IdentityMintPeersFileEnvironmentVariable, peers)
 
 	cfg := loadConfig(context.Background())
 	if cfg.allowedCallersFile != callers {
 		t.Fatalf("loadConfig resolved the caller set from %q, want the provisioned %q", cfg.allowedCallersFile, callers)
 	}
-	if cfg.platformPeersFile != peers {
-		t.Fatalf("loadConfig resolved the peer set from %q, want the provisioned %q", cfg.platformPeersFile, peers)
+	if cfg.mintPeersFile != peers {
+		t.Fatalf("loadConfig resolved the mint peer set from %q, want the provisioned %q", cfg.mintPeersFile, peers)
 	}
 
 	server := New(Manifest{ID: testSolutionID})
@@ -590,7 +594,11 @@ func TestTheOutboundLeafIsHeldWhenItIsPresented(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The destination this test dials, so the authorization set for it is
+		// the mint's: the set is chosen per destination now.
+		mintURL: host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -628,11 +636,13 @@ func TestTheOutboundPeerMustBeAProvisionedPlatformIdentity(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 
-	build := func(t *testing.T) *http.Client {
+	build := func(t *testing.T, host *platformHost) *http.Client {
 		t.Helper()
 		server := New(Manifest{ID: testSolutionID})
 		server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-			platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+			mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+			gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+			mintURL:          host.URL + credentialMintPath}
 		server.principal = testPrincipal
 		client, err := server.outboundClient(nil)
 		if err != nil {
@@ -643,7 +653,7 @@ func TestTheOutboundPeerMustBeAProvisionedPlatformIdentity(t *testing.T) {
 
 	t.Run("the provisioned platform identity is dialled", func(t *testing.T) {
 		host := newPlatformHost(t, c, testGatewayPrincipal)
-		resp, err := build(t).Get(host.URL + credentialMintPath)
+		resp, err := build(t, host).Get(host.URL + credentialMintPath)
 		if err != nil {
 			t.Fatalf("the provisioned platform destination was refused: %v", err)
 		}
@@ -654,7 +664,7 @@ func TestTheOutboundPeerMustBeAProvisionedPlatformIdentity(t *testing.T) {
 		// A valid certificate from the same anchor, valid for this address,
 		// naming a workload that is not the platform.
 		host := newPlatformHost(t, c, rivalPrincipal)
-		resp, err := build(t).Get(host.URL + credentialMintPath)
+		resp, err := build(t, host).Get(host.URL + credentialMintPath)
 		if err == nil {
 			_ = resp.Body.Close()
 			t.Fatal("this workload's credentials were presented to a destination that is not a provisioned platform identity: a chain and a hostname do not distinguish the gateway from any other workload in the cell")
@@ -682,7 +692,11 @@ func TestABusyConnectionDoesNotOutliveTheTrustThatAuthenticatedIt(t *testing.T) 
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The destination this test dials, so the authorization set for it is
+		// the mint's: the set is chosen per destination now.
+		mintURL: host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -786,7 +800,11 @@ func TestEveryPlatformConnectionIsWatched(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The destination this test dials, so the authorization set for it is
+		// the mint's: the set is chosen per destination now.
+		mintURL: host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -919,7 +937,9 @@ func TestARotationBetweenTheCheckAndTheHandshakeIsRefused(t *testing.T) {
 	source := rotatingIdentity{approved: c.identity(t, testPrincipal), rival: c.identity(t, rivalPrincipal), roots: c.roots, asked: &asked}
 
 	server := New(Manifest{ID: testSolutionID}).Identity(source)
-	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		mintURL:          host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	identity, err := server.serverIdentity()
 	if err != nil {
@@ -993,7 +1013,9 @@ func TestAnEstablishedConnectionFollowsTheProvisionedPeerSet(t *testing.T) {
 	provisioned := identitiesFile(t, testGatewayPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: provisioned}
+		mintPeersFile:    provisioned,
+		gatewayPeersFile: provisioned,
+		mintURL:          host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -1038,7 +1060,11 @@ func TestALeafReadFailureDoesNotCloseATrustedConnection(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The destination this test dials, so the authorization set for it is
+		// the mint's: the set is chosen per destination now.
+		mintURL: host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -1213,7 +1239,11 @@ func TestANonAtomicRotationDoesNotFailANewDial(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The destination this test dials, so the authorization set for it is
+		// the mint's: the set is chosen per destination now.
+		mintURL: host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -1462,7 +1492,11 @@ func TestTheOutboundHandshakeIsBoundedWhateverTheCallerPassed(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The black hole is this test's "mint", so the dial has an
+		// authorization set at all: the set is chosen per destination now.
+		mintURL: "https://" + silent.Addr().String() + credentialMintPath}
 	server.principal = testPrincipal
 	server.handshakeTimeout = 750 * time.Millisecond
 	client, err := server.outboundClient(nil)
@@ -1579,4 +1613,161 @@ func TestTheInboundWatchStartsAtAuthentication(t *testing.T) {
 		}
 	}
 	t.Fatalf("a caller that authenticated and then sent nothing was still connected %s after its admission was withdrawn: the watch begins at the first request, so the whole pre-request window is unwatched", 5*inboundTrustRecheckInterval)
+}
+
+// TestAResumedConnectionCannotBeAdmittedWithoutACertificate is the executed
+// bypass from round five, committed.
+//
+// A resumed TLS connection presents no certificate: the peer is accepted on a
+// ticket. So anything able to forge a ticket is admitted as whoever the ticket
+// was issued to, and a denylist could not close that — it caught
+// SessionTicketKey and could not catch SetSessionTicketKeys, whose keys are
+// unexported and unreadable from the configuration. The review drove it end to
+// end: with a known key, a client holding only that key and an admitted
+// caller's ticket resumed as that caller with DidResume=true, presenting
+// nothing, and the per-second recheck then re-verified the stolen certificate
+// and kept the connection open.
+//
+// Resumption is therefore off on everything this listener serves, which is why
+// this test asserts a property of the configuration rather than replaying a
+// ticket: there is no ticket to replay.
+func TestAResumedConnectionCannotBeAdmittedWithoutACertificate(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, caller, roots := c.workload(t, testPrincipal)
+
+	// A source that deliberately fixes its ticket key, which is the HA-replica
+	// shape, and reaches the bypass through the field the denylist can see.
+	keyed, err := projectedIdentity{certFile: certFile, keyFile: keyFile, trustBundleFile: bundleFile}.ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyed.SessionTicketKey = [32]byte{7}
+	if err := usableServerIdentity(keyed); err == nil {
+		t.Error("a source fixing its own resumption ticket key was accepted: anyone holding that key can forge a ticket this listener resumes, and a resumed connection presents no certificate")
+	}
+
+	// And the half a check cannot see: keys installed through the method.
+	// Nothing can read them back, so the only sound answer is that this
+	// listener does not resume at all.
+	viaMethod, err := projectedIdentity{certFile: certFile, keyFile: keyFile, trustBundleFile: bundleFile}.ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaMethod.SetSessionTicketKeys([][32]byte{{9}})
+	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: viaMethod})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	served, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	if !served.SessionTicketsDisabled {
+		t.Fatal("the configuration this listener serves permits resumption while the source controls the ticket keys: a ticket forged with those keys is admitted as whoever it was issued to, with no certificate presented and nothing in this package able to notice")
+	}
+
+	// Every per-connection answer too, since that configuration replaces the
+	// base one for its connection.
+	perConnection, err := projectedIdentity{certFile: certFile, keyFile: keyFile, trustBundleFile: bundleFile}.ServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perConnection.GetConfigForClient == nil {
+		t.Fatal("the projected source stopped answering per connection, so this case no longer covers anything")
+	}
+	answered, err := served.GetConfigForClient(&tls.ClientHelloInfo{ServerName: "localhost"})
+	if err != nil {
+		t.Fatalf("the per-connection answer was refused: %v", err)
+	}
+	if answered != nil && !answered.SessionTicketsDisabled {
+		t.Error("a per-connection answer permits resumption: the configuration a callback returns replaces the base one for that connection, so disabling it on the base alone leaves the bypass open")
+	}
+
+	// The control: an admitted caller is still served, so this is not a
+	// listener that refuses everything.
+	if outcome := servedTo(t, served, caller, "localhost"); outcome.refused() {
+		t.Fatalf("an admitted caller was refused with resumption off: %s", outcome.reason())
+	}
+	_ = roots
+}
+
+// TestEachDestinationHasItsOwnAuthorizationSet: the mint and the gateway are
+// two parties, and one set spanning both authorises each to stand in for the
+// other at the other's address. The set already excluded every other workload
+// in the cell, which was the finding it was added for, and that is a different
+// question from whether "the platform" is one party.
+func TestEachDestinationHasItsOwnAuthorizationSet(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	const gatewayIdentity = "spiffe://codefly.test/ns/platform/sa/gateway"
+	const mintIdentity = "spiffe://codefly.test/ns/platform/sa/mint"
+
+	// Two hosts: one answering as the mint, one as the gateway.
+	mint := newPlatformHost(t, c, mintIdentity)
+	gateway := newPlatformHost(t, c, gatewayIdentity)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		mintURL:          mint.URL + credentialMintPath,
+		gatewayURL:       gateway.URL,
+		mintPeersFile:    identitiesFile(t, mintIdentity),
+		gatewayPeersFile: identitiesFile(t, gatewayIdentity),
+	}
+	server.principal = testPrincipal
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+
+	t.Run("each destination admits its own identity", func(t *testing.T) {
+		for _, at := range []struct{ name, url string }{
+			{"the mint", mint.URL + credentialMintPath},
+			{"the gateway", gateway.URL + "/anything"},
+		} {
+			resp, err := client.Get(at.url)
+			if err != nil {
+				t.Errorf("%s was refused while answering under its own provisioned identity: %v", at.name, err)
+				continue
+			}
+			_ = resp.Body.Close()
+		}
+	})
+
+	t.Run("neither stands in for the other", func(t *testing.T) {
+		// The gateway's identity, answering at the mint's address. Under one
+		// shared set this was accepted, and the projected service-account
+		// token went to it.
+		impostor := newPlatformHost(t, c, gatewayIdentity)
+		server.cfg.mintURL = impostor.URL + credentialMintPath
+		impersonating, err := server.outboundClient(nil)
+		if err != nil {
+			t.Fatalf("outboundClient: %v", err)
+		}
+		resp, err := impersonating.Get(impostor.URL + credentialMintPath)
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatal("the gateway's identity was accepted at the credential mint's address: a set spanning both parties lets either present itself as the other, and the mint is the destination that receives the projected service-account token")
+		}
+		if !strings.Contains(err.Error(), gatewayIdentity) {
+			t.Errorf("the refusal %q does not name the identity that answered", err)
+		}
+	})
+
+	t.Run("a third address has no set and is refused", func(t *testing.T) {
+		// This runtime dials the mint and the gateway and nothing else, so
+		// there is no set that should admit a third destination.
+		server.cfg.mintURL = mint.URL + credentialMintPath
+		fresh, err := server.outboundClient(nil)
+		if err != nil {
+			t.Fatalf("outboundClient: %v", err)
+		}
+		stranger := newPlatformHost(t, c, mintIdentity)
+		resp, err := fresh.Get(stranger.URL + credentialMintPath)
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatal("a destination that is neither the mint nor the gateway was dialled with this workload's credentials")
+		}
+		if !strings.Contains(err.Error(), "no authorization set") {
+			t.Errorf("the refusal %q does not say the address has no set, so it may be refusing for some other reason", err)
+		}
+	})
 }

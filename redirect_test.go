@@ -282,7 +282,11 @@ func TestOutboundTrustIsReReadPerConnection(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// The destination this test dials, so the authorization set for it is
+		// the mint's: the set is chosen per destination now.
+		mintURL: host.URL + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {

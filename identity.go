@@ -398,6 +398,7 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 	// answer, in those words, and this function then did the thing that comment
 	// forbids one level up.
 	config := answered.Clone()
+	refuseResumption(config)
 	if err := holdServedCertificate(config, s.principal); err != nil {
 		return nil, err
 	}
@@ -500,8 +501,8 @@ func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
 		if slices.Contains(peers, identity) {
 			return nil
 		}
-		return fmt.Errorf("refusing to present this workload's credentials to %q: it holds a certificate from this cell's anchor for the address this runtime dialled, which is not the same as being the platform — see %s and %s/%s",
-			identity, IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityGroup, WorkloadIdentityPlatformPeersFileKey)
+		return fmt.Errorf("refusing to present this workload's credentials to %q: it holds a certificate from this cell's anchor for the address this runtime dialled, which is not the same as being the party that answers there — each destination has its own provisioned set under %s, so neither the mint nor the gateway can stand in for the other",
+			identity, WorkloadIdentityGroup)
 	}
 }
 
@@ -651,6 +652,36 @@ func usableServerIdentity(config *tls.Config) error {
 	return unsubvertedPosture(config)
 }
 
+// refuseResumption turns session resumption off on the configuration this
+// listener actually serves.
+//
+// Taken, not filtered, and this is the one place in this file where that
+// distinction was load-bearing. A resumed TLS connection presents **no
+// certificate**: the peer is accepted on the strength of a ticket. This
+// listener's whole model is that a caller's certificate names them and the
+// admitted set decides whether that name may call, so anything able to forge a
+// ticket is able to be admitted as whoever the ticket was issued to, without a
+// certificate ever being presented.
+//
+// A denylist could not close that. It caught `SessionTicketKey`, and it could
+// not catch `SetSessionTicketKeys`, which installs unexported keys that cannot
+// be read back off the configuration — and a review demonstrated the gap end to
+// end: with a known key, a client holding only that key and an admitted
+// caller's ticket resumed as that caller, `DidResume=true`, peer identity
+// intact, presenting nothing. The per-connection recheck then re-verified the
+// stolen certificate from the resumed state and kept the connection open, which
+// is the recheck working correctly on a premise that was already false.
+//
+// So resumption is off, on the held clone and on every per-connection clone.
+// What it costs is one round trip on a reconnect, for a service that re-reads
+// its admission set every second anyway; what it buys is that every connection
+// this listener serves had a certificate presented on it. The denylist entry
+// stays, because a source that sets the field deserves to be told at boot
+// rather than silently overridden.
+func refuseResumption(config *tls.Config) {
+	config.SessionTicketsDisabled = true
+}
+
 // unsubvertedPosture refuses the fields that leave every check above passing
 // and the posture gone.
 //
@@ -782,6 +813,7 @@ func holdPerConnectionPosture(config *tls.Config, principal string, allowed func
 		// handshake may be reading, which is both a data race and a violation
 		// of the rule that a configuration in use is not modified.
 		admitted := answer.Clone()
+		refuseResumption(admitted)
 		// Held to the frozen principal here, on the clone, and not by probing
 		// the answer: a per-connection answer selects its own certificate, and
 		// an answer whose GetCertificate returned the approved leaf for a

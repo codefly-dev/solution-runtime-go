@@ -320,6 +320,7 @@ func isWorkContextPath(path string) bool {
 // to the same credential-bearing handler. It now reads every call to the seam
 // in the module and requires the calling function to refuse a non-test binary.
 func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.T) {
+	reachesTheSeam, refusesANonTestBinary := seamCallGraph(t)
 	fset := token.NewFileSet()
 	for _, name := range moduleSources(t) {
 		file, err := parser.ParseFile(fset, name, nil, 0)
@@ -334,17 +335,20 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 				}
 				// Whoever reaches the seam is an exported path to a handler
 				// holding a real credential, whatever it is called and whether
-				// it hangs off a receiver or not. Inside the root package the
-				// seam is assigned, not called, and Serve's own path is
-				// unexported — so the only callers this can match are the ones
-				// that have to carry the refusal.
-				if !callsThe(declared, "seam", "Passthrough") {
+				// it hangs off a receiver or not.
+				//
+				// Transitively. The rule matched only a function that calls
+				// seam.Passthrough *directly*, so an exported Handler
+				// delegating to an unexported helper — and a root-package
+				// wrapper over passthroughSeam — both walked past it. One hop
+				// of indirection is the first thing anyone writes.
+				if !reachesTheSeam[declared.Name.Name] {
 					continue
 				}
 				if !declared.Name.IsExported() {
 					continue
 				}
-				if !callsThe(declared, "", "mustBeATest") {
+				if !refusesANonTestBinary[declared.Name.Name] {
 					t.Errorf("%s exports %s, which builds a passthrough through internal/seam without refusing a non-test binary: that handler holds a real execution credential and skips validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, so an exported path to it has to call mustBeATest()",
 						name, declared.Name.Name)
 				}
@@ -420,6 +424,63 @@ func renderedType(expr ast.Expr) string {
 		}
 	}
 	return ""
+}
+
+// seamCallGraph is, for every function in the module, whether it reaches the
+// passthrough seam and whether it refuses a non-test binary — both
+// transitively, because one hop of indirection is the first thing anyone
+// writes and the previous rule only looked at direct calls.
+func seamCallGraph(t *testing.T) (reaches, refuses map[string]bool) {
+	t.Helper()
+	fset := token.NewFileSet()
+	calls := map[string][]string{}
+	reaches, refuses = map[string]bool{}, map[string]bool{}
+	for _, name := range moduleSources(t) {
+		if strings.Contains(name, "internal/seam") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if callsThe(fn, "seam", "Passthrough") {
+				reaches[fn.Name.Name] = true
+			}
+			if callsThe(fn, "", "mustBeATest") || callsThe(fn, "", "refuseOutsideTest") {
+				refuses[fn.Name.Name] = true
+			}
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if callee, ok := calleeName(call); ok {
+					calls[fn.Name.Name] = append(calls[fn.Name.Name], callee)
+				}
+				return true
+			})
+		}
+	}
+	// Propagate both properties up the call graph until nothing changes.
+	for changed := true; changed; {
+		changed = false
+		for caller, callees := range calls {
+			for _, callee := range callees {
+				if reaches[callee] && !reaches[caller] {
+					reaches[caller], changed = true, true
+				}
+				if refuses[callee] && !refuses[caller] {
+					refuses[caller], changed = true, true
+				}
+			}
+		}
+	}
+	return reaches, refuses
 }
 
 // callsThe reports whether fn calls pkg.name, or bare name when pkg is empty.

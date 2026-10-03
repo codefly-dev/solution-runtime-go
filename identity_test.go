@@ -50,7 +50,7 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 		// say a destination is the platform — and outbound is the direction
 		// where being wrong hands over the projected token rather than
 		// accepting a call.
-		{name: "no platform peers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "platform peer identities", variable: IdentityPlatformPeersFileEnvironmentVariable},
+		{name: "no platform peers", cert: certFile, key: keyFile, token: "t", bundle: bundleFile, callers: testGatewayPrincipal, names: "credential mint peer identity", variable: IdentityMintPeersFileEnvironmentVariable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID})
@@ -63,7 +63,8 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 				projectedTokenPath: tc.token,
 				trustBundleFile:    tc.bundle,
 				allowedCallersFile: optionalIdentitiesFile(t, tc.callers),
-				platformPeersFile:  optionalIdentitiesFile(t, tc.peers),
+				mintPeersFile:      optionalIdentitiesFile(t, tc.peers),
+				gatewayPeersFile:   optionalIdentitiesFile(t, tc.peers),
 				profile:            localProfile,
 			}
 			if err := server.cfg.validate(); err != nil {
@@ -131,7 +132,8 @@ func TestASuppliedSourceNeedsNoProvisioningItDoesNotRead(t *testing.T) {
 		// workload is, this says which callers it serves — and which
 		// destinations are the platform.
 		allowedCallersFile: identitiesFile(t, testGatewayPrincipal),
-		platformPeersFile:  identitiesFile(t, testGatewayPrincipal),
+		mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile:   identitiesFile(t, testGatewayPrincipal),
 	}
 	t.Run("an identity source replaces the projected pair", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{})
@@ -816,7 +818,8 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 	t.Setenv(IdentityKeyFileEnvironmentVariable, keyFile)
 	t.Setenv(IdentityTrustBundleFileEnvironmentVariable, bundleFile)
 	t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
-	t.Setenv(IdentityPlatformPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
+	t.Setenv(IdentityMintPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
+	t.Setenv(IdentityGatewayPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
 	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
 	t.Setenv("ASSETS_DIR", t.TempDir())
 
@@ -905,7 +908,8 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{port: freePort(t), identityCertFile: certFile, identityKeyFile: keyFile,
-		trustBundleFile: bundleFile, allowedCallersFile: identitiesFile(t, testGatewayPrincipal), platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		trustBundleFile: bundleFile, allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 
 	config, err := server.serverIdentity()

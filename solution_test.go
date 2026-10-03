@@ -1116,7 +1116,11 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// This test inspects the transport rather than dialling, so any
+		// resolved destination will do.
+		mintURL: "https://mint.cell:443" + credentialMintPath}
 	server.principal = testPrincipal
 	client, err := server.outboundClient(nil)
 	if err != nil {
@@ -1174,7 +1178,8 @@ func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		platformPeersFile: identitiesFile(t, testGatewayPrincipal), gatewayURL: host.URL}
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal), gatewayURL: host.URL}
 	server.principal = testPrincipal
 	outbound, err := server.outboundClient(nil)
 	if err != nil {
@@ -1598,4 +1603,114 @@ func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
 			t.Errorf("a conflict was reported with no override set: %v", err)
 		}
 	})
+}
+
+// TestAnAdmissionFileIsReadWholeOrRefused: each entry has to be a complete
+// line, which is the part that is not obvious.
+//
+// The previous reader split whatever it was handed, so a file caught mid-write
+// — a platform rewriting it without an atomic swap, an operator's `>` redirect
+// — truncated an entry and the truncation was admitted as an identity of its
+// own. The executed review showed ".../sa/gateway-internal" read as
+// ".../sa/gateway", admitting a caller the set never named.
+func TestAnAdmissionFileIsReadWholeOrRefused(t *testing.T) {
+	const gateway = "spiffe://codefly.test/ns/platform/sa/gateway"
+	const internal = "spiffe://codefly.test/ns/platform/sa/gateway-internal"
+
+	read := func(t *testing.T, content string) ([]string, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "identities")
+		writeFile(t, path, content)
+		return resolvedIdentities(path, "unresolved")()
+	}
+
+	t.Run("a truncated last line is refused, not admitted", func(t *testing.T) {
+		// What a reader sees partway through a non-atomic rewrite of a file
+		// whose only entry is the -internal identity.
+		got, err := read(t, internal[:len(internal)-len("-internal")])
+		if err == nil {
+			t.Fatalf("a file caught mid-write resolved to %v: the fragment %q is a different identity from the one being written, and admitting it lets in a caller the set never named", got, gateway)
+		}
+		if !strings.Contains(err.Error(), "newline") {
+			t.Errorf("the refusal %q does not say why the file is not whole", err)
+		}
+	})
+
+	t.Run("a terminated file is read", func(t *testing.T) {
+		got, err := read(t, gateway+"\n"+internal+"\n")
+		if err != nil {
+			t.Fatalf("a complete file was refused: %v", err)
+		}
+		if len(got) != 2 || got[0] != gateway || got[1] != internal {
+			t.Errorf("resolved %v, want both identities", got)
+		}
+	})
+
+	t.Run("entries that can never match are refused at the file", func(t *testing.T) {
+		for _, tc := range []struct{ name, content string }{
+			{"a byte-order mark", "\ufeff" + gateway + "\n"},
+			{"a NUL in an entry", "spiffe://codefly.test/ns/platform/sa/gate\x00way\n"},
+			{"not a URI at all", "gateway\n"},
+			{"another scheme", "https://codefly.test/ns/platform/sa/gateway\n"},
+			{"no path", "spiffe://codefly.test\n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got, err := read(t, tc.content); err == nil {
+					t.Errorf("resolved %v: an entry that cannot match any peer is a provisioning mistake, and carrying it silently turns into a caller nobody admits at a handshake far from the cause", got)
+				}
+			})
+		}
+	})
+
+	t.Run("a file too large to re-read every second is refused", func(t *testing.T) {
+		big := strings.Repeat(gateway+"\n", (admissionFileLimit/(len(gateway)+1))+16)
+		if got, err := read(t, big); err == nil {
+			t.Errorf("resolved %d identities from a file over the limit: this is read on every handshake, every dial, and once a second per established connection in each direction", len(got))
+		}
+	})
+
+	t.Run("comments, CRLF and commas still work", func(t *testing.T) {
+		got, err := read(t, "# the gateway\r\n"+gateway+", "+internal+"\r\n")
+		if err != nil {
+			t.Fatalf("a conforming file was refused: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("resolved %v, want two identities", got)
+		}
+	})
+}
+
+// TestACredentialBearingURLCarriesNothingButADestination: userinfo, a query and
+// a fragment were all accepted on both credential-bearing destinations, and the
+// first two were written to the boot log verbatim — a secret that is disclosed
+// and, in the userinfo case, that net/http strips before the request is even
+// sent, so it is never used for anything except being logged.
+func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
+	for _, tc := range []struct{ name, mint, names string }{
+		{"userinfo", "https://ops:s3cr3t@mint.cell/platform/_credential", "userinfo"},
+		{"a query", "https://mint.cell/platform/_credential?token=s3cr3t", "query"},
+		{"a fragment", "https://mint.cell/platform/_credential#part", "fragment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config{port: "8080", gatewayURL: "https://gateway:42152", mintURL: tc.mint, profile: localProfile}
+			err := cfg.validate()
+			if err == nil {
+				t.Fatalf("a credential mint URL carrying %s was accepted", tc.names)
+			}
+			if !strings.Contains(err.Error(), tc.names) {
+				t.Errorf("the refusal %q does not say the URL carries %s", err, tc.names)
+			}
+		})
+	}
+
+	// And the log redacts regardless, because a log line is the wrong place to
+	// depend on a check that runs elsewhere.
+	for _, tc := range []struct{ raw, hidden string }{
+		{"https://ops:s3cr3t@mint.cell/x", "s3cr3t"},
+		{"https://mint.cell/x?token=s3cr3t", "s3cr3t"},
+	} {
+		if got := redactedURL(tc.raw); strings.Contains(got, tc.hidden) {
+			t.Errorf("redactedURL(%q) = %q, which still carries the secret", tc.raw, got)
+		}
+	}
 }

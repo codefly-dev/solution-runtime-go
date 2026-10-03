@@ -401,7 +401,8 @@ func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, key
 	t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
 	// And whom this runtime may present credentials to: the same identity, for
 	// the mirror-image reason. The fake host serves under it.
-	t.Setenv(IdentityPlatformPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
+	t.Setenv(IdentityMintPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
+	t.Setenv(IdentityGatewayPeersFileEnvironmentVariable, identitiesFile(t, testGatewayPrincipal))
 	t.Setenv(ContractProfileEnvironmentVariable, localProfile)
 	// A test that serves assets provisions the directory before booting, since
 	// a boot's configuration is read by the serving goroutine and must not be
@@ -658,18 +659,67 @@ func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
 // to name a real one.
 func freePort(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// Bind, read the port, close, hand it over — which is a time-of-check /
+	// time-of-use race, and it is the one that produced the intermittent
+	// failures this suite was reporting as an unexplained flake: a test booted
+	// and got `bind: address already in use`, in a different test each time.
+	// Between the close here and the boot's own bind, anything else asking the
+	// OS for an ephemeral port can be handed this one, and this suite stands up
+	// httptest servers constantly.
+	//
+	// Two things narrow it: a port handed out once in this process is never
+	// handed out again, and the port is re-bound immediately before being
+	// returned to confirm it is still free. Neither makes it impossible — only
+	// never closing the listener would, and the boot has to bind it — so the
+	// retry is what covers the rest.
+	for attempt := range 20 {
+		ln, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, port, err := net.SplitHostPort(ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if handedOutPort(port) {
+			continue
+		}
+		// Still free for the bind the boot will actually make, which is on all
+		// interfaces (`:port`) and not on loopback: 127.0.0.1:P being free
+		// does not mean :P is, and checking the wrong one is how this helper
+		// handed out ports that then failed to bind.
+		again, err := net.Listen("tcp", ":"+port)
+		if err != nil {
+			continue
+		}
+		if err := again.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_ = attempt
+		return port
 	}
-	_, port, err := net.SplitHostPort(ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
+	t.Fatal("could not find a free port that had not already been handed out")
+	return ""
+}
+
+var (
+	handedOutMu    sync.Mutex
+	handedOutPorts = map[string]bool{}
+)
+
+// handedOutPort records a port and reports whether it had been handed out
+// before, so no two tests in this process are given the same one.
+func handedOutPort(port string) bool {
+	handedOutMu.Lock()
+	defer handedOutMu.Unlock()
+	if handedOutPorts[port] {
+		return true
 	}
-	if err := ln.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return port
+	handedOutPorts[port] = true
+	return false
 }
 
 // getStatus GETs target through client and returns the status.
@@ -784,7 +834,8 @@ func TestABootWithAnUnusableAdmissionFileIsRefused(t *testing.T) {
 				projectedTokenPath: "t",
 				trustBundleFile:    bundleFile,
 				allowedCallersFile: path,
-				platformPeersFile:  identitiesFile(t, testGatewayPrincipal),
+				mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
+				gatewayPeersFile:   identitiesFile(t, testGatewayPrincipal),
 				profile:            localProfile,
 			}
 			err := server.validateSources()

@@ -389,7 +389,19 @@ type config struct {
 	// for, not that it is the platform. A neighbouring workload holding a
 	// certificate valid for the gateway's hostname completed this handshake and
 	// was handed the projected token.
-	platformPeersFile string
+	// mintPeersFile and gatewayPeersFile are the identities this runtime
+	// accepts at each of the two destinations it dials, one set per
+	// destination.
+	//
+	// One set for both was the previous shape, and it meant the gateway's
+	// identity was accepted at the mint's address and the mint's at the
+	// gateway's. The set already excluded every other workload in the cell,
+	// which was the finding it was added for — but "the platform" is not one
+	// party, and a set that spans two parties authorises each of them to stand
+	// in for the other. The maximum-security answer is one authorization set
+	// per destination, and a dial to anything that is neither is refused
+	// outright: this runtime has exactly two destinations.
+	mintPeersFile, gatewayPeersFile string
 	// profile is the configuration profile this process runs under, which the
 	// published contract is keyed by. A deployed environment has a profile of
 	// its own (codefly-dev/core#687, fixed in core v0.7.1), so a contract that
@@ -590,7 +602,8 @@ func loadConfig(ctx context.Context) config {
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
 		trustBundleFile:    workloadPath(ctx, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey),
 		allowedCallersFile: workloadPath(ctx, IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityAllowedCallersFileKey),
-		platformPeersFile:  workloadPath(ctx, IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityPlatformPeersFileKey),
+		mintPeersFile:      workloadPath(ctx, IdentityMintPeersFileEnvironmentVariable, WorkloadIdentityMintPeersFileKey),
+		gatewayPeersFile:   workloadPath(ctx, IdentityGatewayPeersFileEnvironmentVariable, WorkloadIdentityGatewayPeersFileKey),
 		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 	}
@@ -615,13 +628,24 @@ func loadConfig(ctx context.Context) config {
 	return cfg
 }
 
-// conflictingAdmissionSources is the error validate() reports when an
-// admission set is answered by both an operator override and the platform's
-// provisioning.
+// conflictingAdmissionSources is the error validate() reports when any value in
+// the identity group is answered by both an operator override and the
+// platform's provisioning.
+//
+// All of them, not only the two admission sets. The override that outranks the
+// platform silently was found first on the caller set, and the same argument
+// reaches the rest of the group: a substituted *trust bundle* widens admission
+// exactly as much as a substituted caller list, and a substituted key pair
+// changes who this process is. The two sets were simply where it was noticed.
 func conflictingAdmissionSources(ctx context.Context) error {
 	for _, admission := range []struct{ what, override, key string }{
 		{"allowed callers", IdentityAllowedCallersFileEnvironmentVariable, WorkloadIdentityAllowedCallersFileKey},
-		{"platform peers", IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityPlatformPeersFileKey},
+		{"credential mint peer identity", IdentityMintPeersFileEnvironmentVariable, WorkloadIdentityMintPeersFileKey},
+		{"gateway peer identity", IdentityGatewayPeersFileEnvironmentVariable, WorkloadIdentityGatewayPeersFileKey},
+		{"peer trust anchor", IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey},
+		{"workload identity certificate", IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey},
+		{"workload identity private key", IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey},
+		{"projected service-account token", ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey},
 	} {
 		overridden := strings.TrimSpace(env(admission.override, ""))
 		if overridden == "" {
@@ -631,7 +655,7 @@ func conflictingAdmissionSources(ctx context.Context) error {
 		if strings.TrimSpace(provisioned) == "" {
 			continue
 		}
-		return fmt.Errorf("the %s are answered twice: %s names %q and the platform provisioned %s/%s as %q. An authorization decision with two sources is refused rather than ranked — whichever this process picked, the other is a decision somebody made that is not in force. Unset the override, or remove the provisioning",
+		return fmt.Errorf("the %s is answered twice: %s names %q and the platform provisioned %s/%s as %q. A value this process is held to with two sources is refused rather than ranked — whichever it picked, the other is a decision somebody made that is not in force. Unset the override, or remove the provisioning",
 			admission.what, admission.override, overridden, WorkloadIdentityGroup, admission.key, strings.TrimSpace(provisioned))
 	}
 	return nil
@@ -674,10 +698,16 @@ const (
 	// runs is a decision this listener would keep honouring after it was
 	// revoked.
 	WorkloadIdentityAllowedCallersFileKey = "ALLOWED_CALLERS_FILE"
-	// WorkloadIdentityPlatformPeersFileKey names the *file* listing the
-	// identities this runtime will present its credentials to. A path, for the
-	// reason above.
-	WorkloadIdentityPlatformPeersFileKey = "PLATFORM_PEERS_FILE"
+	// WorkloadIdentityMintPeersFileKey and
+	// WorkloadIdentityGatewayPeersFileKey name the *files* listing the
+	// identities this runtime will present its credentials to, one per
+	// destination. Paths, for the reason above.
+	//
+	// Two keys rather than one, because the mint and the gateway are two
+	// parties and a single set lets each stand in for the other at the other's
+	// address.
+	WorkloadIdentityMintPeersFileKey    = "MINT_PEERS_FILE"
+	WorkloadIdentityGatewayPeersFileKey = "GATEWAY_PEERS_FILE"
 )
 
 // The environment overrides for the paths above. Each names a file, and
@@ -689,9 +719,11 @@ const (
 	IdentityCertFileEnvironmentVariable        = "CODEFLY__WORKLOAD_IDENTITY_CERT_FILE"
 	IdentityKeyFileEnvironmentVariable         = "CODEFLY__WORKLOAD_IDENTITY_KEY_FILE"
 	IdentityTrustBundleFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE"
-	// IdentityPlatformPeersFileEnvironmentVariable overrides the file listing
-	// the identities this runtime accepts outbound.
-	IdentityPlatformPeersFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_PLATFORM_PEERS_FILE"
+	// IdentityMintPeersFileEnvironmentVariable and
+	// IdentityGatewayPeersFileEnvironmentVariable override the files listing
+	// the identities this runtime accepts at each destination.
+	IdentityMintPeersFileEnvironmentVariable    = "CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE"
+	IdentityGatewayPeersFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE"
 	// IdentityAllowedCallersFileEnvironmentVariable overrides the file listing
 	// the identities allowed to call this solution.
 	IdentityAllowedCallersFileEnvironmentVariable = "CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE"
@@ -793,6 +825,30 @@ func (c config) validate() error {
 			return fmt.Errorf("%s %q is not https: it carries %s, so a plaintext hop hands them to anything on the path. Set %s to an https destination",
 				required.name, required.value, credentialsCarriedOn(required.name), required.override)
 		}
+		// And nothing but a destination. These three were accepted, and the
+		// first two were then written to the log at every boot:
+		//
+		//   - userinfo (https://ops:s3cr3t@mint.cell/…) is a credential in a
+		//     URL, which net/http also strips from the request it sends, so it
+		//     is a secret that is logged and never used;
+		//   - a query (…?token=s3cr3t) is the same shape, and it travels;
+		//   - a fragment is never sent at all, so a destination carrying one
+		//     is not the destination somebody meant.
+		//
+		// A boot refusal is the right answer rather than quietly trimming
+		// them: an operator who put a token in this URL believes it is doing
+		// something.
+		switch {
+		case u.User != nil:
+			return fmt.Errorf("%s carries userinfo: credentials in a URL are a secret that this runtime would log at boot and net/http would strip from the request, so it is disclosed and never used. Put the host in %s and nothing else",
+				required.name, required.override)
+		case u.RawQuery != "":
+			return fmt.Errorf("%s carries a query string: this address is dialled, not templated, and anything secret in a query is logged by every hop that sees the URL. Put the host and path in %s and nothing else",
+				required.name, required.override)
+		case u.Fragment != "":
+			return fmt.Errorf("%s carries a fragment: a fragment is never sent, so this is not the destination it appears to be. Set %s to the address the host actually serves",
+				required.name, required.override)
+		}
 	}
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
@@ -808,9 +864,25 @@ func (c config) validate() error {
 	// Said at every boot: the operator set this address by hand, because
 	// nothing resolves it yet, so a 404 here is the endpoint not existing on
 	// this host rather than this build being refused.
+	// Redacted, always. validate() refuses userinfo and a query above, so there
+	// should be nothing to hide — and a log line is the wrong place to depend
+	// on a check that runs elsewhere.
 	log.Printf("codefly: this execution's credential will be minted at %q, which was set explicitly through %s — no resolver produces it yet, so a 404 here means that endpoint does not exist on this host, not that this build was refused.",
-		c.mintURL, CredentialMintURLEnvironmentVariable)
+		redactedURL(c.mintURL), CredentialMintURLEnvironmentVariable)
 	return nil
+}
+
+// redactedURL is a URL as it may appear in a log: url.Redacted() replaces a
+// password with "xxxxx", and a query is dropped entirely, because a token in a
+// query is the shape this package refuses at boot and a log line must not be
+// the place that depends on that refusal having run.
+func redactedURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "(unparseable)"
+	}
+	parsed.RawQuery, parsed.Fragment = "", ""
+	return parsed.Redacted()
 }
 
 // credentialsCarriedOn names what a plaintext destination would disclose, so
@@ -863,10 +935,14 @@ func (s *Server) validateSources() error {
 	// reason in the other direction. It is required on every path, including a
 	// supplied identity source: a source says who this workload is, not which
 	// destinations are the platform.
-	if err := s.cfg.requirePath("platform peer identities", s.cfg.platformPeersFile,
-		IdentityPlatformPeersFileEnvironmentVariable, WorkloadIdentityPlatformPeersFileKey); err != nil {
-		return fmt.Errorf("%w — this runtime presents the projected service-account token, the viewer's bearer and its own credential to the mint and the gateway, and verifying their chain and hostname says only that a destination holds a certificate this cell issued, which every workload in the cell does. Without this, a neighbouring workload answering at the gateway's address is handed all three",
-			err)
+	for _, peers := range []struct{ name, value, override, key string }{
+		{"credential mint peer identity", s.cfg.mintPeersFile, IdentityMintPeersFileEnvironmentVariable, WorkloadIdentityMintPeersFileKey},
+		{"gateway peer identity", s.cfg.gatewayPeersFile, IdentityGatewayPeersFileEnvironmentVariable, WorkloadIdentityGatewayPeersFileKey},
+	} {
+		if err := s.cfg.requirePath(peers.name, peers.value, peers.override, peers.key); err != nil {
+			return fmt.Errorf("%w — this runtime presents the projected service-account token, the viewer's bearer and its own credential to these destinations, and verifying their chain and hostname says only that a destination holds a certificate this cell issued, which every workload in the cell does. Each destination has its own set, so neither party can stand in for the other at the other's address",
+				err)
+		}
 	}
 	// And both files have to be readable and name somebody *now*. The per-use
 	// readers refuse a handshake over an unreadable set, which is the right
@@ -879,7 +955,8 @@ func (s *Server) validateSources() error {
 		admits func() ([]string, error)
 	}{
 		{"allowed callers", s.admittedCallers()},
-		{"platform peers", s.admittedPlatform()},
+		{"credential mint peer identity", s.admittedMint()},
+		{"gateway peer identity", s.admittedGateway()},
 	} {
 		if _, err := set.admits(); err != nil {
 			return fmt.Errorf("the provisioned %s are not usable at boot: %w", set.what, err)
@@ -902,11 +979,60 @@ func (s *Server) admittedCallers() func() ([]string, error) {
 		WorkloadIdentityGroup, WorkloadIdentityAllowedCallersFileKey, IdentityAllowedCallersFileEnvironmentVariable))
 }
 
-// admittedPlatform is admittedCallers for the destinations this runtime dials.
-func (s *Server) admittedPlatform() func() ([]string, error) {
-	return resolvedIdentities(s.cfg.platformPeersFile, fmt.Sprintf(
-		"which destinations count as the platform could not be resolved, and the destinations held to that set receive the projected token, the viewer's bearer and this workload's credential, so the dial is refused. Provision %s/%s, or set %s",
-		WorkloadIdentityGroup, WorkloadIdentityPlatformPeersFileKey, IdentityPlatformPeersFileEnvironmentVariable))
+// admittedMint and admittedGateway are admittedCallers for each of the two
+// destinations this runtime dials, one authorization set each.
+func (s *Server) admittedMint() func() ([]string, error) {
+	return resolvedIdentities(s.cfg.mintPeersFile, fmt.Sprintf(
+		"which identity answers for the credential mint could not be resolved, and that destination receives the projected service-account token, so the dial is refused. Provision %s/%s, or set %s",
+		WorkloadIdentityGroup, WorkloadIdentityMintPeersFileKey, IdentityMintPeersFileEnvironmentVariable))
+}
+
+func (s *Server) admittedGateway() func() ([]string, error) {
+	return resolvedIdentities(s.cfg.gatewayPeersFile, fmt.Sprintf(
+		"which identity answers for the gateway could not be resolved, and that destination receives the viewer's bearer and the capability minted for them, so the dial is refused. Provision %s/%s, or set %s",
+		WorkloadIdentityGroup, WorkloadIdentityGatewayPeersFileKey, IdentityGatewayPeersFileEnvironmentVariable))
+}
+
+// admittedAt is the authorization set for one destination address, and an error
+// for an address that is neither.
+//
+// A dial to a third address is refused rather than held to some union: this
+// runtime talks to the mint and the gateway and to nothing else, so an address
+// that is neither is a misbuilt client or a redirect that got through, and
+// there is no set that should admit it.
+func (s *Server) admittedAt(addr string) func() ([]string, error) {
+	mint, gateway := dialAddress(s.cfg.mintURL), dialAddress(s.cfg.gatewayURL)
+	switch addr {
+	case mint:
+		return s.admittedMint()
+	case gateway:
+		return s.admittedGateway()
+	}
+	return func() ([]string, error) {
+		return nil, fmt.Errorf("refusing to present this workload's credentials at %s: this runtime dials the credential mint (%s) and the gateway (%s) and nothing else, so an address that is neither has no authorization set and is not a destination this runtime has one for",
+			addr, mint, gateway)
+	}
+}
+
+// dialAddress is the host:port a URL is dialled at, with the scheme's default
+// port made explicit so it compares equal to what the dialler is handed.
+//
+// Host and port together, because the two destinations may well share a host
+// and differ only by port — the mint has lived on the gateway's host — and a
+// comparison on the host alone would then hold both to whichever set matched
+// first, which is the merge this split exists to undo.
+func dialAddress(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	if parsed.Port() != "" {
+		return parsed.Host
+	}
+	if parsed.Scheme == "http" {
+		return parsed.Host + ":80"
+	}
+	return parsed.Host + ":443"
 }
 
 // resolvedIdentities reads an admission set from its file, per call.
@@ -922,16 +1048,103 @@ func resolvedIdentities(path, unresolved string) func() ([]string, error) {
 		if path == "" {
 			return nil, fmt.Errorf("%s", unresolved)
 		}
-		content, err := os.ReadFile(path)
+		content, err := readAdmissionFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("%s: reading %q: %w", unresolved, path, err)
 		}
-		identities := parsedAllowedCallers(string(content))
+		identities, err := parsedIdentities(content)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %q: %w", unresolved, path, err)
+		}
 		if len(identities) == 0 {
 			return nil, fmt.Errorf("%s: %q names none", unresolved, path)
 		}
 		return identities, nil
 	}
+}
+
+// admissionFileLimit caps an admission file.
+//
+// A set this runtime reads on every handshake, on every dial, and once a second
+// per established connection in each direction is not a file to read without a
+// bound: a 10MB one measured 9.5ms per read, which is a cost an operator can
+// inflict by accident and an attacker who can write that path can inflict on
+// purpose. A realistic set is a handful of SPIFFE IDs.
+const admissionFileLimit = 64 << 10
+
+// readAdmissionFile reads an admission set with a size bound.
+func readAdmissionFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, admissionFileLimit+1))
+	if err != nil {
+		return "", err
+	}
+	if len(content) > admissionFileLimit {
+		return "", fmt.Errorf("the file is larger than %d bytes, which is not a set of identities: this is read on every handshake, every dial, and once a second per established connection", admissionFileLimit)
+	}
+	return string(content), nil
+}
+
+// parsedIdentities is the admitted set a file names, and an error for a file
+// this runtime will not guess at.
+//
+// Each entry must be a *complete* line, which is the part that matters and is
+// not obvious. The previous reader split on whatever it was handed, so a file
+// caught mid-write — the platform rewriting it without an atomic swap, an
+// operator's `>` redirect — truncated an entry and the truncation was admitted
+// as an identity of its own: ".../sa/gateway-internal" read as ".../sa/gateway"
+// and let in a caller the set never named. A trailing newline is the only
+// evidence a line is whole, so a final fragment is refused rather than taken.
+//
+// Each entry is then checked to be a SPIFFE ID, because that is what it is
+// compared against and an entry that cannot match anything is a provisioning
+// mistake this runtime should name at boot rather than carry silently.
+func parsedIdentities(raw string) ([]string, error) {
+	if strings.HasPrefix(raw, "\ufeff") {
+		return nil, fmt.Errorf("the file begins with a byte-order mark, so its first entry can never match an identity")
+	}
+	if raw != "" && !strings.HasSuffix(raw, "\n") {
+		return nil, fmt.Errorf("the file does not end in a newline, so its last line may be a fragment of one — a set caught mid-rewrite would otherwise admit a truncated identity as an identity of its own")
+	}
+	var identities []string
+	for _, line := range strings.Split(raw, "\n") {
+		if hash := strings.Index(line, "#"); hash >= 0 {
+			line = line[:hash]
+		}
+		for _, entry := range strings.Split(line, ",") {
+			trimmed := strings.TrimSpace(entry)
+			if trimmed == "" {
+				continue
+			}
+			if err := usableIdentity(trimmed); err != nil {
+				return nil, err
+			}
+			identities = append(identities, trimmed)
+		}
+	}
+	return identities, nil
+}
+
+// usableIdentity refuses an entry that could never match a peer, so the refusal
+// names the provisioning rather than appearing later as a caller nobody admits.
+func usableIdentity(entry string) error {
+	for _, r := range entry {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == 0xfeff {
+			return fmt.Errorf("the entry %q contains a control character, so it can never match an identity a peer presents", entry)
+		}
+	}
+	parsed, err := url.Parse(entry)
+	if err != nil {
+		return fmt.Errorf("the entry %q is not a URI: an admitted identity is a SPIFFE ID, compared against the one URI SAN a peer's certificate carries", entry)
+	}
+	if parsed.Scheme != "spiffe" || parsed.Host == "" || parsed.Path == "" {
+		return fmt.Errorf("the entry %q is not a SPIFFE ID (spiffe://<trust-domain>/<path>): it is compared against the one URI SAN a peer's certificate carries, so an entry of another shape admits nobody and is a provisioning mistake rather than a narrower set", entry)
+	}
+	return nil
 }
 
 // parsedAllowedCallers splits and trims the configured caller identities.
@@ -1155,7 +1368,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		srv.Close()
 	}()
 
-	log.Printf("solution %q listening on :%s (gateway=%s, profile=%s)", s.manifest.ID, s.cfg.port, s.cfg.gatewayURL, s.cfg.profile)
+	log.Printf("solution %q listening on :%s (gateway=%s, profile=%s)", s.manifest.ID, s.cfg.port, redactedURL(s.cfg.gatewayURL), s.cfg.profile)
 	if serveErr := srv.Serve(ln); !errors.Is(serveErr, http.ErrServerClosed) {
 		return serveErr
 	}
@@ -1844,13 +2057,16 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 	// established connections whose peers were still perfectly trusted. A
 	// half-written copy of this workload's own key is not a judgement about
 	// the peer, and the two must not share a failure path.
-	peers := s.admittedPlatform()
 	leaf, err := s.outboundLeaf(identityConfig)
 	if err != nil {
 		return nil, err
 	}
 	trust := s.peerTrustAnchor(identityConfig)
-	newConfig := func() (*tls.Config, error) {
+	// Per destination, not per "platform": the authorization set is chosen by
+	// the address being dialled, so the mint's identity is not accepted at the
+	// gateway's address or the other way round, and a third address has no set
+	// and is refused.
+	newConfig := func(addr string) (*tls.Config, error) {
 		anchor, err := trust()
 		if err != nil {
 			return nil, err
@@ -1860,19 +2076,19 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 			RootCAs:              anchor,
 			GetClientCertificate: leaf,
 		}
-		// Held to the frozen principal at presentation, and pointed at the
-		// destinations this runtime is allowed to present it to. Both apply to
-		// a consumer's source and to the projected pair: one of the two paths
+		// Held to the frozen principal at presentation, and pointed at the one
+		// identity allowed to answer at this address. Both apply to a
+		// consumer's source and to the projected pair: one of the two paths
 		// carrying a check is not the check.
 		if err := holdPresentedCertificate(config, s.principal); err != nil {
 			return nil, err
 		}
-		admitOnlyPlatform(config, peers)
+		admitOnlyPlatform(config, s.admittedAt(addr))
 		return config, nil
 	}
 	// Refused at boot rather than at the first dial: a configuration this
 	// runtime cannot build is a boot failure, not a mint that fails later.
-	if _, err := newConfig(); err != nil {
+	if _, err := newConfig(dialAddress(s.cfg.gatewayURL)); err != nil {
 		return nil, err
 	}
 
@@ -1881,7 +2097,7 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 	// snapshot here would be the bug this function exists to avoid.
 	transport.TLSClientConfig = nil
 	transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		config, err := newConfig()
+		config, err := newConfig(addr)
 		if err != nil {
 			return nil, err
 		}
@@ -1921,7 +2137,7 @@ func (s *Server) outboundClient(identityConfig *tls.Config) (*http.Client, error
 		}
 		// Watched on the two inputs that are a judgement about the peer — the
 		// anchor and the admitted set — and on nothing else.
-		return watchOutboundTrust(conn, host, trust, peers), nil
+		return watchOutboundTrust(conn, host, trust, s.admittedAt(addr)), nil
 	}
 	// Pool hygiene, not the trust bound: a connection nothing sends on is
 	// dropped rather than held open indefinitely. What bounds the trust
