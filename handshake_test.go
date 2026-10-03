@@ -2065,3 +2065,59 @@ func TestASharedDestinationAddressIsHeldToBothSets(t *testing.T) {
 		}
 	})
 }
+
+// TestACallersIdentityComesFromTheBytesItSigned: a source's own
+// VerifyConnection runs before this runtime's admission and is handed the same
+// *x509.Certificate the admission reads the caller's identity from.
+//
+// Executed in review: a source that rewrote leaf.URIs there had a rival caller
+// admitted, and the per-second recheck read the same mutated leaf and agreed
+// with it. The parsed certificate in a tls.ConnectionState is a pointer to a
+// mutable object; the DER the peer signed is not.
+func TestACallersIdentityComesFromTheBytesItSigned(t *testing.T) {
+	c := newCell(t)
+	approved := c.identity(t, testPrincipal)
+	rival := c.identity(t, rivalPrincipal)
+
+	base := serverConfigFor(t, approved, c)
+	// The source's own verifier, which admitOnly composes over rather than
+	// replaces — so it runs first, with a pointer to the chain.
+	base.VerifyConnection = func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
+			return nil
+		}
+		// Claim to be the admitted identity, on a certificate issued for
+		// somebody else.
+		admitted, err := url.Parse(testGatewayPrincipal)
+		if err != nil {
+			return err
+		}
+		state.PeerCertificates[0].URIs = []*url.URL{admitted}
+		return nil
+	}
+
+	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
+	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	// The rival's certificate names the rival in its DER, whatever the
+	// source's verifier wrote onto the parsed copy.
+	outcome := servedTo(t, config, rival, "")
+	if !outcome.refused() {
+		t.Fatal("a caller outside the admitted set was served because the source's own verifier rewrote the URI SANs on the parsed leaf: the admission has to read the bytes the peer signed, which nothing between the handshake and the check can edit")
+	}
+	if reason := outcome.reason(); !strings.Contains(reason, rivalPrincipal) {
+		t.Errorf("the refusal %q does not name the identity the certificate was actually issued for", reason)
+	}
+
+	// The control: the admitted caller is still served, so this is not a
+	// listener refusing everything.
+	admitted := c.identity(t, testGatewayPrincipal)
+	if outcome := servedTo(t, config, admitted, ""); outcome.refused() {
+		t.Fatalf("an admitted caller was refused: %s", outcome.reason())
+	}
+}

@@ -1069,6 +1069,68 @@ func TestAStreamOfViewerRequestsDoesNotMintPerRequest(t *testing.T) {
 	}
 }
 
+// TestConcurrentViewerRequestsShareOneCredentialAsk is the other half, and the
+// half a sequential test cannot see: without single-flight, N requests arriving
+// together each start their own ask, and each ask that reaches a due credential
+// mints.
+//
+// It is the shape production takes — the passthrough calls this from whatever
+// goroutine the server hands it — and the saving this whole change buys is one
+// mint plus a handful of renewals an hour against the heartbeat's 240.
+func TestConcurrentViewerRequestsShareOneCredentialAsk(t *testing.T) {
+	// Slow enough that every caller arrives while the first ask is in flight,
+	// which is exactly when a per-caller ask would mint again.
+	source := &countedSlowSource{after: 400 * time.Millisecond}
+	server := New(Manifest{ID: testSolutionID}).Credential(source)
+
+	const callers = 24
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = server.credentialWithin(context.Background(), 5*time.Second)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := source.count(); got != 1 {
+		t.Errorf("%d concurrent callers produced %d asks, want 1: each ask that finds the credential due for renewal mints, so one per caller is one audited mint per request", callers, got)
+	}
+}
+
+// countedSlowSource answers after a delay and counts how many times it was
+// reached.
+type countedSlowSource struct {
+	mu    sync.Mutex
+	asks  int
+	after time.Duration
+	held  workcontext.Credential
+}
+
+func (c *countedSlowSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	c.mu.Lock()
+	c.asks++
+	c.mu.Unlock()
+	select {
+	case <-time.After(c.after):
+	case <-ctx.Done():
+		return workcontext.Credential{}, ctx.Err()
+	}
+	// Deliberately unusable, so the test turns on the ask count alone and not
+	// on what came back.
+	return c.held, nil
+}
+
+func (c *countedSlowSource) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.asks
+}
+
 // TestACredentialThatAuthorisesNothingIsRefused: a supplied source may hand
 // back the zero credential, or an expired one, and this runtime held it,
 // booted, answered /health 200 and acted for viewers under it.
@@ -1086,9 +1148,13 @@ func TestACredentialThatAuthorisesNothingIsRefused(t *testing.T) {
 		name       string
 		credential workcontext.Credential
 		terminal   bool
+		// names is the part of the refusal that has to be about this case, so
+		// a credential failing several checks at once does not stand in for
+		// each of them.
+		names string
 	}{
-		{"the zero credential", workcontext.Credential{}, true},
-		{"an expired credential", expiring, false},
+		{"the zero credential", workcontext.Credential{}, true, "empty token"},
+		{"an expired credential", expiring, false, "expired at"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// At the boot.
@@ -1109,6 +1175,14 @@ func TestACredentialThatAuthorisesNothingIsRefused(t *testing.T) {
 			err := usableCredential(tc.credential)
 			if got := terminalCredentialFailure(err); got != tc.terminal {
 				t.Errorf("terminal = %v, want %v for %v: the boot and the run have to classify these the same way", got, tc.terminal, err)
+			}
+			// Refused for its OWN reason. The zero credential fails three of
+			// these checks at once — no token, no seal, no expiry — so
+			// asserting only that it is refused left each individual check
+			// unprotected: deleting the empty-token check still refused it, on
+			// the seal.
+			if !strings.Contains(err.Error(), tc.names) {
+				t.Errorf("the refusal %q does not name %s, so this case does not cover that check", err, tc.names)
 			}
 		})
 	}
