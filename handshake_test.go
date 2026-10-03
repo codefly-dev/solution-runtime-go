@@ -1175,3 +1175,50 @@ func TestTheListenerBoundsAStalledPeer(t *testing.T) {
 		t.Errorf("the handshake deadline %s is not shorter than the longest declared stream %s, so it is not bounding anything", inboundHandshakeTimeout, MaxStreamDurationLimit)
 	}
 }
+
+// TestANonAtomicRotationDoesNotFailANewDial is the other half of the
+// last-good-pair property, and the half only a fresh dial can show.
+//
+// The SDK's reloader swallows a failed or half-written re-read and keeps
+// serving the pair it already has, which is what makes a rotation invisible to
+// whoever is dialling. Building a new reloader per dial throws that away,
+// because the constructor loads eagerly and returns the error: with the
+// certificate replaced and the key a moment behind, every new dial fails until
+// both files settle. Nothing about the destination is wrong.
+func TestANonAtomicRotationDoesNotFailANewDial(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	host := newPlatformHost(t, c, testGatewayPrincipal)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		platformPeersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
+	}
+
+	resp, err := client.Get(host.URL + credentialMintPath)
+	if err != nil {
+		t.Fatalf("the platform was not reachable: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// Halfway through a rotation: the certificate on disk no longer pairs with
+	// the key beside it.
+	writeFile(t, certFile, "-----BEGIN CERTIFICATE-----\nhalf a rotation\n-----END CERTIFICATE-----\n")
+
+	// Force a genuinely new connection, so the dial path resolves the leaf
+	// rather than reusing one that already presented it.
+	transport.CloseIdleConnections()
+	resp, err = client.Get(host.URL + credentialMintPath)
+	if err != nil {
+		t.Fatalf("a new dial failed while a rotation was half-written: the reloader keeps the last good pair for exactly this, and resolving a new one per dial reports the half-written state as a failure to reach the platform: %v", err)
+	}
+	_ = resp.Body.Close()
+}

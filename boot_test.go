@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -657,3 +658,109 @@ const consumesThings = `[{"id":"thingstore.things","module":"thingstore","servic
 // consumesThingsAndBearer adds a module called with the viewer's bearer, which
 // mints nothing — the case a ceiling must refuse an ask for.
 const consumesThingsAndBearer = `[{"id":"thingstore.things","module":"thingstore","service":"things","endpoint":"rest","protocol":"rest","as":"things"},{"id":"pagestore.pages","module":"pagestore","service":"pages","endpoint":"rest","protocol":"rest","as":"pages"}]`
+
+// TestTheBootedListenerDropsACallerItNoLongerAdmits drives the production
+// serve() path, which is the only place the per-connection watch is installed.
+//
+// A unit test that builds its own http.Server proves the hook works and not
+// that anything installs it: removing `ConnState: watch` from serve() left
+// every such test passing. This boots the runtime the way Serve does.
+func TestTheBootedListenerDropsACallerItNoLongerAdmits(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	solution := boot(t, New(Manifest{ID: testSolutionID}).
+		Handle("/thing", func(context.Context, *Gateway) (any, error) { return map[string]string{"ok": "yes"}, nil }), mint)
+
+	call := func() error {
+		request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := solution.client.Do(request)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		return nil
+	}
+
+	// The control: an admitted caller is served, and stays served on one busy
+	// connection across more than a recheck interval.
+	if err := call(); err != nil {
+		t.Fatalf("an admitted caller was refused: %v", err)
+	}
+	quiet := time.Now().Add(2 * inboundTrustRecheckInterval)
+	for time.Now().Before(quiet) {
+		if err := call(); err != nil {
+			t.Fatalf("a request failed while this caller was still admitted, so nothing below is about admission: %v", err)
+		}
+		time.Sleep(inboundTrustRecheckInterval / 10)
+	}
+
+	// The platform removes this caller from the provisioned file. Nothing
+	// restarts, and traffic keeps arriving on the connection it already holds.
+	callersFile := os.Getenv(IdentityAllowedCallersFileEnvironmentVariable)
+	if callersFile == "" {
+		t.Fatal("the boot resolved no allowed-callers path, so this test cannot withdraw admission")
+	}
+	writeFile(t, callersFile, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
+
+	deadline := time.Now().Add(5 * inboundTrustRecheckInterval)
+	for {
+		if err := call(); err != nil {
+			return // the connection stopped being served, which is the point
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("this caller was still served %s after it was removed from the provisioned set, on the connection it already held: the booted listener installs no per-connection recheck, so revocation waits for a restart",
+				5*inboundTrustRecheckInterval)
+		}
+		time.Sleep(inboundTrustRecheckInterval / 10)
+	}
+}
+
+// TestABootWithAnUnusableAdmissionFileIsRefused: the path resolving is not the
+// same question as the set being readable, and the second one has to be asked
+// at boot rather than at the first handshake.
+//
+// A provisioned path naming a file that is empty, or absent, would otherwise
+// start a listener that refuses every caller and a client that refuses every
+// dial, and report it as an admission failure once traffic arrived instead of
+// as the provisioning gap it is.
+func TestABootWithAnUnusableAdmissionFileIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		contents string
+		write    bool
+	}{
+		{"a file naming nobody", "\n", true},
+		{"a file of comments only", "# the gateway goes here\n", true},
+		{"a path with no file behind it", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cell := newCell(t)
+			certFile, keyFile, bundleFile, _, _ := cell.workload(t, testPrincipal)
+			path := filepath.Join(t.TempDir(), "callers")
+			if tc.write {
+				writeFile(t, path, tc.contents)
+			}
+			server := New(Manifest{ID: testSolutionID})
+			server.cfg = config{
+				port: "8080", gatewayURL: "https://gateway:42152",
+				mintURL:            "https://gateway:42152" + credentialMintPath,
+				identityCertFile:   certFile,
+				identityKeyFile:    keyFile,
+				projectedTokenPath: "t",
+				trustBundleFile:    bundleFile,
+				allowedCallersFile: path,
+				platformPeersFile:  identitiesFile(t, testGatewayPrincipal),
+				profile:            localProfile,
+			}
+			err := server.validateSources()
+			if err == nil {
+				t.Fatal("the boot accepted an admission set it cannot read: the listener would start and refuse every caller, reported as an admission failure rather than as provisioning")
+			}
+			if !strings.Contains(err.Error(), "not usable at boot") {
+				t.Errorf("the refusal %q does not say the provisioned set is unusable, so it reads as a different problem", err)
+			}
+		})
+	}
+}
