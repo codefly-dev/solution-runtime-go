@@ -331,14 +331,18 @@ func callerStillAdmitted(state tls.ConnectionState, trust func() (*x509.CertPool
 	if err != nil {
 		return err
 	}
-	if len(state.PeerCertificates) == 0 {
+	chain, err := immutableChain(state)
+	if err != nil {
+		return err
+	}
+	if len(chain) == 0 {
 		return fmt.Errorf("the established connection presents no caller certificate to re-verify")
 	}
 	intermediates := x509.NewCertPool()
-	for _, cert := range state.PeerCertificates[1:] {
+	for _, cert := range chain[1:] {
 		intermediates.AddCert(cert)
 	}
-	if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
+	if _, err := chain[0].Verify(x509.VerifyOptions{
 		Roots:         anchor,
 		Intermediates: intermediates,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -349,7 +353,7 @@ func callerStillAdmitted(state tls.ConnectionState, trust func() (*x509.CertPool
 	if err != nil {
 		return err
 	}
-	identity, err := oneURIIdentity(state, "caller")
+	identity, err := oneURIIdentity(chain, "caller")
 	if err != nil {
 		return err
 	}
@@ -492,7 +496,11 @@ func verifyCaller(allowed func() ([]string, error)) func(tls.ConnectionState) er
 		if err != nil {
 			return err
 		}
-		identity, err := oneURIIdentity(state, "caller")
+		chain, err := immutableChain(state)
+		if err != nil {
+			return err
+		}
+		identity, err := oneURIIdentity(chain, "caller")
 		if err != nil {
 			return err
 		}
@@ -531,7 +539,11 @@ func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
 		if err != nil {
 			return err
 		}
-		identity, err := oneURIIdentity(state, "platform destination")
+		chain, err := immutableChain(state)
+		if err != nil {
+			return err
+		}
+		identity, err := oneURIIdentity(chain, "platform destination")
 		if err != nil {
 			return err
 		}
@@ -543,6 +555,33 @@ func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
 	}
 }
 
+// immutableChain is a private copy of the chain a handshake authenticated,
+// parsed from copied bytes.
+//
+// Nothing this runtime decides is computed from the *x509.Certificate objects
+// crypto/tls put in the ConnectionState. Those are shared: tls.Conn returns the
+// same pointers on every call, so anything that was ever handed them can change
+// what a later read sees — and the rechecks read minutes after the handshake.
+// The source-supplied verifiers that could hold them are refused outright, and
+// this is the other half: even if something acquires them, the identity and the
+// re-verification are computed from bytes nothing else has a reference to.
+//
+// The copy is of the DER, not of the parsed struct: copying the struct would
+// copy the pointers inside it.
+func immutableChain(state tls.ConnectionState) ([]*x509.Certificate, error) {
+	chain := make([]*x509.Certificate, 0, len(state.PeerCertificates))
+	for i, presented := range state.PeerCertificates {
+		der := make([]byte, len(presented.Raw))
+		copy(der, presented.Raw)
+		parsed, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, fmt.Errorf("the certificate at position %d of this peer's chain cannot be parsed from the bytes it presented: %w", i, err)
+		}
+		chain = append(chain, parsed)
+	}
+	return chain, nil
+}
+
 // oneURIIdentity is the SPIFFE ID a verified peer presented.
 //
 // Exactly one URI SAN, because that is what a SPIFFE certificate has. Accepting
@@ -550,26 +589,11 @@ func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
 // whichever one is convenient, and a leaf naming several is not a SPIFFE
 // identity at all — the one it would be held to elsewhere is unknowable from
 // here.
-func oneURIIdentity(state tls.ConnectionState, side string) (string, error) {
-	if len(state.PeerCertificates) == 0 {
+func oneURIIdentity(chain []*x509.Certificate, side string) (string, error) {
+	if len(chain) == 0 {
 		return "", fmt.Errorf("refusing a %s that presented no certificate", side)
 	}
-	// From the raw DER, parsed here — and, just as importantly, read *before*
-	// any verifier a source supplied has run (see admitOnly).
-	//
-	// Both halves are needed and neither is sufficient. tls.ConnectionState
-	// hands out pointers to the parsed chain, so a source's verifier can
-	// rewrite the leaf's URI SANs to claim an admitted identity, which was
-	// demonstrated getting a rival caller in. Re-parsing Raw defends against
-	// a verifier that edits the *parsed* fields; it does not defend against one
-	// that edits Raw itself, because that is a field on the same object. What
-	// makes this sound is running before any of them, on the chain the
-	// handshake authenticated; the re-parse then guarantees the identity comes
-	// from the certificate's own bytes rather than from a cache beside them.
-	leaf, err := x509.ParseCertificate(state.PeerCertificates[0].Raw)
-	if err != nil {
-		return "", fmt.Errorf("refusing a %s whose certificate cannot be parsed from the bytes it presented: %w", side, err)
-	}
+	leaf := chain[0]
 	if len(leaf.URIs) != 1 {
 		return "", fmt.Errorf("refusing a %s whose certificate names %d URI identities: a SPIFFE certificate names exactly one, and a leaf naming several could be accepted on whichever happens to match",
 			side, len(leaf.URIs))
@@ -783,7 +807,24 @@ func unsubvertedPosture(config *tls.Config) error {
 		// longer decides anything; this refusal is the other half, because a
 		// source has no business holding a pointer to the chain this
 		// listener's admission is computed from.
-		{"VerifyPeerCertificate", "it is handed the parsed certificate chain this runtime reads the caller's identity from, and it runs first — a source that rewrites the leaf's URI SANs there decides who is admitted. Verify what you need in VerifyConnection, which is given a copy of the connection state", config.VerifyPeerCertificate != nil},
+		{"VerifyPeerCertificate", "it is handed the parsed certificate chain this listener authenticates the caller by, and it runs before the signature check — so a source can change the public key the handshake is verified against, as well as the identity the admission reads", config.VerifyPeerCertificate != nil},
+		// And VerifyConnection, for the half that ordering could not close.
+		//
+		// A tls.ConnectionState carries *pointers* to the parsed chain, and
+		// tls.Conn hands out the same ones on every ConnectionState() call —
+		// so a source's verifier does not merely see the certificates, it
+		// holds them, and the per-second rechecks read them minutes later.
+		// Running this runtime's admission first fixes the admission and
+		// nothing else: an established caller whose identity was rewritten
+		// afterwards survives withdrawal, because the recheck re-reads the
+		// mutated object and agrees with it.
+		//
+		// There is no safe way to lend a source these objects, so it is not
+		// lent them. A consumer that needs its own connection check is a
+		// follow-up for a hook that passes an immutable copy; the composition
+		// below is kept for the outbound direction, where the configuration is
+		// this package's own.
+		{"VerifyConnection", "it is handed pointers to the certificate chain this listener authenticates its callers by, and the per-connection rechecks read those same objects for as long as the connection lives — so anything written to them there decides who stays admitted", config.VerifyConnection != nil},
 		// The ticket *keys*, not just the ticket callbacks. Resumption is the
 		// sharpest of these because a resumed connection presents no
 		// certificate, and a source can reach it two ways: by encoding the

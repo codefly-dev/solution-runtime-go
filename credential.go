@@ -295,6 +295,14 @@ func (s *Server) openCredential(ctx context.Context) error {
 				return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
 			}
 		case err == nil && deadline.Err() == nil:
+			// Into the controller, which is the half that was missing: the
+			// boot obtained the credential and then nothing held it, so the
+			// first route after boot saw an empty controller, asked again, and
+			// got none of the backoff or held-credential behaviour the
+			// controller exists to provide. "One credential per execution"
+			// starts at the boot's own credential or it starts one request
+			// late.
+			s.holdCredential(credential)
 			seal := credential.Seal()
 			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
 				s.manifest.ID, seal.InstallationID, seal.InstallationRevision, seal.BuildIncarnation,

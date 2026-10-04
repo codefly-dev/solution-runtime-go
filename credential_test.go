@@ -1561,3 +1561,42 @@ func authorityFor(t *testing.T, ctx context.Context) *codefly.Authority {
 	}
 	return server.authority
 }
+
+// TestTheBootsCredentialIsHeldByTheController: the boot obtained the
+// credential and nothing held it, so the first route after boot saw an empty
+// controller — it asked again, and got none of the backoff or
+// held-credential behaviour the controller exists to provide.
+//
+// "One credential per execution" starts at the boot's own credential or it
+// starts one request late.
+func TestTheBootsCredentialIsHeldByTheController(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := New(Manifest{ID: testSolutionID})
+	ln, err := takeListener(server).start(ctx)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	_ = ln.Close()
+
+	held, ok := server.heldCredential()
+	if !ok {
+		t.Fatal("the boot obtained a credential and the controller holds nothing: the first route after boot therefore asks again, outside the single-flight and the backoff, which is the per-request minting this controller was built to stop")
+	}
+	if held.Token() == "" {
+		t.Fatal("the controller holds a credential with no token")
+	}
+
+	// And the boot's mint is the only one: a route served immediately after
+	// boot must not produce a second.
+	before := mint.count()
+	if err := server.actingForAViewer(ctx); err != nil {
+		t.Fatalf("a route was refused immediately after a successful boot: %v", err)
+	}
+	if got := mint.count(); got != before {
+		t.Errorf("the host minted %d more times for the first route after boot: the boot's credential is what that route acts under", got-before)
+	}
+}

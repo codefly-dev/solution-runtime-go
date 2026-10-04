@@ -1394,8 +1394,7 @@ func TestALeafNamingSeveralIdentitiesIsRefusedInEveryDirection(t *testing.T) {
 	})
 
 	t.Run("an outbound platform destination", func(t *testing.T) {
-		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{parsedLeaf(t, doubled)}}
-		if _, err := oneURIIdentity(state, "platform destination"); err == nil {
+		if _, err := oneURIIdentity([]*x509.Certificate{parsedLeaf(t, doubled)}, "platform destination"); err == nil {
 			t.Fatal("a platform destination naming two identities was accepted, so the one it is held to is whichever the check happened to read first")
 		}
 	})
@@ -1460,40 +1459,12 @@ func TestAPerConnectionAnswerIsHeldToTheAdmittedSet(t *testing.T) {
 	}
 }
 
-// TestASourcesOwnVerifyConnectionStillRuns: admitOnly composes over whatever
-// the source already verifies instead of assigning over it. Assigning silently
-// deletes a check the source author wrote, which is the opposite of what adding
-// a check should do — and nothing committed noticed, because no test gave a
-// source a VerifyConnection of its own.
-func TestASourcesOwnVerifyConnectionStillRuns(t *testing.T) {
-	c := newCell(t)
-	approved := c.identity(t, testPrincipal)
-	admitted := c.identity(t, testGatewayPrincipal)
-
-	var theirs atomic.Int64
-	base := serverConfigFor(t, approved, c)
-	base.VerifyConnection = func(tls.ConnectionState) error {
-		theirs.Add(1)
-		return fmt.Errorf("the source refuses this caller for a reason this runtime knows nothing about")
-	}
-	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
-	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
-	server.principal = testPrincipal
-	config, err := server.serverIdentity()
-	if err != nil {
-		t.Fatalf("boot: %v", err)
-	}
-	outcome := servedTo(t, config, admitted, "")
-	if theirs.Load() == 0 {
-		t.Fatal("the source's own VerifyConnection was never called: composing the admission check over it was replaced by assigning over it, which deletes a check the source author wrote")
-	}
-	if !outcome.refused() {
-		t.Fatal("a caller the source itself refused was served: the source's check runs first, because a caller its rules refuse should be refused for its reason")
-	}
-	if reason := outcome.reason(); !strings.Contains(reason, "knows nothing about") {
-		t.Errorf("the handshake was refused for %q, not for the source's own reason", reason)
-	}
-}
+// A source's own VerifyConnection used to be composed over this runtime's
+// admission, and a test here asserted it still ran. That capability is gone:
+// the hook handed a source pointers to the chain the rechecks read, so it is
+// refused at boot (TestASourceCannotHoldTheChainTheRechecksRead). The
+// composition in admitOnly is kept for the outbound direction, where the
+// configuration being composed is this package's own.
 
 // mentionsTheCertificate reports whether a boot refusal is about the identity
 // the listener would present, rather than any other way a boot can fail.
@@ -2068,114 +2039,124 @@ func TestASharedDestinationAddressIsHeldToBothSets(t *testing.T) {
 	})
 }
 
-// TestACallersIdentityComesFromTheBytesItSigned: a source's own
-// VerifyConnection runs before this runtime's admission and is handed the same
-// *x509.Certificate the admission reads the caller's identity from.
+// TestACallersIdentityComesFromTheBytesItSigned: admission is decided on the
+// certificate's own DER, not on the parsed object a ConnectionState hands out.
 //
-// Executed in review: a source that rewrote leaf.URIs there had a rival caller
-// admitted, and the per-second recheck read the same mutated leaf and agreed
-// with it. The parsed certificate in a tls.ConnectionState is a pointer to a
-// mutable object; the DER the peer signed is not.
+// Those objects are shared — tls.Conn returns the same pointers every call — so
+// anything that ever holds one can change what a later read sees. The hooks
+// that could hold them are refused at boot now; this is the other half, and it
+// is what makes the refusal belt rather than the only line.
 func TestACallersIdentityComesFromTheBytesItSigned(t *testing.T) {
 	c := newCell(t)
-	approved := c.identity(t, testPrincipal)
 	rival := c.identity(t, rivalPrincipal)
 
-	base := serverConfigFor(t, approved, c)
-	// The source's own verifier, which admitOnly composes over rather than
-	// replaces — so it runs first, with a pointer to the chain.
-	base.VerifyConnection = func(state tls.ConnectionState) error {
-		if len(state.PeerCertificates) == 0 {
-			return nil
-		}
-		// Claim to be the admitted identity, on a certificate issued for
-		// somebody else.
-		admitted, err := url.Parse(testGatewayPrincipal)
-		if err != nil {
-			return err
-		}
-		state.PeerCertificates[0].URIs = []*url.URL{admitted}
-		return nil
-	}
-
-	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
-	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
-	server.principal = testPrincipal
-	config, err := server.serverIdentity()
+	// A parsed leaf rewritten to claim an identity the set admits, over a DER
+	// that says otherwise.
+	leaf := parsedLeaf(t, rival)
+	claimed, err := url.Parse(testGatewayPrincipal)
 	if err != nil {
-		t.Fatalf("boot: %v", err)
+		t.Fatal(err)
+	}
+	leaf.URIs = []*url.URL{claimed}
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+
+	admit := verifyCaller(func() ([]string, error) { return []string{testGatewayPrincipal}, nil })
+	err = admit(state)
+	if err == nil {
+		t.Fatal("a caller was admitted on a rewritten parsed leaf: the identity has to come from the bytes the peer signed, which nothing between the handshake and the check holds a reference to")
+	}
+	if !strings.Contains(err.Error(), rivalPrincipal) {
+		t.Errorf("the refusal %q does not name the identity the certificate was actually issued for", err)
 	}
 
-	// The rival's certificate names the rival in its DER, whatever the
-	// source's verifier wrote onto the parsed copy.
-	outcome := servedTo(t, config, rival, "")
-	if !outcome.refused() {
-		t.Fatal("a caller outside the admitted set was served because the source's own verifier rewrote the URI SANs on the parsed leaf: the admission has to read the bytes the peer signed, which nothing between the handshake and the check can edit")
-	}
-	if reason := outcome.reason(); !strings.Contains(reason, rivalPrincipal) {
-		t.Errorf("the refusal %q does not name the identity the certificate was actually issued for", reason)
-	}
-
-	// The control: the admitted caller is still served, so this is not a
-	// listener refusing everything.
-	admitted := c.identity(t, testGatewayPrincipal)
-	if outcome := servedTo(t, config, admitted, ""); outcome.refused() {
-		t.Fatalf("an admitted caller was refused: %s", outcome.reason())
+	// The control: the genuinely admitted caller passes.
+	intact := tls.ConnectionState{PeerCertificates: []*x509.Certificate{parsedLeaf(t, c.identity(t, testGatewayPrincipal))}}
+	if err := admit(intact); err != nil {
+		t.Fatalf("an admitted caller was refused: %v", err)
 	}
 }
 
-// TestAdmissionRunsBeforeASourcesOwnVerifier: re-parsing the leaf's Raw after a
-// source's verifier has run is narrower, not sound — Raw is a field on the same
-// mutable object, so a verifier that rewrites it hands the admission check
-// attacker-chosen bytes.
+// The ordering test that stood here drove a source-supplied VerifyConnection,
+// which is refused at boot now, so the scenario is unreachable. Ordering alone
+// was never the fix: it corrected the admission and left the rechecks reading
+// objects the source still held. See
+// TestASourceCannotHoldTheChainTheRechecksRead.
+
+// TestASourceCannotHoldTheChainTheRechecksRead is the blocker R7-5 only half
+// closed.
 //
-// The only sound answer is to decide admission on the chain as the handshake
-// left it, before anything a source supplied has been given the chance to touch
-// it.
-func TestAdmissionRunsBeforeASourcesOwnVerifier(t *testing.T) {
+// Running this runtime's admission before a source's verifier fixes the
+// admission and nothing else. A tls.ConnectionState carries *pointers* to the
+// parsed chain and tls.Conn hands out the same ones on every call — so a
+// source's VerifyConnection does not merely see the certificates, it holds
+// them, and the per-second recheck reads those same objects minutes later. An
+// established caller whose leaf was rewritten afterwards survives withdrawal,
+// because the recheck re-reads the mutated object and agrees with it.
+//
+// Two things close it: such a source is refused at boot, and nothing this
+// runtime decides is computed from the shared objects at all.
+func TestASourceCannotHoldTheChainTheRechecksRead(t *testing.T) {
 	c := newCell(t)
 	approved := c.identity(t, testPrincipal)
-	rival := c.identity(t, rivalPrincipal)
-	admittedLeaf := c.identity(t, testGatewayPrincipal)
-	// The DER of a certificate that IS admitted, which a verifier can swap in.
-	admittedDER := admittedLeaf.Certificate[0]
 
-	var ran atomic.Int64
-	base := serverConfigFor(t, approved, c)
-	base.VerifyConnection = func(state tls.ConnectionState) error {
-		ran.Add(1)
-		if len(state.PeerCertificates) == 0 {
-			return nil
+	t.Run("a source supplying its own connection verifier is refused", func(t *testing.T) {
+		base := serverConfigFor(t, approved, c)
+		base.VerifyConnection = func(tls.ConnectionState) error { return nil }
+		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
+		server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+		server.principal = testPrincipal
+		_, err := server.serverIdentity()
+		if err == nil {
+			t.Fatal("a source supplying its own VerifyConnection was accepted: it is handed pointers to the chain this listener authenticates callers by, and the rechecks read those same objects for as long as the connection lives, so anything written to them decides who stays admitted")
 		}
-		// Rewrite the raw bytes themselves, which is what defeats a re-parse.
-		state.PeerCertificates[0].Raw = admittedDER
-		return nil
-	}
+		if !strings.Contains(err.Error(), "VerifyConnection") {
+			t.Errorf("the refusal %q does not name the field", err)
+		}
+	})
 
-	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
-	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
-	server.principal = testPrincipal
-	config, err := server.serverIdentity()
-	if err != nil {
-		t.Fatalf("boot: %v", err)
-	}
+	t.Run("a mutated chain cannot keep a withdrawn caller admitted", func(t *testing.T) {
+		// The recheck's own input, mutated the way a verifier holding the
+		// objects would: the leaf claims an identity the set admits while its
+		// DER says otherwise.
+		admitted, rival := c.identity(t, testGatewayPrincipal), c.identity(t, rivalPrincipal)
+		leaf := parsedLeaf(t, rival)
+		claimed, err := url.Parse(testGatewayPrincipal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf.URIs = []*url.URL{claimed}
+		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
 
-	outcome := servedTo(t, config, rival, "")
-	if !outcome.refused() {
-		t.Fatal("a caller outside the admitted set was served because the source's verifier replaced the leaf's raw DER with an admitted certificate's: re-parsing Raw is not a defence when the verifier that runs first can rewrite Raw, so the admission has to run before it")
-	}
-	if reason := outcome.reason(); !strings.Contains(reason, rivalPrincipal) {
-		t.Errorf("the refusal %q does not name the identity the handshake actually authenticated", reason)
-	}
+		anchor := func() (*x509.CertPool, error) { return c.roots, nil }
+		set := func() ([]string, error) { return []string{testGatewayPrincipal}, nil }
+		if err := callerStillAdmitted(state, anchor, set); err == nil {
+			t.Fatal("the recheck admitted a caller whose parsed leaf had been rewritten to claim an admitted identity: it has to decide on the bytes the peer signed, which nothing between the handshake and the check holds a reference to")
+		}
 
-	// The control: an admitted caller is served — and the source's own verifier
-	// runs on it, because it is composed and not discarded. For the rival above
-	// it never ran at all, which is the ordering working: the admission refused
-	// before anything else was handed the chain.
-	if outcome := servedTo(t, config, admittedLeaf, ""); outcome.refused() {
-		t.Fatalf("an admitted caller was refused: %s", outcome.reason())
-	}
-	if ran.Load() == 0 {
-		t.Error("the source's own VerifyConnection was never called even for an admitted caller: running the admission first must not mean dropping the source's check")
-	}
+		// The control: the genuinely admitted caller passes the same recheck,
+		// so this is not a check that refuses everything.
+		intact := tls.ConnectionState{PeerCertificates: []*x509.Certificate{parsedLeaf(t, admitted)}}
+		if err := callerStillAdmitted(intact, anchor, set); err != nil {
+			t.Fatalf("an admitted caller was refused by the recheck: %v", err)
+		}
+	})
+
+	t.Run("the private chain does not alias the handshake's objects", func(t *testing.T) {
+		leaf := parsedLeaf(t, approved)
+		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+		chain, err := immutableChain(state)
+		if err != nil {
+			t.Fatalf("immutableChain: %v", err)
+		}
+		if chain[0] == leaf {
+			t.Fatal("the chain is the handshake's own object, so anything holding it can change what a recheck reads")
+		}
+		if &chain[0].Raw[0] == &leaf.Raw[0] {
+			t.Fatal("the chain shares the handshake's DER bytes: copying the struct without copying the bytes leaves the parse re-derivable from memory something else can write")
+		}
+		// And it still says the same thing.
+		if chain[0].URIs[0].String() != testPrincipal {
+			t.Errorf("the private copy names %v, want %q", chain[0].URIs, testPrincipal)
+		}
+	})
 }

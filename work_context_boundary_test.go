@@ -422,6 +422,14 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 				if !ok || !typed.Name.IsExported() {
 					continue
 				}
+				// A named type whose underlying type is a map, slice or
+				// channel of handlers is the same re-exposure with a name on
+				// it.
+				if rendered := renderedType(typed.Type); servable[rendered] || servesHTTP(typed.Type) {
+					t.Errorf("%s exports the type %s over %s: naming a collection of handlers does not make handing one out any less servable",
+						name, typed.Name.Name, rendered)
+					continue
+				}
 				structure, ok := typed.Type.(*ast.StructType)
 				if !ok || structure.Fields == nil {
 					continue
@@ -504,6 +512,14 @@ func renderedType(expr ast.Expr) string {
 		return renderedType(typed.X)
 	case *ast.ArrayType:
 		return renderedType(typed.Elt)
+	case *ast.MapType:
+		// A map, channel or slice of handlers hands out handlers. `type Routes
+		// map[string]http.Handler` returned from an exported method walked
+		// past a rule that looked only at the result type itself and at struct
+		// fields.
+		return renderedType(typed.Value)
+	case *ast.ChanType:
+		return renderedType(typed.Value)
 	case *ast.SelectorExpr:
 		if pkg, ok := typed.X.(*ast.Ident); ok {
 			return pkg.Name + "." + typed.Sel.Name

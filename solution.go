@@ -1636,6 +1636,15 @@ func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (workcon
 	return credential, err
 }
 
+// holdCredential records a credential the controller did not itself acquire —
+// the boot's — so the first caller after boot sees a process that holds one.
+func (s *Server) holdCredential(credential workcontext.Credential) {
+	s.credentialMu.Lock()
+	s.credentialHeld = credential
+	s.credentialQuietUntil = time.Time{}
+	s.credentialMu.Unlock()
+}
+
 // heldCredential is the credential this process last obtained, if it has not
 // expired. The zero credential never counts as held: a source that hands back
 // nothing has given this process no authority, which is the case a wrapper
@@ -2590,14 +2599,21 @@ func peerStillTrusted(state tls.ConnectionState, host string, trust func() (*x50
 	if err != nil {
 		return err
 	}
-	if len(state.PeerCertificates) == 0 {
+	// The private chain, for the reason immutableChain records: the objects in
+	// a ConnectionState are shared, and this runs for as long as the
+	// connection lives.
+	chain, err := immutableChain(state)
+	if err != nil {
+		return err
+	}
+	if len(chain) == 0 {
 		return fmt.Errorf("the established platform connection presents no peer certificate to re-verify")
 	}
 	intermediates := x509.NewCertPool()
-	for _, cert := range state.PeerCertificates[1:] {
+	for _, cert := range chain[1:] {
 		intermediates.AddCert(cert)
 	}
-	if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
+	if _, err := chain[0].Verify(x509.VerifyOptions{
 		Roots:         anchor,
 		Intermediates: intermediates,
 		DNSName:       host,
@@ -2612,7 +2628,7 @@ func peerStillTrusted(state tls.ConnectionState, host string, trust func() (*x50
 	if err != nil {
 		return err
 	}
-	identity, err := oneURIIdentity(state, "platform destination")
+	identity, err := oneURIIdentity(chain, "platform destination")
 	if err != nil {
 		return err
 	}
