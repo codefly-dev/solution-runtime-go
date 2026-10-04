@@ -136,8 +136,6 @@ func heldToTheFrozenAuthority(source CredentialSource, authority *codefly.Author
 type authorityHeldSource struct {
 	inner     CredentialSource
 	authority *codefly.Authority
-	mu        sync.Mutex
-	last      string
 }
 
 func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Credential, error) {
@@ -162,24 +160,17 @@ func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Crede
 	if err := usableCredential(credential); err != nil {
 		return workcontext.Credential{}, err
 	}
-	a.mu.Lock()
-	renewed := a.last != "" && credential.Token() != a.last
-	a.mu.Unlock()
 	// And again after, unconditionally — for drift that landed during the ask
 	// itself, including the FIRST credential and an ask that returned the one
-	// already held. Gating this on the token changing meant a drift arriving
-	// mid-ask was not noticed until some later renewal happened to produce a
-	// different token.
-	_ = renewed
-	{
-		if err := a.authority.Recheck(ctx); err != nil {
-			return workcontext.Credential{}, fmt.Errorf("%w: this execution's credential was renewed while an authority-bearing value had drifted from the one this process froze at boot: %w",
-				workcontext.ErrMintRefused, err)
-		}
+	// already held. This was once gated on the token having changed, which
+	// meant a drift arriving mid-ask went unnoticed until some later renewal
+	// happened to produce a different token. Removing the gate left the
+	// comparison, the token it remembered and the mutex guarding it all
+	// computed and discarded.
+	if err := a.authority.Recheck(ctx); err != nil {
+		return workcontext.Credential{}, fmt.Errorf("%w: this execution's credential was renewed while an authority-bearing value had drifted from the one this process froze at boot: %w",
+			workcontext.ErrMintRefused, err)
 	}
-	a.mu.Lock()
-	a.last = credential.Token()
-	a.mu.Unlock()
 	return credential, nil
 }
 

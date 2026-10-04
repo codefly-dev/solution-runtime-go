@@ -1,6 +1,7 @@
 package solution
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -294,6 +295,10 @@ func (s *Server) watchInboundTrust() (func(net.Conn, http.ConnState), error) {
 func recheckCaller(conn *tls.Conn, done <-chan struct{}, trust func() (*x509.CertPool, error), admitted func() ([]string, error)) {
 	ticker := time.NewTicker(inboundTrustRecheckInterval)
 	defer ticker.Stop()
+	var (
+		pinned     string
+		pinnedLeaf []byte
+	)
 	for {
 		select {
 		case <-done:
@@ -307,7 +312,39 @@ func recheckCaller(conn *tls.Conn, done <-chan struct{}, trust func() (*x509.Cer
 			if !conn.ConnectionState().HandshakeComplete {
 				continue
 			}
-			if err := callerStillAdmitted(conn.ConnectionState(), trust, admitted); err != nil {
+			// The identity this connection was admitted as, recorded once and
+			// then held to.
+			//
+			// Re-deriving it every tick asks "who is this connection now?",
+			// and the answer comes from objects the connection shares:
+			// tls.ConnectionState.PeerCertificates shares its backing array
+			// with the connection's own slice, and TLS 1.3 runs
+			// VerifyConnection *before* checking CertificateVerify against
+			// peerCertificates[0].PublicKey — so a hook that swapped the leaf
+			// had the handshake authenticated against the swapped key, and an
+			// attacker holding only an admitted identity's public certificate
+			// plus its own private key was served. The quieter half was a Raw
+			// swap: the recheck re-parsed the swapped DER and agreed with it,
+			// so a de-admitted caller kept being served.
+			//
+			// The hooks that could do that are refused at boot. This is the
+			// question being asked correctly regardless: not "who is this?"
+			// but "is this still the caller we admitted?"
+			//
+			// Recorded on the first tick after the handshake, because the
+			// admission has no handle on the connection. That gap is sound
+			// only because no in-process hook can run inside it — the source's
+			// verifiers are refused — so this hardens the recheck and does not
+			// replace that refusal.
+			if pinned == "" {
+				identity, leaf, err := admittedIdentity(conn.ConnectionState())
+				if err != nil {
+					_ = conn.Close()
+					return
+				}
+				pinned, pinnedLeaf = identity, leaf
+			}
+			if err := callerStillAdmitted(conn.ConnectionState(), trust, admitted, pinned, pinnedLeaf); err != nil {
 				_ = conn.Close()
 				return
 			}
@@ -326,7 +363,7 @@ const inboundTrustRecheckInterval = time.Second
 // Client auth, not server auth, and no hostname: a caller is held to the chain
 // and the identity it presented, which is the same pair of questions the
 // handshake answered, asked again against trust as it is now.
-func callerStillAdmitted(state tls.ConnectionState, trust func() (*x509.CertPool, error), admitted func() ([]string, error)) error {
+func callerStillAdmitted(state tls.ConnectionState, trust func() (*x509.CertPool, error), admitted func() ([]string, error), pinned string, pinnedLeaf []byte) error {
 	anchor, err := trust()
 	if err != nil {
 		return err
@@ -357,10 +394,35 @@ func callerStillAdmitted(state tls.ConnectionState, trust func() (*x509.CertPool
 	if err != nil {
 		return err
 	}
+	// Still the caller this connection was admitted as. A connection whose
+	// certificate changed under it is not a caller whose authorisation can be
+	// re-evaluated — it is one whose authentication no longer means anything,
+	// so it is closed rather than judged.
+	if pinned != "" && identity != pinned {
+		return fmt.Errorf("this connection was admitted as %q and now presents %q: the certificate authenticating an established connection does not change, so there is nothing left to re-authorise", pinned, identity)
+	}
+	if pinnedLeaf != nil && !bytes.Equal(chain[0].Raw, pinnedLeaf) {
+		return fmt.Errorf("this connection's caller certificate is not the one the handshake authenticated, though it still names %q", identity)
+	}
 	if !slices.Contains(allowed, identity) {
 		return fmt.Errorf("the established connection's caller %q is no longer one this solution admits", identity)
 	}
 	return nil
+}
+
+// admittedIdentity is the identity and leaf an established connection was
+// authenticated as, taken from a private parse so what is recorded cannot be
+// changed afterwards through the objects the connection shares.
+func admittedIdentity(state tls.ConnectionState) (string, []byte, error) {
+	chain, err := immutableChain(state)
+	if err != nil {
+		return "", nil, err
+	}
+	identity, err := oneURIIdentity(chain, "caller")
+	if err != nil {
+		return "", nil, err
+	}
+	return identity, chain[0].Raw, nil
 }
 
 // serverIdentity resolves this workload's identity once and holds it to every

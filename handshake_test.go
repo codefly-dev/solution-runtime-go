@@ -1312,6 +1312,11 @@ func TestANonAtomicRotationDoesNotFailANewDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the platform was not reachable: %v", err)
 	}
+	// Drained, not just closed: an undrained body leaves the connection out of
+	// the pool, so CloseIdleConnections below closes nothing and the next
+	// request reuses it — which would make this test pass without ever
+	// dialling, which is the one thing it asserts.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 
 	// Halfway through a rotation: the certificate on disk no longer pairs with
@@ -1321,11 +1326,50 @@ func TestANonAtomicRotationDoesNotFailANewDial(t *testing.T) {
 	// Force a genuinely new connection, so the dial path resolves the leaf
 	// rather than reusing one that already presented it.
 	transport.CloseIdleConnections()
-	resp, err = client.Get(host.URL + credentialMintPath)
+	ctx, dialled := freshDial(t)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, host.URL+credentialMintPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = client.Do(request)
 	if err != nil {
 		t.Fatalf("a new dial failed while a rotation was half-written: the reloader keeps the last good pair for exactly this, and resolving a new one per dial reports the half-written state as a failure to reach the platform: %v", err)
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	dialled()
+}
+
+// freshDial asserts that the request made under the context it returns really
+// dialled, rather than being served on a connection that was already open.
+//
+// Two tests here closed a response body without draining it, so the connection
+// had not returned to the pool when CloseIdleConnections ran; the next request
+// reused it and never handshook. One then flaked under -race (65 of 200), and
+// the other passed vacuously — it asserted that a dial resolves the leaf, on a
+// request that made no dial. A reused connection performs no TLS handshake,
+// which is what this watches for, and it works whether the request succeeds or
+// is refused.
+func freshDial(t *testing.T) (context.Context, func()) {
+	t.Helper()
+	var dialled atomic.Bool
+	// ConnectStart, not TLSHandshakeStart: this runtime's outbound transport
+	// sets DialTLSContext, and a custom DialTLSContext never reaches net/http's
+	// addTLS — which is what invokes the TLS trace hooks. So
+	// TLSHandshakeStart never fires on this transport at all, whether or not a
+	// connection was reused, and watching for it would be another signal that
+	// cannot distinguish the thing it was chosen to distinguish. ConnectStart
+	// fires on a real TCP dial, including one whose handshake is then refused,
+	// which is the case one of these two tests needs.
+	trace := &httptrace.ClientTrace{
+		ConnectStart: func(string, string) { dialled.Store(true) },
+	}
+	return httptrace.WithClientTrace(context.Background(), trace), func() {
+		t.Helper()
+		if !dialled.Load() {
+			t.Fatal("the request was served on a connection that was already open, so it made no dial and this test asserted nothing about dialling: drain the previous response body before CloseIdleConnections, or the connection has not returned to the pool when it runs")
+		}
+	}
 }
 
 // issueMultiURILeaf is a leaf naming two SPIFFE identities, which no SPIFFE
@@ -1889,6 +1933,11 @@ func TestAFreshDialFollowsTheProvisionedPeerSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the provisioned destination was refused: %v", err)
 	}
+	// Drained, not just closed. Undrained, the connection has not returned to
+	// the pool when CloseIdleConnections runs, so the second request reuses it
+	// and is served without a handshake — the test then fails because nothing
+	// refused it, which is how this flaked 65 times in 200 under -race.
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 
 	// The destination is removed, and every connection to it is dropped, so
@@ -1896,11 +1945,18 @@ func TestAFreshDialFollowsTheProvisionedPeerSet(t *testing.T) {
 	writeFile(t, provisioned, "spiffe://codefly.test/ns/platform/sa/somebody-else\n")
 	transport.CloseIdleConnections()
 
-	resp, err = client.Get(host.URL + credentialMintPath)
+	ctx, dialled := freshDial(t)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, host.URL+credentialMintPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = client.Do(request)
 	if err == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		t.Fatal("a fresh dial was made to a destination removed from the provisioned set: the set has to be read per dial, not captured when the client was built")
 	}
+	dialled()
 	if !strings.Contains(err.Error(), testGatewayPrincipal) {
 		t.Errorf("the refusal %q does not name the identity that answered", err)
 	}
@@ -2129,14 +2185,14 @@ func TestASourceCannotHoldTheChainTheRechecksRead(t *testing.T) {
 
 		anchor := func() (*x509.CertPool, error) { return c.roots, nil }
 		set := func() ([]string, error) { return []string{testGatewayPrincipal}, nil }
-		if err := callerStillAdmitted(state, anchor, set); err == nil {
+		if err := callerStillAdmitted(state, anchor, set, "", nil); err == nil {
 			t.Fatal("the recheck admitted a caller whose parsed leaf had been rewritten to claim an admitted identity: it has to decide on the bytes the peer signed, which nothing between the handshake and the check holds a reference to")
 		}
 
 		// The control: the genuinely admitted caller passes the same recheck,
 		// so this is not a check that refuses everything.
 		intact := tls.ConnectionState{PeerCertificates: []*x509.Certificate{parsedLeaf(t, admitted)}}
-		if err := callerStillAdmitted(intact, anchor, set); err != nil {
+		if err := callerStillAdmitted(intact, anchor, set, "", nil); err != nil {
 			t.Fatalf("an admitted caller was refused by the recheck: %v", err)
 		}
 	})
@@ -2157,6 +2213,90 @@ func TestASourceCannotHoldTheChainTheRechecksRead(t *testing.T) {
 		// And it still says the same thing.
 		if chain[0].URIs[0].String() != testPrincipal {
 			t.Errorf("the private copy names %v, want %q", chain[0].URIs, testPrincipal)
+		}
+	})
+}
+
+// TestAnEstablishedConnectionIsHeldToTheIdentityItWasAdmittedAs carries the
+// executed round's two probes: the key swap and the Raw swap.
+//
+// tls.ConnectionState.PeerCertificates shares its backing array with the
+// connection's own slice, and TLS 1.3 runs VerifyConnection BEFORE checking
+// CertificateVerify against peerCertificates[0].PublicKey. A source verifier
+// that swapped the leaf pointer therefore had the handshake signature verified
+// against the RIVAL's key: an attacker holding only an admitted identity's
+// public certificate plus its own private key was served 16 requests in 2.5s,
+// against a control of 0. A Raw swap was the quieter half — the recheck
+// re-parsed the swapped DER and agreed with it, so a de-admitted caller kept
+// being served.
+//
+// Both hooks that could do this are refused at boot, and the recheck holds a
+// connection to the identity it was admitted as rather than re-asking who it
+// is now.
+func TestAnEstablishedConnectionIsHeldToTheIdentityItWasAdmittedAs(t *testing.T) {
+	c := newCell(t)
+	anchor := func() (*x509.CertPool, error) { return c.roots, nil }
+	set := func() ([]string, error) { return []string{testGatewayPrincipal}, nil }
+
+	t.Run("the key swap is refused at boot", func(t *testing.T) {
+		// The shape of the attack: a source verifier that replaces the leaf
+		// with one carrying an admitted identity and the attacker's own key.
+		base := serverConfigFor(t, c.identity(t, testPrincipal), c)
+		base.VerifyConnection = func(state tls.ConnectionState) error {
+			state.PeerCertificates[0] = parsedLeaf(t, c.identity(t, testGatewayPrincipal))
+			return nil
+		}
+		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: base})
+		server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+		server.principal = testPrincipal
+		if _, err := server.serverIdentity(); err == nil {
+			t.Fatal("a source verifier able to swap the leaf was accepted: TLS 1.3 checks CertificateVerify against peerCertificates[0].PublicKey after VerifyConnection runs, so the handshake would be authenticated against the swapped key")
+		}
+	})
+
+	t.Run("a Raw swap cannot keep a de-admitted caller served", func(t *testing.T) {
+		admitted := parsedLeaf(t, c.identity(t, testGatewayPrincipal))
+		pinnedID, pinnedLeaf, err := admittedIdentity(tls.ConnectionState{PeerCertificates: []*x509.Certificate{admitted}})
+		if err != nil {
+			t.Fatalf("admittedIdentity: %v", err)
+		}
+
+		// The connection's own object swapped under the recheck for another
+		// certificate that still verifies and still names an admitted
+		// identity. Re-deriving the identity each tick agrees with it; holding
+		// the connection to what it was admitted as does not.
+		reissued := parsedLeaf(t, c.identity(t, testGatewayPrincipal))
+		swapped := tls.ConnectionState{PeerCertificates: []*x509.Certificate{reissued}}
+		if err := callerStillAdmitted(swapped, anchor, set, pinnedID, pinnedLeaf); err == nil {
+			t.Fatal("the recheck accepted a connection whose caller certificate is not the one the handshake authenticated: an established connection's certificate does not change, so this is not a caller to re-authorise but one whose authentication means nothing")
+		}
+
+		// An identity swap, the louder half.
+		rival := tls.ConnectionState{PeerCertificates: []*x509.Certificate{parsedLeaf(t, c.identity(t, rivalPrincipal))}}
+		if err := callerStillAdmitted(rival, anchor, set, pinnedID, pinnedLeaf); err == nil {
+			t.Fatal("the recheck accepted a connection presenting a different identity than the one it was admitted as")
+		}
+
+		// The control: the connection as it actually was stays served, so this
+		// is not a check that closes everything.
+		intact := tls.ConnectionState{PeerCertificates: []*x509.Certificate{admitted}}
+		if err := callerStillAdmitted(intact, anchor, set, pinnedID, pinnedLeaf); err != nil {
+			t.Fatalf("the connection the handshake authenticated was closed by its own recheck: %v", err)
+		}
+	})
+
+	t.Run("withdrawal still closes a pinned connection", func(t *testing.T) {
+		// Pinning says which caller this is; it must not make the connection
+		// immortal. The admitted set is still read every tick.
+		admitted := parsedLeaf(t, c.identity(t, testGatewayPrincipal))
+		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{admitted}}
+		pinnedID, pinnedLeaf, err := admittedIdentity(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		withdrawn := func() ([]string, error) { return []string{rivalPrincipal}, nil }
+		if err := callerStillAdmitted(state, anchor, withdrawn, pinnedID, pinnedLeaf); err == nil {
+			t.Fatal("a pinned connection survived the withdrawal of its caller from the admitted set")
 		}
 	})
 }
