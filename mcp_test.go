@@ -1,12 +1,16 @@
 package solution
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -209,10 +213,12 @@ func post(t *testing.T, server *httptest.Server, header http.Header) *http.Respo
 	return resp
 }
 
-// TestMCPChallengesARequestWithNoBearer pins the discovery handshake: an MCP
-// client's first contact is unauthenticated, and the 401 is what tells it where
-// to find the authorization server. Without the challenge the client has nothing
-// to go on but the status code.
+// TestMCPChallengesARequestWithNoBearer pins the direct caller's answer and the
+// shape the gateway's own challenge has to match. Through the gateway an
+// unauthenticated request is denied by ext_authz before it is proxied, so what
+// arrives here with no bearer reached this solution directly — a local run, a
+// port-forward — and without the challenge it would have nothing to go on but a
+// status code.
 func TestMCPChallengesARequestWithNoBearer(t *testing.T) {
 	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer}, readCollectionTool)
 
@@ -230,9 +236,8 @@ func TestMCPChallengesARequestWithNoBearer(t *testing.T) {
 // TestMCPChallengesARequestTheGatewayDidNotStamp covers the request that carries
 // a bearer the runtime never looks at. Nothing but the gateway may reach this
 // endpoint, so a bearer with no stamped identity is not a caller this runtime can
-// serve — and it is answered with the challenge rather than a bare 401, because a
-// client that dialled the wrong address can still discover the right issuer from
-// it.
+// serve — and it is answered with the challenge rather than a bare 401 so that a
+// caller which reached the wrong address has something to act on.
 func TestMCPChallengesARequestTheGatewayDidNotStamp(t *testing.T) {
 	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer, PublicURL: "https://host.test/solutions/wiki" + MCPPath}, readCollectionTool)
 
@@ -273,6 +278,31 @@ func TestMCPRefusesACredentialWithNoSession(t *testing.T) {
 	body := readBody(t, resp)
 	if !strings.Contains(body, apiKeyCredentialKind) || !strings.Contains(body, credentialKindHeader) {
 		t.Errorf("refusal %q names neither %s nor %q", body, credentialKindHeader, apiKeyCredentialKind)
+	}
+}
+
+// TestMCPNoSessionRefusalNamesTheStampedKind: told about an API key, a caller
+// whose credential is of another kind goes looking for an API key it does not
+// have — while the one fact that would have helped, what the gateway stamped, is
+// what the message replaced with a guess.
+func TestMCPNoSessionRefusalNamesTheStampedKind(t *testing.T) {
+	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer}, readCollectionTool)
+
+	resp := post(t, server, http.Header{
+		"authorization":      {"Bearer token"},
+		userHeader:           {"viewer-principal"},
+		orgHeader:            {viewerOrg},
+		credentialKindHeader: {"service_account"},
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("answered %d, want 403", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, "service_account") {
+		t.Errorf("refusal %q does not name the stamped kind", body)
+	}
+	if strings.Contains(body, apiKeyCredentialKind) {
+		t.Errorf("refusal %q names %q, which is not what the gateway stamped", body, apiKeyCredentialKind)
 	}
 }
 
@@ -407,6 +437,88 @@ func TestMCPMetadataDropsAnUnusableForwardedHost(t *testing.T) {
 	}
 }
 
+// TestMCPMetadataDropsAnUnusableForwardedScheme: a forwarded proto is a hop's
+// claim about the client's connection, and only the two schemes an HTTP resource
+// can be dialled over are usable. "javascript" would otherwise be spliced in
+// front of "://" and handed to a client as the URL of this resource.
+func TestMCPMetadataDropsAnUnusableForwardedScheme(t *testing.T) {
+	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer}, readCollectionTool)
+
+	for _, scheme := range []string{"javascript", "file", "ws", "httpss", "data"} {
+		document := metadata(t, server, http.Header{
+			"x-forwarded-proto": {scheme},
+			"x-forwarded-host":  {"host.test"},
+		})
+		if got, want := document["resource"], "http://host.test"+MCPPath; got != want {
+			t.Errorf("with forwarded proto %q, resource = %v, want the request's own scheme in %q", scheme, got, want)
+		}
+	}
+	// The one a proxy actually forwards is used.
+	document := metadata(t, server, http.Header{"x-forwarded-proto": {"HTTPS"}, "x-forwarded-host": {"host.test"}})
+	if got, want := document["resource"], "https://host.test"+MCPPath; got != want {
+		t.Errorf("resource = %v, want %q: https is the scheme a proxy in front of TLS forwards", got, want)
+	}
+}
+
+// TestMCPToolCallIsRecordedByName is the only trace a tool call leaves here:
+// minting is audited on accounts and names the viewer and the module, but not
+// which tool asked, so an operator reading that audit cannot tell one tool from
+// another. The name only — arguments are the viewer's content, and the headers
+// carry their credentials.
+func TestMCPToolCallIsRecordedByName(t *testing.T) {
+	host := newWorkContextGateway(t, &workContextGateway{})
+	server := serveMCP(t, MCPEnvironment{GatewayURL: host.URL, IssuerURL: testIssuer}, readCollectionTool)
+	session := connectMCP(t, server, viewerStamp())
+
+	recorded := captureLog(t)
+	if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      mcpToolName,
+		Arguments: map[string]any{"question": "a secret question"},
+	}); err != nil {
+		t.Fatalf("tools/call: %v", err)
+	}
+	logged := recorded.String()
+	if !strings.Contains(logged, mcpToolName) {
+		t.Errorf("the log %q does not name the tool that ran", logged)
+	}
+	if strings.Contains(logged, "a secret question") || strings.Contains(logged, "viewer-token") {
+		t.Errorf("the log %q carries the call's arguments or the viewer's credential", logged)
+	}
+}
+
+// captureLog collects what the runtime logs for the rest of the test. It is
+// locked because the heartbeat goroutines of tests that have finished are still
+// writing to the same logger.
+func captureLog(t *testing.T) *lockedBuffer {
+	t.Helper()
+	buffer := &lockedBuffer{}
+	flags := log.Flags()
+	log.SetOutput(buffer)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(flags)
+	})
+	return buffer
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // --- transport shape ---
 
 // TestMCPIsStateless pins the transport the gateway can actually proxy: a
@@ -520,6 +632,99 @@ func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
 	cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: "https://host.test/solutions/wiki" + MCPPath}
 	if err := cfg.validateMCP(); err != nil {
 		t.Errorf("a pairable public URL was refused: %v", err)
+	}
+}
+
+// TestServeMCPRefusesARedeclaredSurface: there is one MCP endpoint, so a second
+// ServeMCP would be the only one served and the tools registered by the first
+// would simply not exist — with tools/list answering as if that were all there
+// is. Refused at boot rather than resolved by call order.
+func TestServeMCPRefusesARedeclaredSurface(t *testing.T) {
+	s := New(Manifest{ID: "wiki"}).
+		ServeMCP("wiki", "v1", readCollectionTool).
+		ServeMCP("wiki", "v1", readCollectionTool)
+	err := s.validateMCPDeclaration()
+	if err == nil {
+		t.Fatal("two ServeMCP calls were accepted")
+	}
+	if !strings.Contains(err.Error(), "ServeMCP") {
+		t.Errorf("refusal %q does not name ServeMCP", err)
+	}
+	if _, err := s.MCPHandler(MCPEnvironment{IssuerURL: testIssuer}); err == nil {
+		t.Error("MCPHandler served a redeclared surface")
+	}
+}
+
+// TestServeMCPRefusesAHandlerOnItsOwnPath: net/http panics on a duplicate
+// pattern, which in serve() happens with http's own message and after the
+// listener is open. One of the two would have to win, so the boot names them
+// both instead.
+func TestServeMCPRefusesAHandlerOnItsOwnPath(t *testing.T) {
+	for _, path := range []string{MCPPath, ProtectedResourceMetadataPath} {
+		s := New(Manifest{ID: "wiki"}).ServeMCP("wiki", "v1", readCollectionTool)
+		s.Handle(path, func(context.Context, *Gateway) (any, error) { return nil, nil })
+		err := s.validateMCPDeclaration()
+		if err == nil {
+			t.Errorf("a handler at %q was accepted alongside ServeMCP", path)
+			continue
+		}
+		if !strings.Contains(err.Error(), path) {
+			t.Errorf("refusal %q does not name %q", err, path)
+		}
+	}
+	// The same solution without the collision is served.
+	if err := New(Manifest{ID: "wiki"}).ServeMCP("wiki", "v1", readCollectionTool).
+		Handle("/search", func(context.Context, *Gateway) (any, error) { return nil, nil }).
+		validateMCPDeclaration(); err != nil {
+		t.Errorf("a handler on its own path was refused: %v", err)
+	}
+}
+
+// TestValidateRefusesADeployedMCPThatNobodyAddressed is the F2 refusal: in a
+// deployment the runtime cannot tell that what it resolved is unreachable. The
+// identifier reconstructed from forwarded headers is missing the route prefix
+// the gateway stripped, and the resolved issuer is the address this composition
+// dials the host at — both served with a 200, from a solution that registered
+// and looks healthy, with a boot log line as the only signal. It is the same
+// silent damage the loopback refusals above already refuse, so it is refused the
+// same way.
+func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
+	const inCluster = "http://frontend.saas.svc.cluster.local:3000"
+	const public = "https://app.example.com/solutions/wiki" + MCPPath
+
+	deployed := config{mcp: true, runtimeContext: "kubernetes", mcpIssuerURL: inCluster}
+	err := deployed.validateMCP()
+	if err == nil {
+		t.Fatal("a deployed MCP surface with no public URL was accepted")
+	}
+	if !strings.Contains(err.Error(), mcpPublicURLEnvironmentVariable) {
+		t.Errorf("refusal %q does not name %s", err, mcpPublicURLEnvironmentVariable)
+	}
+
+	addressed := deployed
+	addressed.mcpPublicURL = public
+	err = addressed.validateMCP()
+	if err == nil {
+		t.Fatal("a deployed MCP surface with an issuer nobody chose was accepted")
+	}
+	if !strings.Contains(err.Error(), hostIssuerURLEnvironmentVariable) {
+		t.Errorf("refusal %q does not name %s", err, hostIssuerURLEnvironmentVariable)
+	}
+
+	told := addressed
+	told.mcpIssuerExplicit = true
+	told.mcpIssuerURL = "https://app.example.com"
+	if err := told.validateMCP(); err != nil {
+		t.Errorf("a deployed MCP surface an operator addressed was refused: %v", err)
+	}
+
+	// A local run resolves a host it can actually reach and is unaffected: the
+	// refusal is about a deployment, never about the environment's name.
+	for _, local := range []string{"", "native", "nix", "container", "free"} {
+		cfg := config{mcp: true, runtimeContext: local, mcpIssuerURL: "http://localhost:3000"}
+		if err := cfg.validateMCP(); err != nil {
+			t.Errorf("runtime context %q was refused: %v", local, err)
+		}
 	}
 }
 

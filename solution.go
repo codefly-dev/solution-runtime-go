@@ -226,9 +226,11 @@ type Server struct {
 	consumed    []ConsumedModule
 	passthrough map[string]passthroughRoute
 	// mcp is the MCP server the solution declared with ServeMCP, nil when it
-	// declared none.
-	mcp *mcpSurface
-	cfg config
+	// declared none; mcpRedeclared records a second ServeMCP, which the boot
+	// refuses rather than letting the last call quietly be the only surface.
+	mcp           *mcpSurface
+	mcpRedeclared bool
+	cfg           config
 	// registrationInterval is how long a registration heartbeat waits between
 	// beats. Zero means defaultRegistrationInterval. Per-server rather than a
 	// package value so a test can drive several beats without every other
@@ -283,6 +285,11 @@ type config struct {
 	// mcpPublicURL is the canonical public MCP URL an operator set, empty when
 	// none was (see mcpResource).
 	mcpPublicURL string
+	// mcpIssuerExplicit says the issuer came from the operator rather than from
+	// the SDK. It is what tells a deployment that resolved the host's
+	// in-cluster address — which validate() refuses — from one that was told
+	// the origin clients authenticate against.
+	mcpIssuerExplicit bool
 }
 
 func env(key, fallback string) string {
@@ -496,8 +503,9 @@ func loadConfig(ctx context.Context, id string) config {
 		// the one this composition reaches the host at, which is right for a
 		// local run and is an in-cluster address in a deployment, where no
 		// public client could reach it: that is what the override is for.
-		mcpIssuerURL: strings.TrimRight(env(hostIssuerURLEnvironmentVariable, frontendURL), "/"),
-		mcpPublicURL: strings.TrimRight(env(mcpPublicURLEnvironmentVariable, ""), "/"),
+		mcpIssuerURL:      strings.TrimRight(env(hostIssuerURLEnvironmentVariable, frontendURL), "/"),
+		mcpIssuerExplicit: env(hostIssuerURLEnvironmentVariable, "") != "",
+		mcpPublicURL:      strings.TrimRight(env(mcpPublicURLEnvironmentVariable, ""), "/"),
 	}
 	cfg.registrationInterval, cfg.registrationIntervalErr = registrationIntervalFromEnv()
 	return cfg
@@ -779,10 +787,8 @@ func (s *Server) Serve() error {
 	if err := s.manifest.validateSurfaces(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
-	if s.mcp != nil {
-		if err := s.mcp.validate(); err != nil {
-			return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
-		}
+	if err := s.validateMCPDeclaration(); err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-secret lookups resolve from them (falling back to

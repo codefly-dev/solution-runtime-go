@@ -33,10 +33,12 @@ const (
 
 	// ProtectedResourceMetadataPath is where the OAuth 2.0 Protected Resource
 	// Metadata document (RFC 9728) serves, at the well-known location a client
-	// discovers it at. It is the document the 401 challenge points to, so a
+	// discovers it at. It is the document a 401 challenge points to, so a
 	// client that cannot reach it cannot learn which authorization server to
 	// use: it is served without authentication, and the gateway must admit it
-	// unauthenticated for discovery to work at all.
+	// unauthenticated for discovery to work at all. Through the gateway that
+	// challenge is the gateway's own — see requireStampedViewer — and this is
+	// the document it has to name.
 	ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource"
 )
 
@@ -94,8 +96,40 @@ func (m *mcpSurface) validate() error {
 // request, so the MCP session would break under any rollout or scale-out. Each
 // request carries its own identity, which is all a tool call needs.
 func (s *Server) ServeMCP(name, version string, register func(*mcp.Server)) *Server {
+	// A second call is not a second server — there is one MCP endpoint — so it
+	// replaces the first. Recorded rather than applied silently, and refused at
+	// boot by validateMCPDeclaration: a solution assembled from two places,
+	// each declaring its own tools, would otherwise serve only the tools of
+	// whichever ran last, with tools/list answering as if that were all there
+	// is. ServeMCP cannot return the error itself, being chainable.
+	if s.mcp != nil {
+		s.mcpRedeclared = true
+	}
 	s.mcp = &mcpSurface{name: name, version: version, register: register}
 	return s
+}
+
+// validateMCPDeclaration refuses what the author declared, before any address
+// is resolved and before the listener opens: these are the same in every
+// environment. It is also what keeps a route collision from reaching net/http,
+// which panics on a duplicate pattern — inside serve(), with http's own message
+// and after the listener is open.
+func (s *Server) validateMCPDeclaration() error {
+	if s.mcp == nil {
+		return nil
+	}
+	if s.mcpRedeclared {
+		return fmt.Errorf("ServeMCP was called more than once: there is one MCP endpoint, so the last call would be the only surface served and the tools registered by the others would simply not exist. Register every tool in one ServeMCP")
+	}
+	if err := s.mcp.validate(); err != nil {
+		return err
+	}
+	for _, path := range []string{MCPPath, ProtectedResourceMetadataPath} {
+		if _, taken := s.handlers[path]; taken {
+			return fmt.Errorf("a handler is registered at %q, which ServeMCP serves: one of the two would have to win, and the solution would serve either its own handler with no MCP endpoint or an MCP endpoint with the handler unreachable. Move the handler to another path", path)
+		}
+	}
+	return nil
 }
 
 // mountMCP serves the MCP endpoint and its metadata document on mux, or does
@@ -104,7 +138,7 @@ func (s *Server) mountMCP(mux *http.ServeMux) error {
 	if s.mcp == nil {
 		return nil
 	}
-	if err := s.mcp.validate(); err != nil {
+	if err := s.validateMCPDeclaration(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: s.mcp.name, Version: s.mcp.version}, nil)
@@ -166,6 +200,9 @@ func (s *Server) MCPHandler(env MCPEnvironment) (http.Handler, error) {
 		return nil, fmt.Errorf("solution %q declares no MCP server (ServeMCP)", s.manifest.ID)
 	}
 	s.cfg.gatewayURL, s.cfg.mcpIssuerURL, s.cfg.mcpPublicURL = env.GatewayURL, env.IssuerURL, env.PublicURL
+	// The caller named the issuer, so it is as explicit as the operator's
+	// override: what validate() refuses is an issuer nobody chose.
+	s.cfg.mcpIssuerExplicit = env.IssuerURL != ""
 	s.cfg.mcp = true
 	if err := s.cfg.validateMCP(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
@@ -220,6 +257,14 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 		if extra := req.GetExtra(); extra != nil && extra.Header != nil {
 			header = extra.Header
 		}
+		// The one thing a tool call leaves nowhere else. Minting is audited on
+		// accounts and names the viewer and the module, but not which tool
+		// asked — so an operator reading that audit cannot tell an "ask the
+		// wiki" from a bulk export. The name only: arguments are the viewer's
+		// content and the headers carry their credentials.
+		if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
+			log.Printf("solution %q: mcp tool %q", s.manifest.ID, call.Params.Name)
+		}
 		id := stampedIdentity(header)
 		gw := newGateway(s.cfg.gatewayURL, id.bearer, id.orgID, id.sessionID)
 		return next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
@@ -268,9 +313,13 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 		id := stampedIdentity(r.Header)
 		switch {
 		case id.bearer == "":
-			// The ordinary first contact of an MCP client, and the reason the
-			// challenge exists: it names the metadata document the client reads
-			// to find the authorization server to get a token from.
+			// Not the request an MCP client makes through the gateway: the
+			// gateway runs ext_authz before it proxies, so an unauthenticated
+			// request is denied there and never arrives. What reaches here
+			// without a bearer is a caller dialling this solution directly — a
+			// local run, a port-forward — and the challenge is both the only
+			// answer that tells such a caller where to authenticate and the
+			// shape the gateway's own has to match.
 			s.challenge(w, r, "no bearer token: this MCP server is a protected resource")
 			return
 		case !id.stamped():
@@ -278,8 +327,8 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 			// not come through the host gateway — nothing else may reach this
 			// endpoint, and no header a caller sends is trusted here — or the
 			// gateway did not authenticate it. Answering the challenge rather
-			// than a bare 401 lets a client that went to the wrong address
-			// still discover the right authorization server.
+			// than a bare 401 leaves a caller that reached the wrong address
+			// something to act on.
 			s.challenge(w, r, fmt.Sprintf("no stamped identity: the host gateway authenticates the bearer and stamps %s, %s and %s, and none of them arrived",
 				userHeader, orgHeader, sessionHeader))
 			return
@@ -289,12 +338,22 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 			// that acts for the viewer mints a Work Context rooted in one
 			// (accounts requires a Task to name a session). Named by kind,
 			// because the kind is what the caller has to change.
-			kind := id.credentialKind
-			if kind == "" {
-				kind = "(unstamped)"
+			// The kind is named as the gateway stamped it, and nothing is
+			// asserted about which kind it is: told about an API key, a caller
+			// whose credential is of some other kind goes looking for an API
+			// key it does not have, and the one fact that would have helped —
+			// what the gateway actually stamped — is the one the message
+			// replaced with a guess.
+			stamped := fmt.Sprintf("%s=%q", credentialKindHeader, id.credentialKind)
+			if id.credentialKind == "" {
+				stamped = credentialKindHeader + " empty"
 			}
-			http.Error(w, fmt.Sprintf("MCP requires a user session: the gateway stamped %s=%q and %s empty, and a credential that authenticates without a session cannot act for a viewer — an organization %s cannot read composed modules. Connect as a signed-in person.",
-				credentialKindHeader, kind, sessionHeader, apiKeyCredentialKind), http.StatusForbidden)
+			detail := ""
+			if id.credentialKind == apiKeyCredentialKind {
+				detail = " — an organization API key names a principal and no session"
+			}
+			http.Error(w, fmt.Sprintf("MCP requires a user session: the gateway stamped %s and %s empty%s. A credential that authenticates without a session cannot act for a viewer: every tool call that does mints a Work Context rooted in one. Connect as a signed-in person.",
+				stamped, sessionHeader, detail), http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -302,10 +361,16 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 }
 
 // challenge answers 401 with the RFC 9728 pointer to this resource's metadata
-// document, which is how an MCP client learns which authorization server to
+// document, the way a protected resource says which authorization server to
 // authenticate against (RFC 9728 §5.1). The URL is absolute and names the
-// resource as the client reached it, so a client following it arrives back here
+// resource as the caller reached it, so one following it arrives back here
 // rather than at an address only the cluster can dial.
+//
+// Through the gateway nothing unauthenticated gets this far, so this is the
+// direct and local caller's answer, and the shape the gateway's own challenge
+// has to match (codefly-dev/module-saas-starter#1003). It is kept here rather
+// than dropped because a solution reached directly would otherwise answer a
+// bare 401 that names nothing.
 func (s *Server) challenge(w http.ResponseWriter, r *http.Request, message string) {
 	metadata := siblingURL(s.mcpResource(r), MCPPath, ProtectedResourceMetadataPath)
 	if metadata != "" {
@@ -361,8 +426,12 @@ const (
 // identifier in its own 401 and its own metadata document, never redirect
 // anyone to an authorization server of its choosing.
 func forwardedOrigin(r *http.Request) string {
-	scheme := firstForwarded(r, forwardedProtoHeader)
-	if scheme == "" {
+	// Only the two schemes an HTTP resource can be dialled over. A forwarded
+	// proto is a hop's claim about the client's connection, and anything else
+	// would be spliced in front of "://" — "javascript" included, which is a
+	// URL a client might hand to something that executes it.
+	scheme := strings.ToLower(firstForwarded(r, forwardedProtoHeader))
+	if scheme != "http" && scheme != "https" {
 		scheme = "http"
 		if r.TLS != nil {
 			scheme = "https"
@@ -477,6 +546,22 @@ func (c config) validateMCP() error {
 		}
 		return fmt.Errorf("unresolved host issuer %q: ServeMCP publishes it as the authorization server of this MCP resource, so a client has nowhere to authenticate without it. Set %s to the origin MCP clients authenticate against, or ensure the SDK resolves the host frontend's http endpoint",
 			c.mcpIssuerURL, hostIssuerURLEnvironmentVariable)
+	}
+	// In a deployment both values below are the operator's to set, for the
+	// reason the loopback refusals above exist: the runtime cannot tell that
+	// what it resolved is unreachable, and serves a well-formed document naming
+	// it with a 200, from a solution that registered and looks healthy. A boot
+	// log line was the only signal, and a log line nobody reads is how a
+	// solution is absent while every gate is green.
+	if deployedRuntimeContext(c.runtimeContext) {
+		if c.mcpPublicURL == "" {
+			return fmt.Errorf("no %s set in the deployed runtime context %q: the gateway strips the route it proxies this solution under, so the identifier reconstructed from the forwarded headers is missing that prefix (and names the scheme of the hop, not the client's) — an MCP client binds its token to the identifier it dialled and rejects any other. Set it to the URL clients dial, ending in %s",
+				mcpPublicURLEnvironmentVariable, c.runtimeContext, MCPPath)
+		}
+		if !c.mcpIssuerExplicit {
+			return fmt.Errorf("no %s set in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Set it to the origin clients authenticate against",
+				hostIssuerURLEnvironmentVariable, c.runtimeContext, c.mcpIssuerURL)
+		}
 	}
 	if c.mcpPublicURL == "" {
 		return nil

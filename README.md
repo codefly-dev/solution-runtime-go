@@ -615,9 +615,20 @@ that the gateway did it:
 
 | The request | Answer |
 | --- | --- |
-| No `authorization` | `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. An MCP client's first contact is unauthenticated, and this challenge is what tells it where to find the authorization server. |
-| A bearer, but none of `x-user-id`, `x-org-id`, `x-session-id` stamped | `401` with the same challenge: nothing but the gateway may reach this endpoint, so either the request did not come through it or it did not authenticate the bearer — and a client that dialled the wrong address can still discover the right issuer from the challenge. |
-| `x-session-id` stamped empty | `403`, naming the `x-credential-kind` the gateway stamped. An organization API key authenticates a principal and no session, and every tool call that acts for the viewer mints a Work Context rooted in one, so this is refused at the boundary rather than once per tool call — where the same refusal would read as the tool being broken. Another token cannot fix it, so it carries no challenge. |
+| No `authorization` | `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. |
+| A bearer, but none of `x-user-id`, `x-org-id`, `x-session-id` stamped | `401` with the same challenge: nothing but the gateway may reach this endpoint, so either the request did not come through it or it did not authenticate the bearer. |
+| `x-session-id` stamped empty | `403`, naming the `x-credential-kind` the gateway stamped. A credential that authenticates without a session cannot act for a viewer, and every tool call that does mints a Work Context rooted in one — so this is refused at the boundary rather than once per tool call, where the same refusal would read as the tool being broken. Another token cannot fix it, so it carries no challenge. |
+
+**Which caller sees those two 401s.** Not an MCP client coming through the
+gateway: the gateway strips the caller's identity headers and runs ext_authz on
+the bearer *before* proxying, so an unauthenticated request is denied there with
+its own `401 authentication required` and never reaches the solution. The
+runtime's 401 is what a caller reaching this solution directly sees — a local
+run, a port-forward, a composition dialling the backend — and it is the shape
+the gateway's own challenge has to match for discovery to work at all. Emitting
+it at the gateway is the host's half
+([codefly-dev/module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003));
+the document that challenge must point at is served here either way.
 
 #### The resource identifier and the issuer
 
@@ -647,15 +658,17 @@ reach, which is what `HOST_ISSUER_URL` is for. A solution that declares
 `ServeMCP` and resolves no issuer is refused at boot; one that declares no MCP
 server is unaffected.
 
-Two things about discovery belong to the host, not to this runtime. It must admit
-an unauthenticated `GET` on
-`/solutions/<id>/.well-known/oauth-protected-resource`, or no client can read the
-document the challenge points at. And that is where the document is — on the
-solution's own path — whereas RFC 9728 §3.1 also defines a location derived from
-the resource's path, `/.well-known/oauth-protected-resource/solutions/<id>/mcp`,
-at the **host's** root. A client that follows the `resource_metadata` of the 401,
-as an MCP client does, reaches the document either way; one that only guesses the
-derived location needs the host to serve it there.
+Three things about discovery belong to the host, not to this runtime, all of them
+tracked by
+[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003).
+The gateway emits the 401 challenge, as above. It must admit an unauthenticated
+`GET` on `/solutions/<id>/.well-known/oauth-protected-resource`, or no client can
+read the document that challenge points at. And that is where the document is —
+on the solution's own path — whereas RFC 9728 §3.1 also defines a location
+derived from the resource's path,
+`/.well-known/oauth-protected-resource/solutions/<id>/mcp`, at the **host's**
+root. A client that follows `resource_metadata` reaches the document either way;
+one that only guesses the derived location needs the host to serve it there.
 
 #### Connecting
 
@@ -667,8 +680,8 @@ claude mcp add --transport http wiki https://<host>/solutions/<id>/mcp \
     --header "Authorization: Bearer <access token>"
 ```
 
-Once the host supports it, the 401 challenge and the metadata document above are
-the whole of what a client needs to authenticate on its own.
+Once the host supports it, the gateway's 401 challenge and the metadata document
+above are the whole of what a client needs to authenticate on its own.
 
 #### Testing the tools: `MCPHandler`
 
