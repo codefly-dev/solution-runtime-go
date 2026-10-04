@@ -1001,6 +1001,21 @@ func redactedURL(raw string) string {
 	if err != nil {
 		return "(unparseable)"
 	}
+	// An OPAQUE url prints nothing of itself.
+	//
+	// url.Parse("ops:SECRET@host/path") is legal and gives scheme "ops" with
+	// everything after the colon as Opaque — so User is nil, RawQuery is
+	// empty, and the three strips below touch nothing. The whole secret came
+	// through this function unchanged, which is the one thing it exists to
+	// stop. There is no safe way to describe such a value, because its
+	// content is arbitrary by definition, so only the scheme is named: enough
+	// for an operator to recognise what they set and nothing more.
+	if parsed.Opaque != "" || parsed.Host == "" {
+		if parsed.Scheme != "" {
+			return parsed.Scheme + ":(redacted)"
+		}
+		return "(redacted)"
+	}
 	// Userinfo dropped entirely, not redacted. url.Redacted() masks the
 	// *password* and keeps the username — so a token carried as the username,
 	// which is how a great many of them are carried, came through it intact.

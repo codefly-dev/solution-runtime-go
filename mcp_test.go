@@ -1444,6 +1444,13 @@ func TestNoMCPRefusalEverPrintsASecret(t *testing.T) {
 		"http://app.example.com/wiki" + MCPPath + "?token=" + secret,
 		"https://" + secret + ":x@app.example.com/not-the-suffix",
 		"not-a-url-at-all?token=" + secret,
+		// Scheme-less and opaque forms. url.Parse accepts
+		// "ops:SECRET@host/path" as scheme "ops" with everything after the
+		// colon opaque, so User is nil and RawQuery empty and the ordinary
+		// strips touch nothing — the secret came through redactedURL intact.
+		"ops:" + secret + "@app.example.com/wiki" + MCPPath,
+		"mailto:ops:" + secret + "@app.example.com",
+		"app.example.com:8443/wiki" + MCPPath + "?token=" + secret,
 		"https://app.example.com/wiki?token=" + secret,
 	}
 	for _, runtimeContext := range []string{"", "kubernetes"} {

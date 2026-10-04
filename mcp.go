@@ -477,13 +477,16 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 		// And this execution's own credential, at the HTTP boundary.
 		//
 		// The method-layer gate in mcpViewer refuses the same thing, and both
-		// are here on purpose. This one answers a real 503 — JSON-RPC carries
-		// no transport status and the SDK's wire-error type is internal, so the
-		// method layer can only fail the call as a protocol error — and it
-		// holds anything that reaches this handler without going through the
-		// method middleware. An MCP client backing off needs the status; a
-		// client that gets a generic protocol error cannot tell "this solution
-		// cannot act right now" from a broken tool.
+		// are here on purpose. This one answers a real HTTP 503, which
+		// JSON-RPC has no equivalent for at all, and it holds anything that
+		// reaches this handler without going through the method middleware.
+		//
+		// The method layer is not codeless: it carries -32001 through
+		// jsonrpc.Error. This comment said the SDK's wire-error type was
+		// internal and a code could not be set, which was my own false claim —
+		// I grepped for the type, found internal/jsonrpc2, and stopped looking
+		// for the exported alias. Corrected in the code one commit and left
+		// standing here.
 		if err := s.actingForAViewer(r.Context()); err != nil {
 			// The sanitized sentence, never the source's error: it wraps
 			// whatever the issuer said, which is a mint URL and sometimes a
