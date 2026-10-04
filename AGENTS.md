@@ -32,9 +32,17 @@ own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
   change a signature, a struct field or an exported constant; a change that
   breaks a consumer carries a `!` in the commit type and says so in the PR body.
 - Boot configuration is resolved in one place, `loadConfig`, and checked in one
-  place, `validate()`: resolved through the SDK, with an explicit env override,
-  refused loudly when unresolved. New configuration follows both rather than
-  reading the environment where it is used.
+  place, `validate()`: resolved through the SDK, refused loudly when unresolved.
+  New configuration follows both rather than reading the environment where it is
+  used. Most values also take an explicit env override, for an operator whose
+  deployment the resolver cannot see — but an override is not how a *composition*
+  supplies a value, because a Codefly render cannot set a bare environment
+  variable on a service. Anything the composition has to supply is a declared
+  workspace-configuration group read with `WorkspaceConfiguration` /
+  `WorkspaceSecret` (`solution-registration/SECRET`, `mcp/issuer-url`,
+  `mcp/public-url`), and a refusal names that group/key, never a variable name.
+  `MCP_PUBLIC_URL` and `HOST_ISSUER_URL` were bare variables for one release and
+  the boot refused with the name of something nobody could set (#48).
 - The exception is the consumed-API projection, read at serve time in
   `registerConsumedAPIs` and never seen by `validate()`. A malformed one is not
   refused: the runtime logs that the federation is disabled and serves on, so
@@ -99,7 +107,12 @@ repository is the runtime that cost was measured against.
    port and refused by `validate()` in a deployed runtime context. Both token-exchange URLs
    are derived from their register URLs by swapping the path suffix, which is
    why an override that drops the documented suffix cannot be paired and is
-   refused at boot rather than guessed at. If you are typing an address, a port
+   refused at boot rather than guessed at. The MCP resource identifier is
+   derived the same way — from the resolved `PUBLIC_URL` and the solution id —
+   and is the one place the gateway's `/solutions/<id>` route is encoded, because
+   a client's token is audience-bound to that exact string and nothing
+   downstream can resolve it later the way the host resolves a relative manifest
+   URL. README says so where it says the route layout is not encoded. If you are typing an address, a port
    or a credential, you are encoding something true only on your machine for the
    next ten minutes.
 5. **Diagnose, do not pattern-match.** "It started working when I set X" is not
