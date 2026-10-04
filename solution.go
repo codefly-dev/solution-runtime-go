@@ -433,6 +433,15 @@ type config struct {
 	// in for the other. The maximum-security answer is one authorization set
 	// per destination, and a dial to anything that is neither is refused
 	// outright: this runtime has exactly two destinations.
+	//
+	// mintPeersFile is KEPT rather than deleted because it is consumed rather
+	// than reserved: sdk-go v0.3.0 owns the mint's transport, so the per-dial
+	// peer re-read reaches the gateway alone — but where the mint and the
+	// gateway answer at the SAME address this runtime cannot attribute a dial,
+	// and what it admits there is the intersection of both sets, so a gateway
+	// dial at a shared address is refused unless the mint's set admits it too.
+	// It is not a claim about the mint hop's posture; `credential.go` states
+	// what that hop does and does not have.
 	mintPeersFile, gatewayPeersFile string
 	// profile is the configuration profile this process runs under, which the
 	// published contract is keyed by. A deployed environment has a profile of

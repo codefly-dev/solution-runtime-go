@@ -539,6 +539,11 @@ type booted struct {
 	// cell is the CA the listener verifies callers against, for a test that
 	// must issue another certificate it will accept.
 	cell *cell
+	// stop ends this runtime and waits for serve to return, so a test can
+	// observe what a SHUTDOWN does rather than only what a serving process
+	// does. It is idempotent, and the cleanup calls it too — a test that stops
+	// the runtime itself must not leave a second cancel racing the first.
+	stop func()
 }
 
 // bootEnvironment provisions everything a deployed solution's boot reads — the
@@ -630,11 +635,16 @@ func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 	}
 	served := make(chan error, 1)
 	go func() { served <- server.serve(ctx, ln) }()
-	t.Cleanup(func() {
-		cancel()
-		<-served
-	})
+	var ended sync.Once
+	stop := func() {
+		ended.Do(func() {
+			cancel()
+			<-served
+		})
+	}
+	t.Cleanup(stop)
 	return &booted{
+		stop:   stop,
 		server: server,
 		base:   "https://127.0.0.1:" + os.Getenv("PORT"),
 		// The caller presents its own identity, because the listener requires

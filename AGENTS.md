@@ -45,6 +45,20 @@ rule is the gate, which is a compiler rather than a naming convention;
 `TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot` fails if an
 exported path reappears.
 
+Beside it, `TestNoExportedPathHandsOutAServableHandler` is the type-based half,
+and it has been falsified four times by a shape nobody had written down —
+`Routes() func(http.ResponseWriter, *http.Request)`, a named collection, an
+import-aliased `nh.Handler`, and this package's own bare `Handler`, which the
+servable set had always named and never matched because the renderer had no
+identifier case at all. A gate cannot be mutation-tested — the harness asks
+"mutate the code, does the suite fail?", and a gate only fails when the
+counterexample it exists to refuse is in the tree — so its acceptance criterion
+is a probe per shape, driving the rule itself rather than a copy of it, and the
+probes are the record of what it has been wrong about. The same applies to the
+seam's refusal: the defeat check (`recover()`, a branch that cannot be taken)
+ran only where `mustBeATest()` was called directly, so the identical defeat one
+hop away was *inherited* as a refusal and passed.
+
 `passthroughtest` is itself importable by any module, so that rule alone did not
 close this: `passthroughtest.Handler` was an exported, production-importable
 path to the same handler, and the gate skipped the package by path while
@@ -81,8 +95,17 @@ embedding it.
   decide. It declares none of a capability's fields and holds no verifier —
   core's needs the issuer's live revision, replay, grant and seal sources, which
   a solution does not have. `work_context_boundary_test.go` fails on a signing
-  primitive, on a `WorkContext`-named declaration of this package's own, and on
-  a call to a verifier. This is not a style rule: a second signed encoding grew
+  primitive, on a `WorkContext`-named declaration of this package's own, on a
+  call to a verifier, on an import of core's generated wire types, and on
+  **constructing** one of core's capability messages — the escape the other
+  four do not close, because `proto.Unmarshal(raw, &workcontext.SealedValues{})`
+  needs no generated import, no signer and no verifier: `SealedValues` is a
+  type *alias* for core's `WorkSealV1`, so the one SDK import this package
+  already has is enough to allocate one and decode into it. The rule is on
+  construction rather than on the name, because the name appears legitimately —
+  `holdSealedIdentity` takes a `*SealedValues` and reads it through
+  `GetInstallationId`; decoding into one requires allocating it and reading one
+  never does. This is not a style rule: a second signed encoding grew
   inside an SDK beside core's once, with its own payload struct, signer,
   verifier and error taxonomy, and 3,532 lines had to be deleted to get back to
   one. Every step of that was locally reasonable.
@@ -189,7 +212,13 @@ embedding it.
   Outbound there is **one set per destination** (`MINT_PEERS_FILE`,
   `GATEWAY_PEERS_FILE`): the mint and the gateway are two parties, and a single
   set spanning both authorises each to stand in for the other at the other's
-  address — the mint being the one that receives the projected token. A dial to
+  address — the mint being the one that receives the projected token.
+  `MINT_PEERS_FILE` is kept rather than deleted for one reason: it is consumed
+  rather than reserved — sdk-go owns the mint's transport, so the per-dial peer
+  re-read reaches the gateway alone, but where the two answer at the **same
+  address** this runtime cannot attribute a dial and what it admits there is
+  the intersection of both sets, so a gateway dial at a shared address is
+  refused unless the mint's set admits it too. A dial to
   a third address has no set and is refused, because this runtime talks to
   exactly two destinations.
   An admission set answered by **both** the env override and the platform's

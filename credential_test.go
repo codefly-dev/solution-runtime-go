@@ -372,40 +372,75 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		}}), mint)
 
-	// A registration heartbeat was 15s; the shortest interval the deleted
-	// configuration accepted was 1s, and it is set above. Give any surviving
-	// beat several periods to happen.
+	// reached is what the observer has seen since the last reset, with the
+	// paths, so every assertion below can name what called a deleted endpoint
+	// rather than only that something did.
+	reached := func() (int64, []string) {
+		paths := []string{}
+		legacyPaths.Range(func(k, _ any) bool { paths = append(paths, k.(string)); return true })
+		return legacyHits.Load(), paths
+	}
+	reset := func() {
+		legacyHits.Store(0)
+		legacyPaths.Range(func(k, _ any) bool { legacyPaths.Delete(k); return true })
+	}
+	// listening proves the observer can still see a request AT THE MOMENT it
+	// is asked, and leaves the counters clean for the next window.
+	//
+	// The defect this replaced was a test concluding "nothing called it" while
+	// watching a closed port, so every zero below has to rest on something
+	// checked rather than assumed — and checked at both ends of the window it
+	// certifies, because the first version of this check was true when it was
+	// written and stopped being true when the boot moved the server.
+	listening := func(when string) {
+		t.Helper()
+		reset()
+		probe, err := http.Get(legacy.URL + "/api/solutions/register")
+		if err != nil {
+			t.Fatalf("the observer for the deleted endpoints is not reachable %s, so a zero count around it would prove nothing: %v", when, err)
+		}
+		drainAndClose(probe)
+		if got, _ := reached(); got != 1 {
+			t.Fatalf("the observer counted %d of its own probe %s, want 1: it is not counting what reaches it", got, when)
+		}
+		reset()
+	}
+
+	// The PERIODIC window, asserted on its own count.
+	//
+	// It used to be slept through and then thrown away: the reachability probe
+	// called reset() before the only `!= 0` assertion, so that assertion
+	// measured a window of roughly zero length and a surviving beat showed up
+	// — if at all — as the probe's own `!= 1`, whose message blames the
+	// instrument. A registration heartbeat was 15s and the shortest interval
+	// the deleted configuration accepted was 1s, which is what is set above,
+	// so three seconds is three periods of the fastest beat that was ever
+	// configurable.
+	listening("before the periodic window")
 	time.Sleep(3 * time.Second)
+	if got, paths := reached(); got != 0 {
+		t.Errorf("a deleted endpoint was called %d times at %v during three periods of the fastest heartbeat interval this configuration ever accepted: the beat, both registrations and the token exchange are deleted, so nothing may reach one", got, paths)
+	}
+	listening("after the periodic window")
+
 	if status := getStatus(t, solution.client, solution.base+HealthPath); status != http.StatusOK {
 		t.Fatalf("health = %d, want 200", status)
 	}
 
-	// FIRST: prove the observer is actually listening on the address those
-	// URLs name.
-	//
-	// The defect this replaced was a test concluding "nothing called it" while
-	// watching a closed port, so the conclusion has to rest on something
-	// checked rather than assumed. If this probe cannot reach the observer,
-	// neither could a surviving registration, and the count below would mean
-	// nothing.
-	probe, err := http.Get(legacy.URL + "/api/solutions/register")
-	if err != nil {
-		t.Fatalf("the observer for the deleted endpoints is not reachable, so a zero count below would prove nothing: %v", err)
+	// The SHUTDOWN window. Every assertion used to run while the solution was
+	// still serving, and the shutdown happened in t.Cleanup afterwards with
+	// nothing left to read the count — so a deregistration on the way out was
+	// unobserved. The cutover's claim is that nothing reaches a deleted
+	// endpoint, and the last thing a process does is part of that.
+	listening("before the shutdown")
+	solution.stop()
+	if got, paths := reached(); got != 0 {
+		t.Errorf("a deleted endpoint was called %d times at %v while this runtime shut down: there is no deregistration, so nothing may reach one on the way out either", got, paths)
 	}
-	drainAndClose(probe)
-	if got := legacyHits.Load(); got != 1 {
-		t.Fatalf("the observer counted %d of its own probe, want 1: it is not counting what reaches it", got)
-	}
-	legacyHits.Store(0)
-	legacyPaths.Range(func(k, _ any) bool { legacyPaths.Delete(k); return true })
+	// The observer outlives the runtime, so the zero above is a statement
+	// about the runtime rather than about a port that closed with it.
+	listening("after the shutdown")
 
-	// The observer is the one that can see a surviving registration, and it is
-	// still listening on the address those URLs name.
-	if got := legacyHits.Load(); got != 0 {
-		paths := []string{}
-		legacyPaths.Range(func(k, _ any) bool { paths = append(paths, k.(string)); return true })
-		t.Errorf("a deleted endpoint was called %d times, at %v: every registration, heartbeat and token exchange is gone, so nothing may reach one", got, paths)
-	}
 	if got := mint.count(); got != 1 {
 		t.Errorf("the host received %d requests, want exactly 1 (the mint): anything more is a registration that survived", got)
 	}
