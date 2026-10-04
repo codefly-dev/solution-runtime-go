@@ -282,14 +282,18 @@ type config struct {
 	// mcpIssuerURL is the host's OAuth issuer, published as the authorization
 	// server of the MCP resource (RFC 9728).
 	mcpIssuerURL string
-	// mcpPublicURL is the canonical public MCP URL an operator set, empty when
-	// none was (see mcpResource).
+	// mcpPublicURL is the canonical public MCP URL: derived from publicURL and
+	// this solution's id, or the override the composition declared. Empty when
+	// neither resolved (see mcpResource).
 	mcpPublicURL string
-	// mcpIssuerExplicit says the issuer came from the operator rather than from
-	// the SDK. It is what tells a deployment that resolved the host's
-	// in-cluster address — which validate() refuses — from one that was told
-	// the origin clients authenticate against.
+	// mcpIssuerExplicit says the issuer came from the configuration the
+	// composition declared rather than from the SDK's endpoint resolution. It
+	// is what tells a deployment that resolved the host's in-cluster address —
+	// which validate() refuses — from one that was told the origin clients
+	// authenticate against. mcpPublicExplicit says the same of the public URL,
+	// which a refusal needs to name the value that fixes it.
 	mcpIssuerExplicit bool
+	mcpPublicExplicit bool
 }
 
 func env(key, fallback string) string {
@@ -497,16 +501,16 @@ func loadConfig(ctx context.Context, id string) config {
 		moduleSecrets:      parseModuleRegistrationSecrets(env(ModuleRegistrationSecretsEnvironmentVariable, "")),
 		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
-		// The host is the authorization server an MCP client authenticates
-		// against, so its issuer is the host's own origin — resolved by role
-		// like every other host endpoint, never typed. The resolved address is
-		// the one this composition reaches the host at, which is right for a
-		// local run and is an in-cluster address in a deployment, where no
-		// public client could reach it: that is what the override is for.
-		mcpIssuerURL:      strings.TrimRight(env(hostIssuerURLEnvironmentVariable, frontendURL), "/"),
-		mcpIssuerExplicit: env(hostIssuerURLEnvironmentVariable, "") != "",
-		mcpPublicURL:      strings.TrimRight(env(mcpPublicURLEnvironmentVariable, ""), "/"),
 	}
+	// The host is the authorization server an MCP client authenticates against,
+	// so its issuer is the host's own origin — resolved by role like every
+	// other host endpoint, never typed. The resolved address is the one this
+	// composition reaches the host at, which is right for a local run and is an
+	// in-cluster address in a deployment, where no public client could reach
+	// it: that is what the declared configuration is for. The public MCP URL
+	// needs no declaration at all, being derived from the two values above it.
+	cfg.mcpIssuerURL, cfg.mcpIssuerExplicit = resolveMCPIssuer(ctx, frontendURL)
+	cfg.mcpPublicURL, cfg.mcpPublicExplicit = resolveMCPPublicURL(ctx, public, id)
 	cfg.registrationInterval, cfg.registrationIntervalErr = registrationIntervalFromEnv()
 	return cfg
 }
