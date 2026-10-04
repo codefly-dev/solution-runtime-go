@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/codefly-dev/core/resources"
+	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -617,8 +619,8 @@ func TestValidateRefusesAnUnresolvedIssuerOnlyWhenMCPIsServed(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unresolved issuer was accepted while serving MCP")
 	}
-	if !strings.Contains(err.Error(), hostIssuerURLEnvironmentVariable) {
-		t.Errorf("refusal %q does not name %s, the variable that fixes it", err, hostIssuerURLEnvironmentVariable)
+	if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+		t.Errorf("refusal %q does not name %s, the configuration that fixes it", err, mcpConfigurationValue(MCPIssuerURLKey))
 	}
 	if err := (config{}).validateMCP(); err != nil {
 		t.Errorf("a solution serving no MCP was refused: %v", err)
@@ -630,11 +632,30 @@ func TestValidateRefusesAnUnresolvedIssuerOnlyWhenMCPIsServed(t *testing.T) {
 // registration token URLs are derived from their register URLs. An override that
 // drops the suffix cannot be paired, so it is refused at boot naming the suffix,
 // rather than leaving every 401 challenge without the one URL a client needs.
+//
+// The refusal names where the value came from, because the two sources are
+// fixed in different places: a declared override is the composition's, and a
+// derived identifier is unusable only because PUBLIC_URL is.
 func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
 	for _, public := range []string{"https://host.test/solutions/wiki", "https://host.test/mcp/", "/solutions/wiki/mcp"} {
-		cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: public}
-		if err := cfg.validateMCP(); err == nil {
-			t.Errorf("%s %q was accepted, want a refusal", mcpPublicURLEnvironmentVariable, public)
+		cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: public, mcpPublicExplicit: true}
+		err := cfg.validateMCP()
+		if err == nil {
+			t.Errorf("%s %q was accepted, want a refusal", mcpConfigurationValue(MCPPublicURLKey), public)
+			continue
+		}
+		if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+			t.Errorf("refusal %q for a declared override does not name %s", err, mcpConfigurationValue(MCPPublicURLKey))
+		}
+		derived := cfg
+		derived.mcpPublicExplicit = false
+		err = derived.validateMCP()
+		if err == nil {
+			t.Errorf("derived public URL %q was accepted, want a refusal", public)
+			continue
+		}
+		if !strings.Contains(err.Error(), "PUBLIC_URL") || strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+			t.Errorf("refusal %q for a derived identifier does not send the operator to PUBLIC_URL", err)
 		}
 	}
 	cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: "https://host.test/solutions/wiki" + MCPPath}
@@ -705,8 +726,8 @@ func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
 	if err == nil {
 		t.Fatal("a deployed MCP surface with no public URL was accepted")
 	}
-	if !strings.Contains(err.Error(), mcpPublicURLEnvironmentVariable) {
-		t.Errorf("refusal %q does not name %s", err, mcpPublicURLEnvironmentVariable)
+	if !strings.Contains(err.Error(), "PUBLIC_URL") || !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+		t.Errorf("refusal %q names neither the origin it derives from nor %s", err, mcpConfigurationValue(MCPPublicURLKey))
 	}
 
 	addressed := deployed
@@ -715,8 +736,8 @@ func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
 	if err == nil {
 		t.Fatal("a deployed MCP surface with an issuer nobody chose was accepted")
 	}
-	if !strings.Contains(err.Error(), hostIssuerURLEnvironmentVariable) {
-		t.Errorf("refusal %q does not name %s", err, hostIssuerURLEnvironmentVariable)
+	if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+		t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPIssuerURLKey))
 	}
 
 	told := addressed
@@ -842,4 +863,204 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 	if !terminal.Load() {
 		t.Error("the gateway has no terminal hook, so a refusal that should end the process does not")
 	}
+}
+
+// --- the composition's half: a derived identifier and one declared value ---
+
+// mcpConfigurationCarrier is the environment variable Codefly's render projects
+// one value of the `mcp` workspace-configuration group into. The runtime never
+// reads it: it resolves the value through the SDK, exactly as it resolves the
+// registration secret. The tests below write the carrier so the SDK's real
+// accessor is what answers — a fake in its place would prove the runtime agrees
+// with the fake about an encoding that is the SDK's to own.
+func mcpConfigurationCarrier(key string) string {
+	return resources.WorkspaceConfigurationPrefix + "__" +
+		strings.ToUpper(MCPConfigurationGroup) + "__" +
+		strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
+}
+
+// declareMCPConfiguration projects one value of the group the way a composition
+// does, and reloads the SDK's process-wide snapshot of the injected carriers.
+func declareMCPConfiguration(t *testing.T, key, value string) {
+	t.Helper()
+	// Registered before Setenv so it runs after the environment is restored,
+	// leaving no declared value behind for the boot tests that follow.
+	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
+	t.Setenv(mcpConfigurationCarrier(key), value)
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMCPPublicURLIsDerivedFromTheProductOrigin is the whole point of issue #48:
+// a composition has no way to set a bare environment variable on a service, so
+// the URL an MCP client dials cannot be one an operator exports. It is built
+// from the origin this product is reachable at and this solution's id — the two
+// things the runtime already has — and a composition declares nothing for it.
+func TestMCPPublicURLIsDerivedFromTheProductOrigin(t *testing.T) {
+	clearSelfEnvironment(t)
+	t.Setenv("PORT", "8080")
+	t.Setenv("PUBLIC_URL", "https://app.example.com/")
+
+	cfg := loadConfig(context.Background(), "wiki", nil)
+	if want := "https://app.example.com/solutions/wiki" + MCPPath; cfg.mcpPublicURL != want {
+		t.Fatalf("mcpPublicURL = %q, want the derived %q", cfg.mcpPublicURL, want)
+	}
+	if cfg.mcpPublicExplicit {
+		t.Error("a derived public URL reads as explicitly declared, so a refusal would name an override nobody set")
+	}
+	// Derived, it is pairable by construction: the metadata document a 401
+	// points a client at is this URL with MCPPath swapped for the well-known
+	// path, so the derivation can never produce the shape validate() refuses.
+	paired := siblingURL(cfg.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath)
+	if want := "https://app.example.com/solutions/wiki" + ProtectedResourceMetadataPath; paired != want {
+		t.Errorf("metadata URL = %q, want %q", paired, want)
+	}
+	// It is also what the served document names, with no request-derived part:
+	// mcpResource returns the configured identifier before it looks at any
+	// forwarded header.
+	s := New(Manifest{ID: "wiki"})
+	s.cfg = cfg
+	request := httptest.NewRequest(http.MethodPost, MCPPath, nil)
+	request.Header.Set(forwardedHostHeader, "attacker.test")
+	if got := s.mcpResource(request); got != cfg.mcpPublicURL {
+		t.Errorf("mcpResource = %q, want the resolved %q", got, cfg.mcpPublicURL)
+	}
+
+	// No origin to derive from: the identifier falls back to the forwarded
+	// headers, which validate() refuses in a deployment.
+	t.Setenv("PUBLIC_URL", "")
+	if got := loadConfig(context.Background(), "wiki", nil).mcpPublicURL; got != "" {
+		t.Errorf("with no PUBLIC_URL, mcpPublicURL = %q, want empty", got)
+	}
+}
+
+// TestMCPPublicURLOverrideIsADeclaredConfiguration: the override survives, for
+// a host whose gateway fronts solutions under some other route — but only as a
+// value the composition declares and the SDK resolves, never as a bare
+// environment variable, which is what a render cannot project.
+func TestMCPPublicURLOverrideIsADeclaredConfiguration(t *testing.T) {
+	clearSelfEnvironment(t)
+	t.Setenv("PORT", "8080")
+	t.Setenv("PUBLIC_URL", "https://app.example.com")
+	const declared = "https://mcp.example.com/wiki" + MCPPath
+	declareMCPConfiguration(t, MCPPublicURLKey, declared+"/")
+
+	cfg := loadConfig(context.Background(), "wiki", nil)
+	if cfg.mcpPublicURL != declared {
+		t.Fatalf("mcpPublicURL = %q, want the declared %q", cfg.mcpPublicURL, declared)
+	}
+	if !cfg.mcpPublicExplicit {
+		t.Error("a declared public URL does not read as explicit, so a refusal would send the operator to PUBLIC_URL instead of the value they set")
+	}
+	// The bare environment variable is gone: an operator who exports the name
+	// the runtime used to read gets the derived URL, not theirs.
+	t.Setenv("MCP_PUBLIC_URL", "https://exported.example.com/mcp")
+	if got := loadConfig(context.Background(), "wiki", nil).mcpPublicURL; got != declared {
+		t.Errorf("mcpPublicURL = %q, want the declared %q — a bare MCP_PUBLIC_URL must have no effect", got, declared)
+	}
+}
+
+// TestMCPIssuerIsADeclaredConfiguration: the issuer is the one value a
+// composition must supply for MCP, and it supplies it as a declared workspace
+// configuration. Resolved from the host frontend's endpoint otherwise, which is
+// right for a local run — and refused in a deployment, where it is the
+// in-cluster address this composition dials the host at.
+func TestMCPIssuerIsADeclaredConfiguration(t *testing.T) {
+	clearSelfEnvironment(t)
+	t.Setenv("PORT", "8080")
+	t.Setenv("CODEFLY_HOST_FRONTEND", "frontend")
+	const declared = "https://login.example.com"
+	declareMCPConfiguration(t, MCPIssuerURLKey, declared+"/")
+
+	cfg := loadConfig(context.Background(), "wiki", nil)
+	if cfg.mcpIssuerURL != declared {
+		t.Fatalf("mcpIssuerURL = %q, want the declared %q", cfg.mcpIssuerURL, declared)
+	}
+	if !cfg.mcpIssuerExplicit {
+		t.Fatal("a declared issuer does not read as explicit, so a deployment that supplied one would still be refused")
+	}
+	// The bare environment variable is gone here too.
+	t.Setenv("HOST_ISSUER_URL", "https://exported.example.com")
+	if got := loadConfig(context.Background(), "wiki", nil).mcpIssuerURL; got != declared {
+		t.Errorf("mcpIssuerURL = %q, want the declared %q — a bare HOST_ISSUER_URL must have no effect", got, declared)
+	}
+}
+
+// TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK drives both F2
+// refusals the way a deployed cell reaches them: a rendered environment, the
+// SDK's own accessors, and nothing else. It is the test that would have caught
+// what #48 reports — the refusals naming variables a composition cannot set.
+func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
+	deployed := func(t *testing.T) config {
+		t.Helper()
+		clearSelfEnvironment(t)
+		t.Setenv("PORT", "8080")
+		t.Setenv("CODEFLY__RUNTIME_CONTEXT", "kubernetes")
+		t.Setenv("GATEWAY_URL", "http://auth-gateway.saas.svc.cluster.local:8080")
+		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg.mcp = true
+		return cfg
+	}
+
+	t.Run("no origin to derive the identifier from", func(t *testing.T) {
+		declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
+		cfg := deployed(t)
+		if cfg.mcpPublicURL != "" {
+			t.Fatalf("mcpPublicURL = %q, want empty with no PUBLIC_URL", cfg.mcpPublicURL)
+		}
+		err := cfg.validateMCP()
+		if err == nil {
+			t.Fatal("a deployed MCP surface with no identifier to publish was accepted")
+		}
+		if !strings.Contains(err.Error(), "PUBLIC_URL") {
+			t.Errorf("refusal %q does not name PUBLIC_URL, which the identifier is derived from", err)
+		}
+		if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+			t.Errorf("refusal %q does not name %s, the declared override", err, mcpConfigurationValue(MCPPublicURLKey))
+		}
+		for _, gone := range []string{"MCP_PUBLIC_URL", "HOST_ISSUER_URL"} {
+			if strings.Contains(err.Error(), gone) {
+				t.Errorf("refusal %q names %s, an environment variable a composition cannot set", err, gone)
+			}
+		}
+	})
+
+	t.Run("no issuer the composition declared", func(t *testing.T) {
+		// For the deployed environment it sets, not the config it returns:
+		// PUBLIC_URL lands after it, so the config has to be loaded again.
+		deployed(t)
+		t.Setenv("PUBLIC_URL", "https://app.example.com")
+		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg.mcp = true
+		if cfg.mcpIssuerExplicit {
+			t.Fatal("an issuer nobody declared reads as explicit")
+		}
+		err := cfg.validateMCP()
+		if err == nil {
+			t.Fatal("a deployed MCP surface with an issuer nobody declared was accepted")
+		}
+		if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+			t.Errorf("refusal %q does not name %s, the configuration that fixes it", err, mcpConfigurationValue(MCPIssuerURLKey))
+		}
+		if strings.Contains(err.Error(), "HOST_ISSUER_URL") {
+			t.Errorf("refusal %q names HOST_ISSUER_URL, an environment variable a composition cannot set", err)
+		}
+	})
+
+	t.Run("the one declared value is enough", func(t *testing.T) {
+		declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
+		// For the deployed environment it sets, not the config it returns:
+		// PUBLIC_URL lands after it, so the config has to be loaded again.
+		deployed(t)
+		t.Setenv("PUBLIC_URL", "https://app.example.com")
+		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg.mcp = true
+		if err := cfg.validateMCP(); err != nil {
+			t.Fatalf("a deployed MCP surface with the issuer declared and PUBLIC_URL resolved was refused: %v", err)
+		}
+		if want := "https://app.example.com/solutions/wiki" + MCPPath; cfg.mcpPublicURL != want {
+			t.Errorf("mcpPublicURL = %q, want the derived %q", cfg.mcpPublicURL, want)
+		}
+	})
 }

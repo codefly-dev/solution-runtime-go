@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 
+	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
@@ -161,13 +162,14 @@ func (s *Server) mountMCP(mux *http.ServeMux) error {
 	mux.Handle(ProtectedResourceMetadataPath, http.HandlerFunc(s.handleProtectedResourceMetadata))
 	if s.cfg.mcpPublicURL == "" {
 		// The one signal that this is happening. The resource identifier a
-		// client binds its token to must be the URL the client dialled, and
-		// without MCP_PUBLIC_URL the runtime can only reconstruct it from what
-		// the proxy forwards: a gateway that forwards no prefix yields an
-		// identifier missing the path it stripped, which a conforming client
-		// rejects and a tolerant one silently binds to the wrong resource.
-		log.Printf("solution %q: MCP resource identifier derived per request from forwarded headers (%s unset): set it to the URL clients dial (%q) if this host's proxy does not forward %s",
-			s.manifest.ID, mcpPublicURLEnvironmentVariable, "https://<host>/solutions/"+s.manifest.ID+MCPPath, forwardedPrefixHeader)
+		// client binds its token to must be the URL the client dialled; with
+		// no PUBLIC_URL to derive it from and no override declared, the runtime
+		// can only reconstruct it from what the proxy forwards, and a gateway
+		// that forwards no prefix yields an identifier missing the path it
+		// stripped — which a conforming client rejects and a tolerant one
+		// silently binds to the wrong resource.
+		log.Printf("solution %q: MCP resource identifier derived per request from forwarded headers (no PUBLIC_URL and no %s): set PUBLIC_URL to the origin clients reach this product at, so the identifier is %q",
+			s.manifest.ID, mcpConfigurationValue(MCPPublicURLKey), "https://<host>"+gatewaySolutionsRoute+s.manifest.ID+MCPPath)
 	}
 	return nil
 }
@@ -181,8 +183,9 @@ type MCPEnvironment struct {
 	// IssuerURL is the host's OAuth issuer, published as the authorization
 	// server in the metadata document.
 	IssuerURL string
-	// PublicURL is the canonical public MCP URL, as Serve reads it from
-	// MCP_PUBLIC_URL. Empty derives it from each request's forwarded headers.
+	// PublicURL is the canonical public MCP URL, which Serve derives from the
+	// resolved PUBLIC_URL and this solution's id. Empty derives it from each
+	// request's forwarded headers, as it does when Serve has neither.
 	PublicURL string
 }
 
@@ -215,9 +218,11 @@ func (s *Server) mcpHandler(env MCPEnvironment) (http.Handler, error) {
 		return nil, fmt.Errorf("solution %q declares no MCP server (ServeMCP)", s.manifest.ID)
 	}
 	s.cfg.gatewayURL, s.cfg.mcpIssuerURL, s.cfg.mcpPublicURL = env.GatewayURL, env.IssuerURL, env.PublicURL
-	// The caller named the issuer, so it is as explicit as the operator's
-	// override: what validate() refuses is an issuer nobody chose.
+	// The caller named both, so they are as explicit as the composition's
+	// declared values: what validate() refuses is an issuer nobody chose, and
+	// what a refusal has to name for a public URL is whoever set it.
 	s.cfg.mcpIssuerExplicit = env.IssuerURL != ""
+	s.cfg.mcpPublicExplicit = env.PublicURL != ""
 	s.cfg.mcp = true
 	if err := s.cfg.validateMCP(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
@@ -423,10 +428,10 @@ func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.
 // It is what the client asks the authorization server for a token for (RFC 8707)
 // and what the metadata document must name, so it has to be the public URL — not
 // this process's listen address and not the in-cluster address the gateway dials.
-// The runtime cannot resolve it: the origin is the host's and the path prefix is
-// the host's route layout, which this runtime deliberately does not encode (see
-// frontendManifestURL). So it is the configured MCP_PUBLIC_URL, and otherwise
-// reconstructed from what the proxy in front of this solution forwarded.
+// So it is the public MCP URL resolved at boot: derived from PUBLIC_URL and this
+// solution's id, or the override the composition declared (see
+// resolveMCPPublicURL). With neither it is reconstructed from what the proxy in
+// front of this solution forwarded, which validate() refuses in a deployment.
 func (s *Server) mcpResource(r *http.Request) string {
 	if s.cfg.mcpPublicURL != "" {
 		return s.cfg.mcpPublicURL
@@ -486,8 +491,9 @@ func validHost(raw string) bool {
 
 // forwardedPrefix is the path the proxy stripped before this solution saw the
 // request — "/solutions/<id>" at the host gateway. Empty when nothing forwarded
-// one, which is the case MCP_PUBLIC_URL exists for: the alternative is to
-// reconstruct the host's route layout here, and this runtime does not know it.
+// one, which is why the identifier is derived at boot rather than per request
+// wherever PUBLIC_URL resolves: a gateway that forwards no prefix leaves this
+// the only input, and it has none.
 func forwardedPrefix(r *http.Request) string {
 	prefix := strings.TrimRight(firstForwarded(r, forwardedPrefixHeader), "/")
 	// A prefix that is not a plain absolute path is not a prefix: "//evil.test"
@@ -529,21 +535,97 @@ func firstForwarded(r *http.Request, name string) string {
 
 // --- boot configuration ---
 
+// MCPConfigurationGroup names the workspace-configuration group a composition
+// declares for a solution that serves MCP, and MCPIssuerURLKey and
+// MCPPublicURLKey the two values in it. They are resolved through the SDK the
+// way the registration secret is (see SolutionRegistrationSecretGroup), because
+// a Codefly composition has no way to set a bare environment variable on a
+// service: every value a service receives is either an endpoint the SDK
+// resolves or a declared configuration the render projects. Both were read as
+// bare environment variables when ServeMCP landed, which named a provisioning
+// path that does not exist.
+//
+// MCPIssuerURLKey is the origin MCP clients authenticate against — the host as
+// an authorization server. A deployment must supply it: what the SDK resolves
+// is the address this composition dials the host at, in-cluster and reachable
+// by no client. It is the one value a composition has to declare for MCP, and
+// it stops being one when module-saas-starter#1003 settles what `iss` is.
+//
+// MCPPublicURLKey overrides the public MCP URL, which the runtime otherwise
+// derives by construction (see resolveMCPPublicURL). It exists for a host whose
+// gateway fronts solutions under some other route; it must end in MCPPath,
+// because the metadata document's own URL is derived from it by swapping that
+// suffix — the same pairing the registration token URLs use, and refused at
+// boot for the same reason when it cannot be made.
 const (
-	// hostIssuerURLEnvironmentVariable overrides the host's OAuth issuer, which
-	// is otherwise the resolved host frontend origin. A deployment sets it
-	// because the resolved address is the one this composition dials the host
-	// at — in-cluster, reachable by no MCP client.
-	hostIssuerURLEnvironmentVariable = "HOST_ISSUER_URL"
-
-	// mcpPublicURLEnvironmentVariable sets the canonical public MCP URL: the
-	// URL clients dial, which is the resource identifier their tokens are bound
-	// to. It must end in MCPPath, because the metadata document's own URL is
-	// derived from it by swapping that suffix — the same pairing the
-	// registration token URLs use, and refused at boot for the same reason when
-	// it cannot be made.
-	mcpPublicURLEnvironmentVariable = "MCP_PUBLIC_URL"
+	MCPConfigurationGroup = "mcp"
+	MCPIssuerURLKey       = "issuer-url"
+	MCPPublicURLKey       = "public-url"
 )
+
+// gatewaySolutionsRoute is the route prefix the host gateway fronts a solution
+// under, "/solutions/<id>" — the one piece of the host's route layout this
+// runtime does encode, and only for the resource identifier.
+//
+// Everywhere else it deliberately does not: the manifest URL is registered
+// root-relative and the host resolves it against the route it reached the
+// solution by (see frontendManifestURL). An MCP client cannot do that. The
+// resource identifier is what its token is audience-bound to (RFC 8707), so it
+// has to be byte-exact with the URL the client dialled, and a client that is
+// handed any other identifier rejects it. Deriving it is what makes a
+// composition supply nothing; MCPPublicURLKey is the way out for a host that
+// routes differently.
+const gatewaySolutionsRoute = "/solutions/"
+
+// mcpConfigurationValue names one value in the group above, as a refusal and
+// the README both name it: group/key, never an environment variable.
+func mcpConfigurationValue(key string) string {
+	return MCPConfigurationGroup + "/" + key
+}
+
+// resolveMCPPublicURL is the canonical public MCP URL: the URL an MCP client
+// dials, which is the resource identifier its token is bound to.
+//
+// It is derived by construction from the origin this product is reachable at
+// and this solution's id — PUBLIC_URL + gatewaySolutionsRoute + id + MCPPath —
+// so a composition that renders a solution serving MCP declares nothing for
+// it. Empty when PUBLIC_URL resolved nothing and no override was declared,
+// which validate() refuses in a deployed runtime context: the identifier would
+// then be reconstructed per request from the forwarded headers.
+//
+// The declared override wins, for a host whose gateway routes solutions
+// elsewhere. It is read through the SDK rather than from the environment for
+// the reason the group's doc comment gives.
+func resolveMCPPublicURL(ctx context.Context, publicURL, id string) (string, bool) {
+	if declared, err := codefly.For(ctx).WorkspaceConfiguration(MCPConfigurationGroup, MCPPublicURLKey); err == nil {
+		if declared = strings.TrimRight(strings.TrimSpace(declared), "/"); declared != "" {
+			return declared, true
+		}
+	}
+	if publicURL == "" || id == "" {
+		return "", false
+	}
+	return strings.TrimRight(publicURL, "/") + gatewaySolutionsRoute + id + MCPPath, false
+}
+
+// resolveMCPIssuer is the host's OAuth issuer, published as this resource's
+// authorization server, and whether the composition declared it. The declared
+// value wins over the resolved host frontend origin; the boolean is what tells
+// a deployment that was told the origin clients authenticate against from one
+// that resolved the host's in-cluster address, which validate() refuses.
+//
+// The SDK's error is dropped for the reason solutionRegistrationSecret drops
+// it: it is the same "no workspace configuration value" whether the group was
+// never declared or its carriers never loaded, and the one signal that
+// distinguishes them is config.environmentLoadErr.
+func resolveMCPIssuer(ctx context.Context, frontendURL string) (string, bool) {
+	if declared, err := codefly.For(ctx).WorkspaceConfiguration(MCPConfigurationGroup, MCPIssuerURLKey); err == nil {
+		if declared = strings.TrimRight(strings.TrimSpace(declared), "/"); declared != "" {
+			return declared, true
+		}
+	}
+	return strings.TrimRight(frontendURL, "/"), false
+}
 
 // validateMCP refuses a configuration whose MCP surface would serve a metadata
 // document no client can act on. It runs only when the solution declared one:
@@ -565,35 +647,49 @@ func (c config) validateMCP() error {
 			return fmt.Errorf("unresolved host issuer %q, and loading Codefly's injected environment failed first: %w — nothing the SDK resolves can be trusted to be absent until that is fixed",
 				c.mcpIssuerURL, c.environmentLoadErr)
 		}
-		return fmt.Errorf("unresolved host issuer %q: ServeMCP publishes it as the authorization server of this MCP resource, so a client has nowhere to authenticate without it. Set %s to the origin MCP clients authenticate against, or ensure the SDK resolves the host frontend's http endpoint",
-			c.mcpIssuerURL, hostIssuerURLEnvironmentVariable)
+		return fmt.Errorf("unresolved host issuer %q: ServeMCP publishes it as the authorization server of this MCP resource, so a client has nowhere to authenticate without it. Provision the workspace configuration %s with the origin MCP clients authenticate against and declare that group as a workspace-configuration dependency of this backend, or ensure the SDK resolves the host frontend's http endpoint",
+			c.mcpIssuerURL, mcpConfigurationValue(MCPIssuerURLKey))
 	}
-	// In a deployment both values below are the operator's to set, for the
-	// reason the loopback refusals above exist: the runtime cannot tell that
-	// what it resolved is unreachable, and serves a well-formed document naming
-	// it with a 200, from a solution that registered and looks healthy. A boot
-	// log line was the only signal, and a log line nobody reads is how a
-	// solution is absent while every gate is green.
+	// In a deployment neither value below can be resolved from inside the
+	// cluster, for the reason the loopback refusals above exist: the runtime
+	// cannot tell that what it resolved is unreachable, and serves a
+	// well-formed document naming it with a 200, from a solution that
+	// registered and looks healthy. A boot log line was the only signal, and a
+	// log line nobody reads is how a solution is absent while every gate is
+	// green.
 	if deployedRuntimeContext(c.runtimeContext) {
 		if c.mcpPublicURL == "" {
-			return fmt.Errorf("no %s set in the deployed runtime context %q: the gateway strips the route it proxies this solution under, so the identifier reconstructed from the forwarded headers is missing that prefix (and names the scheme of the hop, not the client's) — an MCP client binds its token to the identifier it dialled and rejects any other. Set it to the URL clients dial, ending in %s",
-				mcpPublicURLEnvironmentVariable, c.runtimeContext, MCPPath)
+			// Only reachable with PUBLIC_URL unresolved and no override
+			// declared: the identifier is otherwise derived by construction.
+			return fmt.Errorf("no public MCP URL in the deployed runtime context %q: it is derived as <PUBLIC_URL>%s<id>%s, and PUBLIC_URL resolved nothing — so the identifier would be reconstructed per request from the forwarded headers, missing the route the gateway strips (and naming the scheme of the hop, not the client's), and an MCP client binds its token to the identifier it dialled and rejects any other. Set PUBLIC_URL to the origin clients reach this product at, or provision the workspace configuration %s with the URL they dial, ending in %s",
+				c.runtimeContext, gatewaySolutionsRoute, MCPPath, mcpConfigurationValue(MCPPublicURLKey), MCPPath)
 		}
 		if !c.mcpIssuerExplicit {
-			return fmt.Errorf("no %s set in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Set it to the origin clients authenticate against",
-				hostIssuerURLEnvironmentVariable, c.runtimeContext, c.mcpIssuerURL)
+			return fmt.Errorf("no %s provisioned in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Provision that workspace configuration with the origin clients authenticate against and declare the %s group as a workspace-configuration dependency of this backend",
+				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, c.mcpIssuerURL, MCPConfigurationGroup)
 		}
 	}
 	if c.mcpPublicURL == "" {
 		return nil
 	}
 	if u, err := url.Parse(c.mcpPublicURL); err != nil || !u.IsAbs() || u.Host == "" {
-		return fmt.Errorf("unusable %s %q: it is the resource identifier an MCP client binds its token to, so it must be the absolute URL clients dial",
-			mcpPublicURLEnvironmentVariable, c.mcpPublicURL)
+		return fmt.Errorf("unusable %s (%q): it is the resource identifier an MCP client binds its token to, so it must be the absolute URL clients dial",
+			c.mcpPublicURLSource(), c.mcpPublicURL)
 	}
 	if siblingURL(c.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath) == "" {
-		return fmt.Errorf("unpairable %s %q: it must end in %s, because the metadata document a 401 points a client to is derived from it by swapping that suffix",
-			mcpPublicURLEnvironmentVariable, c.mcpPublicURL, MCPPath)
+		return fmt.Errorf("unpairable %s (%q): it must end in %s, because the metadata document a 401 points a client to is derived from it by swapping that suffix",
+			c.mcpPublicURLSource(), c.mcpPublicURL, MCPPath)
 	}
 	return nil
+}
+
+// mcpPublicURLSource names where the public MCP URL came from, so a refusal
+// sends an operator to the value they can change. A derived identifier is
+// unusable because PUBLIC_URL is, and naming the override instead would send
+// them to provision a value whose absence is not the problem.
+func (c config) mcpPublicURLSource() string {
+	if c.mcpPublicExplicit {
+		return "workspace configuration " + mcpConfigurationValue(MCPPublicURLKey)
+	}
+	return "public MCP URL derived from PUBLIC_URL"
 }

@@ -453,14 +453,18 @@ type config struct {
 	// mcpIssuerURL is the host's OAuth issuer, published as the authorization
 	// server of the MCP resource (RFC 9728).
 	mcpIssuerURL string
-	// mcpPublicURL is the canonical public MCP URL an operator set, empty when
-	// none was (see mcpResource).
+	// mcpPublicURL is the canonical public MCP URL: derived from publicURL and
+	// this solution's id, or the override the composition declared. Empty when
+	// neither resolved (see mcpResource).
 	mcpPublicURL string
-	// mcpIssuerExplicit says the issuer came from the operator rather than from
-	// the SDK. It is what tells a deployment that resolved the host's
-	// in-cluster address — which validate() refuses — from one that was told
-	// the origin clients authenticate against.
+	// mcpIssuerExplicit says the issuer came from the configuration the
+	// composition declared rather than from the SDK's endpoint resolution. It
+	// is what tells a deployment that resolved the host's in-cluster address —
+	// which validate() refuses — from one that was told the origin clients
+	// authenticate against. mcpPublicExplicit says the same of the public URL,
+	// which a refusal needs to name the value that fixes it.
 	mcpIssuerExplicit bool
+	mcpPublicExplicit bool
 }
 
 func env(key, fallback string) string {
@@ -607,13 +611,20 @@ func resolveGateway(ctx context.Context, module, gateway string) string {
 // credential.go); the shared cluster-internal token and the per-solution
 // registration secret that preceded it are gone, along with the surfaces that
 // accepted them.
-func loadConfig(ctx context.Context, environmentLoadErr error) config {
+func loadConfig(ctx context.Context, id string, environmentLoadErr error) config {
 	// Empty by default: the host is resolved by service+endpoint role, not by its
 	// workspace module name (see resolveGateway). An explicit CODEFLY_HOST_MODULE
 	// scopes the lookup only when a composition is genuinely ambiguous.
 	hostModule := env("CODEFLY_HOST_MODULE", "")
 	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-gateway")
 	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
+	// PUBLIC_URL is back, with one consumer and a different argument behind it.
+	// It went with the manifest registration it fed, where building an absolute
+	// URL from it was wrong because the route a browser reaches this solution
+	// through is the host's to resolve. The MCP resource identifier an agent
+	// client binds its token to needs that public origin, and #49 derives it
+	// from this value when no MCP configuration declares one outright.
+	public := strings.TrimRight(env("PUBLIC_URL", ""), "/")
 
 	// Own endpoint: the port Codefly assigned this service, not a fixed default.
 	port := env("PORT", "")
@@ -664,15 +675,6 @@ func loadConfig(ctx context.Context, environmentLoadErr error) config {
 		// they broke themselves is the specific mistake validate() was written
 		// to stop making.
 		environmentLoadErr: environmentLoadErr,
-		// The host is the authorization server an MCP client authenticates
-		// against, so its issuer is the host's own origin — resolved by role
-		// like every other host endpoint, never typed. The resolved address is
-		// the one this composition reaches the host at, which is right for a
-		// local run and is an in-cluster address in a deployment, where no
-		// public client could reach it: that is what the override is for.
-		mcpIssuerURL:      strings.TrimRight(env(hostIssuerURLEnvironmentVariable, frontendURL), "/"),
-		mcpIssuerExplicit: env(hostIssuerURLEnvironmentVariable, "") != "",
-		mcpPublicURL:      strings.TrimRight(env(mcpPublicURLEnvironmentVariable, ""), "/"),
 	}
 	// Two sources for one authorization fact are refused, not ranked.
 	//
@@ -692,6 +694,15 @@ func loadConfig(ctx context.Context, environmentLoadErr error) config {
 	// and are refused" (file_carrier.go) — applied to the one kind of value
 	// where being wrong admits a caller.
 	cfg.admissionConflict = conflictingAdmissionSources(ctx, environmentLoadErr)
+	// The host is the authorization server an MCP client authenticates against,
+	// so its issuer is the host's own origin — resolved by role like every
+	// other host endpoint, never typed. The resolved address is the one this
+	// composition reaches the host at, which is right for a local run and is an
+	// in-cluster address in a deployment, where no public client could reach
+	// it: that is what the declared configuration is for. The public MCP URL
+	// needs no declaration at all, being derived from the two values above it.
+	cfg.mcpIssuerURL, cfg.mcpIssuerExplicit = resolveMCPIssuer(ctx, frontendURL)
+	cfg.mcpPublicURL, cfg.mcpPublicExplicit = resolveMCPPublicURL(ctx, public, id)
 	return cfg
 }
 
@@ -1401,7 +1412,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if environmentLoadErr != nil {
 		log.Printf("codefly: load environment: %v", environmentLoadErr)
 	}
-	s.cfg = loadConfig(ctx, environmentLoadErr)
+	s.cfg = loadConfig(ctx, s.manifest.ID, environmentLoadErr)
 	// Whether an MCP surface was declared, which is what makes the MCP
 	// configuration load-bearing: validate() checks it only then, so a
 	// solution serving no MCP is unaffected by a host whose issuer does not
@@ -2088,9 +2099,13 @@ const federationManifestPath = "/assets/mf-manifest.json"
 // PUBLIC_URL or, with none set, from this process's own listen address: true in
 // a browser on the developer's machine and in no other browser anywhere, so
 // every deployed solution registered a manifest the product could not load.
-// PUBLIC_URL is gone with the registration it fed: the origin a browser reaches
-// this solution through is named by the route in the presence document, which
-// is the host's to resolve.
+// This runtime no longer builds it from PUBLIC_URL: the origin a browser
+// reaches this solution through is named by the route in the presence document,
+// which is the host's to resolve. PUBLIC_URL itself still exists, with exactly
+// one consumer — the MCP resource identifier an agent client binds its token to
+// (#49), which genuinely needs a public origin. Whether a runtime should derive
+// the host's /solutions/<id> route even for that is an open follow-up; it is
+// the one place this package encodes the host's route layout.
 func (s *Server) frontendManifestURL() string {
 	return federationManifestPath
 }

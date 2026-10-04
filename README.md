@@ -1,24 +1,11 @@
 # solution-runtime-go
 
 Generic Go runtime for **codefly solutions** — independently deployed modules
-<<<<<<< HEAD
 that plug into a host at runtime with no build-time coupling. Owns configuration
 resolution, this execution's one credential, a listener that presents the
 workload's own identity, CORS, Module Federation asset serving, the capability
 handshake, the manifest, the published authority contract, and the gateway
 client each handler uses to read composed modules on the viewer's behalf.
-||||||| 8da58cd
-that plug into a host at runtime with no build-time coupling. Owns registration
-(host + gateway, with heartbeat), CORS, Module Federation asset serving, the
-capability handshake, the manifest, and the gateway client each handler uses
-to read composed modules on the viewer's behalf.
-=======
-that plug into a host at runtime with no build-time coupling. Owns registration
-(host + gateway, with heartbeat), CORS, Module Federation asset serving, the
-capability handshake, the manifest, serving the solution's MCP server to agent
-clients, and the gateway client each handler uses to read composed modules on
-the viewer's behalf.
->>>>>>> origin/main
 
 A solution author writes a manifest and one handler:
 
@@ -98,8 +85,16 @@ The runtime hardcodes nothing. On boot `Serve` calls
 `codefly.LoadEnvironmentVariables()` to load Codefly's injected carriers, then
 `loadConfig` resolves every address, port, and path through the codefly Go SDK
 (`github.com/codefly-dev/sdk-go`), falling back to the local native workspace
-map when not running under the runtime. Each value has an explicit env override;
-the SDK-resolved value is the default.
+map when not running under the runtime. Most values have an explicit env
+override for an operator with a deployment the resolver cannot see; the
+SDK-resolved value is the default.
+
+The two MCP values have none, because a Codefly composition cannot set a bare
+environment variable on a service: every value a service receives is either an
+endpoint the SDK resolves or a **declared configuration** the render projects.
+Their override is therefore a value in the `mcp` workspace-configuration group,
+resolved through the SDK the way the registration secret is — see [The resource
+identifier and the issuer](#the-resource-identifier-and-the-issuer).
 
 | What | SDK resolution | Env override (default) |
 |---|---|---|
@@ -118,8 +113,8 @@ the SDK-resolved value is the default.
 | Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
-| Host issuer (MCP) | the resolved host frontend origin — the host is the authorization server an MCP client authenticates against (see [Exposing an MCP server](#exposing-an-mcp-server)); checked at boot only when `ServeMCP` is declared | `HOST_ISSUER_URL` |
-| Public MCP URL | none — the resource identifier is then reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | `MCP_PUBLIC_URL` (must end in `/mcp`) |
+| Host issuer (MCP) | `codefly.For(ctx).WorkspaceConfiguration("mcp", "issuer-url")` — the declared value the composition supplies; without one, the resolved host frontend origin (see [Exposing an MCP server](#exposing-an-mcp-server)). Checked at boot only when `ServeMCP` is declared | — (declared configuration, no env override) |
+| Public MCP URL | derived by construction: `<PUBLIC_URL>/solutions/<id>/mcp`. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")` (must end in `/mcp`). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
 
 Every `workload-identity` value is a **path, never material**, the three
 admission sets included — and that is what makes them live. They are admission
@@ -158,8 +153,15 @@ and "loading the injected environment failed first", because one generic message
 sent an operator to inspect endpoint resolution over a variable they had broken
 themselves.
 
-**Removed in this cutover, with the registrations they fed**: `PUBLIC_URL`,
-`SELF_UPSTREAM`, `HOST_REGISTER_URL`, `GATEWAY_REGISTER_URL`,
+`PUBLIC_URL` survived the cutover with one consumer. It fed the manifest
+registration, where building an absolute URL from it was wrong — the route a
+browser reaches this solution through is the host's to resolve — and the
+manifest is a path now. The MCP resource identifier an agent client binds its
+token to does need a public origin, and derives from it when no `mcp/public-url`
+is declared. Whether a runtime should derive the host's `/solutions/<id>` route
+even for that is an open follow-up.
+
+**Removed in this cutover, with the registrations they fed**: `SELF_UPSTREAM`, `HOST_REGISTER_URL`, `GATEWAY_REGISTER_URL`,
 `GATEWAY_MODULE_REGISTER_URL`, `GATEWAY_MODULE_REGISTRATION_TOKEN_URL`,
 `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, `CODEFLY_INTERNAL_TOKEN`,
 `CODEFLY__SOLUTION_REGISTRATION_SECRET`, `CODEFLY__MODULE_REGISTRATION_SECRETS`,
@@ -1006,7 +1008,6 @@ cancellation. It never proves that a real host admits the solution, that
 accounts grants the scopes, or that the real module answers its binding the way
 the test's stand-in does.
 
-<<<<<<< HEAD
 **This seam is reachable only from here.** `Server.PassthroughHandler` was
 exported until this change, and that made it a production bypass: a solution
 could build a usable, credential-bearing handler that had skipped `validate()`,
@@ -1028,8 +1029,7 @@ not the gate it resembles: `testing.TB`'s unexported method stops a type
 production code satisfy it. `testing.Testing()` is wrong for the root package —
 where the legitimate caller is production code — and exactly right here, where
 every legitimate caller is a test.
-||||||| 8da58cd
-=======
+
 ### Exposing an MCP server
 
 A solution exposes its experience to an agent client — Claude Code, Claude
@@ -1044,6 +1044,13 @@ solution.New(solution.Manifest{ID: "wiki", Title: "Wiki"}).
     }).
     Serve()
 ```
+
+A composition that renders this solution supplies **one** declared value for it,
+and only in a deployment: `issuer-url` in the `mcp` workspace-configuration
+group, declared as a workspace-configuration dependency of the solution's
+backend — the origin MCP clients authenticate against. Everything else is
+derived or resolved; see [The resource identifier and the
+issuer](#the-resource-identifier-and-the-issuer).
 
 `register` receives the official SDK's own `*mcp.Server`
 (`github.com/modelcontextprotocol/go-sdk`, pinned in this module's `go.mod`), so
@@ -1116,28 +1123,51 @@ the document that challenge must point at is served here either way.
 The `resource` in the metadata document is what a client asks the authorization
 server for a token for (RFC 8707) and what its token is audience-bound to, so it
 must be the **public** MCP URL — not this process's listen address, not the
-in-cluster address the gateway dials. The runtime cannot resolve it: the origin
-is the host's, and the path is the host's route layout, which this runtime
-deliberately does not encode (see
-[Where the host reaches the solution](#where-the-host-reaches-the-solution)).
+in-cluster address the gateway dials. A client that is handed any other
+identifier rejects it, and unlike the manifest URL nobody downstream can resolve
+it on the solution's behalf.
 
-So `MCP_PUBLIC_URL` is it when set, and must end in `/mcp` — the metadata
+So it is **derived by construction** from the two things the runtime already
+has: the origin this product is reachable at and this solution's id —
+`<PUBLIC_URL>/solutions/<id>/mcp`. This is the one place the runtime encodes the
+gateway's solution route (see [Where the host reaches the
+solution](#where-the-host-reaches-the-solution)), and the reason it is worth
+encoding is that it makes a composition declare nothing: a deployment that
+already sets `PUBLIC_URL` to the origin browsers reach the product at has
+addressed the MCP surface too.
+
+A host whose gateway fronts solutions under some other route declares
+`public-url` in the `mcp` group instead. It must end in `/mcp` — the metadata
 document's own URL is derived from it by swapping that suffix, the same pairing
 the registration token URLs use, refused at boot for the same reason when it
-cannot be made. Unset, the identifier is reconstructed per request from
-`x-forwarded-proto`, `x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP`
-logs at boot that it is doing so: a proxy that forwards no prefix yields an
-identifier missing the path it stripped, which a conforming client rejects and a
-tolerant one binds to the wrong resource. Set it in any deployment.
+cannot be made. With neither — no `PUBLIC_URL`, no declared override — the
+identifier is reconstructed per request from `x-forwarded-proto`,
+`x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
+is doing so: a proxy that forwards no prefix yields an identifier missing the
+path it stripped, which a conforming client rejects and a tolerant one binds to
+the wrong resource. In a deployed runtime context that state is refused at boot
+rather than logged.
 
-`authorization_servers` is the host issuer resolved at boot — by role, like every
-other host endpoint — and is never derived from a request, so a crafted `Host`
-header cannot point a client at an authorization server of someone's choosing.
-The resolved value is the address this composition reaches the host at: right for
-a local run, and in a deployment an in-cluster address no public client could
-reach, which is what `HOST_ISSUER_URL` is for. A solution that declares
-`ServeMCP` and resolves no issuer is refused at boot; one that declares no MCP
-server is unaffected.
+`authorization_servers` is the host issuer resolved at boot, never derived from
+a request, so a crafted `Host` header cannot point a client at an authorization
+server of someone's choosing. It is `issuer-url` in the `mcp` group when the
+composition declares one, and otherwise the host frontend's origin resolved by
+role like every other host endpoint. That resolved value is the address this
+composition reaches the host at: right for a local run, and in a deployment an
+in-cluster address no public client could reach — so a deployed solution that
+declares `ServeMCP` must supply `mcp`/`issuer-url`, and is refused at boot
+naming it when it does not. It stops being the composition's to supply when
+[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003)
+settles what `iss` is. A solution that declares `ServeMCP` and resolves no
+issuer at all is refused at boot; one that declares no MCP server is unaffected.
+
+Both values are read with `codefly.For(ctx).WorkspaceConfiguration("mcp", …)`,
+never from the environment. `MCP_PUBLIC_URL` and `HOST_ISSUER_URL` were bare
+environment variables when `ServeMCP` landed, and a render cannot project one —
+so the boot refused with the name of something no composition could set
+(codefly-dev/solution-runtime-go#48). Provisioned locally with `codefly config
+generate`, and from the cell's configuration when deployed, exactly as the
+`solution-registration` group is.
 
 Three things about discovery belong to the host, not to this runtime, all of them
 tracked by
@@ -1191,7 +1221,6 @@ authority each one mints, and the refusals its callers get. It never proves that
 a real gateway stamps what the test's `RoundTripper` stamps, that accounts mints
 a Work Context, or that a real MCP client's OAuth flow completes against the
 host.
->>>>>>> origin/main
 
 ### Generated messages in a response
 

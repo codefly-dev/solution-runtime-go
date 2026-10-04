@@ -474,7 +474,7 @@ func TestTheProvisionedCallerSetIsReadThroughLoadConfig(t *testing.T) {
 	peers := identitiesFile(t, testGatewayPrincipal)
 	t.Setenv(IdentityMintPeersFileEnvironmentVariable, peers)
 
-	cfg := loadConfig(context.Background(), nil)
+	cfg := loadConfig(context.Background(), testSolutionID, nil)
 	if cfg.allowedCallersFile != callers {
 		t.Fatalf("loadConfig resolved the caller set from %q, want the provisioned %q", cfg.allowedCallersFile, callers)
 	}

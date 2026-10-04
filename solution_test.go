@@ -389,7 +389,7 @@ func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
 	const addr = "https://gateway:42152"
 	t.Run("the current role resolves", func(t *testing.T) {
 		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", addr)
-		cfg := loadConfig(context.Background(), nil)
+		cfg := loadConfig(context.Background(), testSolutionID, nil)
 		if cfg.gatewayURL != addr {
 			t.Fatalf("gatewayURL = %q, want %q resolved from the current role without an override", cfg.gatewayURL, addr)
 		}
@@ -433,7 +433,7 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__REST__REST", gatewayAddr)
 
-			cfg := loadConfig(context.Background(), nil)
+			cfg := loadConfig(context.Background(), testSolutionID, nil)
 			if cfg.gatewayURL != gatewayAddr {
 				t.Errorf("gatewayURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.gatewayURL, gatewayAddr)
 			}
@@ -1447,7 +1447,7 @@ func TestManifestURLIsNeverAnAbsoluteOrigin(t *testing.T) {
 	t.Setenv("PUBLIC_URL", "https://solutions.example.com/widgets")
 	t.Setenv("PORT", "8080")
 	s := New(Manifest{ID: testSolutionID})
-	s.cfg = loadConfig(context.Background(), nil)
+	s.cfg = loadConfig(context.Background(), testSolutionID, nil)
 	frontend, _ := s.manifestMap()["frontend"].(map[string]any)
 	if got := frontend["manifestUrl"]; got != federationManifestPath {
 		t.Errorf("manifestUrl = %v, want %q: no environment variable may make it absolute again", got, federationManifestPath)
@@ -1790,7 +1790,7 @@ func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
 	loadErr := errors.New("the injected carriers could not be read")
 
 	t.Run("loadConfig carries it onto the configuration", func(t *testing.T) {
-		cfg := loadConfig(context.Background(), loadErr)
+		cfg := loadConfig(context.Background(), testSolutionID, loadErr)
 		if cfg.environmentLoadErr == nil {
 			t.Fatal("loadConfig dropped the environment-load error, so every refusal below reads as absent provisioning rather than as an environment that never loaded")
 		}
@@ -1835,5 +1835,23 @@ func TestAUsernameCredentialIsNotLogged(t *testing.T) {
 		if got := redactedURL(raw); !strings.Contains(got, "mint.cell") {
 			t.Errorf("redactedURL(%q) = %q, which no longer names the destination", raw, got)
 		}
+	}
+}
+
+// clearSelfEnvironment unsets every carrier the configuration tests key on, so
+// a variable exported in the shell running the suite cannot decide an
+// assertion.
+//
+// It lived in deployed_registration_test.go, which went with the
+// registrations. The MCP configuration tests that arrived on main need it, and
+// the reason it exists outlives what it was written for: these assertions are
+// about what the SDK resolves, and an exported variable answering instead is a
+// green run that proves nothing.
+func clearSelfEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{"SELF_UPSTREAM", "PUBLIC_URL", "CODEFLY__RUNTIME_CONTEXT",
+		"CODEFLY__MODULE", "CODEFLY__SERVICE", "CODEFLY__ENVIRONMENT",
+		"CODEFLY__SELF_ENDPOINT__LASTLOGIN_GO__BACKEND__HTTP__HTTP"} {
+		t.Setenv(key, "")
 	}
 }
