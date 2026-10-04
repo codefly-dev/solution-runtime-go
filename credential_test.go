@@ -385,6 +385,7 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	gateway := server.gatewayFor(header)
 	if _, err := gateway.ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
 		t.Fatalf("ForModule: %v", err)
@@ -428,6 +429,7 @@ func TestAMintIsRefusedWhenThisWorkloadCannotAttest(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	for range 3 {
 		_, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
 		if err == nil {
@@ -465,6 +467,7 @@ func TestAServerWithNoCredentialSourceMintsNothing(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	_, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
 	if !errors.Is(err, ErrNotAttested) {
 		t.Fatalf("ForModule error = %v, want ErrNotAttested", err)
@@ -613,6 +616,7 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 			header.Set("authorization", viewerBearer())
 			header.Set(orgHeader, "org-1")
 			header.Set(sessionHeader, "session-1")
+			header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			_, err := server.gatewayFor(header).ForModule(context.Background(), "things",
 				Scope{ResourceKind: "things", Actions: []string{"read"}})
 			if !errors.Is(err, ErrNotAttested) {
@@ -1331,6 +1335,7 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
 		Scope{ResourceKind: "things", Actions: []string{"read"}}); err == nil {
 		t.Fatal("a mint refused with a conflict was reported as a success")
@@ -1378,6 +1383,7 @@ func TestAViewersMintGoesThroughTheOneController(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	mintFor := func(t *testing.T) error {
 		t.Helper()
 		_, err := server.gatewayFor(header).ForModule(context.Background(), "things",
@@ -1396,6 +1402,7 @@ func TestAViewersMintGoesThroughTheOneController(t *testing.T) {
 	const viewers = 40
 	for i := range viewers {
 		header.Set(sessionHeader, fmt.Sprintf("session-%d", i))
+		header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 		if err := mintFor(t); err != nil {
 			t.Fatalf("viewer %d was refused while this process held a credential valid until %s: %v",
 				i, held.ExpiresAt().UTC().Format(time.RFC3339), err)
@@ -1729,7 +1736,7 @@ func (c *countingCredentialSource) count() int {
 // one inside the signature, and a header is caller-controlled while a seal is
 // not. This runtime reads neither itself — SealedInstallation is the SDK's.
 func TestAViewerMintNamesTheInstallationItActsUnder(t *testing.T) {
-	t.Run("from the seal of the capability the viewer arrived with", func(t *testing.T) {
+	t.Run("the gateway's stamped installation reaches the mint", func(t *testing.T) {
 		gw := newWorkContextGateway(t, &workContextGateway{})
 		solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
 			_, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
@@ -1760,6 +1767,8 @@ func TestAViewerMintNamesTheInstallationItActsUnder(t *testing.T) {
 		header.Set("authorization", "Bearer an-opaque-session-token")
 		header.Set(orgHeader, viewerOrg)
 		header.Set(sessionHeader, viewerSession)
+		// No installation, which is the point: the gateway stamped none and no
+		// capability was carried.
 
 		_, err := server.gatewayFor(header).ForModule(context.Background(), "documents",
 			Scope{ResourceKind: "documents", Actions: []string{"read"}})
@@ -1780,20 +1789,57 @@ func TestAViewerMintNamesTheInstallationItActsUnder(t *testing.T) {
 		}
 	})
 
-	t.Run("the header answers only when there is no seal to read", func(t *testing.T) {
+	t.Run("a caller-supplied capability does not decide the installation", func(t *testing.T) {
+		// Inbound, x-codefly-work-context is caller-controlled: a browser can
+		// send one, and this runtime's standing property is that such a
+		// capability authenticates nothing and is never forwarded. Reading the
+		// installation out of it would let a caller name the installation
+		// their own mint is attributed to.
+		header := http.Header{}
+		header.Set("authorization", "Bearer an-opaque-session-token")
+		header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+		header.Set(workcontext.HeaderName, capability("forged-by-the-caller"))
+		got, err := viewerInstallation(header)
+		if err != nil {
+			t.Fatalf("a request carrying a caller-supplied capability was refused: %v", err)
+		}
+		if got != testInstallation {
+			t.Errorf("installation = %q, want the stamped %q", got, testInstallation)
+		}
+
+		// And a malformed one cannot decide whether the mint happens either.
+		header.Set(workcontext.HeaderName, "not-a-capability-at-all")
+		if got, err := viewerInstallation(header); err != nil || got != testInstallation {
+			t.Errorf("a caller's malformed capability changed the answer (%q, %v): it is not read at all", got, err)
+		}
+	})
+
+	t.Run("the stamped header is the source, and absent is a refusal", func(t *testing.T) {
+		// The ordinary inbound shape: the gateway stamps identity and this
+		// runtime mints the capability itself, so nothing arrives carrying
+		// one. There the stamped header is the only source there is.
 		header := http.Header{}
 		header.Set("authorization", "Bearer an-opaque-session-token")
 		header.Set(workcontext.InstallationIDHeaderName, "installation-from-a-header")
-		if got := viewerInstallation(header); got != "installation-from-a-header" {
-			t.Errorf("with no sealed capability the header is the only source, got %q", got)
+		got, err := viewerInstallation(header)
+		if err != nil {
+			t.Fatalf("a stamped installation was refused with no capability carried: %v", err)
+		}
+		if got != "installation-from-a-header" {
+			t.Errorf("installation = %q, want the stamped one", got)
 		}
 
-		// And the seal outranks it when both are present, because a header is
-		// caller-controlled and a seal is not.
-		header.Set("authorization", viewerBearer())
-		header.Set(workcontext.InstallationIDHeaderName, "an-installation-the-caller-chose")
-		if got := viewerInstallation(header); got != corework.FixtureInstallation {
-			t.Errorf("the caller's header decided the installation (%q): the seal has to win, or a caller names the deployment its mint is attributed to", got)
+		// And neither is a refusal that names both carriers.
+		bare := http.Header{}
+		bare.Set("authorization", "Bearer an-opaque-session-token")
+		_, err = viewerInstallation(bare)
+		if err == nil {
+			t.Fatal("a request naming no installation at all was accepted")
+		}
+		for _, named := range []string{workcontext.InstallationIDHeaderName, orgHeader, sessionHeader} {
+			if !strings.Contains(err.Error(), named) {
+				t.Errorf("the refusal %q does not name %s", err, named)
+			}
 		}
 	})
 }

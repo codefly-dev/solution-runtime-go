@@ -745,10 +745,10 @@ func (c config) validateMCP() error {
 	if u, err := url.Parse(c.mcpIssuerURL); err != nil || !u.IsAbs() || u.Host == "" {
 		if c.environmentLoadErr != nil {
 			return fmt.Errorf("unresolved host issuer %q, and loading Codefly's injected environment failed first: %w — nothing the SDK resolves can be trusted to be absent until that is fixed",
-				c.mcpIssuerURL, c.environmentLoadErr)
+				redactedURL(c.mcpIssuerURL), c.environmentLoadErr)
 		}
 		return fmt.Errorf("unresolved host issuer %q: ServeMCP publishes it as the authorization server of this MCP resource, so a client has nowhere to authenticate without it. Provision the workspace configuration %s with the origin MCP clients authenticate against and declare that group as a workspace-configuration dependency of this backend, or ensure the SDK resolves the host frontend's http endpoint",
-			c.mcpIssuerURL, mcpConfigurationValue(MCPIssuerURLKey))
+			redactedURL(c.mcpIssuerURL), mcpConfigurationValue(MCPIssuerURLKey))
 	}
 	// In a deployment neither value below can be resolved from inside the
 	// cluster, for the reason the loopback refusals above exist: the runtime
@@ -766,7 +766,7 @@ func (c config) validateMCP() error {
 		}
 		if !c.mcpIssuerExplicit {
 			return fmt.Errorf("no %s provisioned in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Provision that workspace configuration with the origin clients authenticate against and declare the %s group as a workspace-configuration dependency of this backend",
-				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, c.mcpIssuerURL, MCPConfigurationGroup)
+				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, redactedURL(c.mcpIssuerURL), MCPConfigurationGroup)
 		}
 		// Declared, not derived. The derived identifier satisfied a check for
 		// "a public URL is set", so this refusal never fired in the one case
@@ -780,7 +780,7 @@ func (c config) validateMCP() error {
 		// person making it.
 		if c.mcpPublicURL != "" && !c.mcpPublicExplicit {
 			return fmt.Errorf("the public MCP URL in the deployed runtime context %q is derived (%q), not declared: it is built as <PUBLIC_URL>%s<id>%s, which encodes the route the HOST serves this solution on — a layout this runtime does not know and must not assume. Provision the workspace configuration %s with the URL clients actually dial, ending in %s",
-				c.runtimeContext, c.mcpPublicURL, gatewaySolutionsRoute, MCPPath,
+				c.runtimeContext, redactedURL(c.mcpPublicURL), gatewaySolutionsRoute, MCPPath,
 				mcpConfigurationValue(MCPPublicURLKey), MCPPath)
 		}
 	}
@@ -847,11 +847,11 @@ func (c config) mcpPublicURLSource() string {
 func usablePublishedURL(name, value, fixWith string, deployed bool) error {
 	u, err := url.Parse(value)
 	if err != nil || !u.IsAbs() || u.Host == "" {
-		return fmt.Errorf("unusable %s (%q): it is published to MCP clients, so it must be an absolute URL. Provision %s", name, value, fixWith)
+		return fmt.Errorf("unusable %s (%q): it is published to MCP clients, so it must be an absolute URL. Provision %s", name, redactedURL(value), fixWith)
 	}
 	if deployed && u.Scheme != "https" {
 		return fmt.Errorf("%s (%q) is not https in a deployed runtime context: MCP clients authenticate against it and dial it, so a plaintext hop hands their credentials to anything on the path. Provision %s with an https URL",
-			name, value, fixWith)
+			name, redactedURL(value), fixWith)
 	}
 	switch {
 	case u.User != nil:
@@ -862,7 +862,7 @@ func usablePublishedURL(name, value, fixWith string, deployed bool) error {
 			name, redactedURL(value), fixWith)
 	case u.Fragment != "":
 		return fmt.Errorf("%s carries a fragment (%q): a fragment is never sent, so this is not the identifier it appears to be. Provision %s with the URL clients actually dial",
-			name, value, fixWith)
+			name, redactedURL(value), fixWith)
 	}
 	return nil
 }

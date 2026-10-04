@@ -125,6 +125,7 @@ func watchRequest(entry string) *connect.Request[dynamicpb.Message] {
 	req.Header().Set("authorization", viewerBearer())
 	req.Header().Set(orgHeader, "org-1")
 	req.Header().Set(sessionHeader, "session-1")
+	req.Header().Set(workcontext.InstallationIDHeaderName, testInstallation)
 	return req
 }
 

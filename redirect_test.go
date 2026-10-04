@@ -109,6 +109,7 @@ func TestACredentialBearingRequestIsNeverRedirected(t *testing.T) {
 			header.Set("authorization", viewerBearer())
 			header.Set(orgHeader, "org-1")
 			header.Set(sessionHeader, "session-1")
+			header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 
 			// The call may fail or succeed depending on which hop bounced; what
 			// it must never do is reach the trap.
@@ -152,6 +153,7 @@ func TestEveryGatewayClientRefusesAForeignDestination(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	gateway := server.gatewayFor(header)
 
 	for _, tc := range []struct {
@@ -231,6 +233,7 @@ func TestASameOriginRedirectIsNotFollowedEither(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
 		Scope{ResourceKind: "things", Actions: []string{"read"}}); err == nil {
 		t.Error("ForModule reported success on a mint that answered 307: the redirect was followed and its answer taken as the capability")

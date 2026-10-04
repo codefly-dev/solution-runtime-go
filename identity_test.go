@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"io"
 	"math/big"
 	"net"
@@ -884,6 +885,7 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 		// The headers a caller must not be able to assert for itself.
 		request.Header.Set(orgHeader, "org-the-caller-chose")
 		request.Header.Set(sessionHeader, "session-the-caller-chose")
+		request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 		return client.Do(request)
 	}
 

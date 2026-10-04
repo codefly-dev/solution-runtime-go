@@ -774,6 +774,7 @@ func viewerRequest(t *testing.T, target string) *http.Response {
 	req.Header.Set("authorization", viewerBearer())
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)
@@ -1376,6 +1377,7 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	req.Header.Set("authorization", viewerBearer())
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	req.Header.Set(workcontext.HeaderName, capability("forged"))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1425,6 +1427,7 @@ func TestRefusedBoundariesAnswerAStatusTheCallerCanAct(t *testing.T) {
 			req.Header.Set("authorization", viewerBearer())
 			req.Header.Set(orgHeader, tt.org)
 			req.Header.Set(sessionHeader, tt.session)
+			req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("call solution: %v", err)

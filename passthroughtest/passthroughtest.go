@@ -51,12 +51,16 @@ import (
 const startTaskProcedure = "/saas.accounts.v1.WorkContextService/StartTask"
 
 // Viewer is the identity the page calls as: the bearer the browser sends, and
-// the organization and session the gateway stamps from it (x-org-id,
-// x-session-id) before the call reaches the solution.
+// the organization, session and installation the gateway stamps from it
+// (x-org-id, x-session-id, x-codefly-installation-id) before the call reaches
+// the solution.
 type Viewer struct {
 	Bearer    string
 	OrgID     string
 	SessionID string
+	// InstallationID is the installation the gateway stamps, which every mint
+	// the runtime runs names. Empty is refused.
+	InstallationID string
 }
 
 // DefaultViewer is the viewer Solution.Client calls as.
@@ -81,6 +85,9 @@ func SealedViewer(seed string) Viewer {
 		Bearer:    "Bearer " + capability(seed),
 		OrgID:     "passthroughtest-org",
 		SessionID: "passthroughtest-session",
+		// The installation the gateway stamps beside the org and the session.
+		// Every mint the runtime runs names one and refuses without it.
+		InstallationID: corework.FixtureInstallation,
 	}
 }
 
@@ -473,6 +480,9 @@ func (t viewerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		"authorization": t.viewer.Bearer,
 		"x-org-id":      t.viewer.OrgID,
 		"x-session-id":  t.viewer.SessionID,
+		// Stamped beside them, because every mint the runtime runs names the
+		// installation it acts under.
+		"x-codefly-installation-id": t.viewer.InstallationID,
 	} {
 		r.Header.Del(header)
 		if value != "" {

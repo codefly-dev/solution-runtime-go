@@ -28,6 +28,9 @@ import (
 // Everything the runtime's MCP surface knows about the caller comes from here.
 type stampedTransport struct {
 	bearer, userID, orgID, sessionID, credentialKind string
+	// installation is what the gateway stamps as x-codefly-installation-id,
+	// which every mint the runtime runs names.
+	installation string
 	// prefix is the path the gateway strips before the solution sees the
 	// request, forwarded as x-forwarded-prefix.
 	prefix string
@@ -38,15 +41,17 @@ func (s stampedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r.Header.Del(orgHeader)
 	r.Header.Del(sessionHeader)
 	r.Header.Del(credentialKindHeader)
+	r.Header.Del(workcontext.InstallationIDHeaderName)
 	if s.bearer != "" {
 		r.Header.Set("authorization", s.bearer)
 	}
 	for name, value := range map[string]string{
-		userHeader:            s.userID,
-		orgHeader:             s.orgID,
-		sessionHeader:         s.sessionID,
-		credentialKindHeader:  s.credentialKind,
-		forwardedPrefixHeader: s.prefix,
+		userHeader:                           s.userID,
+		orgHeader:                            s.orgID,
+		sessionHeader:                        s.sessionID,
+		credentialKindHeader:                 s.credentialKind,
+		workcontext.InstallationIDHeaderName: s.installation,
+		forwardedPrefixHeader:                s.prefix,
 	} {
 		if value != "" {
 			r.Header.Set(name, value)
@@ -64,6 +69,7 @@ func viewerStamp() stampedTransport {
 		orgID:          viewerOrg,
 		sessionID:      viewerSession,
 		credentialKind: "user_session",
+		installation:   testInstallation,
 	}
 }
 
@@ -562,6 +568,7 @@ func TestMCPIsStateless(t *testing.T) {
 	}
 	req.Header.Set("authorization", stamp.bearer)
 	req.Header.Set(sessionHeader, stamp.sessionID)
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	stream, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", MCPPath, err)
@@ -1198,6 +1205,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 			req.Header.Set(userHeader, stamp.userID)
 			req.Header.Set(orgHeader, stamp.orgID)
 			req.Header.Set(sessionHeader, stamp.sessionID)
+			req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("post a tool call: %v", err)
@@ -1245,6 +1253,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		req.Header.Set("authorization", stamp.bearer)
 		req.Header.Set(orgHeader, stamp.orgID)
 		req.Header.Set(sessionHeader, stamp.sessionID)
+		req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -1394,3 +1403,62 @@ func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
 		}
 	})
 }
+
+// TestNoMCPRefusalEverPrintsASecret is item 4, as a property rather than an
+// audit.
+//
+// Every refusal that quotes a URL goes through redactedURL, which drops
+// userinfo, the query and the fragment — url.Redacted() masks the password and
+// keeps the username, which is how a great many tokens are carried. I had
+// redacted two paths and missed six, so this drives every refusal validateMCP
+// can produce with a secret in each position and asserts none of them comes
+// back out.
+func TestNoMCPRefusalEverPrintsASecret(t *testing.T) {
+	const secret = "s3cr3tvalue"
+	// Every shape that reaches a refusal: unresolved, in-cluster, derived,
+	// unpairable, plaintext, and a secret in each of the three positions a URL
+	// can hide one.
+	withSecret := []string{
+		"https://ops:" + secret + "@app.example.com/wiki" + MCPPath,
+		"https://app.example.com/wiki" + MCPPath + "?token=" + secret,
+		"https://app.example.com/wiki" + MCPPath + "#" + secret,
+		"http://app.example.com/wiki" + MCPPath + "?token=" + secret,
+		"https://" + secret + ":x@app.example.com/not-the-suffix",
+		"not-a-url-at-all?token=" + secret,
+		"https://app.example.com/wiki?token=" + secret,
+	}
+	for _, runtimeContext := range []string{"", "kubernetes"} {
+		for _, value := range withSecret {
+			for _, which := range []string{"issuer", "public"} {
+				cfg := config{mcp: true, runtimeContext: runtimeContext,
+					mcpIssuerURL: "https://login.example.com", mcpIssuerExplicit: true,
+					mcpPublicURL: "https://app.example.com/wiki" + MCPPath, mcpPublicExplicit: true}
+				switch which {
+				case "issuer":
+					cfg.mcpIssuerURL = value
+				case "public":
+					cfg.mcpPublicURL = value
+				}
+				err := cfg.validateMCP()
+				if err == nil {
+					continue // accepted; nothing was printed
+				}
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("a refusal printed the secret in %s=%q (runtime context %q): %v",
+						which, value, runtimeContext, err)
+				}
+			}
+		}
+	}
+}
+
+// A transport failure through gw.HTTPClient() is deliberately NOT sanitized,
+// and a test asserting otherwise was deleted rather than weakened.
+//
+// Two reasons, found by writing it. http.Client.Do wraps whatever the
+// transport returns in its own *url.Error carrying the URL, so a transport
+// wrapper cannot remove the address. And the author built that request from
+// BaseURL(), so the address is already theirs — the error discloses nothing
+// they did not have. What the runtime owes them is not handing over what they
+// could not otherwise see, which is Gateway.surfaced's job and is covered by
+// TestAToolsOwnFailureIsSanitizedOnTheWayOut.

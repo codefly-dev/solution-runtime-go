@@ -626,6 +626,7 @@ func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
 			// ForModule needs both to mint.
 			request.Header.Set(orgHeader, "org-1")
 			request.Header.Set(sessionHeader, "session-1")
+			request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := solution.client.Do(request)
 			if err != nil {
 				t.Errorf("call: %v", err)
@@ -994,6 +995,7 @@ func TestACredentialThatCannotBePresentedRefusesTheMint(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	_, err = server.gatewayFor(header).ForModule(context.Background(), "things",
 		Scope{ResourceKind: "things", Actions: []string{"read"}})
 	if err == nil {

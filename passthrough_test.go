@@ -111,6 +111,7 @@ func call(t *testing.T, s *Server, path, bearer, body string) (int, map[string]a
 	}
 	req.Header.Set(orgHeader, "org-1")
 	req.Header.Set(sessionHeader, "session-1")
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	rec := httptest.NewRecorder()
 	s.passthroughHandler(routes).ServeHTTP(rec, req)
 	var out map[string]any
@@ -431,6 +432,7 @@ func TestAViewerBearerRouteRefusesToActWithoutACredential(t *testing.T) {
 	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 
 	t.Run("a refused build", func(t *testing.T) {
 		server, route := build(t, failingCredentialSource{

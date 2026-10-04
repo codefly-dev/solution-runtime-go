@@ -2185,6 +2185,8 @@ type Gateway struct {
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
+	// installationErr is why installationID is empty, when it is.
+	installationErr error
 	// sanitizeErrors makes this gateway hand back errors a caller may relay
 	// verbatim. Set on the MCP path, where a tool's error becomes content the
 	// client reads and nothing downstream can tell it from the author's own.
@@ -2243,7 +2245,9 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 // mints it will run.
 func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
-	gw.installationID = viewerInstallation(header)
+	// Kept with its reason, so ForModule can say why rather than only that it
+	// is absent.
+	gw.installationID, gw.installationErr = viewerInstallation(header)
 	gw.id, gw.report = s.manifest.ID, &s.attestation
 	// Left nil when no source was supplied, so a mint is refused for want of
 	// one rather than panicking inside the controller.
@@ -2332,6 +2336,21 @@ func (g *Gateway) bearerClient() *http.Client {
 // origin: every destination this gateway has is one host, and validate()
 // already refuses a gateway URL that is not https in a real boot.
 func (g *Gateway) platformClient(transport http.RoundTripper, timeout time.Duration) *http.Client {
+	// No error sanitizing here, and the reason is worth writing down because I
+	// tried it.
+	//
+	// A transport wrapper cannot remove the address: http.Client.Do wraps
+	// whatever the transport returns in its own *url.Error carrying the URL,
+	// after the wrapper has run. And it would be pointless if it could — the
+	// author built that request from BaseURL(), so the address is already
+	// theirs and the error discloses nothing they did not have.
+	//
+	// What the runtime must not do is hand an author an error carrying what
+	// they could NOT otherwise see: the mint URL, the issuer's own words, an
+	// internal dial failure from a credential ask. Those come from this
+	// package and go through Gateway.surfaced. Whether an author then relays
+	// their own error text to a client is their choice, like any other string
+	// they return, and the runtime cannot police it without rewriting it.
 	return &http.Client{
 		Transport:     transport,
 		Timeout:       timeout,
@@ -2748,29 +2767,42 @@ const platformRequestTimeout = 10 * time.Second
 // reached on the same base URL the solution's module calls already use.
 const workContextStartTaskProcedure = "/saas.accounts.v1.WorkContextService/StartTask"
 
-// viewerInstallation is the installation a viewer's request acts under.
+// viewerInstallation is the installation a viewer's request acts under, or an
+// error naming why it cannot be read.
 //
-// From the seal of the capability they arrived with, through the SDK's own
-// reader, and only from the header beside it when there is no capability to
-// read. That order is the SDK's rule rather than a preference of this file: the
-// installation that governs a call is the one inside the signature, and a
-// receiver preferring the header would be trusting a value the caller set. This
-// runtime reads neither itself — SealedInstallation is the SDK's, which is also
-// why asking this question here is not the second Work Context implementation
-// this package is forbidden to grow.
+// From the header the gateway stamps, and from nothing else.
 //
-// Returns "" when neither answers, which ForModule refuses. There is no
-// fallback to the organization: an org is not an installation, and minting
-// under the wrong one attributes a capability to a deployment that never asked
-// for it.
-func viewerInstallation(header http.Header) string {
-	bearer := strings.TrimSpace(strings.TrimPrefix(header.Get("authorization"), "Bearer "))
-	if bearer != "" {
-		if id, _, err := workcontext.SealedInstallation(bearer); err == nil && id != "" {
-			return id
-		}
+// Round ten asked for this to be read from the capability carrier the SDK
+// names, refusing rather than degrading when one cannot be read. The second
+// half is right and is what this does. The first half cannot be: INBOUND, that
+// carrier is caller-controlled. A browser can put a capability in
+// x-codefly-work-context, and this runtime's standing property — with its own
+// test, TestBrowserSuppliedWorkContextIsNeverForwarded — is that such a
+// capability authenticates nothing and is never forwarded. Reading the
+// installation out of it would give a caller a say in the installation their
+// own mint is attributed to, which is the defect inverted rather than fixed.
+//
+// It is worse than useless: FromHeaders refuses a capability whose installation
+// carriers are incomplete, so a caller sending a malformed one would decide
+// whether the mint happens at all. That is how the change was caught — the
+// forged-capability test stopped being able to mint and hung.
+//
+// So the stamped header is the source, on the same footing as x-org-id and
+// x-session-id: the gateway replaces all three from verified claims, and a
+// value a caller sent does not survive. Absent is a refusal, not a mint under
+// an unnamed installation.
+//
+// Where a capability IS the authority being carried — outbound, where this
+// runtime attaches one — the SDK's Attach puts the seal's own installation
+// beside it and the far end cross-checks the two. That is the direction the
+// SDK's rule is about.
+func viewerInstallation(header http.Header) (string, error) {
+	id := strings.TrimSpace(header.Get(workcontext.InstallationIDHeaderName))
+	if id == "" {
+		return "", fmt.Errorf("this request names no installation: the gateway stamps it as %s from the same verified claims it stamps %s and %s from, and none arrived",
+			workcontext.InstallationIDHeaderName, orgHeader, sessionHeader)
 	}
-	return strings.TrimSpace(header.Get(workcontext.InstallationIDHeaderName))
+	return id, nil
 }
 
 // orgHeader carries the viewer's organization. The gateway injects it after it
@@ -2917,6 +2949,10 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 			audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
 	}
 	if g.installationID == "" {
+		if g.installationErr != nil {
+			return nil, g.surfaced(fmt.Errorf("cannot mint a work context for %q: %w. The host requires an installation on every mint and refuses one naming none, and an organization is not an installation — one org may hold several",
+				audience, g.installationErr))
+		}
 		// Not a status the caller can act on, so not a ClientError: the
 		// installation comes from the capability the gateway handed us, and a
 		// caller cannot seal one. A viewer seeing "pick an installation" would
