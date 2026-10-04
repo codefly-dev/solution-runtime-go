@@ -176,6 +176,21 @@ func (s shapeShifter) ServerTLSConfig() (*tls.Config, error) {
 	return base, nil
 }
 
+// PeerAnchor is what makes the per-connection cases of
+// TestTheCertificateServedIsTheCertificateChecked run at all.
+//
+// Without it, a source setting GetConfigForClient is refused at boot for not
+// implementing PeerAnchorSource — and that refusal contains the words "identity
+// source", which mentionsTheCertificate accepted, so the two perConnection
+// cases took the early return and asserted nothing. Mutant C2-2 (the
+// per-connection answer's certificate is not held to the frozen principal)
+// survived the whole suite because of it.
+//
+// This source's defect is which CERTIFICATE it serves for which hello; it has
+// no quarrel with the anchor, so answering the real one here leaves the
+// certificate shape as the only thing under test.
+func (s shapeShifter) PeerAnchor() (*x509.CertPool, error) { return s.roots, nil }
+
 func (s shapeShifter) apply(config *tls.Config) {
 	switch {
 	case s.byName:
@@ -398,6 +413,24 @@ func (a conditionalAnchor) ServerTLSConfig() (*tls.Config, error) {
 		return answered, nil
 	}
 	return base, nil
+}
+
+// PeerAnchor makes this source usable at boot, which is the whole reason
+// TestANilPerConnectionAnswerCannotDropTheTrustAnchor can assert anything.
+//
+// Without it serverIdentity refuses the boot — a source resolving its
+// configuration per handshake has to be able to answer what its anchor is
+// without a handshake — and that test's "refused at boot is also fail-closed"
+// early return swallowed it, so every assertion below the return had been dead
+// code since PeerAnchorSource landed. Mutant C2-1 (a nil per-connection answer
+// serves a base configuration with no anchor) survived the whole suite because
+// of it.
+//
+// The anchor is the real one: this source's defect is what it answers PER
+// HANDSHAKE, not what it can say about its trust, so answering honestly here
+// is what leaves the per-handshake hole as the only thing under test.
+func (a conditionalAnchor) PeerAnchor() (*x509.CertPool, error) {
+	return a.roots, nil
 }
 
 // TestTheAdmittedCallerSetIsResolvedPerHandshake: the set was read once at
@@ -857,8 +890,36 @@ func TestEveryPlatformConnectionIsWatched(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	// The connection is usable, and stays usable while trust holds.
-	if _, err := conn.Write([]byte("GET " + credentialMintPath + " HTTP/1.0\r\n\r\n")); err != nil {
+	//
+	// HTTP/1.1 with keep-alive, and the response drained, because the point of
+	// the exchange is to leave the connection OPEN. This asked over HTTP/1.0,
+	// so the server closed it as soon as it had answered — and the loop below
+	// returns on io.EOF, which means it returned on the server's own close and
+	// passed identically with no watcher installed at all. Mutant C2-3 (an
+	// established outbound connection is not watched) survived the whole
+	// suite on exactly that.
+	request := "GET " + credentialMintPath + " HTTP/1.1\r\nHost: " + address + "\r\nConnection: keep-alive\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
 		t.Fatalf("the dialled connection was not usable: %v", err)
+	}
+	// Drain what the host answered. A read that times out means there is
+	// nothing more to read AND the connection is still open, which is the
+	// state this test needs before it can attribute a later close.
+	answered := 0
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(outboundTrustRecheckInterval))
+		var buf [512]byte
+		read, err := conn.Read(buf[:])
+		answered += read
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("the connection closed while the host was answering (%v), so a close observed after the root is removed would not be the watcher's doing and this test could not tell the two apart", err)
+		}
+	}
+	if answered == 0 {
+		t.Fatal("the host answered nothing, so this connection was never a working one and what closes it later is unattributable")
 	}
 	time.Sleep(2 * outboundTrustRecheckInterval)
 
@@ -1518,10 +1579,16 @@ func TestAPerConnectionAnswerIsHeldToTheAdmittedSet(t *testing.T) {
 // mentionsTheCertificate reports whether a boot refusal is about the identity
 // the listener would present, rather than any other way a boot can fail.
 func mentionsTheCertificate(err error) bool {
+	// "identity source" is NOT in this list, and that is the correction.
+	//
+	// It was, and nearly every boot refusal in identity.go opens with those
+	// two words — including the PeerAnchorSource refusal, which is about the
+	// anchor and says nothing about a certificate. So the guard written to
+	// stop "returning on *any* boot error" was satisfied by a refusal for an
+	// unrelated reason, which is the same defect one layer up.
 	for _, named := range []string{
 		"issued for another workload",
 		"certificate",
-		"identity source",
 		"principal",
 	} {
 		if strings.Contains(err.Error(), named) {
