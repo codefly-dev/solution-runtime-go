@@ -11,6 +11,7 @@ import (
 
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 )
@@ -273,20 +274,36 @@ func ViewerFromContext(ctx context.Context) (*Gateway, error) {
 // checked.
 func actsForNobody(method string) bool {
 	switch method {
-	case "initialize", "ping", "tools/list", "prompts/list", "resources/list", "resources/templates/list":
+	// The handshake, the keepalive and the listings that describe what this
+	// solution declares.
+	case "initialize", "ping",
+		"tools/list", "prompts/list", "resources/list", "resources/templates/list",
+		// The notifications the SDK itself sends, named one by one.
+		//
+		// This was strings.HasPrefix(method, "notifications/"), which is a
+		// DENYLIST wearing an allowlist's clothes: the namespace is open, the
+		// SDK's extension API lets author code register methods under it, and
+		// one registered there would have run with a viewer's gateway and no
+		// credential check — the round-nine defect, still reachable. An exact
+		// list cannot be widened by someone else's naming.
+		"notifications/initialized", "notifications/cancelled",
+		"notifications/progress", "notifications/roots/list_changed":
 		return true
 	}
-	// A notification is not a request a viewer's authority is spent on, and it
-	// has no reply to carry a refusal in.
-	return strings.HasPrefix(method, "notifications/")
+	return false
 }
 
-// A plain error, carrying the sanitized sentence and nothing else. The MCP
-// SDK's wire-error type is in an internal package, so a specific JSON-RPC code
-// cannot be set from here and the call fails as a protocol error instead — the
-// property that matters is that the tool does not run and the viewer is not
-// told what the issuer said. Naming a code is a follow-up for the SDK to
-// export one.
+// mcpCredentialUnavailableCode is what an MCP client is told when this process
+// will not act for a viewer: -32001, in JSON-RPC's implementation-defined
+// server range, beside the SDK's own CodeResourceNotFound (-32002).
+//
+// I claimed this could not be set because the SDK's wire-error type was
+// internal. That was wrong, and wrong because I grepped for the type and
+// stopped: package jsonrpc exports it as an alias
+// (jsonrpc.Error = jsonrpc2.WireError) precisely so a server can set a code. A
+// client that only gets a generic protocol error cannot tell "this solution
+// cannot act right now" from a broken tool, so it cannot back off.
+const mcpCredentialUnavailableCode = -32001
 
 // mcpViewer binds each incoming MCP request to the viewer it arrived as, so a
 // tool handler reads composed modules on their behalf and not as the solution.
@@ -345,7 +362,10 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 				// failure naming an internal address — and an MCP client is as
 				// much a viewer's channel as a browser is.
 				log.Printf("solution %q: refusing an MCP %s for a viewer: %v", s.manifest.ID, method, err)
-				return nil, errors.New(credentialRefusalForAViewer(err))
+				return nil, &jsonrpc.Error{
+					Code:    mcpCredentialUnavailableCode,
+					Message: credentialRefusalForAViewer(err),
+				}
 			}
 		}
 		result, err := next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)

@@ -1271,12 +1271,18 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		// The method-layer gate's property, not an enumeration: a method this
 		// file has never heard of is held to the credential. A denylist over
 		// the SDK's method set is the mistake the TLS posture made three times.
-		for _, method := range []string{"tools/call", "resources/read", "prompts/get", "completion/complete", "some/method-added-next-release"} {
+		for _, method := range []string{"tools/call", "resources/read", "prompts/get", "completion/complete", "some/method-added-next-release",
+			// The namespace that used to be exempted by prefix. It is open —
+			// the SDK's extension API lets author code register under it — so
+			// a method nobody here named must be gated, not waved through for
+			// looking like a notification.
+			"notifications/anything-an-author-registers", "notifications/tools/call"} {
 			if actsForNobody(method) {
 				t.Errorf("%q is treated as acting for nobody, so a viewer action on it would skip the credential gate", method)
 			}
 		}
-		for _, method := range []string{"initialize", "ping", "tools/list", "prompts/list", "resources/list", "notifications/cancelled"} {
+		for _, method := range []string{"initialize", "ping", "tools/list", "prompts/list", "resources/list",
+			"notifications/initialized", "notifications/cancelled", "notifications/progress", "notifications/roots/list_changed"} {
 			if !actsForNobody(method) {
 				t.Errorf("%q is gated at the method layer though it runs nothing for a viewer", method)
 			}
