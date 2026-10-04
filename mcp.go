@@ -369,10 +369,29 @@ func forwardedOrigin(r *http.Request) string {
 		}
 	}
 	host := firstForwarded(r, forwardedHostHeader)
-	if host == "" {
+	// A forwarded host that is not a host is not usable: it would be spliced
+	// into the middle of the identifier, where a space or a slash makes the
+	// rest of the URL mean something else. The request's own host is what the
+	// identifier is built from then.
+	if !validHost(host) {
 		host = r.Host
 	}
 	return scheme + "://" + host
+}
+
+// validHost reports whether raw is a plain host[:port] — enough to be
+// concatenated into an origin without changing where the URL points.
+func validHost(raw string) bool {
+	if raw == "" || len(raw) > 253+6 {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		switch c := raw[i]; {
+		case c <= ' ', c >= 0x7f, c == '/', c == '?', c == '#', c == '@', c == '\\':
+			return false
+		}
+	}
+	return true
 }
 
 // forwardedPrefix is the path the proxy stripped before this solution saw the

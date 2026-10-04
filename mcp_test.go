@@ -391,6 +391,22 @@ func TestMCPMetadataDropsAnUnusablePrefix(t *testing.T) {
 	}
 }
 
+// TestMCPMetadataDropsAnUnusableForwardedHost: a forwarded host that is not a
+// host would be spliced into the middle of the identifier, where a space or a
+// slash makes the rest of the URL mean something else. The request's own host is
+// what the identifier is built from then.
+func TestMCPMetadataDropsAnUnusableForwardedHost(t *testing.T) {
+	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer}, readCollectionTool)
+	own := strings.TrimPrefix(server.URL, "http://")
+
+	for _, host := range []string{"host.test/../elsewhere", "host.test other.test", "user@host.test", "host.test?x=1"} {
+		document := metadata(t, server, http.Header{"x-forwarded-host": {host}})
+		if got, want := document["resource"], "http://"+own+MCPPath; got != want {
+			t.Errorf("with forwarded host %q, resource = %v, want the request's own host %q", host, got, want)
+		}
+	}
+}
+
 // --- transport shape ---
 
 // TestMCPIsStateless pins the transport the gateway can actually proxy: a

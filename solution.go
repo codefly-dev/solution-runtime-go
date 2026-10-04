@@ -2,12 +2,15 @@
 // deployed extensions that plug into a host at runtime with no build-time
 // coupling. It owns everything every solution needs identically: env/config,
 // self-registration with the host and the gateway (with a heartbeat), CORS,
-// static Module Federation asset serving, the capability handshake, and the
-// solution manifest. A solution author supplies a manifest and one or more
-// handlers; each handler receives a Gateway that forwards the caller's bearer.
+// static Module Federation asset serving, the capability handshake, the
+// solution manifest, and serving the solution's MCP server to agent clients. A
+// solution author supplies a manifest and one or more handlers; each handler
+// receives a Gateway that forwards the caller's bearer, and ServeMCP exposes
+// the same experience to an MCP client as the signed-in person.
 //
-// This package depends on nothing but the standard library and knows nothing
-// about any specific host or solution.
+// This package knows nothing about any specific host or solution: what it
+// depends on beyond the standard library is the codefly SDK it resolves
+// configuration through, Connect for the wire, and the official MCP SDK.
 package solution
 
 import (
