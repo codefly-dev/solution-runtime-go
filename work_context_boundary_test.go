@@ -394,86 +394,9 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 // can be absolute rather than a list of blessed exceptions. A consumer writes
 // Handler and RequestHandler and lets Serve mount them.
 func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
-	servable := map[string]bool{
-		"http.Handler": true, "http.HandlerFunc": true, "http.ServeMux": true,
-		"http.RoundTripper": true,
-		// Local aliases and this package's own handler types count too: the
-		// rule is about handing out something servable, not about one
-		// package's spelling of it.
-		"Handler": true, "RequestHandler": true,
-	}
-	fset := token.NewFileSet()
-	for _, name := range moduleSources(t) {
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		// An exported struct carrying a servable field is the same re-exposure
-		// with a type in the way: `type Mounted struct { Handler http.Handler }`
-		// returned from an exported method hands out exactly what a direct
-		// result would, and a gate reading only result types walks past it.
-		for _, decl := range file.Decls {
-			declared, ok := decl.(*ast.GenDecl)
-			if !ok || strings.Contains(name, "passthroughtest") || strings.Contains(name, "internal/seam") {
-				continue
-			}
-			for _, spec := range declared.Specs {
-				typed, ok := spec.(*ast.TypeSpec)
-				if !ok || !typed.Name.IsExported() {
-					continue
-				}
-				// A named type whose underlying type is a map, slice or
-				// channel of handlers is the same re-exposure with a name on
-				// it.
-				if rendered := renderedType(typed.Type); servable[rendered] || servesHTTP(typed.Type) {
-					t.Errorf("%s exports the type %s over %s: naming a collection of handlers does not make handing one out any less servable",
-						name, typed.Name.Name, rendered)
-					continue
-				}
-				structure, ok := typed.Type.(*ast.StructType)
-				if !ok || structure.Fields == nil {
-					continue
-				}
-				for _, field := range structure.Fields.List {
-					rendered := renderedType(field.Type)
-					if !servable[rendered] && !servesHTTP(field.Type) {
-						continue
-					}
-					for _, fieldName := range field.Names {
-						if fieldName.IsExported() {
-							t.Errorf("%s exports the type %s with a servable field %s %s: a struct is not a gate, and handing one out hands out the handler inside it",
-								name, typed.Name.Name, fieldName.Name, rendered)
-						}
-					}
-				}
-			}
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || !fn.Name.IsExported() || fn.Type.Results == nil {
-				continue
-			}
-			// passthroughtest is where a consumer's test is *supposed* to get a
-			// handler; it refuses a non-test binary instead, which
-			// TestTheSeamRefusesANonTestBinary drives.
-			if strings.Contains(name, "passthroughtest") || strings.Contains(name, "internal/seam") {
-				continue
-			}
-			for _, result := range fn.Type.Results.List {
-				// A func type whose own signature is ServeHTTP's is a handler
-				// however it is spelled, which is the shape `func (s *Server)
-				// Routes() func(http.ResponseWriter, *http.Request)` uses to
-				// avoid naming http.Handler at all.
-				if servesHTTP(result.Type) {
-					t.Errorf("%s exports %s returning a function with ServeHTTP's signature: naming the type something else does not make it less servable",
-						name, fn.Name.Name)
-					continue
-				}
-				if rendered := renderedType(result.Type); servable[rendered] {
-					t.Errorf("%s exports %s returning %s: a servable handler obtained outside Serve has skipped validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, and whoever mounts it serves the viewer's bearer and this workload's credential over whatever it is mounted on. Let Serve mount it.",
-						name, fn.Name.Name, rendered)
-				}
-			}
+	for _, pkg := range moduleBoundaryPackages(t) {
+		for _, violation := range newHandlerBoundary(t, pkg).violations() {
+			t.Error(violation)
 		}
 	}
 }
@@ -487,42 +410,6 @@ func renderedReference(expr ast.Expr) string {
 	case *ast.SelectorExpr:
 		if pkg, ok := named.X.(*ast.Ident); ok {
 			return pkg.Name + "." + named.Sel.Name
-		}
-	}
-	return ""
-}
-
-// servesHTTP reports whether a type is a function taking
-// (http.ResponseWriter, *http.Request).
-func servesHTTP(expr ast.Expr) bool {
-	fn, ok := expr.(*ast.FuncType)
-	if !ok || fn.Params == nil || len(fn.Params.List) != 2 {
-		return false
-	}
-	return renderedType(fn.Params.List[0].Type) == "http.ResponseWriter" &&
-		renderedType(fn.Params.List[1].Type) == "http.Request"
-}
-
-// renderedType is pkg.Name for a qualified type, with one level of pointer and
-// slice stripped, which is enough to recognise a handler however it is handed
-// back.
-func renderedType(expr ast.Expr) string {
-	switch typed := expr.(type) {
-	case *ast.StarExpr:
-		return renderedType(typed.X)
-	case *ast.ArrayType:
-		return renderedType(typed.Elt)
-	case *ast.MapType:
-		// A map, channel or slice of handlers hands out handlers. `type Routes
-		// map[string]http.Handler` returned from an exported method walked
-		// past a rule that looked only at the result type itself and at struct
-		// fields.
-		return renderedType(typed.Value)
-	case *ast.ChanType:
-		return renderedType(typed.Value)
-	case *ast.SelectorExpr:
-		if pkg, ok := typed.X.(*ast.Ident); ok {
-			return pkg.Name + "." + typed.Sel.Name
 		}
 	}
 	return ""
@@ -664,7 +551,7 @@ func moduleSources(t *testing.T) []string {
 		if entry.IsDir() {
 			// Nothing generated and nothing vendored: those are not this
 			// repository's declarations to answer for.
-			if name := entry.Name(); path != "." && (name == "vendor" || strings.HasPrefix(name, ".")) {
+			if name := entry.Name(); path != "." && (name == "vendor" || name == "testdata" || strings.HasPrefix(name, ".")) {
 				return fs.SkipDir
 			}
 			return nil
