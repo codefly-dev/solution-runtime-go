@@ -667,10 +667,6 @@ func importedAs(file *ast.File) map[string]string {
 	return aliases
 }
 
-// renderedType is renderedTypeIn with no import names resolved, for a probe
-// that only needs the unqualified shapes.
-func renderedType(expr ast.Expr) string { return renderedTypeIn(nil, expr) }
-
 // renderedTypeIn is <import path>.Name for a qualified type, the bare name for
 // an unqualified one, and "any" for the empty interface — with one level of
 // pointer, slice, map and channel stripped, which is enough to recognise a
