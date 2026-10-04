@@ -22,60 +22,15 @@ import (
 // be deleted to get back to one. Every step of that was locally reasonable. The
 // cheapest way to not repeat it is to make the first step fail a test here.
 //
-// What this checks is narrow on purpose: a signing primitive, and a type or
-// function of this package's own that claims to be a Work Context. It does not
+// This checks signing primitives, local capability declarations, verifier
+// references, and decoding into Core's capability/seal wire types. It does not
 // forbid encoding/json — this package serves JSON documents for a living — and
 // the one capability-shaped JSON this package does touch, the mint endpoint's
 // HTTP bodies, lives in the SDK client and not here.
 func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
-	fset := token.NewFileSet()
-	for _, name := range moduleSources(t) {
-		file, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		for _, imported := range file.Imports {
-			path := strings.Trim(imported.Path.Value, `"`)
-			switch path {
-			case "crypto/ed25519", "crypto/ecdsa", "crypto/hmac", "crypto/rsa", "crypto/ed25519/internal/edwards25519":
-				t.Errorf("%s imports %s: signing a capability is core's, and a runtime that can sign one is a second implementation waiting to happen. Carry the credential the mint client hands you.",
-					name, path)
-			}
-			// A JOSE or raw-segment path reaches the same place by another
-			// road: the 3,532 lines that had to be deleted were a payload
-			// struct, a signer, a verifier and an error taxonomy, and none of
-			// them needed crypto/ed25519 by name.
-			switch {
-			case strings.HasPrefix(path, "golang.org/x/crypto"),
-				strings.Contains(path, "go-jose"), strings.Contains(path, "jwt"),
-				strings.Contains(path, "jws"), strings.Contains(path, "jwk"):
-				t.Errorf("%s imports %s: a second signed encoding beside core's is what this boundary exists to prevent, and it does not have to be spelled crypto/ed25519 to be one.",
-					name, path)
-			}
-		}
-		// A declaration of this package's own that names itself after the thing
-		// core owns. The two this package legitimately has are a refusal it
-		// returns to a handler and the principals it reports from a mint
-		// answer — neither is a capability, and both are named below so a third
-		// has to be argued for rather than appearing.
-		allowed := map[string]bool{"WorkContextRefusal": true, "WorkContextPrincipals": true}
-		for _, decl := range file.Decls {
-			var declared string
-			switch node := decl.(type) {
-			case *ast.FuncDecl:
-				declared = node.Name.Name
-			case *ast.GenDecl:
-				for _, spec := range node.Specs {
-					if typeSpec, ok := spec.(*ast.TypeSpec); ok && strings.Contains(typeSpec.Name.Name, "WorkContext") && !allowed[typeSpec.Name.Name] {
-						t.Errorf("%s declares the type %s: a Work Context type in this package is core's type copied. Use the SDK's alias of core's, or carry the capability as the string it travels as.",
-							name, typeSpec.Name.Name)
-					}
-				}
-				continue
-			}
-			if strings.Contains(declared, "SignWorkContext") || strings.Contains(declared, "ParseWorkContext") || strings.Contains(declared, "VerifyWorkContext") {
-				t.Errorf("%s declares %s: signing, parsing and verifying a capability are core's. This runtime presents one and lets the far end decide.", name, declared)
-			}
+	for _, pkg := range moduleBoundaryPackages(t) {
+		for _, violation := range implementationViolations(pkg) {
+			t.Error(violation)
 		}
 	}
 }
@@ -100,21 +55,14 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 // judgement without the issuer's four sources is the silent downgrade this
 // single-implementation rule exists to prevent.
 func TestThisRuntimeVerifiesNothing(t *testing.T) {
-	fset := token.NewFileSet()
-	for _, name := range moduleSources(t) {
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
+	for _, pkg := range moduleBoundaryPackages(t) {
+		for _, violation := range typedVerifierReferences(pkg) {
+			t.Error(violation)
 		}
-		for _, reached := range verifiersReachedBy(file) {
-			t.Errorf("%s names %s: verifying a capability needs the issuer's live revision, replay, grant and seal sources, which this runtime does not hold. It presents its own credential and lets the component that holds them decide.",
-				name, reached)
-		}
-		if dotted := dotImportedWorkContext(file); dotted != "" {
-			// A dot-import makes every name in that package unqualified, so
-			// nothing above could find them. It is also not a style this
-			// package uses anywhere.
-			t.Errorf("%s dot-imports %s: the names a verifier is built from would then be unqualified, which this gate cannot see and a reader cannot either", name, dotted)
+		for _, file := range pkg.files {
+			if dotted := dotImportedWorkContext(file); dotted != "" {
+				t.Errorf("%s dot-imports %s: keep the owner of capability operations explicit", pkg.fset.Position(file.Pos()), dotted)
+			}
 		}
 	}
 }

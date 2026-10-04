@@ -32,7 +32,7 @@ type boundaryPackage struct {
 // A failed load/type check fails the gate; partial type information never means
 // a source was admitted. No dependency or toolchain downloads are needed here.
 var boundaryExports = sync.OnceValues(func() (map[string]string, error) {
-	cmd := exec.Command("go", "list", "-deps", "-export", "-json", "./...")
+	cmd := exec.Command("go", "list", "-deps", "-export", "-json", "-test", "./...")
 	cmd.Env = append(os.Environ(), "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
