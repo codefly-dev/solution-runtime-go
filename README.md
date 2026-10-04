@@ -549,9 +549,13 @@ A module's refusal of a presented capability reaches a handler by kind:
 it (an installation revision, a principal's epoch, a build incarnation, a
 binding) — is reported as `aborted`, because the answer to every one of those
 is to mint again rather than to retry or to tell the viewer their authorization
-failed. `ErrInvalid`, `ErrUnsealed` and `ErrNotACoreToken` are reported as
-`internal`: a credential this solution could not present is this solution's
-problem, not a module that is briefly unreachable.
+failed. `ErrInvalid` and `ErrNotACoreToken` are reported as `internal`: a
+credential this solution could not present is this solution's problem, not a
+module that is briefly unreachable. There are two, not three: core v0.9.0
+**deleted** `ErrUnsealed`, because the seal is now required by the schema and
+`protovalidate` refuses a capability carrying none before any seal check is
+reached — so that case arrives as `ErrInvalid`, and a consumer who wrote a
+branch for the dedicated sentinel had one that could never run.
 
 ## The published contract
 
