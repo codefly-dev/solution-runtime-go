@@ -598,8 +598,7 @@ func resolveMCPPublicURL(ctx context.Context, publicURL, id string) (string, boo
 // never declared or its carriers never loaded, and the one signal that
 // distinguishes them is config.environmentLoadErr.
 func resolveMCPIssuer(ctx context.Context, frontendURL string) (string, bool) {
-	declared, err := codefly.For(ctx).WorkspaceConfiguration(MCPConfigurationGroup, MCPIssuerURLKey)
-	if err == nil {
+	if declared, err := codefly.For(ctx).WorkspaceConfiguration(MCPConfigurationGroup, MCPIssuerURLKey); err == nil {
 		if declared = strings.TrimRight(strings.TrimSpace(declared), "/"); declared != "" {
 			return declared, true
 		}
