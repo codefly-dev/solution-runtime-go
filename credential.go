@@ -415,7 +415,7 @@ func (s *Server) openCredential(ctx context.Context) error {
 	// and a success after it was accepted — and a source that blocks until its
 	// context is cancelled was never cancelled at all, so a boot could wait
 	// forever inside one attempt.
-	deadline, cancel := context.WithCancel(ctx)
+	deadline, cancel := context.WithDeadline(ctx, time.Now().Add(window))
 	defer cancel()
 	// The first wait is a quarter of the window at most, so a window shorter
 	// than the backoff still gets more than one attempt. At the real window
