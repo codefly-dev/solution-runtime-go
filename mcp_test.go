@@ -1343,3 +1343,54 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 		t.Error("the client was told nothing at all")
 	}
 }
+
+// TestTheMethodLayerGateRefusesOnItsOwn exercises the MCP method middleware
+// directly, without the HTTP boundary in front of it.
+//
+// Both gates refuse a viewer action while this execution holds no credential,
+// and after the HTTP one was added the method one had nothing holding it: the
+// mutation that removes it survived, because every test reaching a tool goes
+// through requireStampedViewer first and is refused there. Adding the better
+// check orphaned the one behind it.
+//
+// It is not redundant. It is what holds a method dispatched without passing
+// through that handler — and it is the layer that knows the method name, so it
+// is where the allowlist lives.
+func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
+	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+		ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
+		Credential(refusingSource{err: fmt.Errorf("%w: at https://mint.internal.example/platform/_credential", workcontext.ErrMintUnavailable)})
+
+	var reached atomic.Bool
+	next := func(context.Context, string, mcp.Request) (mcp.Result, error) {
+		reached.Store(true)
+		return nil, nil
+	}
+	gated := server.mcpViewer(next)
+
+	t.Run("a method that acts for a viewer is refused", func(t *testing.T) {
+		reached.Store(false)
+		_, err := gated(context.Background(), "tools/call", &mcp.CallToolRequest{})
+		if err == nil {
+			t.Fatal("the method middleware admitted a tool call while this execution held no usable credential: it is what holds a method dispatched without the HTTP handler in front of it")
+		}
+		if reached.Load() {
+			t.Error("the call reached the next handler, so nothing was gated")
+		}
+		for _, leak := range []string{"mint.internal.example", "_credential"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("the refusal discloses %q: %s", leak, err)
+			}
+		}
+	})
+
+	t.Run("a method that acts for nobody passes", func(t *testing.T) {
+		reached.Store(false)
+		if _, err := gated(context.Background(), "tools/list", &mcp.ListToolsRequest{}); err != nil {
+			t.Errorf("the method middleware refused tools/list, which runs nothing for a viewer: %v", err)
+		}
+		if !reached.Load() {
+			t.Error("tools/list never reached the next handler")
+		}
+	})
+}
