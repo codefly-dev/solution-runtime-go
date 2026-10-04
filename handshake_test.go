@@ -1345,11 +1345,16 @@ func TestANonAtomicRotationDoesNotFailANewDial(t *testing.T) {
 //
 // Two tests here closed a response body without draining it, so the connection
 // had not returned to the pool when CloseIdleConnections ran; the next request
-// reused it and never handshook. One then flaked under -race (65 of 200), and
-// the other passed vacuously — it asserted that a dial resolves the leaf, on a
-// request that made no dial. A reused connection performs no TLS handshake,
-// which is what this watches for, and it works whether the request succeeds or
-// is refused.
+// reused it and made no dial. One then flaked under -race (65 of 200), and the
+// other passed vacuously — it asserted that a dial resolves the leaf, on a
+// request that never dialled. A reused connection performs no TCP dial, which
+// is what this watches for, and it works whether the request succeeds or is
+// refused.
+//
+// Not "never handshook", which is what this comment and the failure message
+// used to say: on this transport nothing observes a handshake at all (see
+// below), so describing the symptom that way named a signal that is absent
+// either way.
 func freshDial(t *testing.T) (context.Context, func()) {
 	t.Helper()
 	var dialled atomic.Bool
@@ -1367,7 +1372,7 @@ func freshDial(t *testing.T) (context.Context, func()) {
 	return httptrace.WithClientTrace(context.Background(), trace), func() {
 		t.Helper()
 		if !dialled.Load() {
-			t.Fatal("the request was served on a connection that was already open, so it made no dial and this test asserted nothing about dialling: drain the previous response body before CloseIdleConnections, or the connection has not returned to the pool when it runs")
+			t.Fatal("the request was served on a connection that was already open, so it made no TCP dial and this test asserted nothing about dialling: drain the previous response body before CloseIdleConnections, or the connection has not returned to the pool when it runs")
 		}
 	}
 }

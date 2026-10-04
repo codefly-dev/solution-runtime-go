@@ -344,7 +344,24 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 				return nil, errors.New(credentialRefusalForAViewer(err))
 			}
 		}
-		return next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
+		result, err := next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
+		if err != nil {
+			// Sanitized on the way out, through the same function the handler
+			// routes use. A tool that called ForModule and was refused handed
+			// the viewer's agent client the whole chain: "mint returned HTTP
+			// 503", and with the issuer unreachable the mint's own URL and
+			// dial address. The gate above stops a tool running without a
+			// credential; this stops what a tool learned about the issuer
+			// reaching the client when one fails mid-call.
+			//
+			// The author's own errors are sanitized by the same rule as a
+			// handler's, which is what that rule is for: a tool's error is
+			// written for a model and read by whoever is driving it.
+			_, message := handlerErrorResponse(err)
+			log.Printf("solution %q: mcp %s failed: %v", s.manifest.ID, method, err)
+			return result, errors.New(message)
+		}
+		return result, nil
 	}
 }
 
@@ -431,6 +448,26 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 			}
 			http.Error(w, fmt.Sprintf("MCP requires a user session: the gateway stamped %s and %s empty%s. A credential that authenticates without a session cannot act for a viewer: every tool call that does mints a Work Context rooted in one. Connect as a signed-in person.",
 				stamped, sessionHeader, detail), http.StatusForbidden)
+			return
+		}
+		// And this execution's own credential, at the HTTP boundary.
+		//
+		// The method-layer gate in mcpViewer refuses the same thing, and both
+		// are here on purpose. This one answers a real 503 — JSON-RPC carries
+		// no transport status and the SDK's wire-error type is internal, so the
+		// method layer can only fail the call as a protocol error — and it
+		// holds anything that reaches this handler without going through the
+		// method middleware. An MCP client backing off needs the status; a
+		// client that gets a generic protocol error cannot tell "this solution
+		// cannot act right now" from a broken tool.
+		if err := s.actingForAViewer(r.Context()); err != nil {
+			// The sanitized sentence, never the source's error: it wraps
+			// whatever the issuer said, which is a mint URL and sometimes a
+			// dial failure naming an internal address. An agent client is a
+			// viewer's channel like a browser is, and this was the disclosure
+			// executed round eight reproduced.
+			log.Printf("solution %q: refusing an MCP request for a viewer: %v", s.manifest.ID, err)
+			http.Error(w, credentialRefusalForAViewer(err), http.StatusServiceUnavailable)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -588,13 +625,16 @@ func firstForwarded(r *http.Request, name string) string {
 
 // MCPConfigurationGroup names the workspace-configuration group a composition
 // declares for a solution that serves MCP, and MCPIssuerURLKey and
-// MCPPublicURLKey the two values in it. They are resolved through the SDK the
-// way the registration secret is (see SolutionRegistrationSecretGroup), because
-// a Codefly composition has no way to set a bare environment variable on a
-// service: every value a service receives is either an endpoint the SDK
+// MCPPublicURLKey the two values in it. They are resolved through the SDK
+// because a Codefly composition has no way to set a bare environment variable
+// on a service: every value a service receives is either an endpoint the SDK
 // resolves or a declared configuration the render projects. Both were read as
 // bare environment variables when ServeMCP landed, which named a provisioning
 // path that does not exist.
+//
+// This used to say "the way the registration secret is", naming
+// SolutionRegistrationSecretGroup. That group and the registrations it fed are
+// deleted; the comparison outlived the thing it compared to.
 //
 // MCPIssuerURLKey is the origin MCP clients authenticate against — the host as
 // an authorization server. A deployment must supply it: what the SDK resolves
@@ -602,12 +642,17 @@ func firstForwarded(r *http.Request, name string) string {
 // by no client. It is the one value a composition has to declare for MCP, and
 // it stops being one when module-saas-starter#1003 settles what `iss` is.
 //
-// MCPPublicURLKey overrides the public MCP URL, which the runtime otherwise
-// derives by construction (see resolveMCPPublicURL). It exists for a host whose
-// gateway fronts solutions under some other route; it must end in MCPPath,
-// because the metadata document's own URL is derived from it by swapping that
-// suffix — the same pairing the registration token URLs use, and refused at
-// boot for the same reason when it cannot be made.
+// MCPPublicURLKey is the public MCP URL. A deployed MCP surface must declare
+// it: the runtime can derive one from PUBLIC_URL, but the derivation builds
+// <PUBLIC_URL>/solutions/<id>/mcp, which encodes the route the HOST serves this
+// solution on — a layout this runtime does not know. The derivation stands for
+// a local run, where whoever made the guess can check it.
+//
+// It must end in MCPPath, because the metadata document's own URL is derived
+// from it by swapping that suffix, and a value that cannot be paired is
+// refused at boot rather than guessed at. The pairing is siblingURL, which the
+// deleted registration token URLs used for the same reason — it is the only
+// caller left.
 const (
 	MCPConfigurationGroup = "mcp"
 	MCPIssuerURLKey       = "issuer-url"

@@ -3428,9 +3428,12 @@ func setCORS(w http.ResponseWriter) {
 // role through the SDK rather than typing an address. They were deleted as
 // collateral when the registrations that called them went.
 
-// siblingURL swaps the trailing `replacing` of base for path. It is how a
-// derived federation endpoint follows an explicitly overridden one: both
-// endpoints of the registration exchange must address the same gateway.
+// siblingURL swaps the trailing `replacing` of base for path.
+//
+// It paired the two endpoints of a registration exchange, which had to address
+// the same gateway. Those are deleted; its one caller now is the MCP metadata
+// document's URL, derived from the resource identifier by swapping that
+// suffix.
 //
 // It replaces a suffix rather than rebuilding from scheme+host, because a
 // gateway is not always mounted at the root. Rebuilding dropped everything

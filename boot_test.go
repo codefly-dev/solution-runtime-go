@@ -385,6 +385,9 @@ type booted struct {
 	base   string
 	client *http.Client
 	mint   *hostMint
+	// cell is the CA the listener verifies callers against, for a test that
+	// must issue another certificate it will accept.
+	cell *cell
 }
 
 // bootEnvironment provisions everything a deployed solution's boot reads — the
@@ -397,9 +400,19 @@ type booted struct {
 // or the test is asserting the first missing value instead.
 func bootEnvironment(t *testing.T, mint *hostMint) (caller *tls.Certificate, roots *x509.CertPool) {
 	t.Helper()
-	certFile, keyFile, bundleFile, caller, roots := bootIdentity(t, mint, testPrincipal)
-	_, _, _ = certFile, keyFile, bundleFile
+	caller, roots, _ = bootCell(t, mint)
 	return caller, roots
+}
+
+// bootCell is bootEnvironment with the cell exposed, for a test that must issue
+// another certificate under the SAME anchor the listener verifies against — a
+// forged leaf from any other cell is refused for its chain, which would answer
+// the test before the property under test is reached.
+func bootCell(t *testing.T, mint *hostMint) (caller *tls.Certificate, roots *x509.CertPool, cell *cell) {
+	t.Helper()
+	certFile, keyFile, bundleFile, caller, roots, cell := bootIdentityIn(t, mint, testPrincipal)
+	_, _, _ = certFile, keyFile, bundleFile
+	return caller, roots, cell
 }
 
 // bootIdentity is bootEnvironment with the projected material exposed, for a
@@ -407,8 +420,14 @@ func bootEnvironment(t *testing.T, mint *hostMint) (caller *tls.Certificate, roo
 // anchor the fake host is served with — otherwise the boot fails verifying the
 // host rather than on the property under test.
 func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, keyFile, bundleFile string, caller *tls.Certificate, roots *x509.CertPool) {
+	certFile, keyFile, bundleFile, caller, roots, _ = bootIdentityIn(t, mint, principal)
+	return
+}
+
+func bootIdentityIn(t *testing.T, mint *hostMint, principal string) (certFile, keyFile, bundleFile string, caller *tls.Certificate, roots *x509.CertPool, issuing *cell) {
 	t.Helper()
 	cell := newCell(t)
+	issuing = cell
 	certFile, keyFile, bundleFile, caller, roots = cell.workload(t, principal)
 	mint.serveTLS(t, cell)
 	authorityValues(t)
@@ -444,14 +463,14 @@ func bootIdentity(t *testing.T, mint *hostMint, principal string) (certFile, key
 	if os.Getenv("ASSETS_DIR") == "" {
 		t.Setenv("ASSETS_DIR", t.TempDir())
 	}
-	return certFile, keyFile, bundleFile, caller, roots
+	return certFile, keyFile, bundleFile, caller, roots, issuing
 }
 
 // boot runs the whole boot a deployed solution runs — configuration, the
 // contract, the one mint, the TLS listener — on an ephemeral port.
 func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 	t.Helper()
-	caller, roots := bootEnvironment(t, mint)
+	caller, roots, cell := bootCell(t, mint)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	ln, err := takeListener(server).start(ctx)
@@ -477,6 +496,7 @@ func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 			MinVersion:   tls.VersionTLS13,
 		}}},
 		mint: mint,
+		cell: cell,
 	}
 }
 
@@ -1047,4 +1067,126 @@ func listenOn(t *testing.T, server *Server) string {
 	ln, port := boundPort(t)
 	server.boundListener = ln
 	return port
+}
+
+// TestAHandlerCannotRewriteTheIdentityThisConnectionWasAdmittedAs is R8-2,
+// reproduced on a booted listener over mTLS.
+//
+// The pin used to be recorded on the recheck's first tick, a second after the
+// connection was accepted. I wrote that the window was sound because "no
+// in-process hook can run inside it". That was false: a RequestHandler is an
+// in-process hook, it is handed r.TLS, and a tls.ConnectionState shares its
+// certificates with the connection. A handler rewriting
+// PeerCertificates[0].Raw inside that first second had the pin record the
+// rewritten identity, and a caller removed from the admitted set went on being
+// served on that connection.
+//
+// The identity is recorded at the first http.StateActive now, which net/http
+// calls after reading a request and before ServeHTTP — ahead of any author
+// code, on the first request and every one after.
+func TestAHandlerCannotRewriteTheIdentityThisConnectionWasAdmittedAs(t *testing.T) {
+	const survivor = "spiffe://codefly.test/ns/platform/sa/somebody-else"
+	mint := newHostMint(t, &hostMint{})
+	var (
+		swapped atomic.Bool
+		forged  *x509.Certificate
+	)
+
+	server := New(Manifest{ID: testSolutionID}).
+		HandleRequest("/thing", func(r *http.Request, _ *Gateway) (any, error) {
+			// What a hostile or merely careless handler can reach: the parsed
+			// chain behind r.TLS, which is the connection's own.
+			if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+				// Forged to the identity that will REMAIN admitted after the
+				// withdrawal below, and issued under the anchor this listener
+				// verifies against.
+				//
+				// Rewriting to an identity nobody admits proves nothing: the
+				// recheck closes such a connection whichever object it read,
+				// so a test doing that passes without the fix. The attack is
+				// to name the identity that survives the change.
+				r.TLS.PeerCertificates[0].Raw = forged.Raw
+				r.TLS.PeerCertificates[0].URIs = forged.URIs
+				swapped.Store(true)
+			}
+			return map[string]string{"ok": "yes"}, nil
+		})
+	solution := boot(t, server, mint)
+	forged = parsedLeaf(t, solution.cell.identity(t, survivor))
+	provisioned := os.Getenv(IdentityAllowedCallersFileEnvironmentVariable)
+	if provisioned == "" {
+		t.Fatal("the boot resolved no allowed-callers path, so this test cannot withdraw admission")
+	}
+
+	call := func() error {
+		request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
+		if err != nil {
+			return err
+		}
+		// The viewer's bearer, because the route gate answers 401 without one
+		// and the handler never runs — which is how the first version of this
+		// test "passed" while exercising nothing.
+		request.Header.Set("authorization", viewerBearer())
+		resp, err := solution.client.Do(request)
+		if err != nil {
+			return err
+		}
+		drainAndClose(resp)
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("the solution answered %d", resp.StatusCode)
+		}
+		return nil
+	}
+
+	// One request, which runs the handler and lets it rewrite the chain. The
+	// pin was taken before that handler ran.
+	if err := call(); err != nil {
+		t.Fatalf("an admitted caller was refused: %v", err)
+	}
+	if !swapped.Load() {
+		t.Fatal("the handler never saw a peer chain, so this test exercised nothing")
+	}
+
+	// The caller is withdrawn. Whatever the handler wrote, the connection is
+	// held to the identity it was admitted as, so the recheck must close it.
+	writeFile(t, provisioned, survivor+"\n")
+
+	deadline := time.Now().Add(6 * inboundTrustRecheckInterval)
+	for time.Now().Before(deadline) {
+		if err := call(); err != nil {
+			return // closed, which is the point
+		}
+		time.Sleep(inboundTrustRecheckInterval / 10)
+	}
+	t.Fatalf("a de-admitted caller was still served %s after its identity was withdrawn: a handler rewrote the chain the recheck reads, and the identity the connection was admitted as has to be recorded before any handler runs",
+		6*inboundTrustRecheckInterval)
+}
+
+// TestTheListenerDoesNotNegotiateHTTP2 pins the assumption the recheck's pin
+// rests on.
+//
+// net/http calls the ConnState hook with StateActive before ServeHTTP for
+// HTTP/1.x, and passes skipHooks for HTTP/2 — so under h2 the pin would never
+// be taken at a request and would fall back to the recheck's first tick, which
+// is the window R8-2 exploited. Nothing negotiates h2 here: the served
+// configuration advertises no ALPN protocol and serve() uses Serve rather than
+// ServeTLS, which is what would configure HTTP/2.
+//
+// If that changes, this fails rather than the pin quietly stopping happening.
+func TestTheListenerDoesNotNegotiateHTTP2(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.principal = testPrincipal
+	config, err := server.serverIdentity()
+	if err != nil {
+		t.Fatalf("serverIdentity: %v", err)
+	}
+	for _, proto := range config.NextProtos {
+		if proto == "h2" {
+			t.Fatal("the listener advertises h2: net/http skips the StateActive ConnState hook for HTTP/2, so the identity a connection was admitted as would no longer be recorded before a handler runs — move the pin before enabling it")
+		}
+	}
 }

@@ -278,30 +278,101 @@ func (s *Server) watchInboundTrust() (func(net.Conn, http.ConnState), error) {
 			if !ok {
 				return
 			}
-			done := make(chan struct{})
-			if _, already := watching.LoadOrStore(conn, done); already {
+			watched := &watchedCaller{done: make(chan struct{})}
+			if _, already := watching.LoadOrStore(conn, watched); already {
 				return
 			}
-			go recheckCaller(tlsConn, done, trust, admitted)
+			go recheckCaller(tlsConn, watched, trust, admitted)
+		case http.StateActive:
+			// The identity is recorded HERE, synchronously, before the handler
+			// runs — not on the recheck's first tick.
+			//
+			// Pinning on the first tick left a one-second window, and I wrote
+			// that it was sound because "no in-process hook can run inside
+			// it". That was false, and executed round eight proved it: a
+			// RequestHandler is an in-process hook, it is handed r.TLS, and
+			// tls.ConnectionState shares its certificates with the connection.
+			// A handler rewriting PeerCertificates[0].Raw inside the first
+			// second had the pin record the rewritten identity, and a
+			// de-admitted caller was served 465 requests over 10 seconds on
+			// one connection.
+			//
+			// net/http calls this hook after readRequest and before
+			// ServeHTTP (server.go, setState(StateActive, runHooks)), so this
+			// runs ahead of any author code on the first request and every
+			// one after it. It does not run for HTTP/2, where net/http passes
+			// skipHooks — which is why TestTheListenerDoesNotNegotiateHTTP2
+			// exists: this listener advertises no ALPN protocol and is served
+			// with Serve rather than ServeTLS, so nothing negotiates h2 today,
+			// and if that changes the pin has to move rather than quietly stop
+			// happening.
+			if watched, ok := watching.Load(conn); ok {
+				if tlsConn, isTLS := conn.(*tls.Conn); isTLS {
+					watched.(*watchedCaller).pin(tlsConn.ConnectionState())
+				}
+			}
 		case http.StateClosed, http.StateHijacked:
-			if done, ok := watching.LoadAndDelete(conn); ok {
-				close(done.(chan struct{}))
+			if watched, ok := watching.LoadAndDelete(conn); ok {
+				watched.(*watchedCaller).stop()
 			}
 		}
 	}, nil
 }
 
+// watchedCaller is one watched connection's lifetime and the identity it was
+// admitted as.
+//
+// The identity is recorded once, by whichever of the two reaches it first: the
+// ConnState hook at the first request, or the recheck's own first tick for a
+// connection that handshakes and then sends nothing. Both read it from a
+// private parse (see immutableChain); the difference is that the hook runs
+// before any handler, and the tick does not.
+type watchedCaller struct {
+	done     chan struct{}
+	stopOnce sync.Once
+	mu       sync.Mutex
+	identity string
+	leaf     []byte
+	refused  error
+}
+
+// pin records the identity this connection was authenticated as, if nothing has
+// yet.
+func (w *watchedCaller) pin(state tls.ConnectionState) {
+	if !state.HandshakeComplete {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.identity != "" || w.refused != nil {
+		return
+	}
+	identity, leaf, err := admittedIdentity(state)
+	if err != nil {
+		w.refused = err
+		return
+	}
+	w.identity, w.leaf = identity, leaf
+}
+
+// pinned is what was recorded, and any error that recording it produced.
+func (w *watchedCaller) pinned() (string, []byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.identity, w.leaf, w.refused
+}
+
+func (w *watchedCaller) stop() {
+	w.stopOnce.Do(func() { close(w.done) })
+}
+
 // recheckCaller re-verifies one established caller until the connection ends.
-func recheckCaller(conn *tls.Conn, done <-chan struct{}, trust func() (*x509.CertPool, error), admitted func() ([]string, error)) {
+func recheckCaller(conn *tls.Conn, watched *watchedCaller, trust func() (*x509.CertPool, error), admitted func() ([]string, error)) {
 	ticker := time.NewTicker(inboundTrustRecheckInterval)
 	defer ticker.Stop()
-	var (
-		pinned     string
-		pinnedLeaf []byte
-	)
 	for {
 		select {
-		case <-done:
+		case <-watched.done:
 			return
 		case <-ticker.C:
 			// Until the handshake completes there is no peer chain to judge,
@@ -309,42 +380,21 @@ func recheckCaller(conn *tls.Conn, done <-chan struct{}, trust func() (*x509.Cer
 			// refused — it is bounded by the handshake deadline instead. This
 			// is why the watch can start at accept: it waits for
 			// authentication rather than for the first request.
-			if !conn.ConnectionState().HandshakeComplete {
+			state := conn.ConnectionState()
+			if !state.HandshakeComplete {
 				continue
 			}
-			// The identity this connection was admitted as, recorded once and
-			// then held to.
-			//
-			// Re-deriving it every tick asks "who is this connection now?",
-			// and the answer comes from objects the connection shares:
-			// tls.ConnectionState.PeerCertificates shares its backing array
-			// with the connection's own slice, and TLS 1.3 runs
-			// VerifyConnection *before* checking CertificateVerify against
-			// peerCertificates[0].PublicKey — so a hook that swapped the leaf
-			// had the handshake authenticated against the swapped key, and an
-			// attacker holding only an admitted identity's public certificate
-			// plus its own private key was served. The quieter half was a Raw
-			// swap: the recheck re-parsed the swapped DER and agreed with it,
-			// so a de-admitted caller kept being served.
-			//
-			// The hooks that could do that are refused at boot. This is the
-			// question being asked correctly regardless: not "who is this?"
-			// but "is this still the caller we admitted?"
-			//
-			// Recorded on the first tick after the handshake, because the
-			// admission has no handle on the connection. That gap is sound
-			// only because no in-process hook can run inside it — the source's
-			// verifiers are refused — so this hardens the recheck and does not
-			// replace that refusal.
-			if pinned == "" {
-				identity, leaf, err := admittedIdentity(conn.ConnectionState())
-				if err != nil {
-					_ = conn.Close()
-					return
-				}
-				pinned, pinnedLeaf = identity, leaf
+			// For a connection that handshook and has sent nothing, no request
+			// has reached StateActive, so nothing has pinned it yet and no
+			// handler has run either. Pinning here is then reading the chain
+			// as the handshake left it.
+			watched.pin(state)
+			pinned, leaf, err := watched.pinned()
+			if err != nil {
+				_ = conn.Close()
+				return
 			}
-			if err := callerStillAdmitted(conn.ConnectionState(), trust, admitted, pinned, pinnedLeaf); err != nil {
+			if err := callerStillAdmitted(state, trust, admitted, pinned, leaf); err != nil {
 				_ = conn.Close()
 				return
 			}
@@ -514,39 +564,27 @@ func (s *Server) serverIdentity() (*tls.Config, error) {
 // set that is too wide. The comparison is the SPIFFE ID in the leaf's URI SAN,
 // the same thing the listener's own identity is held to.
 func admitOnly(config *tls.Config, allowed func() ([]string, error)) {
-	// Composed, not overwritten. A source may have its own VerifyConnection —
-	// a mesh CA checking its own claims, a consumer enforcing something this
-	// runtime knows nothing about — and assigning over it silently deleted a
-	// check the source author wrote, which is the opposite of what adding a
-	// check should do. Theirs runs first, since a caller their rules refuse
-	// should be refused for their reason.
-	theirs := config.VerifyConnection
-	mine := verifyCaller(allowed)
-	config.VerifyConnection = func(state tls.ConnectionState) error {
-		// OURS FIRST, and the order is the fix rather than a preference.
-		//
-		// It used to run the source's check first, on the grounds that a
-		// caller its rules refuse should be refused for its reason. But
-		// tls.ConnectionState carries *pointers* to the parsed chain, so a
-		// source's verifier running first can edit the certificate this
-		// admission then reads — rewriting the leaf's URI SANs to claim an
-		// admitted identity was demonstrated getting a rival caller in.
-		// Re-parsing the leaf's Raw afterwards does not fix it either: Raw is
-		// a field on the same mutable object, so a verifier that rewrites it
-		// hands this check attacker-chosen bytes.
-		//
-		// The only sound answer is to decide admission on the chain as the
-		// handshake left it, before anything else has been given the chance to
-		// touch it. The cost is that a source's own refusal reason now comes
-		// second, which is cosmetic beside the alternative.
-		if err := mine(state); err != nil {
-			return err
-		}
-		if theirs != nil {
-			return theirs(state)
-		}
-		return nil
-	}
+	// Assigned, not composed, and that is a consequence rather than a
+	// preference.
+	//
+	// This composed over a source's own VerifyConnection, so that a consumer's
+	// check was not silently deleted by adding one. Then the order had to
+	// change — tls.ConnectionState carries pointers to the parsed chain, so a
+	// source's verifier running first could edit the certificate this
+	// admission reads, and rewriting the leaf's URI SANs was demonstrated
+	// getting a rival caller in. Then the hook was refused outright, because
+	// holding those pointers also let it change what the per-second rechecks
+	// read minutes later, and there is no safe way to lend a source the
+	// objects this listener authenticates by.
+	//
+	// So the composition had nothing left to compose: usableServerIdentity
+	// refuses a source that sets VerifyConnection, on the base configuration
+	// and on every per-connection answer, and clientTLSFrom builds the
+	// outbound configuration from scratch rather than copying one. The branch
+	// was kept here with a comment claiming it served the outbound direction.
+	// It did not, and a mutation that removed it survived the whole suite.
+	// Legacy means delete.
+	config.VerifyConnection = verifyCaller(allowed)
 }
 
 // verifyCaller is the check itself, so it can be applied to a per-connection
@@ -590,13 +628,11 @@ func verifyCaller(allowed func() ([]string, error)) func(tls.ConnectionState) er
 // Composed over whatever the configuration already verifies, never assigned
 // over it, for the reason admitOnly records.
 func admitOnlyPlatform(config *tls.Config, expected func() ([]string, error)) {
-	theirs := config.VerifyConnection
+	// Assigned too, for the same reason: clientTLSFrom builds this
+	// configuration field by field and never carries a source's
+	// VerifyConnection onto it, so there was never anything here to compose
+	// with either.
 	config.VerifyConnection = func(state tls.ConnectionState) error {
-		if theirs != nil {
-			if err := theirs(state); err != nil {
-				return err
-			}
-		}
 		peers, err := expected()
 		if err != nil {
 			return err

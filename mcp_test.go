@@ -1143,16 +1143,19 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 //
 // A plain handler and a ViewerBearer passthrough are both refused while the
 // issuer has withdrawn this execution's credential — "fail closed, with no
-// exception for a counterpart's current state". A tool call was not: it
-// received a gateway carrying the viewer's bearer and ran author code with it,
-// which is acting for a viewer without authority. A tool that mints nothing
-// still sends that bearer wherever it dials.
+// exception for a counterpart's current state". A tool call was not: executed
+// round eight reproduced one being SERVED over mTLS with a real MCP client,
+// with the viewer's bearer reaching the gateway.
 //
-// The gate is an allowlist of the methods that act for nobody, so a method the
-// MCP SDK adds is held by default. Both refusal classes are driven here,
-// because the boot and the run have to classify them the same way and have not
-// always: a terminal refusal ends the process, a transient one does not, and
-// neither may let a tool run.
+// Refused at the HTTP boundary, which answers a real 503. An earlier version of
+// this gated only at the method layer so that tools/list could still answer,
+// on the grounds that refusing it would make a withdrawn credential look like
+// a solution serving no MCP at all. That reasoning was weak: a 503 carrying
+// the sanitized sentence says "temporarily cannot act", which is accurate,
+// where a 404 would be the indistinguishable answer. And a client that
+// connects and lists tools it can never call is worse served than one told to
+// back off. The method-layer gate stays as well, for anything reaching the
+// method middleware another way.
 func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1172,7 +1175,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 			}
 			server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
 				ServeMCP(mcpServerName, "v1.2.3", register).
-				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/platform/_credential", tc.err)})
+				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/platform/_credential (dial tcp 10.4.1.9:8443: connection refused)", tc.err)})
 
 			handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
 			if err != nil {
@@ -1180,33 +1183,49 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 			}
 			host := httptest.NewServer(handler)
 			t.Cleanup(host.Close)
-			session := connectMCP(t, host, viewerStamp())
 
-			_, err = session.CallTool(context.Background(), &mcp.CallToolParams{
-				Name:      "act",
-				Arguments: map[string]any{"question": "anything"},
-			})
-			if err == nil {
-				t.Fatal("a tool call was answered while this execution held no usable credential: the viewer's bearer went to author code under authority this process does not have")
+			// A tools/call the way a client sends it, by hand: the SDK's
+			// client cannot complete its handshake against a surface that is
+			// refusing, which is the point.
+			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"act","arguments":{"question":"anything"}}}`
+			req, err := http.NewRequest(http.MethodPost, host.URL+MCPPath, strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("content-type", "application/json")
+			stamp := viewerStamp()
+			req.Header.Set("authorization", stamp.bearer)
+			req.Header.Set(userHeader, stamp.userID)
+			req.Header.Set(orgHeader, stamp.orgID)
+			req.Header.Set(sessionHeader, stamp.sessionID)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post a tool call: %v", err)
+			}
+			defer drainAndClose(resp)
+
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("a tool call answered %d while this execution held no usable credential, want 503: the viewer's bearer would otherwise reach author code under authority this process does not have", resp.StatusCode)
 			}
 			if ran.Load() {
-				t.Error("the tool ran: the gate has to refuse before anything author-written executes, not report afterwards")
+				t.Error("the tool ran: the gate has to refuse before anything author-written executes")
 			}
-			// Sanitized, like every other viewer-facing refusal. The source's
-			// error names an internal mint address; a client must not learn it.
-			if strings.Contains(err.Error(), "mint.internal.example") {
-				t.Errorf("the refusal %q discloses the runtime's own mint address to an MCP client", err)
+			said, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if strings.Contains(err.Error(), "_credential") {
-				t.Errorf("the refusal %q discloses the runtime's credential path", err)
+			for _, leak := range []string{"mint.internal.example", "_credential", "10.4.1.9", "connection refused"} {
+				if strings.Contains(string(said), leak) {
+					t.Errorf("the refusal discloses %q to an MCP client: %s", leak, said)
+				}
 			}
 		})
 	}
 
-	t.Run("a listing still answers, because it acts for nobody", func(t *testing.T) {
-		// The allowlist's other half: refusing the handshake and the listings
-		// would make a withdrawn credential indistinguishable from a solution
-		// that serves no MCP at all, and neither runs anything for a viewer.
+	t.Run("the refusal is 503 and not 404", func(t *testing.T) {
+		// A withdrawn credential must not read as "this solution serves no
+		// MCP": one is a back-off, the other sends a client looking for an
+		// endpoint that does not exist.
 		server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
 			ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
 			Credential(refusingSource{err: workcontext.ErrMintRefused})
@@ -1216,16 +1235,33 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		}
 		host := httptest.NewServer(handler)
 		t.Cleanup(host.Close)
-		session := connectMCP(t, host, viewerStamp())
-		if _, err := session.ListTools(context.Background(), nil); err != nil {
-			t.Errorf("tools/list was refused while no credential was held: it runs nothing for the viewer, and refusing it hides a withdrawn credential behind a surface that looks absent: %v", err)
+
+		req, err := http.NewRequest(http.MethodPost, host.URL+MCPPath, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("content-type", "application/json")
+		stamp := viewerStamp()
+		req.Header.Set("authorization", stamp.bearer)
+		req.Header.Set(orgHeader, stamp.orgID)
+		req.Header.Set(sessionHeader, stamp.sessionID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer drainAndClose(resp)
+		if resp.StatusCode == http.StatusNotFound {
+			t.Error("a withdrawn credential answered 404: an MCP client cannot tell that from a solution that serves no MCP at all")
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", resp.StatusCode)
 		}
 	})
 
-	t.Run("every method that is not allowlisted is gated", func(t *testing.T) {
-		// The property, not an enumeration: a method this file has never heard
-		// of is held to the credential. A denylist over the SDK's method set is
-		// the mistake the TLS posture made three times.
+	t.Run("every method that is not allowlisted is gated at the method layer too", func(t *testing.T) {
+		// The method-layer gate's property, not an enumeration: a method this
+		// file has never heard of is held to the credential. A denylist over
+		// the SDK's method set is the mistake the TLS posture made three times.
 		for _, method := range []string{"tools/call", "resources/read", "prompts/get", "completion/complete", "some/method-added-next-release"} {
 			if actsForNobody(method) {
 				t.Errorf("%q is treated as acting for nobody, so a viewer action on it would skip the credential gate", method)
@@ -1233,7 +1269,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		}
 		for _, method := range []string{"initialize", "ping", "tools/list", "prompts/list", "resources/list", "notifications/cancelled"} {
 			if !actsForNobody(method) {
-				t.Errorf("%q is gated though it runs nothing for a viewer", method)
+				t.Errorf("%q is gated at the method layer though it runs nothing for a viewer", method)
 			}
 		}
 	})
