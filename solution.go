@@ -2185,6 +2185,10 @@ type Gateway struct {
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
+	// sanitizeErrors makes this gateway hand back errors a caller may relay
+	// verbatim. Set on the MCP path, where a tool's error becomes content the
+	// client reads and nothing downstream can tell it from the author's own.
+	sanitizeErrors bool
 	// installationID is the installation the viewer's capability is sealed to,
 	// which every mint this gateway runs names. Empty when the caller arrived
 	// with nothing a seal could be read from, which is a refusal rather than a
@@ -2938,9 +2942,35 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 	acting := *g
 	acting.delegation = &delegation{key: string(key), ask: ask}
 	if _, err := acting.workContext(ctx); err != nil {
-		return nil, err
+		return nil, g.surfaced(err)
 	}
 	return &acting, nil
+}
+
+// surfaced is the error a caller is handed, sanitized where the caller cannot
+// be trusted to sanitize it themselves.
+//
+// On a handler route this returns the error unchanged: the detail is what a log
+// line and an operator need, and handlerErrorResponse sanitizes at the HTTP
+// boundary, which every handler response passes through.
+//
+// An MCP tool has no such boundary. A tool returns an error and the MCP SDK
+// turns it into a CallToolResult carrying that text, *below* the middleware
+// this runtime installs — so by the time anything here sees the call again the
+// text is content, indistinguishable from what the author meant to say. The
+// runtime's own errors name the mint URL, the gateway URL and the issuer's
+// message, because that is what a boot refusal needs; relayed to an agent
+// client they are a disclosure, which executed round eight reproduced.
+//
+// So the sanitizing happens where the error leaves this runtime's hands,
+// rather than where it would be too late. The detail goes to the log.
+func (g *Gateway) surfaced(err error) error {
+	if err == nil || !g.sanitizeErrors {
+		return err
+	}
+	_, message := handlerErrorResponse(err)
+	log.Printf("solution %q: refusing a module read for a viewer: %v", g.id, err)
+	return errors.New(message)
 }
 
 // withinPublishedCeiling holds a mint to the contract this process published.

@@ -318,6 +318,10 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 		// held to nothing the contract claims. Every other path a viewer
 		// reaches this runtime on is built here, and this one has to be too.
 		gw := s.gatewayFor(header)
+		// A tool's error becomes content the client reads, below this
+		// middleware, so the runtime's own errors are sanitized before the
+		// author ever holds one. See Gateway.surfaced.
+		gw.sanitizeErrors = true
 		// The credential gate, before anything author-written runs.
 		//
 		// This is R4-3 on the MCP path, and it arrived with the surface rather

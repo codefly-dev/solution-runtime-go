@@ -1274,3 +1274,72 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		}
 	})
 }
+
+// TestAToolsOwnFailureIsSanitizedOnTheWayOut is the other half of R8-1, and
+// the half my first answer to it did not test.
+//
+// The gate refuses a tool when this execution holds no credential. This is the
+// case the gate lets through: the credential is fine when the call starts and
+// the viewer's mint fails during it. A tool that called ForModule and was
+// refused handed the agent client the whole chain — "mint returned HTTP 503",
+// and with the issuer unreachable the mint's own URL and dial address.
+//
+// A tool's error is written for a model and read by whoever is driving it, so
+// it is sanitized by the same rule a handler's is. The mutation that relays
+// err.Error() verbatim survived until this test existed, because the gate test
+// refuses before any tool runs and never reaches the out-path.
+func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
+	// A gateway whose mint refuses, and a workload credential that is
+	// perfectly good — so the gate passes and the failure happens inside the
+	// tool.
+	gw := newWorkContextGateway(t, &workContextGateway{mintStatus: http.StatusServiceUnavailable})
+	register := func(srv *mcp.Server) {
+		mcp.AddTool(srv, &mcp.Tool{Name: "read", Description: "reads a module as the viewer"},
+			func(ctx context.Context, _ *mcp.CallToolRequest, _ askInput) (*mcp.CallToolResult, askOutput, error) {
+				viewer, err := ViewerFromContext(ctx)
+				if err != nil {
+					return nil, askOutput{}, err
+				}
+				// The real shape: a tool minting for the viewer, refused.
+				if _, err := viewer.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}}); err != nil {
+					return nil, askOutput{}, err
+				}
+				return nil, askOutput{Status: 200}, nil
+			})
+	}
+	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+		ServeMCP(mcpServerName, "v1.2.3", register).
+		Credential(attestingSource(t))
+	server.cfg.gatewayURL = gw.URL
+
+	handler, err := server.mcpHandler(MCPEnvironment{GatewayURL: gw.URL, IssuerURL: testIssuer})
+	if err != nil {
+		t.Fatalf("mount MCP: %v", err)
+	}
+	host := httptest.NewServer(handler)
+	t.Cleanup(host.Close)
+	session := connectMCP(t, host, viewerStamp())
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "read",
+		Arguments: map[string]any{"question": "anything"},
+	})
+	// Either shape is a failure the client sees; what matters is what it says.
+	said := ""
+	switch {
+	case err != nil:
+		said = err.Error()
+	case result != nil && result.IsError:
+		said = toolErrorText(result)
+	default:
+		t.Fatal("a tool whose viewer mint was refused answered as though it had succeeded")
+	}
+	for _, leak := range []string{gw.URL, "StartTask", "503", "mint returned"} {
+		if strings.Contains(said, leak) {
+			t.Errorf("the tool's failure discloses %q to the MCP client: %s", leak, said)
+		}
+	}
+	if said == "" {
+		t.Error("the client was told nothing at all")
+	}
+}
