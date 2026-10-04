@@ -319,59 +319,16 @@ func isWorkContextPath(path string) bool {
 // to the same credential-bearing handler. It now reads every call to the seam
 // in the module and requires the calling function to refuse a non-test binary.
 func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.T) {
-	reachesTheSeam, refusesANonTestBinary := seamCallGraph(t)
-	fset := token.NewFileSet()
-	for _, name := range moduleSources(t) {
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
+	for _, pkg := range moduleBoundaryPackages(t) {
+		for _, violation := range newSeamBoundary(pkg).violations() {
+			t.Error(violation)
 		}
-		for _, decl := range file.Decls {
-			switch declared := decl.(type) {
-			case *ast.FuncDecl:
-				if strings.Contains(name, "internal/seam") {
-					continue
-				}
-				// Whoever reaches the seam is an exported path to a handler
-				// holding a real credential, whatever it is called and whether
-				// it hangs off a receiver or not.
-				//
-				// Transitively. The rule matched only a function that calls
-				// seam.Passthrough *directly*, so an exported Handler
-				// delegating to an unexported helper — and a root-package
-				// wrapper over passthroughSeam — both walked past it. One hop
-				// of indirection is the first thing anyone writes.
-				if !reachesTheSeam[declared.Name.Name] {
-					continue
-				}
-				if !declared.Name.IsExported() {
-					continue
-				}
-				if !refusesANonTestBinary[declared.Name.Name] {
-					t.Errorf("%s exports %s, which builds a passthrough through internal/seam without refusing a non-test binary: that handler holds a real execution credential and skips validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, so an exported path to it has to call mustBeATest()",
-						name, declared.Name.Name)
-				}
-			case *ast.GenDecl:
-				for _, spec := range declared.Specs {
-					if typed, ok := spec.(*ast.TypeSpec); ok && typed.Name.Name == "PassthroughEnvironment" {
-						t.Errorf("%s exports PassthroughEnvironment, the argument of the constructor this change removed", name)
-					}
-					// An exported *variable* holding the seam is the same
-					// bypass with no function to inspect: `var
-					// BuildPassthrough = passthroughSeam` in the root package,
-					// or `var Build = seam.Passthrough` in passthroughtest,
-					// both passed a gate that only read function bodies.
-					value, ok := spec.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					for i, declaredName := range value.Names {
-						if !declaredName.IsExported() || i >= len(value.Values) {
-							continue
-						}
-						if named := renderedReference(value.Values[i]); reachesTheSeam[named] || named == "seam.Passthrough" {
-							t.Errorf("%s exports the variable %s holding %s: that is a path to a credential-bearing handler with no function body for a gate to read and no refusal in front of it",
-								name, declaredName.Name, named)
+		for _, file := range pkg.files {
+			for _, decl := range file.Decls {
+				if decl, ok := decl.(*ast.GenDecl); ok {
+					for _, spec := range decl.Specs {
+						if typed, ok := spec.(*ast.TypeSpec); ok && typed.Name.Name == "PassthroughEnvironment" {
+							t.Errorf("%s exports the removed PassthroughEnvironment", pkg.fset.Position(typed.Pos()))
 						}
 					}
 				}
@@ -399,137 +356,6 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 			t.Error(violation)
 		}
 	}
-}
-
-// renderedReference is pkg.Name or Name for an expression that merely refers to
-// something, which is what an exported variable's initialiser is.
-func renderedReference(expr ast.Expr) string {
-	switch named := expr.(type) {
-	case *ast.Ident:
-		return named.Name
-	case *ast.SelectorExpr:
-		if pkg, ok := named.X.(*ast.Ident); ok {
-			return pkg.Name + "." + named.Sel.Name
-		}
-	}
-	return ""
-}
-
-// seamCallGraph is, for every function in the module, whether it reaches the
-// passthrough seam and whether it refuses a non-test binary — both
-// transitively, because one hop of indirection is the first thing anyone
-// writes and the previous rule only looked at direct calls.
-func seamCallGraph(t *testing.T) (reaches, refuses map[string]bool) {
-	t.Helper()
-	fset := token.NewFileSet()
-	var files []*ast.File
-	for _, name := range moduleSources(t) {
-		if strings.Contains(name, "internal/seam") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		files = append(files, file)
-	}
-	return seamReachability(files)
-}
-
-// seamReachability is seamCallGraph over files already parsed, so a probe can
-// supply its own.
-func seamReachability(files []*ast.File) (reaches, refuses map[string]bool) {
-	calls := map[string][]string{}
-	reaches, refuses = map[string]bool{}, map[string]bool{}
-	for _, file := range files {
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			if callsThe(fn, "seam", "Passthrough") {
-				reaches[fn.Name.Name] = true
-			}
-			// A refusal swallowed by recover(), or sitting on a branch that
-			// cannot be taken, is not a refusal. Counting the call alone made
-			// both of those read as guarded.
-			if (callsThe(fn, "", "mustBeATest") || callsThe(fn, "", "refuseOutsideTest")) && !defeatsItsOwnRefusal(fn) {
-				refuses[fn.Name.Name] = true
-			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if callee, ok := calleeName(call); ok {
-					calls[fn.Name.Name] = append(calls[fn.Name.Name], callee)
-				}
-				return true
-			})
-		}
-	}
-	// Propagate both properties up the call graph until nothing changes.
-	for changed := true; changed; {
-		changed = false
-		for caller, callees := range calls {
-			for _, callee := range callees {
-				if reaches[callee] && !reaches[caller] {
-					reaches[caller], changed = true, true
-				}
-				if refuses[callee] && !refuses[caller] {
-					refuses[caller], changed = true, true
-				}
-			}
-		}
-	}
-	return reaches, refuses
-}
-
-// defeatsItsOwnRefusal reports whether fn recovers from a panic or guards the
-// refusal behind a constant false, either of which makes the call decorative.
-func defeatsItsOwnRefusal(fn *ast.FuncDecl) bool {
-	defeated := false
-	ast.Inspect(fn, func(node ast.Node) bool {
-		if call, ok := node.(*ast.CallExpr); ok {
-			if named, ok := call.Fun.(*ast.Ident); ok && named.Name == "recover" {
-				defeated = true
-			}
-		}
-		if branch, ok := node.(*ast.IfStmt); ok {
-			if cond, ok := branch.Cond.(*ast.Ident); ok && cond.Name == "false" {
-				defeated = true
-			}
-		}
-		return true
-	})
-	return defeated
-}
-
-// callsThe reports whether fn calls pkg.name, or bare name when pkg is empty.
-func callsThe(fn *ast.FuncDecl, pkg, name string) bool {
-	found := false
-	ast.Inspect(fn, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if pkg == "" {
-			if called, ok := call.Fun.(*ast.Ident); ok && called.Name == name {
-				found = true
-			}
-			return true
-		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		qualifier, ok := selector.X.(*ast.Ident)
-		if ok && qualifier.Name == pkg && selector.Sel.Name == name {
-			found = true
-		}
-		return true
-	})
-	return found
 }
 
 // moduleSources is every non-test Go source in this module, which is what both
@@ -574,43 +400,19 @@ func moduleSources(t *testing.T) []string {
 // seam.Passthrough *directly*, so an exported wrapper one hop away passed it —
 // and one hop of indirection is the first thing anyone writes.
 func TestTheSeamGateFollowsIndirection(t *testing.T) {
-	parse := func(t *testing.T, source string) []*ast.File {
-		t.Helper()
-		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
-		if err != nil {
-			t.Fatalf("parse the probe: %v", err)
-		}
-		return []*ast.File{file}
+	for _, tc := range []struct {
+		name, probe string
+		refused     bool
+	}{
+		{"an exported path one hop from the seam is seen", "seam_indirect", true},
+		{"a refusal one hop away is seen too", "control_guard_helper", false},
+		{"a function that reaches nothing is not flagged", "control_guard_unrelated", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			violations := newSeamBoundary(boundaryProbe(t, tc.probe)).violations()
+			if (len(violations) != 0) != tc.refused {
+				t.Fatalf("refused=%t, want %t: %v", len(violations) != 0, tc.refused, violations)
+			}
+		})
 	}
-
-	t.Run("an exported path one hop from the seam is seen", func(t *testing.T) {
-		reaches, refuses := seamReachability(parse(t, `package solution
-func ExportedIndirect() (http.Handler, error) { return viaHelper() }
-func viaHelper() (http.Handler, error) { return seam.Passthrough(nil, "", "") }`))
-		if !reaches["ExportedIndirect"] {
-			t.Error("the gate did not see that ExportedIndirect reaches the seam: it delegates, so a rule matching only direct callers reports an exported path to a credential-bearing handler as if it were not one")
-		}
-		if refuses["ExportedIndirect"] {
-			t.Error("the gate thinks ExportedIndirect refuses a non-test binary, which nothing in it does")
-		}
-	})
-
-	t.Run("a refusal one hop away is seen too", func(t *testing.T) {
-		// Or the gate would flag a path that is in fact guarded, and a rule
-		// that cries wolf gets relaxed rather than obeyed.
-		_, refuses := seamReachability(parse(t, `package solution
-func Guarded() (http.Handler, error) { return guard() }
-func guard() (http.Handler, error) { mustBeATest(); return seam.Passthrough(nil, "", "") }`))
-		if !refuses["Guarded"] {
-			t.Error("the gate did not see that Guarded refuses a non-test binary through its helper")
-		}
-	})
-
-	t.Run("a function that reaches nothing is not flagged", func(t *testing.T) {
-		reaches, _ := seamReachability(parse(t, `package solution
-func Unrelated() error { return nil }`))
-		if reaches["Unrelated"] {
-			t.Error("the gate flagged a function that does not reach the seam")
-		}
-	})
 }
