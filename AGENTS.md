@@ -207,23 +207,49 @@ embedding it.
   listener that verifies every caller and admits all of them lets a consumed
   module set its own `x-org-id`/`x-session-id` and drive mints under this
   workload's attestation.
-- **Every mint names the installation it acts under.** The host requires it
-  (core's `StartInput.InstallationID`) and refuses a mint naming none; an
-  organization is not an installation, since one org may hold several. A
-  viewer-driven mint takes it from the **seal** of the capability the caller
-  arrived with, through the SDK's reader, and from the
-  `x-codefly-installation-id` header only when there is no capability to read —
-  the SDK's own rule, because the installation that governs a call is the one
-  inside the signature and a header is caller-controlled. A request with no
-  readable installation is refused, and not as a `ClientError`: no caller can
-  seal one, so it is not theirs to fix. A background or delegated call would
-  take it from the parent capability's seal on the held credential; no such path
-  exists here, because every mint is viewer-driven and `ForModule` already
-  refuses a caller without an org and a session. This execution's own credential
-  is sealed by the host from the projected token — the SDK's `MintOptions`
-  carries no installation field — so what this runtime owns is refusing one
-  sealed to no installation and refusing a renewal sealed to a *different* one,
-  which is a different identity arriving through the renewal path.
+- **Every mint names the installation it acts under, and it comes from the
+  header the gateway stamps.** The host requires it (core's
+  `StartInput.InstallationID`) and refuses a mint naming none; an organization
+  is not an installation, since one org may hold several.
+  `x-codefly-installation-id` is the source, on the same footing as `x-org-id`
+  and `x-session-id`: the gateway stamps all three from verified claims and
+  replaces whatever a caller sent. A request naming none is refused, and not as
+  a `ClientError` — no caller can stamp one, so it is not theirs to fix.
+  **This paragraph said the opposite for two rounds.** It described reading the
+  installation from the *seal* of the carried capability, with the header as a
+  fallback, which is the SDK's rule for the direction where a capability IS the
+  authority being carried — outbound, where `Attach` puts the seal's own
+  installation beside it and the far end cross-checks the two. Inbound that
+  carrier is caller-controlled: a browser can put a capability in
+  `x-codefly-work-context`, and this runtime's standing property — with its own
+  test, `TestBrowserSuppliedWorkContextIsNeverForwarded` — is that such a
+  capability authenticates nothing. Reading the installation out of it would
+  let a caller name the deployment their own mint is attributed to, and because
+  `FromHeaders` refuses a capability whose installation carriers are
+  incomplete, a caller sending a malformed one would decide whether the mint
+  happens at all. The code has read only the stamped header since round ten;
+  these two documents did not follow it, which is the failure this file warns
+  about in its own first line.
+  A background or delegated call would take the installation from the parent
+  capability's seal on the held credential; no such path exists here, because
+  every mint is viewer-driven and `ForModule` refuses a caller without an org
+  and a session.
+- **This execution's own credential is held to what it was FIRST sealed to.**
+  The host seals it from the projected token — `MintOptions` carries no
+  installation field — so what this runtime owns is refusing one sealed to no
+  installation, refusing one sealed to no **execution** (image digest and build
+  incarnation, which core seals as a pair), and refusing a renewal sealed to a
+  *different* installation, digest or incarnation. The last is one value, not
+  three checks: a renewal that changed any part of it is a different
+  execution's credential arriving through the renewal path, and every work
+  context this process mints for a viewer is attested by it — so the mints
+  either side would name a different deployment or a different build,
+  including one the host's approved-build ceiling was never applied to. The
+  no-execution case is the one the sdk-go v0.3.0 migration opened: the previous
+  SDK's reader refused a zero incarnation, so a credential arriving here
+  carried one by construction, and core legitimately mints execution-free
+  credentials for a principal recorded as bearing none. The guarantee was
+  inherited and the inheritance ended.
 - **Every surface that acts for a viewer is held to this execution's
   credential, and the MCP methods are held by an allowlist.** A plain handler
   and a `ViewerBearer` passthrough were gated and a tool call was not, so an

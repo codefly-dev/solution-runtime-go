@@ -202,13 +202,13 @@ func heldToTheFrozenAuthority(source CredentialSource, authority *codefly.Author
 type authorityHeldSource struct {
 	inner     CredentialSource
 	authority *codefly.Authority
-	// mu guards installation, the installation this execution's credential was
-	// first sealed to. It is frozen for the same reason the authority-bearing
-	// values are: every viewer mint this process runs names an installation,
-	// and a renewal that quietly moved to another one would attribute those
-	// mints to a deployment that never asked for them.
-	mu           sync.Mutex
-	installation string
+	// mu guards sealed, what this execution's credential was FIRST sealed to.
+	// It is frozen for the same reason the authority-bearing values are: every
+	// viewer mint this process runs is attested by that credential, and a
+	// renewal that quietly moved to another deployment or another build would
+	// attribute those mints to an execution that never asked for them.
+	mu     sync.Mutex
+	sealed sealedIdentity
 }
 
 func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Credential, error) {
@@ -258,26 +258,60 @@ func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Crede
 	// Terminal, not transient: the host has answered about a different
 	// installation than the one this build was approved for, and no number of
 	// retries changes that.
-	if err := a.holdInstallation(credential.Seal().GetInstallationId()); err != nil {
+	if err := a.holdSealedIdentity(credential.Seal()); err != nil {
 		return workcontext.Credential{}, err
 	}
 	return credential, nil
 }
 
-// holdInstallation freezes the installation this execution acts under and
-// refuses a later credential sealed to another.
-func (a *authorityHeldSource) holdInstallation(id string) error {
+// holdSealedIdentity freezes what this execution's credential is sealed to —
+// the installation AND the execution pair — and refuses a renewal sealed to
+// anything else.
+//
+// usableCredential refuses a credential sealed to no installation and one
+// sealed to no execution. This is the other axis: a renewal that is
+// well-formed, carries both, and carries DIFFERENT ones. That is not a renewal
+// of this execution's credential, it is a different execution's, and the
+// executed round found both halves accepted silently — an installation move
+// was caught and a build move from incarnation 11 to 99 was not.
+//
+// It matters for the same reason the installation does. Every work context this
+// process mints for a viewer is attested by this credential, so the mints
+// before and after a silent change would be attributed to different builds,
+// and the host's ceiling for the build it approved would have been applied to
+// one it did not. A process whose approved build has moved under it is a
+// process that should end and be restarted against the delivery as it now
+// stands, which is where that gets resolved.
+//
+// Read through the SDK's own accessor on the verified seal. No decoder here.
+func (a *authorityHeldSource) holdSealedIdentity(seal *workcontext.SealedValues) error {
+	held := sealedIdentity{
+		installation: seal.GetInstallationId(),
+		digest:       seal.GetImageDigest(),
+		incarnation:  seal.GetBuildIncarnation(),
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.installation == "" {
-		a.installation = id
+	if a.sealed == (sealedIdentity{}) {
+		a.sealed = held
 		return nil
 	}
-	if a.installation != id {
-		return fmt.Errorf("%w: this execution has been acting under installation %s and its credential renewed sealed to %s. That is a different installation, not a renewal: every work context this process mints for a viewer names the installation it acts under, so the mints before and after this point would name different deployments",
-			workcontext.ErrMintRefused, a.installation, id)
+	if a.sealed == held {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%w: this execution has been acting under installation %s, image %s, build incarnation %d, and its credential renewed sealed to installation %s, image %s, build incarnation %d. That is a different execution, not a renewal: every work context this process mints for a viewer is attested by this credential, so the mints before and after this point would name a different deployment or a different build — including one the host's approved-build ceiling was never applied to",
+		workcontext.ErrMintRefused,
+		a.sealed.installation, a.sealed.digest, a.sealed.incarnation,
+		held.installation, held.digest, held.incarnation)
+}
+
+// sealedIdentity is what a credential is sealed to: which deployment, and
+// which build inside it. Compared as one value, because a renewal that changed
+// any part of it changed which execution is asking.
+type sealedIdentity struct {
+	installation string
+	digest       string
+	incarnation  uint64
 }
 
 // mintOptions is how this runtime asks the SDK's mint client for a credential.

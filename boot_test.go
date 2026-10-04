@@ -104,6 +104,10 @@ type hostMint struct {
 	// cellRoots is set when serveTLS re-serves this mint under a cell's
 	// anchor, so roots() answers that rather than httptest's own certificate.
 	cellRoots *x509.CertPool
+	// digest and incarnation override the build this host attests, so a test
+	// can have a RENEWAL seal a different execution than the first credential.
+	digest      string
+	incarnation uint64
 	// executionFree makes this host mint a credential sealing NO execution,
 	// which core allows: the sealed execution became optional because a
 	// principal that bears no approved build — a person at a terminal — must
@@ -160,6 +164,26 @@ func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 		// terminal — and it is the shape a WORKLOAD credential must never have.
 		if err := seals.PutBearsNoExecution(corework.FixturePrincipal); err != nil {
 			t.Fatalf("record the principal as bearing no execution: %v", err)
+		}
+		_, key := corework.FixtureKeyPair()
+		mint.authority = &corework.Authority{
+			Issuer:    corework.FixtureIssuer,
+			KeyID:     corework.FixtureKeyID,
+			Key:       key,
+			Revisions: corework.FixtureRevisions(),
+			Seals:     seals,
+		}
+	}
+	if mint.digest != "" || mint.incarnation != 0 {
+		// An issuer whose APPROVED BUILD has moved, which is the only way it
+		// can attest a different one: core refuses to seal an execution the
+		// issuer does not approve for that principal. Built from core's own
+		// fixture seal source with the approved build overridden.
+		seals := corework.FixtureSeals()
+		if err := seals.PutApprovedBuild(corework.FixturePrincipal,
+			cmp.Or(mint.digest, corework.FixtureImageDigest),
+			cmp.Or(mint.incarnation, uint64(corework.FixtureBuildIncarnation))); err != nil {
+			t.Fatalf("move the issuer's approved build: %v", err)
 		}
 		_, key := corework.FixtureKeyPair()
 		mint.authority = &corework.Authority{
@@ -262,8 +286,8 @@ func (m *hostMint) execution() corework.Execution {
 		return corework.Execution{}
 	}
 	return corework.Execution{
-		ImageDigest:      corework.FixtureImageDigest,
-		BuildIncarnation: corework.FixtureBuildIncarnation,
+		ImageDigest:      cmp.Or(m.digest, corework.FixtureImageDigest),
+		BuildIncarnation: cmp.Or(m.incarnation, uint64(corework.FixtureBuildIncarnation)),
 	}
 }
 

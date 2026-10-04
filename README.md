@@ -779,16 +779,23 @@ organization is not a substitute: one org may hold several installations, so a
 capability minted without naming one is attributable to the org and to no
 deployment inside it.
 
-For a viewer-driven mint it is the viewer's own, read from the **seal of the
-capability they arrived with** through the SDK's reader — not from the
-`x-codefly-installation-id` header beside it, which is consulted only when there
-is no capability to read a seal from. That order is the SDK's own rule, in its
-words: the installation that governs a call is the one inside the signature, and
-a header is caller-controlled while a seal is not. A request this runtime cannot
-read an installation for is refused, and the refusal is deliberately *not* a
-`ClientError`: the installation comes from the capability the gateway handed
-over, and no caller can seal one, so telling a viewer to fix it would point them
-at something that is not theirs.
+For a viewer-driven mint it is the viewer's own, read from the
+`x-codefly-installation-id` header the gateway stamps — on the same footing as
+`x-org-id` and `x-session-id`, which the gateway also stamps from verified
+claims and replaces whatever the caller sent. A request naming no installation
+is refused, and the refusal is deliberately *not* a `ClientError`: no caller
+can stamp one, so telling a viewer to fix it would point them at something that
+is not theirs.
+
+This section described the opposite for two rounds — the installation read from
+the **seal** of a carried capability, with the header as a fallback. That is the
+SDK's rule for the direction where a capability *is* the authority being
+carried: outbound, where `Attach` puts the seal's own installation beside it and
+the far end refuses the two if they disagree. Inbound, that carrier is
+caller-controlled — a browser can send `x-codefly-work-context`, and a
+caller-supplied capability authenticates nothing here — so reading the
+installation out of it would let a caller name the deployment their own mint is
+attributed to.
 
 A background or delegated call would carry the installation its parent
 capability was sealed to, read off this execution's held credential. **This

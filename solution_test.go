@@ -748,12 +748,17 @@ func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, 
 // viewerBearer is the bearer a real gateway forwards: the viewer's own sealed
 // capability, minted by core's authority from core's fixture identities.
 //
-// It was the placeholder string viewerBearer(), which was enough while
-// nothing here read the bearer. Every mint now names the installation it acts
-// under, and the viewer's comes from the seal of the capability they arrived
-// with — so a placeholder bearer is a request no installation can be read from,
-// and a fixture that cannot answer the question the code asks is a fixture that
-// tests the refusal path forever.
+// It was a placeholder string, which was enough while nothing here read the
+// bearer. A real gateway forwards the viewer's own capability, so the fixture
+// does too — one that cannot answer a question the code might ask is a fixture
+// that tests the refusal path forever.
+//
+// The installation does NOT come from it. That was the design for one round
+// and the comment here said so; the installation is read from the stamped
+// x-codefly-installation-id header, because inbound a carried capability is
+// caller-controlled. See viewerInstallation. The sealed bearer stays because
+// it is what a gateway actually forwards, not because anything reads a seal
+// out of it.
 func viewerBearer() string { return sealedBearer("viewer") }
 
 // sealedBearer is a bearer for a named viewer, sealed the same way: a test that

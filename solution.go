@@ -2231,10 +2231,10 @@ type Gateway struct {
 	// verbatim. Set on the MCP path, where a tool's error becomes content the
 	// client reads and nothing downstream can tell it from the author's own.
 	sanitizeErrors bool
-	// installationID is the installation the viewer's capability is sealed to,
-	// which every mint this gateway runs names. Empty when the caller arrived
-	// with nothing a seal could be read from, which is a refusal rather than a
-	// mint under an unnamed installation.
+	// installationID is the installation the gateway stamped for this request,
+	// which every mint this gateway runs names. Empty when none arrived, which
+	// is a refusal rather than a mint under an unnamed installation. It is not
+	// read from a carried capability: see viewerInstallation.
 	installationID string
 	// sessionID is the viewer's session, which the bearer does not carry
 	// either. Accounts seals the selected organization into that session, so
@@ -2999,8 +2999,8 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		// be told to fix something that is not theirs, so this surfaces as the
 		// runtime's generic failure with an operator-readable reason.
 		return nil, fmt.Errorf(
-			"cannot mint a work context for %q: this request names no installation. The host requires one on every mint and refuses a mint naming none, and an organization is not an installation — one org may hold several. It is read from the seal of the capability the caller arrived with, so either the gateway did not hand this request a sealed capability or it carried one sealed to nothing",
-			audience)
+			"cannot mint a work context for %q: this request names no installation. The host requires one on every mint and refuses a mint naming none, and an organization is not an installation — one org may hold several. It is read from the %s header the gateway stamps from verified claims, like the org and the session beside it, so either this request did not come through the gateway or the gateway stamped none",
+			audience, workcontext.InstallationIDHeaderName)
 	}
 	ask := startTaskRequest{
 		OrgID:           g.orgID,
@@ -3171,10 +3171,15 @@ type startTaskRequest struct {
 	// capability minted without naming one is attributable to the org and to no
 	// deployment inside it.
 	//
-	// For a viewer-driven mint it is the viewer's own, taken from the seal of
-	// the capability they arrived with rather than from a header beside it —
-	// the SDK's rule, in its words: a header is caller-controlled and a seal is
-	// not. For a background or delegated call it would be the installation the
+	// For a viewer-driven mint it is the viewer's own, read from the
+	// x-codefly-installation-id header the gateway stamps from verified claims
+	// — on the same footing as the org and the session beside it, and replaced
+	// by the gateway whatever a caller sent. NOT from the seal of a carried
+	// capability: inbound that carrier is caller-controlled, and a
+	// caller-supplied capability authenticates nothing here. See
+	// viewerInstallation, which carries the whole argument.
+	//
+	// For a background or delegated call it would be the installation the
 	// parent capability was sealed to, read off this execution's held
 	// credential; this runtime has no such path today, because every mint it
 	// makes is driven by a viewer request and ForModule refuses one without an

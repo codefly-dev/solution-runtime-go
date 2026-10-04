@@ -2226,3 +2226,82 @@ func mintClientWithRoots(t *testing.T, mint *hostMint, tokenFile string, roots *
 	}
 	return client
 }
+
+// TestARenewalSealedToADifferentExecutionIsRefused is the half of round
+// eleven's blocker my own fix did not cover.
+//
+// usableCredential refuses a credential sealed to no installation and one
+// sealed to no execution. This is the other axis: a renewal that is
+// well-formed, carries both, and carries DIFFERENT ones. The executed round
+// found an installation move caught and a build move — incarnation 11 to 99 —
+// accepted silently, which is a different execution's credential arriving
+// through the renewal path.
+//
+// It matters for the reason the installation does: every work context this
+// process mints for a viewer is attested by this credential, so the mints
+// either side of a silent change name a different deployment or a different
+// build — including one the host's approved-build ceiling was never applied
+// to.
+func TestARenewalSealedToADifferentExecutionIsRefused(t *testing.T) {
+	authorityValues(t)
+	ctx := context.Background()
+	authority, err := readAuthority(ctx)
+	if err != nil {
+		t.Fatalf("readAuthority: %v", err)
+	}
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+
+	for _, tc := range []struct {
+		name  string
+		moved *hostMint
+	}{
+		{"a different build incarnation", &hostMint{incarnation: 99}},
+		// A new digest comes with a new incarnation, because core refuses it
+		// otherwise: "a new build is a new run, so advance the incarnation —
+		// reusing it lets a swap back to the earlier digest re-admit every
+		// capability sealed to it". So this is the realistic redeploy shape
+		// rather than a digest swapped under a fixed incarnation.
+		{"a different image digest", &hostMint{digest: "sha256:" + strings.Repeat("b", 64), incarnation: 12}},
+		{"a different installation", &hostMint{installation: "installation-somewhere-else"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first := newHostMint(t, &hostMint{})
+			source := &movingInstallationSource{credential: mintedCredential(t, first, testProjectionAudience)}
+			held := heldToTheFrozenAuthority(source, authority)
+			if _, err := held.Credential(ctx); err != nil {
+				t.Fatalf("the first credential was refused: %v", err)
+			}
+
+			// The same process, renewing, and the issuer answers with a
+			// credential sealed to a different execution.
+			moved := newHostMint(t, tc.moved)
+			source.credential = mintedCredential(t, moved, testProjectionAudience)
+			_, err := held.Credential(ctx)
+			if err == nil {
+				t.Fatal("a renewal sealed to a different execution was accepted: the mints before and after it would be attributed to different builds, and the ceiling the host approved for one would have been applied to the other")
+			}
+			if !errors.Is(err, workcontext.ErrMintRefused) {
+				t.Errorf("the refusal is %v, want ErrMintRefused: a process whose approved build has moved under it should end and be restarted against the delivery as it now stands", err)
+			}
+			if !strings.Contains(err.Error(), "different execution") {
+				t.Errorf("the refusal %q does not say what changed", err)
+			}
+		})
+	}
+
+	t.Run("an unchanged renewal is accepted", func(t *testing.T) {
+		// The control: the freeze must not refuse an ordinary renewal, which
+		// is the mistake that would turn this into a crash loop.
+		mint := newHostMint(t, &hostMint{})
+		source := &movingInstallationSource{credential: mintedCredential(t, mint, testProjectionAudience)}
+		held := heldToTheFrozenAuthority(source, authority)
+		if _, err := held.Credential(ctx); err != nil {
+			t.Fatalf("the first credential was refused: %v", err)
+		}
+		source.credential = mintedCredential(t, mint, testProjectionAudience)
+		if _, err := held.Credential(ctx); err != nil {
+			t.Fatalf("an ordinary renewal from the same issuer was refused: %v", err)
+		}
+	})
+}
