@@ -3,11 +3,24 @@
 This repository owns the generic Go runtime for **codefly solutions** — modules
 deployed independently of the host they extend, with no build-time coupling. It
 owns what every solution needs identically: configuration resolution through the
+<<<<<<< HEAD
 codefly SDK, obtaining this execution's credential once from the projected
 service-account token, a listener that presents the workload's own X.509-SVID,
 CORS, Module Federation asset serving, the capability handshake, the manifest,
 the published authority contract, and the gateway client a handler uses to read
 composed modules on the viewer's behalf.
+||||||| 8da58cd
+codefly SDK, self-registration with the host frontend and the gateway (the
+credential exchanges and their heartbeats), CORS, Module Federation asset
+serving, the capability handshake, the manifest, and the gateway client a
+handler uses to read composed modules on the viewer's behalf.
+=======
+codefly SDK, self-registration with the host frontend and the gateway (the
+credential exchanges and their heartbeats), CORS, Module Federation asset
+serving, the capability handshake, the manifest, serving the solution's MCP
+server to agent clients, and the gateway client a handler uses to read composed
+modules on the viewer's behalf.
+>>>>>>> origin/main
 
 **A runtime does not register itself.** Presence is delivered — a signed
 presence document declares which solution runs on which host, and the host
@@ -96,6 +109,7 @@ embedding it.
 - Validate at the boundary — boot, and the headers a request arrives with — not
   between internal callers. `validate()` is the model: each refusal names the
   variable or the provisioning path that fixes it.
+<<<<<<< HEAD
 - The listener presents this workload's own identity and there is no plain-HTTP
   listener. A configuration that cannot produce one is refused at boot naming the
   material, because a solution serving plain HTTP is refused at the edge instead,
@@ -247,6 +261,22 @@ embedding it.
   `TestThisRuntimesContractDoesNotClaimTheRenderersSchema` fails if the two ever
   converge again. Writing the renderer's file would be a generator in this repo
   and nothing here does it today.
+||||||| 8da58cd
+- A registration that cannot attest which publisher it speaks for is not a
+  registration. There is no fallback to the shared cluster-internal token and no
+  downgrade path when an exchange answers `404`.
+=======
+- A registration that cannot attest which publisher it speaks for is not a
+  registration. There is no fallback to the shared cluster-internal token and no
+  downgrade path when an exchange answers `404`.
+- The MCP surface verifies no token, and must not start: the gateway runs
+  ext_authz and stamps the identity, so a check here would be a second,
+  divergent copy of the host's admission rules. What `requireStampedViewer`
+  enforces is that the gateway did it — and the refusal for a credential with no
+  session is at that boundary, not inside a tool, because there it reads as a
+  broken tool. A tool's arguments are written by a model: no identity ever comes
+  from them.
+>>>>>>> origin/main
 - Tests live beside the code in the same package. Every behaviour change brings
   one, and the counterpart it exercises is an `httptest` server, never a real
   host.
@@ -352,6 +382,7 @@ credentials, no running composition.
 Keep this file short; add depth to the file that owns the subject.
 
 - [README.md](README.md) — the consumer-facing contract: handler errors, the
+<<<<<<< HEAD
   full configuration and env-override table, the workload identity and the one
   mint, the published contract, consumed-module federation, and reading a
   Work-Context-authenticated module. It also carries the migration note: an old
@@ -361,6 +392,25 @@ Keep this file short; add depth to the file that owns the subject.
   [`contract.go`](contract.go) — why a refusal, a renewal point or a cache
   lifetime is what it is. Several record a failure mode that is not obvious from
   the code; read the one next to what you are changing before you change it.
+||||||| 8da58cd
+  full configuration and env-override table, self-registration and its
+  provisioning, consumed-module federation, and reading a
+  Work-Context-authenticated module.
+- The package doc comment and the comments in [`solution.go`](solution.go) —
+  why a refusal, a backoff cap or a cache lifetime is what it is. Several
+  record a failure mode that is not obvious from the code; read the one next to
+  what you are changing before you change it.
+=======
+  full configuration and env-override table, self-registration and its
+  provisioning, consumed-module federation, reading a Work-Context-authenticated
+  module, and the MCP surface (what is served, every refusal, and why the
+  resource identifier cannot be resolved here).
+- The package doc comment and the comments in [`solution.go`](solution.go) and
+  [`mcp.go`](mcp.go) — why a refusal, a backoff cap or a cache lifetime is what
+  it is. Several
+  record a failure mode that is not obvious from the code; read the one next to
+  what you are changing before you change it.
+>>>>>>> origin/main
 - `.claude/skills/` — procedures an agent repeats, loaded only when relevant.
   None exist yet, because nothing here repeats beyond the four commands above.
   Add one instead of growing this file.

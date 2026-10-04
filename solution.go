@@ -3,9 +3,11 @@
 // coupling. It owns everything every solution needs identically: env/config,
 // obtaining this execution's credential, a listener that presents the
 // workload's own identity, CORS, static Module Federation asset serving, the
-// capability handshake, the solution manifest and the authority contract. A
-// solution author supplies a manifest and one or more handlers; each handler
-// receives a Gateway that forwards the caller's bearer.
+// capability handshake, the solution manifest, the authority contract, and
+// serving the solution's MCP server to agent clients. A solution author
+// supplies a manifest and one or more handlers; each handler receives a Gateway
+// that forwards the caller's bearer, and ServeMCP exposes the same experience to
+// an MCP client as the signed-in person.
 //
 // # A runtime does not register itself
 //
@@ -31,8 +33,9 @@
 // exist, which is the intended outcome of the cutover and not a condition either
 // side recovers from.
 //
-// This package depends on nothing but the standard library, the Codefly SDK and
-// Core, and knows nothing about any specific host or solution.
+// This package knows nothing about any specific host or solution: what it
+// depends on beyond the standard library is the Codefly SDK it resolves
+// configuration through, Core, Connect for the wire, and the official MCP SDK.
 package solution
 
 import (
@@ -268,7 +271,12 @@ type Server struct {
 	// resolved routes, checked by Serve before it listens.
 	consumed    []ConsumedModule
 	passthrough map[string]passthroughRoute
-	cfg         config
+	// mcp is the MCP server the solution declared with ServeMCP, nil when it
+	// declared none; mcpRedeclared records a second ServeMCP, which the boot
+	// refuses rather than letting the last call quietly be the only surface.
+	mcp           *mcpSurface
+	mcpRedeclared bool
+	cfg           config
 	// declaredContract is the authority contract the author declared
 	// (Contract); contract is that contract resolved for the profile this
 	// process runs under, which is what it publishes.
@@ -424,6 +432,10 @@ type config struct {
 	// declares only "local" is refused in a deployment rather than read as if
 	// the deployment were a developer machine.
 	profile string
+	// runtimeContext is the kind of runtime Codefly says this process runs in,
+	// read from one explicit signal. It is what tells a loopback MCP issuer
+	// apart from a deployed one; see deployedRuntimeContext.
+	runtimeContext string
 	// environmentLoadErr is the failure, if any, of loading Codefly's injected
 	// carriers. Every SDK-resolved value above is empty when that load failed,
 	// so validate() must say so rather than report each empty value as
@@ -433,6 +445,22 @@ type config struct {
 	// passthrough declaration and the published contract are both checked
 	// against before the boot listens.
 	apiConsumes string
+	// mcp says the solution declared an MCP surface (ServeMCP), which is what
+	// makes the two values below load-bearing: validate() checks them only
+	// then, so a solution that serves no MCP is unaffected by a host whose
+	// issuer does not resolve.
+	mcp bool
+	// mcpIssuerURL is the host's OAuth issuer, published as the authorization
+	// server of the MCP resource (RFC 9728).
+	mcpIssuerURL string
+	// mcpPublicURL is the canonical public MCP URL an operator set, empty when
+	// none was (see mcpResource).
+	mcpPublicURL string
+	// mcpIssuerExplicit says the issuer came from the operator rather than from
+	// the SDK. It is what tells a deployment that resolved the host's
+	// in-cluster address — which validate() refuses — from one that was told
+	// the origin clients authenticate against.
+	mcpIssuerExplicit bool
 }
 
 func env(key, fallback string) string {
@@ -585,6 +613,7 @@ func loadConfig(ctx context.Context, environmentLoadErr error) config {
 	// scopes the lookup only when a composition is genuinely ambiguous.
 	hostModule := env("CODEFLY_HOST_MODULE", "")
 	hostGateway := env("CODEFLY_HOST_GATEWAY", "auth-gateway")
+	hostFrontend := env("CODEFLY_HOST_FRONTEND", "frontend")
 
 	// Own endpoint: the port Codefly assigned this service, not a fixed default.
 	port := env("PORT", "")
@@ -596,6 +625,10 @@ func loadConfig(ctx context.Context, environmentLoadErr error) config {
 
 	// Host endpoints, resolved via the SDK (no localhost:port literals).
 	gatewayURL := strings.TrimRight(env("GATEWAY_URL", resolveGateway(ctx, hostModule, hostGateway)), "/")
+	// The host's own origin, resolved by role. Its only consumer is the MCP
+	// surface's default authorization server: the registrations that used to
+	// resolve it are gone.
+	frontendURL := strings.TrimRight(resolveFrontend(ctx, hostModule, hostFrontend), "/")
 
 	cfg := config{
 		port:       port,
@@ -621,6 +654,7 @@ func loadConfig(ctx context.Context, environmentLoadErr error) config {
 		mintPeersFile:      workloadPath(ctx, IdentityMintPeersFileEnvironmentVariable, WorkloadIdentityMintPeersFileKey),
 		gatewayPeersFile:   workloadPath(ctx, IdentityGatewayPeersFileEnvironmentVariable, WorkloadIdentityGatewayPeersFileKey),
 		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
+		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 		// Carried here, which the refactor that changed this function's
 		// signature dropped: three refusals and a boot log exist to tell an
@@ -630,6 +664,15 @@ func loadConfig(ctx context.Context, environmentLoadErr error) config {
 		// they broke themselves is the specific mistake validate() was written
 		// to stop making.
 		environmentLoadErr: environmentLoadErr,
+		// The host is the authorization server an MCP client authenticates
+		// against, so its issuer is the host's own origin — resolved by role
+		// like every other host endpoint, never typed. The resolved address is
+		// the one this composition reaches the host at, which is right for a
+		// local run and is an in-cluster address in a deployment, where no
+		// public client could reach it: that is what the override is for.
+		mcpIssuerURL:      strings.TrimRight(env(hostIssuerURLEnvironmentVariable, frontendURL), "/"),
+		mcpIssuerExplicit: env(hostIssuerURLEnvironmentVariable, "") != "",
+		mcpPublicURL:      strings.TrimRight(env(mcpPublicURLEnvironmentVariable, ""), "/"),
 	}
 	// Two sources for one authorization fact are refused, not ranked.
 	//
@@ -901,6 +944,13 @@ func (c config) validate() error {
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
 			c.profile, err, ContractProfileEnvironmentVariable)
+	}
+	// The MCP surface's own configuration, checked here because that is where
+	// boot configuration is checked. It is a no-op for a solution that declared
+	// no MCP surface, which is what keeps a host whose issuer does not resolve
+	// from refusing the boot of a solution that serves none.
+	if err := c.validateMCP(); err != nil {
+		return err
 	}
 	c.logResolved()
 	return nil
@@ -1338,6 +1388,9 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if err := s.manifest.validateSurfaces(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
+	if err := s.validateMCPDeclaration(); err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-configuration lookups resolve from them (falling
 	// back to the local native workspace map when not running under the
@@ -1349,6 +1402,11 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 		log.Printf("codefly: load environment: %v", environmentLoadErr)
 	}
 	s.cfg = loadConfig(ctx, environmentLoadErr)
+	// Whether an MCP surface was declared, which is what makes the MCP
+	// configuration load-bearing: validate() checks it only then, so a
+	// solution serving no MCP is unaffected by a host whose issuer does not
+	// resolve.
+	s.cfg.mcp = s.mcp != nil
 	if err := s.cfg.validate(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -1437,6 +1495,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	}
 	mux.Handle("/assets/", http.StripPrefix("/assets/", withCORSHandler(s.assetsHandler())))
 	if err := s.mountPassthrough(mux); err != nil {
+		return err
+	}
+	if err := s.mountMCP(mux); err != nil {
 		return err
 	}
 
@@ -3286,4 +3347,67 @@ func setCORS(w http.ResponseWriter) {
 	w.Header().Set("access-control-allow-origin", "*")
 	w.Header().Set("access-control-allow-headers", "authorization, content-type")
 	w.Header().Set("access-control-allow-methods", "GET, POST, OPTIONS")
+}
+
+// Restored for the MCP surface, which arrived on main after this cutover
+// branched and is the only caller of each now. None of the three is a
+// registration: siblingURL swaps a path suffix, deployedRuntimeContext reads
+// one explicit signal, and resolveFrontend resolves the host's own origin by
+// role through the SDK rather than typing an address. They were deleted as
+// collateral when the registrations that called them went.
+
+// siblingURL swaps the trailing `replacing` of base for path. It is how a
+// derived federation endpoint follows an explicitly overridden one: both
+// endpoints of the registration exchange must address the same gateway.
+//
+// It replaces a suffix rather than rebuilding from scheme+host, because a
+// gateway is not always mounted at the root. Rebuilding dropped everything
+// between the host and the endpoint, so a gateway served under a path prefix
+// (GATEWAY_URL=http://gateway:8080/gw) registered at /gw/modules/_register while
+// exchanging at /modules/_registration-token — an absolute URL, so validate()
+// passed it, and a 404 on every beat thereafter.
+func siblingURL(base, replacing, path string) string {
+	if u, err := url.Parse(base); err != nil || !u.IsAbs() || u.Host == "" {
+		// Unparseable or relative: hand the value straight back so config
+		// validation reports the one broken URL the operator actually set,
+		// rather than a second one synthesized from it.
+		return base
+	}
+	prefix, ok := strings.CutSuffix(base, replacing)
+	if !ok {
+		// The override does not end in the endpoint we know how to pair, so its
+		// sibling is not derivable — a query string, a trailing slash, or a
+		// wholly custom path. Returning "" makes validate() refuse to boot and
+		// name the module token URL, which is the one the operator must set
+		// explicitly; synthesizing a plausible-looking guess would instead 404
+		// on every beat.
+		return ""
+	}
+	return prefix + path
+}
+
+// deployedRuntimeContext reports whether Codefly says this process runs in a
+// deployment rather than on a developer machine. The signal is explicit —
+// CODEFLY__RUNTIME_CONTEXT, which core's GitOps render injects (e.g.
+// "kubernetes") — and never the environment name: an environment called
+// "local-dogfood" or "staging" says nothing about where the process runs.
+// Every runtime context `codefly run` uses on a developer machine is local;
+// any other declared context is a deployment, so a new deployed kind is
+// covered without a change here. Nothing declared means not deployed.
+//
+// PENDING codefly-dev/core v0.5.6, which injects the signal into renders:
+// until a cell is rendered with it, this reports false there too.
+func deployedRuntimeContext(kind string) bool {
+	switch strings.ToLower(kind) {
+	case "", resources.RuntimeContextNative, resources.RuntimeContextNix,
+		resources.RuntimeContextContainer, resources.RuntimeContextFree:
+		return false
+	}
+	return true
+}
+
+// resolveFrontend resolves the host frontend's http endpoint by role, like
+// resolveGateway — host-module-name-agnostic.
+func resolveFrontend(ctx context.Context, module, frontend string) string {
+	return hostAddress(ctx, module, frontend, "http", "http")
 }
