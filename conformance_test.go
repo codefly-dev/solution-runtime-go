@@ -49,8 +49,8 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("core conformance fixtures: %v", err)
 	}
-	if len(fixtures) < 20 {
-		t.Fatalf("core published %d fixtures; the kit is 21, so this test is reading a trimmed set", len(fixtures))
+	if len(fixtures) < 39 {
+		t.Fatalf("core published %d fixtures; the kit is 39 at core v0.9.0, so this test is reading a trimmed set", len(fixtures))
 	}
 
 	var carriedCount, refusedCount int
@@ -94,7 +94,15 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 				// package's own: the classification is Core's, and a refusal
 				// this runtime invented a taxonomy for is the beginning of the
 				// second implementation this module is gated against.
-				if !errors.Is(err, corework.ErrInvalid) && !errors.Is(err, corework.ErrUnsealed) && !errors.Is(err, corework.ErrNotACoreToken) {
+				//
+				// ErrUnsealed was in this list and core v0.9.0 deleted it, for
+				// a reason worth repeating: protovalidate refuses a capability
+				// with no seal before anything in core's own reader is
+				// reached, so no branch could produce that sentinel — and "a
+				// sentinel no branch can produce is worse than no sentinel,
+				// because a consumer writes a handler for it and the handler
+				// never runs". An unsealed capability arrives as ErrInvalid.
+				if !errors.Is(err, corework.ErrInvalid) && !errors.Is(err, corework.ErrNotACoreToken) {
 					t.Errorf("the carrier refused %s with %v, which is none of Core's sentinels for a capability it cannot read", fixture.Name, err)
 				}
 				refusedCount++
@@ -190,6 +198,43 @@ var boundary = map[string]carriage{
 	"stale-build-incarnation":      carried,
 	"stale-principal-epoch":        carried,
 	"wrong-binding-revision":       carried,
+	// --- core v0.9.0 added eighteen fixtures. Each is classified by the one
+	// question this boundary turns on: is the defect visible in the BYTES IN
+	// HAND, or is it a judgement against the issuer's live state and keys?
+
+	// Schema violations, refused by protovalidate inside core's own decode —
+	// which this runtime's carrier reaches, because reading the sealed
+	// installation decodes the claims. A counter at zero names nothing and
+	// would compare equal to a source holding nothing; half a binding and half
+	// an execution are not one; an unknown field nested in the seal lets data
+	// ride inside a signed credential nothing here reads. All structural, all
+	// decidable without a key.
+	"zero-principal-epoch":       refusedHere,
+	"zero-installation-revision": refusedHere,
+	"zero-build-incarnation":     refusedHere,
+	"seal-half-execution":        refusedHere,
+	"partial-operation-binding":  refusedHere,
+	"actor-without-epoch":        refusedHere,
+	"unknown-field":              refusedHere,
+
+	// Judgements this runtime cannot make. The issuer's identity is a claim
+	// and the key is not the trust decision; a validity window needs a clock
+	// this carrier does not apply; and every remaining one compares a sealed
+	// value against live state only the issuer holds — an approved build, a
+	// principal's epoch, an authorization revision, a binding's revision,
+	// incarnation, grantee or installation. A carrier that refused any of
+	// these would be claiming a strength it does not have.
+	"another-issuer":                    carried,
+	"expired":                           carried,
+	"not-yet-valid":                     carried,
+	"execution-missing":                 carried,
+	"unapproved-build":                  carried,
+	"stale-actor-epoch":                 carried,
+	"superseded-authorization-revision": carried,
+	"revoked-operation-binding":         carried,
+	"wrong-binding-incarnation":         carried,
+	"binding-of-another-principal":      carried,
+	"binding-in-another-installation":   carried,
 }
 
 // carryThroughThisRuntime drives one capability through this package's carriage

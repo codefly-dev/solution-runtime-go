@@ -102,7 +102,7 @@ func TestACredentialBearingRequestIsNeverRedirected(t *testing.T) {
 			mint := newHostMint(t, &hostMint{})
 			tokenFile := filepath.Join(t.TempDir(), "token")
 			writeFile(t, tokenFile, "projected")
-			server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+			server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint, tokenFile))
 			server.cfg.gatewayURL = gw.URL
 
 			header := http.Header{}
@@ -226,7 +226,7 @@ func TestASameOriginRedirectIsNotFollowedEither(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
-	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint, tokenFile))
 	server.cfg.gatewayURL = gw.URL
 
 	header := http.Header{}

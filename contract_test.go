@@ -617,7 +617,7 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 			// attestation whether the ceiling governs or not, and this test
 			// passes either way — which is exactly how the mutation survived
 			// the first version of it.
-			Credential(mintClientFor(t, mint.URL, tokenFile))
+			Credential(mintClientFor(t, mint, tokenFile))
 		server.cfg.profile = localProfile
 		server.cfg.gatewayURL = gw.URL
 		contract, err := server.resolveContract()

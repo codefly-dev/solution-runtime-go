@@ -94,7 +94,7 @@ func handlerErrorResponse(err error) (int, string) {
 		return http.StatusConflict, "the authority this solution presented has been superseded; the call was not made"
 	case errors.Is(err, ErrNotAttested):
 		return http.StatusServiceUnavailable, "this solution cannot currently act for the viewer against the module"
-	case errors.Is(err, workcontext.ErrUnsealed), errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
+	case errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
 		return http.StatusBadGateway, "this solution could not present a usable credential for the module"
 	}
 	// A transport failure carries the URL it was dialling. *url.Error puts the

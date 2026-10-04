@@ -101,6 +101,9 @@ type hostMint struct {
 	recoverAfter int64
 	// ttl is how long the credential it issues is valid.
 	ttl time.Duration
+	// cellRoots is set when serveTLS re-serves this mint under a cell's
+	// anchor, so roots() answers that rather than httptest's own certificate.
+	cellRoots *x509.CertPool
 	// installation overrides the installation it seals credentials to, so a
 	// test can have a renewal answer about a different one. Empty means
 	// testInstallation.
@@ -132,11 +135,15 @@ func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 		// bindings — is core's to define, and duplicating it here is how a
 		// fixture drifts from the thing it stands in for.
 		seals := corework.FixtureSeals()
+		// Two fields, because core v0.9.0's Seal is the installation and its
+		// revision and nothing else: the principal's epoch and the approved
+		// build moved off the installation seal, where they described the
+		// OWNER's workload however many delegation hops had been added. The
+		// fixture's own epoch and approved-build entries are already in the
+		// source this starts from.
 		if err := seals.Put(corework.FixturePrincipal, corework.Seal{
-			PrincipalEpoch:       corework.FixturePrincipalEpoch,
 			InstallationID:       mint.installation,
 			InstallationRevision: corework.FixtureInstallationRevision,
-			BuildIncarnation:     corework.FixtureBuildIncarnation,
 		}); err != nil {
 			t.Fatalf("seal the stand-in issuer to %s: %v", mint.installation, err)
 		}
@@ -156,7 +163,10 @@ func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 		// behaviour ordinary rather than asserting a cap that does not exist.
 		mint.ttl = 10 * time.Minute
 	}
-	mint.Server = httptest.NewServer(http.HandlerFunc(mint.serve))
+	// TLS, not plaintext. The SDK's mint client refuses plain HTTP outright —
+	// the projected service-account token travels on that request — so a
+	// plaintext fake mint can no longer stand in for a real one at all.
+	mint.Server = httptest.NewTLSServer(http.HandlerFunc(mint.serve))
 	t.Cleanup(mint.Close)
 	return mint
 }
@@ -165,15 +175,38 @@ func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 // of its own and requiring the caller's — which is what the runtime's outbound
 // client expects, because an https URL alone says only that the scheme is
 // https.
+// roots is the pool that may sign this fake mint's certificate, which the SDK
+// now requires and will not default to the system pool for.
+func (m *hostMint) roots() *x509.CertPool {
+	if m.cellRoots != nil {
+		return m.cellRoots
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(m.Certificate())
+	return pool
+}
+
 func (m *hostMint) serveTLS(t *testing.T, c *cell) {
 	t.Helper()
+	m.cellRoots = c.roots
 	m.Close()
 	m.Server = httptest.NewUnstartedServer(http.HandlerFunc(m.serve))
+	// No client certificate is REQUIRED of the mint's caller, and that is the
+	// SDK's design rather than a weakening of this fixture.
+	//
+	// The mint client builds and owns its transport now and takes only the
+	// roots: it presents no client certificate, because the request's
+	// credential is the projected service-account token it carries. A fixture
+	// demanding mTLS here would fail every boot against the real client and
+	// would be asserting a property this runtime no longer has.
+	//
+	// Requested and verified if offered, so a caller that does present one is
+	// still held to this cell's anchor.
 	m.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{*c.identity(t, testGatewayPrincipal)},
 		ClientCAs:    c.roots,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientAuth:   tls.VerifyClientCertIfGiven,
 	}
 	m.StartTLS()
 	t.Cleanup(m.Close)
@@ -216,6 +249,16 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		OrganizationID:     corework.FixtureOrganization,
 		InstallationID:     cmp.Or(m.installation, testInstallation),
 		TTL:                m.ttl,
+		// Core v0.9.0 requires the caller to attest the build it is running:
+		// a principal that exercises an approved execution must name the image
+		// digest and incarnation, and the issuer checks them against the
+		// approved build it holds for that principal. The execution moved off
+		// the installation seal, where it described the OWNER's workload
+		// however many delegation hops had been added.
+		Execution: corework.Execution{
+			ImageDigest:      corework.FixtureImageDigest,
+			BuildIncarnation: corework.FixtureBuildIncarnation,
+		},
 	})
 	if err != nil {
 		m.signErr = err
@@ -650,10 +693,32 @@ func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
 	if got := len(mint.observedStartTasks()); got == 0 {
 		t.Error("no viewer mint was attempted, so nothing in this test exercised the credential at all")
 	}
-	// And the mint named this workload on the way out, not just in its body:
-	// the outbound client presents the same identity the listener does.
-	if got := mint.callers[0]; got != testPrincipal {
-		t.Errorf("the mint was dialled by %q, want this workload's own identity %q", got, testPrincipal)
+	// The mint is dialled WITHOUT a client certificate, and that is a property
+	// this runtime lost at the sdk-go v0.3.0 pin rather than a gap in the
+	// test.
+	//
+	// This asserted that the mint saw this workload's own SPIFFE identity,
+	// because the mint went out on this runtime's authenticated client. The
+	// SDK's mint client now builds and owns that transport and takes only the
+	// roots — it presents no certificate — and its reasoning for refusing a
+	// caller-supplied client is sound: a supplied client is a hole it cannot
+	// inspect, since a nil Transport means the global mutable default, a
+	// DialTLSContext bypasses TLSClientConfig entirely, and a caller holding
+	// the same *http.Transport can turn verification off after construction.
+	//
+	// So what authenticates the mint request is the projected
+	// service-account token it carries, which is what this now asserts. Two
+	// consequences are recorded in AGENTS.md rather than left to be
+	// rediscovered: MINT_PEERS_FILE no longer governs this hop, and the
+	// per-dial peer re-read this runtime applies outbound does not reach it.
+	if len(mint.presented) == 0 {
+		t.Fatal("the mint saw no authorization header at all, so nothing attested which workload was asking")
+	}
+	if got := mint.presented[0]; !strings.Contains(got, "projected-token") {
+		t.Errorf("the mint was presented %q, want the projected service-account token: with no client certificate on this hop, that token is the whole of what attests which workload is asking", got)
+	}
+	if got := mint.callers[0]; got != "" {
+		t.Errorf("the mint was dialled with client identity %q: the SDK's mint client presents none, so a certificate arriving here means something else built that transport", got)
 	}
 }
 
@@ -951,16 +1016,26 @@ func TestTheMintIsConfiguredWithTheFrozenAuthority(t *testing.T) {
 	}
 	_ = ln.Close()
 
-	options := server.mintOptions("audience", "projection")
+	anchor := x509.NewCertPool()
+	options := server.mintOptions("projection", anchor)
 	if options.Authority == nil {
 		t.Error("the mint client is configured with no authority to recheck, so a renewal proceeds after the principal, the mint audience or the projection audience has drifted — the one moment that drift would otherwise be caught")
 	}
 	if options.Authority != server.authority {
 		t.Error("the mint client rechecks something other than the reader this boot froze: a second reader is a second answer, and the one that disagrees is the one nobody approved")
 	}
-	// The rest of the options are decisions too, and each has been wrong once.
-	if options.HTTPClient != server.outbound {
-		t.Error("the mint does not use this runtime's authenticated outbound client, so it would not present this workload's identity, would not verify the host against the projected anchor, and would follow a redirect carrying the projected token")
+	// The audience is NAMED, not resolved here and passed beside the pin. The
+	// SDK made that a typed reference because a string passed alongside meant
+	// the drift check guarded a value the mint did not use.
+	if want := (workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey}); options.Audience != want {
+		t.Errorf("the mint reads its audience from %v, want the pinned %v", options.Audience, want)
+	}
+	// The anchor, and nothing else about the transport. The SDK refuses a
+	// caller-supplied client and refuses a nil pool rather than falling back
+	// to the system one, so this is the whole of what this runtime says about
+	// how the mint is dialled.
+	if options.RootCAs != anchor {
+		t.Error("the mint is configured with a trust anchor other than the one this boot read, so the endpoint receiving the projected service-account token is verified against something else")
 	}
 	if options.URL != server.cfg.mintURL {
 		t.Errorf("the mint is configured for %q, not the resolved %q", options.URL, server.cfg.mintURL)

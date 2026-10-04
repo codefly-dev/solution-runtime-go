@@ -34,7 +34,22 @@ func TestARefusedMintFailsTheBootAndIsNeverRetried(t *testing.T) {
 		status int
 	}{
 		{"the host refuses this workload's build or identity", http.StatusForbidden},
-		{"the host of this generation serves no mint", http.StatusNotFound},
+		{"the projected token is not acceptable", http.StatusUnauthorized},
+		// 404 is NOT here any more, and that is sdk-go v0.3.0 inverting the
+		// default rather than this test being relaxed.
+		//
+		// The rule was "429 and 5xx retry, everything else is terminal", which
+		// made every status anything between the host and this process might
+		// invent into a permanent stop — measured: a 408 from a proxy, with a
+		// valid credential in hand, latched for the life of the process, and a
+		// 404 from an ingress mid-rollout would do the same. Only 401 and 403
+		// latch now, because those are the two the host signs: the projected
+		// token is not acceptable, or the build is not approved.
+		//
+		// An old runtime against a new host still does not recover — it waits
+		// out its bounded window and exits non-zero for the orchestrator
+		// instead of failing on the first answer. Covered by the unavailable
+		// cases, and AGENTS.md says so now.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mint := newHostMint(t, &hostMint{status: tc.status})
@@ -173,7 +188,7 @@ func TestTheProjectedTokenIsReadAtEveryMintNotCachedAtBoot(t *testing.T) {
 	mint := newHostMint(t, &hostMint{ttl: 30 * time.Second})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "first-projection")
-	source := mintClientFor(t, mint.URL, tokenFile)
+	source := mintClientFor(t, mint, tokenFile)
 
 	first, err := source.Credential(context.Background())
 	if err != nil {
@@ -247,11 +262,11 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
-	source := mintClientFor(t, mint.URL, tokenFile)
+	source := mintClientFor(t, mint, tokenFile)
 
 	const callers = 32
 	carriers := make([]string, callers)
-	seals := make([]workcontext.Seal, callers)
+	seals := make([]*workcontext.SealedValues, callers)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range callers {
@@ -288,8 +303,8 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 	// The client's own accounting, which is the only place a source that
 	// re-dialled the host for the same bytes would be visible at all.
 	if client, ok := source.(*workcontext.MintClient); ok {
-		if mints, renewals := client.Counts(); mints != 1 || renewals != 0 {
-			t.Errorf("the client reports %d mints and %d renewals, want 1 and 0", mints, renewals)
+		if counts := client.Counts(); counts.Mints != 1 || counts.Renewals != 0 {
+			t.Errorf("the client reports %d mints and %d renewals, want 1 and 0", counts.Mints, counts.Renewals)
 		}
 	}
 }
@@ -372,7 +387,7 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	host := newHostMint(t, &hostMint{})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
-	source := mintClientFor(t, host.URL, tokenFile)
+	source := mintClientFor(t, host, tokenFile)
 	credential, err := source.Credential(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -422,7 +437,7 @@ func TestAMintIsRefusedWhenThisWorkloadCannotAttest(t *testing.T) {
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
 	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
-	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, refusing.URL, tokenFile))
+	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, refusing, tokenFile))
 	server.cfg.gatewayURL = gw.URL
 
 	header := http.Header{}
@@ -526,14 +541,21 @@ func (s stubCredentialSource) Credential(context.Context) (workcontext.Credentia
 // boot tests, which stand their fake host up under the cell's anchor. These
 // tests drive the client directly, where the question is the mint's behaviour
 // rather than who dialled it.
-func mintClientFor(t *testing.T, mintURL, tokenFile string) CredentialSource {
+func mintClientFor(t *testing.T, mint *hostMint, tokenFile string) CredentialSource {
 	t.Helper()
 	client, err := workcontext.NewMintClient(workcontext.MintOptions{
-		URL:                mintURL,
-		Audience:           testAudience,
+		URL: mint.URL + credentialMintPath,
+		// The audience is named as a pinned value now, not passed as a string
+		// beside the pin: a string alongside meant the drift check guarded a
+		// value the mint did not use.
+		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
+		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: testProjectionAudience,
-		HTTPClient:         &http.Client{Transport: unauthenticatedTransport, Timeout: platformRequestTimeout},
+		// The roots, and nothing else about the transport. The client builds
+		// and owns that now, and refuses a nil pool rather than falling back
+		// to whatever the image ships.
+		RootCAs: mint.roots(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -541,22 +563,23 @@ func mintClientFor(t *testing.T, mintURL, tokenFile string) CredentialSource {
 	return client
 }
 
-// mintClientVia is mintClientFor with the caller's own HTTP client, for a test
-// whose fake host is served over TLS: a credential source is consumer code and
-// brings its own transport, so nothing in the runtime hands it one.
-func mintClientVia(t *testing.T, mintURL, tokenFile string, client *http.Client) CredentialSource {
-	t.Helper()
-	source, err := workcontext.NewMintClient(workcontext.MintOptions{
-		URL:                mintURL,
-		Audience:           testAudience,
-		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
-		ProjectionAudience: testProjectionAudience,
-		HTTPClient:         client,
-	})
-	if err != nil {
-		t.Fatal(err)
+// fixedAuthority is an AuthorityPin whose values do not drift. The drift
+// refusal is exercised by its own tests against the real reader; a fixture
+// that drifted would fail every other test for a reason none of them is about.
+type fixedAuthority struct{ audience string }
+
+func (fixedAuthority) Recheck(context.Context) error { return nil }
+
+func (a fixedAuthority) Value(name, key string) (string, error) {
+	switch {
+	case name == AuthorityGroup && key == AuthorityAudienceKey:
+		return a.audience, nil
+	case name == AuthorityGroup && key == AuthorityProjectionAudienceKey:
+		return testProjectionAudience, nil
+	case name == AuthorityGroup && key == AuthorityPrincipalKey:
+		return testPrincipal, nil
 	}
-	return source
+	return "", fmt.Errorf("no pinned authority value %s/%s", name, key)
 }
 
 // refusingSource is a credential source whose renewal the issuer has started
@@ -684,7 +707,7 @@ func TestHealthIsHonestAboutTheCredential(t *testing.T) {
 		mint := newHostMint(t, &hostMint{})
 		tokenFile := filepath.Join(t.TempDir(), "token")
 		writeFile(t, tokenFile, "projected")
-		server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+		server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint, tokenFile))
 		if status, body := healthStatus(t, server); status != http.StatusOK {
 			t.Errorf("health = %d (%s) with a credential the issuer mints, want 200", status, body)
 		}
@@ -794,7 +817,7 @@ func TestAPlainHandlerStillServesWithAnApprovedCredential(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
-	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint.URL, tokenFile))
+	server := New(Manifest{ID: testSolutionID}).Credential(mintClientFor(t, mint, tokenFile))
 	handler := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
 		return map[string]string{"ok": "yes"}, nil
 	})
@@ -879,14 +902,14 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 
 	// An expired one is not "in hand" at all.
 	t.Run("with an expired credential, the route refuses", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{ttl: time.Second})
-		expired := mintedCredential(t, mint, "expired")
+		mint := newHostMint(t, &hostMint{})
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+		// Already past its expiry, which is the state a route must not act
+		// under. No waiting: see expiredCredential.
+		expired := expiredCredential(t, mint, tokenFile)
 		server := New(Manifest{ID: testSolutionID}).Credential(slow)
 		server.credentialHeld = expired
-		// Past its expiry, which is the state a route must not act under.
-		for !time.Now().After(expired.ExpiresAt()) {
-			time.Sleep(50 * time.Millisecond)
-		}
 		done := make(chan error, 1)
 		go func() { done <- server.actingForAViewer(context.Background()) }()
 		select {
@@ -986,7 +1009,7 @@ func mintedCredential(t *testing.T, mint *hostMint, projection string) workconte
 	t.Helper()
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, projection)
-	credential, err := mintClientFor(t, mint.URL, tokenFile).Credential(context.Background())
+	credential, err := mintClientFor(t, mint, tokenFile).Credential(context.Background())
 	if err != nil {
 		t.Fatalf("mint a credential for the test: %v", err)
 	}
@@ -1143,11 +1166,10 @@ func (c *countedSlowSource) count() int {
 // The authority wrapper could not see either: it keys on the token *changing*,
 // and a token that is always "" never changes.
 func TestACredentialThatAuthorisesNothingIsRefused(t *testing.T) {
-	mint := newHostMint(t, &hostMint{ttl: time.Second})
-	expiring := mintedCredential(t, mint, "expiring")
-	for !time.Now().After(expiring.ExpiresAt()) {
-		time.Sleep(50 * time.Millisecond)
-	}
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	expiring := expiredCredential(t, mint, tokenFile)
 
 	for _, tc := range []struct {
 		name       string
@@ -1322,7 +1344,7 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		}}).
-		Credential(mintClientFor(t, mint.URL, tokenFile))
+		Credential(mintClientFor(t, mint, tokenFile))
 	server.cfg.profile = localProfile
 	server.cfg.gatewayURL = gw.URL
 	contract, err := server.resolveContract()
@@ -1893,4 +1915,63 @@ func (m *movingInstallationSource) Credential(context.Context) (workcontext.Cred
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.credential, nil
+}
+
+// expiredCredential is a credential that has already expired in real time,
+// without waiting for it.
+//
+// Minting a short-lived one no longer works: the SDK floors the renewal lead
+// at five seconds (minRenewalLeadTime), so it refuses to install a credential
+// whose whole remaining lifetime is inside that lead — installing one would
+// put the client straight back into a renewal, which is a mint loop and one
+// audit event per iteration. That refusal is right, and it means a test cannot
+// obtain a nearly-dead credential from the client at all.
+//
+// So the clock moves instead of the lifetime. MintOptions.Now is the SDK's own
+// hook for exactly this: the client mints and installs against a backdated
+// clock, where the credential is comfortably valid, and every check in THIS
+// runtime reads the real time, where it expired twenty minutes ago.
+func expiredCredential(t *testing.T, mint *hostMint, tokenFile string) workcontext.Credential {
+	t.Helper()
+	// Both clocks move, not one. The ISSUER stamps not-before and expiry, so
+	// backdating only the client makes the credential not-yet-valid rather
+	// than expired; backdating only the issuer makes the client refuse it as
+	// expired on arrival. Both are held twenty minutes back, where the
+	// credential is comfortably valid, and every check in THIS runtime reads
+	// real time, where it expired ten minutes ago.
+	backdated := time.Now().Add(-20 * time.Minute)
+	// Its OWN authority, not the shared stand-in. standInAuthority returns a
+	// singleton, so setting Now on it would backdate every other test's
+	// issuer too — a fixture that poisons the tests around it is worse than
+	// the wait this replaces.
+	_, key := corework.FixtureKeyPair()
+	mint.authority = &corework.Authority{
+		Issuer:    corework.FixtureIssuer,
+		KeyID:     corework.FixtureKeyID,
+		Key:       key,
+		Revisions: corework.FixtureRevisions(),
+		Seals:     corework.FixtureSeals(),
+		Now:       func() time.Time { return backdated },
+	}
+	mint.ttl = 10 * time.Minute
+	client, err := workcontext.NewMintClient(workcontext.MintOptions{
+		URL:                mint.URL + credentialMintPath,
+		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
+		Authority:          fixedAuthority{audience: testAudience},
+		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
+		ProjectionAudience: testProjectionAudience,
+		RootCAs:            mint.roots(),
+		Now:                func() time.Time { return backdated },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := client.Credential(context.Background())
+	if err != nil {
+		t.Fatalf("mint a credential against a backdated clock: %v", err)
+	}
+	if !time.Now().After(credential.ExpiresAt()) {
+		t.Fatalf("the credential expires at %s, which is not in the past", credential.ExpiresAt())
+	}
+	return credential
 }

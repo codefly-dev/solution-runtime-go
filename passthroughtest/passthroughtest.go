@@ -26,6 +26,7 @@ package passthroughtest
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	corework "github.com/codefly-dev/core/workcontext"
@@ -144,6 +145,22 @@ type Host struct {
 	calls   []Call
 	// workloadMints counts the solution's own execution credentials.
 	workloadMints int
+	// mintServer serves the workload mint over TLS, separately from the
+	// gateway's own plaintext server.
+	//
+	// The SDK's mint client refuses plain HTTP outright — the projected
+	// service-account token travels on that request — and it requires the
+	// roots that may sign the endpoint, with no system-pool fallback. Both are
+	// right, and neither can be satisfied by the plaintext server the rest of
+	// this host uses.
+	//
+	// Only the mint moves. Making the whole host TLS would need a SPIFFE leaf
+	// from a test CA for the gateway's own identity, because the runtime's
+	// outbound client admits a platform destination by its certificate — and
+	// the seam deliberately runs without that boot. That remains the
+	// fidelity gap seam.go already names; this closes the half the SDK now
+	// requires rather than pretending to close both.
+	mintServer *httptest.Server
 }
 
 // NewHost starts a fake host, closed when the test ends.
@@ -153,6 +170,8 @@ func NewHost(t testing.TB) *Host {
 	h := &Host{modules: map[string]*httputil.ReverseProxy{}, dir: t.TempDir()}
 	h.server = httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	t.Cleanup(h.server.Close)
+	h.mintServer = httptest.NewTLSServer(http.HandlerFunc(h.serveHTTP))
+	t.Cleanup(h.mintServer.Close)
 	return h
 }
 
@@ -237,6 +256,10 @@ func (h *Host) mintWorkload(w http.ResponseWriter, r *http.Request) {
 		OrganizationID:     corework.FixtureOrganization,
 		InstallationID:     corework.FixtureInstallation,
 		TTL:                10 * time.Minute,
+		Execution: corework.Execution{
+			ImageDigest:      corework.FixtureImageDigest,
+			BuildIncarnation: corework.FixtureBuildIncarnation,
+		},
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": 13, "message": err.Error()})
@@ -400,11 +423,17 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 	if err := os.WriteFile(tokenFile, []byte("passthroughtest-projected-token"), 0o600); err != nil {
 		return nil, err
 	}
+	roots := x509.NewCertPool()
+	roots.AddCert(h.mintServer.Certificate())
 	return workcontext.NewMintClient(workcontext.MintOptions{
-		URL:                h.URL() + workloadMintPath,
-		Audience:           WorkloadAudience,
+		URL: h.mintServer.URL + workloadMintPath,
+		// The audience is named as a pinned value now, not passed as a string
+		// beside the pin, so the seam supplies a pin that answers it.
+		Audience:           workcontext.AuthorityValue{Name: authorityGroup, Key: audienceKey},
+		Authority:          fixedAuthority{audience: WorkloadAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: "accounts",
+		RootCAs:            roots,
 	})
 }
 
@@ -520,6 +549,10 @@ func capability(seed string) string {
 		OrganizationID:     corework.FixtureOrganization,
 		InstallationID:     corework.FixtureInstallation,
 		TTL:                10 * time.Minute,
+		Execution: corework.Execution{
+			ImageDigest:      corework.FixtureImageDigest,
+			BuildIncarnation: corework.FixtureBuildIncarnation,
+		},
 	})
 	if err != nil {
 		panic("stand-in capability: " + err.Error())
@@ -549,3 +582,26 @@ var standInAuthority = sync.OnceValue(func() *corework.Authority {
 		Seals:     corework.FixtureSeals(),
 	}
 })
+
+// authorityGroup and audienceKey name the pinned value this seam's mint reads
+// its audience from. They mirror the root package's own constants; the seam
+// cannot import them without importing the package it is a seam for.
+const (
+	authorityGroup = "module-authority"
+	audienceKey    = "AUDIENCE"
+)
+
+// fixedAuthority is an AuthorityPin whose values never drift, which is what a
+// fake host should be: the drift refusal is the runtime's behaviour to exercise
+// elsewhere, and a seam that drifted at random would fail a consumer's suite
+// for a reason they did not write.
+type fixedAuthority struct{ audience string }
+
+func (fixedAuthority) Recheck(context.Context) error { return nil }
+
+func (a fixedAuthority) Value(name, key string) (string, error) {
+	if name == authorityGroup && key == audienceKey {
+		return a.audience, nil
+	}
+	return "", fmt.Errorf("passthroughtest: no pinned authority value %s/%s", name, key)
+}

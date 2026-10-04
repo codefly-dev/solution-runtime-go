@@ -583,7 +583,7 @@ func relayedError(err error) error {
 		// one renewal away, which is what unavailable says and what neither
 		// internal nor permission_denied would.
 		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
-	case errors.Is(err, workcontext.ErrUnsealed), errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
+	case errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
 		// A capability this solution could not present is this solution's
 		// problem, not a module that is briefly unreachable, and not the
 		// viewer's authorization. Reported as the unavailable fallthrough it

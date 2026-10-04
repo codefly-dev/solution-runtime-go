@@ -101,7 +101,7 @@ func TestAHandlerPathCredentialFailureDisclosesNothing(t *testing.T) {
 	}{
 		{"a workload this solution cannot attest for", fmt.Errorf("obtain this execution's credential from %s: 403 forbidden: build 11 is not approved: %w", secretish, ErrNotAttested), http.StatusServiceUnavailable},
 		{"a superseded authority", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrRevoked), http.StatusConflict},
-		{"a capability this solution cannot carry", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrUnsealed), http.StatusBadGateway},
+		{"a capability this solution cannot carry", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrInvalid), http.StatusBadGateway},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status, message := handlerErrorResponse(tc.err)

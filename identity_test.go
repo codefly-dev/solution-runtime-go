@@ -743,12 +743,15 @@ func TestASuppliedSourceBootsAndStaysAuthenticatedOutbound(t *testing.T) {
 		// The fake host is served over TLS under the cell's anchor, and a
 		// supplied credential source brings its own transport — the runtime
 		// hands it none, which is the point of supplying one.
-		viaCell := &http.Client{Timeout: platformRequestTimeout, Transport: &http.Transport{TLSClientConfig: &tls.Config{
-			RootCAs: roots, Certificates: []tls.Certificate{*caller}, MinVersion: tls.VersionTLS13,
-		}}}
+		//
+		// It no longer brings a transport: the SDK's mint client builds and
+		// owns that, and takes only the roots. A consumer supplying a
+		// credential source therefore supplies the anchor the mint endpoint is
+		// verified against and nothing else about how it is dialled.
+		_, _ = caller, roots
 		server := New(Manifest{ID: testSolutionID}).
 			Identity(suppliedIdentity{certFile: certFile, keyFile: keyFile, bundleFile: bundleFile}).
-			Credential(mintClientVia(t, mint.URL+credentialMintPath, tokenFile, viaCell))
+			Credential(mintClientFor(t, mint, tokenFile))
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		ln, err := takeListener(server).start(ctx)

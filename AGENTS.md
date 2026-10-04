@@ -262,6 +262,29 @@ embedding it.
   answer is recorded **where the answer lands** rather than by whichever caller
   was still waiting — the ask is detached, so it can finish with nobody
   listening.
+- **The mint hop is the SDK's transport, not this runtime's.** `MintOptions`
+  takes `RootCAs` and nothing else about how the mint is dialled: the client
+  builds and owns that transport, and its reasoning for refusing a
+  caller-supplied one is sound — a supplied client is a hole it cannot inspect,
+  since a nil `Transport` means the global mutable default, a `DialTLSContext`
+  bypasses `TLSClientConfig` entirely, and a caller holding the same
+  `*http.Transport` can turn verification off after construction. Two
+  consequences, recorded because they are properties this cutover argued for
+  and no longer owns: **the mint request presents no client certificate** — the
+  projected service-account token it carries is the whole of what attests which
+  workload is asking — and **`MINT_PEERS_FILE` does not govern that hop**, so
+  the per-dial peer re-read applies to the gateway alone. A fake host that
+  demands mTLS on the mint is asserting a property this runtime does not have.
+- **Only 401 and 403 latch a credential refusal.** The rule was "429 and 5xx
+  retry, everything else is terminal", and sdk-go v0.3.0 inverted it after
+  measuring the cost: a 408 from a proxy, with a valid credential in hand,
+  refused and latched for the life of the process, and a 404 from an ingress
+  mid-rollout would do the same. Those two are the statuses the host signs —
+  the projected token is not acceptable, or the build is not approved. **A 404
+  on the mint is now an outage**, so an old runtime against a host of this
+  generation waits out its bounded window and exits non-zero for the
+  orchestrator rather than failing on the first answer. It still does not
+  recover; what changed is the shape, not the outcome.
 - **A terminal credential refusal ends the process; a transient one does not.**
   `ErrMintRefused` at renewal fails `/health` and ends `serve` with the reason.
   `ErrMintUnavailable` must not: it is transient by construction and exiting on

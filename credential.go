@@ -2,6 +2,7 @@ package solution
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -97,15 +98,19 @@ func readAuthority(ctx context.Context) (*codefly.Authority, error) {
 // the projected token that attests which workload this process is, and a
 // Location would hand that to whatever answered at the mint URL.
 func (s *Server) platformCredentialSource() (CredentialSource, error) {
-	audience, err := s.authority.Value(AuthorityGroup, AuthorityAudienceKey)
-	if err != nil {
-		return nil, err
-	}
 	projectionAudience, err := s.authority.Value(AuthorityGroup, AuthorityProjectionAudienceKey)
 	if err != nil {
 		return nil, err
 	}
-	client, err := workcontext.NewMintClient(s.mintOptions(audience, projectionAudience))
+	identity, err := s.serverIdentity()
+	if err != nil {
+		return nil, err
+	}
+	anchor, err := s.peerTrustAnchor(identity)()
+	if err != nil {
+		return nil, fmt.Errorf("read the trust anchor the mint endpoint is verified against: %w", err)
+	}
+	client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, anchor))
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
 	}
@@ -192,7 +197,7 @@ func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Crede
 	// Terminal, not transient: the host has answered about a different
 	// installation than the one this build was approved for, and no number of
 	// retries changes that.
-	if err := a.holdInstallation(credential.Seal().InstallationID); err != nil {
+	if err := a.holdInstallation(credential.Seal().GetInstallationId()); err != nil {
 		return workcontext.Credential{}, err
 	}
 	return credential, nil
@@ -222,20 +227,35 @@ func (a *authorityHeldSource) holdInstallation(id string) error {
 // would otherwise be laundered into a credential nobody approved. Dropping it
 // leaves the boot and the first mint working perfectly and only renewals wrong,
 // which is not a shape a test over the happy path can see.
-func (s *Server) mintOptions(audience, projectionAudience string) workcontext.MintOptions {
+func (s *Server) mintOptions(projectionAudience string, anchor *x509.CertPool) workcontext.MintOptions {
 	return workcontext.MintOptions{
-		URL:                s.cfg.mintURL,
-		Audience:           audience,
+		URL: s.cfg.mintURL,
+		// The pinned value the audience is READ from, not an audience this
+		// runtime resolved and passed beside the pin. The SDK made that a
+		// typed reference for a reason worth keeping in mind here: a string
+		// passed alongside the pin meant the drift check guarded a value the
+		// mint did not use.
+		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
 		ProjectedToken:     workcontext.ProjectedTokenFile(s.cfg.projectedTokenPath),
 		ProjectionAudience: projectionAudience,
 		// The frozen reader, not a value read again here: it is what rechecks
-		// the three authority-bearing values before each renewal.
+		// the authority-bearing values before each mint, including the first.
 		Authority: s.authority,
-		// This runtime's own authenticated client, so the mint presents this
-		// workload's X.509-SVID, verifies the host against the projected
-		// anchor, is unproxied, and does not follow a redirect that would hand
-		// the projected token to whatever answered.
-		HTTPClient: s.outbound,
+		// The anchor, and nothing else about the transport.
+		//
+		// This used to hand over this runtime's own authenticated client, so
+		// the mint presented this workload's X.509-SVID and went through the
+		// per-dial peer admission. The SDK now builds and owns that transport
+		// and takes only the roots, and its reasoning is sound: a supplied
+		// client is a hole it cannot inspect — a nil Transport means the
+		// global mutable default, a DialTLSContext bypasses TLSClientConfig
+		// entirely, and a caller holding the same *http.Transport can turn
+		// verification off after construction.
+		//
+		// What that costs here is stated rather than glossed: the mint request
+		// no longer presents a client certificate, and MINT_PEERS_FILE no
+		// longer governs it. See admittedAt.
+		RootCAs: anchor,
 	}
 }
 
@@ -334,9 +354,21 @@ func (s *Server) openCredential(ctx context.Context) error {
 			// starts at the boot's own credential or it starts one request
 			// late.
 			s.holdCredential(credential)
+			// Through the generated GETTERS, not the fields.
+			//
+			// SealedValues is core's protobuf type now (an alias for
+			// basev0.WorkSealV1), so its scalars are POINTERS: formatting
+			// seal.BuildIncarnation with %d printed a pointer address into the
+			// boot log instead of the incarnation — the one line an operator
+			// reads to see which approved build this credential is sealed to.
+			// The getters return values and answer zero for a nil seal.
+			//
+			// golangci-lint's govet caught this and plain `go vet ./...` did
+			// not, which is worth knowing: the four gate commands would have
+			// shipped it.
 			seal := credential.Seal()
 			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
-				s.manifest.ID, seal.InstallationID, seal.InstallationRevision, seal.BuildIncarnation,
+				s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation(),
 				credential.ExpiresAt().UTC().Format(time.RFC3339))
 			return nil
 		case err == nil:

@@ -144,7 +144,7 @@ func attestingSource(t *testing.T) CredentialSource {
 	mint := newHostMint(t, &hostMint{})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
-	return mintClientFor(t, mint.URL, tokenFile)
+	return mintClientFor(t, mint, tokenFile)
 }
 
 const searchPath = "/modules/things/things.v1.Things/Search"
@@ -459,7 +459,7 @@ func TestAViewerBearerRouteRefusesToActWithoutACredential(t *testing.T) {
 		tokenFile := filepath.Join(t.TempDir(), "token")
 		writeFile(t, tokenFile, "projected")
 		mint := newHostMint(t, &hostMint{})
-		server, route := build(t, mintClientFor(t, mint.URL, tokenFile))
+		server, route := build(t, mintClientFor(t, mint, tokenFile))
 		if _, err := server.authorize(context.Background(), route, header, nil); err != nil {
 			t.Fatalf("a ViewerBearer route was refused while this process holds an approved credential: %v", err)
 		}

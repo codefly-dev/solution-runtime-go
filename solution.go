@@ -1873,7 +1873,11 @@ func usableCredential(credential workcontext.Credential) error {
 		return fmt.Errorf("%w: the credential source returned no credential at all (empty token), so this process holds nothing that attests which workload it is",
 			workcontext.ErrMintRefused)
 	}
-	if seal := credential.Seal(); seal.InstallationID == "" {
+	// GetInstallationId, not the field: Seal() returns a POINTER now, so
+	// reading the field on a credential carrying no seal panics — in the one
+	// check written to refuse exactly that. The getter answers "" for a nil
+	// seal, which is the refusal this wants.
+	if seal := credential.Seal(); seal.GetInstallationId() == "" {
 		return fmt.Errorf("%w: the credential this process holds is sealed to no installation, so there is nothing for a far end to hold it to",
 			workcontext.ErrMintRefused)
 	}
