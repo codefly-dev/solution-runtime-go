@@ -1975,3 +1975,105 @@ func expiredCredential(t *testing.T, mint *hostMint, tokenFile string) workconte
 	}
 	return credential
 }
+
+// TestAnExecutionFreeCredentialIsRefusedEverywhere is round eleven's blocker,
+// and a regression the sdk-go v0.3.0 migration introduced silently.
+//
+// usableCredential never checked for a sealed execution and never had to: the
+// previous SDK's own reader refused a seal whose build incarnation was zero,
+// so a credential reaching it carried one by construction. v0.3.0 moved
+// structural validation to core, and core LEGITIMATELY mints a credential
+// sealing no execution — for a principal recorded as bearing none, a person at
+// a terminal. That is core's own execution-missing shape. The guarantee was
+// inherited, the inheritance ended, and nothing here noticed.
+//
+// Reproduced before it was fixed: the runtime booted on such a credential,
+// held it, passed actingForAViewer, and served handlers with a credential
+// attesting no approved build.
+//
+// A workload credential is the one kind that may never be execution-free: its
+// purpose is attesting which build is asking, so a host can hold a mint to the
+// build its presence document approved.
+func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
+	t.Run("the boot refuses it, terminally", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{executionFree: true})
+		bootEnvironment(t, mint)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		server := New(Manifest{ID: testSolutionID})
+		// Short, so a refusal that were wrongly classified as transient shows
+		// up as a bounded wait rather than hanging this test.
+		server.firstMintWindow = 2 * time.Second
+		ln, err := takeListener(server).start(ctx)
+		if ln != nil {
+			_ = ln.Close()
+		}
+		if err == nil {
+			t.Fatal("the boot accepted a credential sealing no execution: it attests no approved build, so the host has nothing to hold a mint to and the ceiling it is held to is nobody's")
+		}
+		if !errors.Is(err, workcontext.ErrMintRefused) {
+			t.Errorf("the boot failed with %v, want ErrMintRefused: the issuer will seal the same thing next time, so this is a judgement and not an outage", err)
+		}
+		if !strings.Contains(err.Error(), "seals no execution") {
+			t.Errorf("the refusal %q does not say what is missing", err)
+		}
+		// Terminal means it asked ONCE. A bounded wait here would be the
+		// audited-mint loop this runtime was changed to remove.
+		if got := mint.count(); got != 1 {
+			t.Errorf("the boot asked the issuer %d times, want exactly 1", got)
+		}
+	})
+
+	t.Run("no handler runs and no module is called", func(t *testing.T) {
+		// The route gate's half: even handed such a credential directly, a
+		// route must not act for a viewer and nothing author-written may run.
+		mint := newHostMint(t, &hostMint{executionFree: true})
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+		gw := newWorkContextGateway(t, &workContextGateway{})
+
+		var ran atomic.Bool
+		server := New(Manifest{ID: testSolutionID}).
+			Credential(mintClientFor(t, mint, tokenFile)).
+			HandleRequest("/thing", func(*http.Request, *Gateway) (any, error) {
+				ran.Store(true)
+				return map[string]string{"ok": "yes"}, nil
+			})
+		server.cfg = config{gatewayURL: gw.URL}
+
+		header := http.Header{}
+		header.Set("authorization", viewerBearer())
+		header.Set(orgHeader, viewerOrg)
+		header.Set(sessionHeader, viewerSession)
+		header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+
+		if err := server.actingForAViewer(context.Background()); err == nil {
+			t.Fatal("a route acted for a viewer under a credential sealing no execution")
+		} else if !errors.Is(err, ErrCredentialRefused) {
+			t.Errorf("the route refused with %v, want one wrapping ErrCredentialRefused", err)
+		}
+		if ran.Load() {
+			t.Error("the handler ran")
+		}
+		if got := gw.mintCount(); got != 0 {
+			t.Errorf("the gateway saw %d viewer mints, want 0", got)
+		}
+		if got := len(gw.calls); got != 0 {
+			t.Errorf("a module was called %d times under a credential attesting no build, want 0", got)
+		}
+	})
+
+	t.Run("the carrier still accepts it as structurally valid", func(t *testing.T) {
+		// The division of labour stays intact. An execution-free capability is
+		// not malformed — core mints it on purpose for a principal bearing no
+		// execution — so the CARRIER must not refuse it. What refuses it is
+		// this runtime holding its OWN credential to a higher bar than it
+		// holds a capability it merely carries.
+		if _, classified := boundary["execution-missing"]; !classified {
+			t.Fatal("core's execution-missing fixture is unclassified, so this says nothing")
+		}
+		if boundary["execution-missing"] != carried {
+			t.Error("the carrier refuses core's execution-missing fixture: a capability core mints legitimately is not the carrier's to reject, and refusing it here would be the silent-downgrade failure this boundary exists to prevent")
+		}
+	})
+}

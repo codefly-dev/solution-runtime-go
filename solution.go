@@ -1881,6 +1881,42 @@ func usableCredential(credential workcontext.Credential) error {
 		return fmt.Errorf("%w: the credential this process holds is sealed to no installation, so there is nothing for a far end to hold it to",
 			workcontext.ErrMintRefused)
 	}
+	// And it has to attest WHICH BUILD is asking.
+	//
+	// This check did not exist and did not need to: the previous SDK's own
+	// reader refused a seal whose build incarnation was zero, so a credential
+	// reaching here carried one by construction. The v0.3.0 migration moved
+	// structural validation to core, and core legitimately mints a credential
+	// sealing NO execution — a principal recorded as bearing none, a person at
+	// a terminal, which is core's own execution-missing shape. The guarantee
+	// was inherited, the inheritance ended, and nothing here noticed.
+	//
+	// Reproduced before fixing: a runtime booted on such a credential, held
+	// it, passed actingForAViewer, and served handlers and ViewerBearer
+	// passthroughs with a credential attesting no approved build at all.
+	//
+	// A WORKLOAD credential is the one kind that may never be execution-free.
+	// Its whole purpose is attesting which build is asking, so that a host can
+	// hold a mint to the build its presence document approved; one sealing no
+	// execution asserts nothing a host can check and the ceiling it is held to
+	// is the ceiling of nobody.
+	//
+	// Read through CORE'S OWN generated accessors on the verified capability's
+	// seal — Credential.Seal() returns core's protobuf type, so GetImageDigest
+	// and GetBuildIncarnation are core's, not a predicate of this package's.
+	// No decoder, no seal validator and no copy of sealOf grows here; that
+	// would be the second implementation this module is gated against. Both
+	// halves are required rather than either, because an execution is the pair
+	// — core's schema refuses a digest without an incarnation, so the shapes
+	// where "and" differs from "or" are shapes that never arrive.
+	//
+	// Terminal. A credential attesting no build is not a transient condition:
+	// the issuer will seal the same thing next time, and a loop around it is
+	// the audited-mint cost this runtime was changed to remove.
+	if seal := credential.Seal(); seal.GetBuildIncarnation() == 0 || seal.GetImageDigest() == "" {
+		return fmt.Errorf("%w: the credential this process holds seals no execution (image digest %q, build incarnation %d), so it attests no approved build and nothing a host can hold a mint to. A workload credential names the build that is asking; one that names none is a credential for a principal bearing no execution, which this process is not",
+			workcontext.ErrMintRefused, seal.GetImageDigest(), seal.GetBuildIncarnation())
+	}
 	if expiry := credential.ExpiresAt(); !time.Now().Before(expiry) {
 		return fmt.Errorf("%w: the credential this process holds expired at %s",
 			workcontext.ErrMintUnavailable, expiry.UTC().Format(time.RFC3339))

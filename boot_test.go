@@ -104,6 +104,13 @@ type hostMint struct {
 	// cellRoots is set when serveTLS re-serves this mint under a cell's
 	// anchor, so roots() answers that rather than httptest's own certificate.
 	cellRoots *x509.CertPool
+	// executionFree makes this host mint a credential sealing NO execution,
+	// which core allows: the sealed execution became optional because a
+	// principal that bears no approved build — a person at a terminal — must
+	// not have one invented for it. It is the shape of core's own
+	// execution-missing fixture, and it is not a shape a WORKLOAD credential
+	// may have.
+	executionFree bool
 	// installation overrides the installation it seals credentials to, so a
 	// test can have a renewal answer about a different one. Empty means
 	// testInstallation.
@@ -127,6 +134,42 @@ type hostMint struct {
 func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 	t.Helper()
 	mint.authority = standInAuthority()
+	if mint.executionFree {
+		// An issuer that mints a credential sealing NO execution, which core
+		// permits only for a principal bearing no approved build — a person at
+		// a terminal. Built by taking core's fixture seal source and recording
+		// the installation seal and epoch WITHOUT an approved build, which is
+		// the shape of core's own execution-missing fixture.
+		//
+		// Core refuses to mint execution-free for a principal that does bear
+		// one, which is why this cannot be done by simply omitting the field.
+		seals := corework.NewMemorySealSource()
+		if err := seals.Put(corework.FixturePrincipal, corework.Seal{
+			InstallationID:       testInstallation,
+			InstallationRevision: corework.FixtureInstallationRevision,
+		}); err != nil {
+			t.Fatalf("seal an execution-free issuer: %v", err)
+		}
+		if err := seals.PutEpoch(corework.FixturePrincipal, corework.FixturePrincipalEpoch); err != nil {
+			t.Fatalf("record the principal's epoch: %v", err)
+		}
+		// Explicitly bearing no execution, which is core's own distinction:
+		// a principal with an approved build MUST attest it, one recorded as
+		// bearing none legitimately carries no execution, and one core knows
+		// nothing about is refused. This is the middle case — a person at a
+		// terminal — and it is the shape a WORKLOAD credential must never have.
+		if err := seals.PutBearsNoExecution(corework.FixturePrincipal); err != nil {
+			t.Fatalf("record the principal as bearing no execution: %v", err)
+		}
+		_, key := corework.FixtureKeyPair()
+		mint.authority = &corework.Authority{
+			Issuer:    corework.FixtureIssuer,
+			KeyID:     corework.FixtureKeyID,
+			Key:       key,
+			Revisions: corework.FixtureRevisions(),
+			Seals:     seals,
+		}
+	}
 	if mint.installation != "" {
 		// An issuer that seals to a different installation, for the renewal
 		// refusal. Built from CORE's fixture seal source with one entry
@@ -212,6 +255,18 @@ func (m *hostMint) serveTLS(t *testing.T, c *cell) {
 	t.Cleanup(m.Close)
 }
 
+// execution is the build this host attests for the credential it mints, or
+// nothing at all when the test asks for an execution-free one.
+func (m *hostMint) execution() corework.Execution {
+	if m.executionFree {
+		return corework.Execution{}
+	}
+	return corework.Execution{
+		ImageDigest:      corework.FixtureImageDigest,
+		BuildIncarnation: corework.FixtureBuildIncarnation,
+	}
+}
+
 func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.presented = append(m.presented, r.Header.Get("authorization"))
@@ -255,14 +310,11 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		// approved build it holds for that principal. The execution moved off
 		// the installation seal, where it described the OWNER's workload
 		// however many delegation hops had been added.
-		Execution: corework.Execution{
-			ImageDigest:      corework.FixtureImageDigest,
-			BuildIncarnation: corework.FixtureBuildIncarnation,
-		},
+		Execution: m.execution(),
 	})
 	if err != nil {
 		m.signErr = err
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "stand-in issuer: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"work_context": token})
