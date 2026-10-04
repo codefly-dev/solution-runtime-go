@@ -3,6 +3,7 @@ package solution
 import (
 	"connectrpc.com/connect"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -2076,4 +2077,106 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 			t.Error("the carrier refuses core's execution-missing fixture: a capability core mints legitimately is not the carrier's to reject, and refusing it here would be the silent-downgrade failure this boundary exists to prevent")
 		}
 	})
+}
+
+// TestTheMintIsDialledUnderTheAnchorAsItIsNow is round eleven's item 2, as far
+// as it can be taken here.
+//
+// NewMintClient takes RootCAs as a value and builds its transport from it on
+// the spot, so the pool a client is constructed with is the pool it keeps. The
+// path this replaced dialled the mint through this runtime's own outbound
+// client, whose DialTLSContext re-read the anchor per dial — so removing a
+// compromised root took effect on the next dial. v0.3.0 exposes no per-dial
+// hook, so the anchor is re-read here and the client rebuilt when it rotated.
+func TestTheMintIsDialledUnderTheAnchorAsItIsNow(t *testing.T) {
+	t.Run("an unreadable anchor refuses rather than using the last good one", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{})
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+
+		var fail atomic.Bool
+		source := &anchorFreshSource{
+			anchor: func() (*x509.CertPool, error) {
+				if fail.Load() {
+					return nil, errors.New("the projected bundle is unreadable")
+				}
+				return mint.roots(), nil
+			},
+			build: func(pool *x509.CertPool) (CredentialSource, error) {
+				return mintClientWithRoots(t, mint, tokenFile, pool), nil
+			},
+		}
+
+		if _, err := source.Credential(context.Background()); err != nil {
+			t.Fatalf("the first ask was refused: %v", err)
+		}
+		// The anchor goes away. A source that cached the last good pool would
+		// go on dialling the mint under trust that no longer exists.
+		fail.Store(true)
+		_, err := source.Credential(context.Background())
+		if err == nil {
+			t.Fatal("an ask succeeded while the trust anchor could not be read: dialling under a stale anchor sends the projected service-account token to whatever now answers at that address")
+		}
+		if !errors.Is(err, workcontext.ErrMintUnavailable) {
+			t.Errorf("the refusal is %v, want ErrMintUnavailable: an unreadable bundle is an outage, not a judgement on this build", err)
+		}
+	})
+
+	t.Run("a rotated anchor rebuilds the client, and an unchanged one does not", func(t *testing.T) {
+		mint := newHostMint(t, &hostMint{})
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+
+		rotated := newCell(t)
+		var useRotated atomic.Bool
+		var builds atomic.Int64
+		source := &anchorFreshSource{
+			anchor: func() (*x509.CertPool, error) {
+				if useRotated.Load() {
+					return rotated.roots, nil
+				}
+				return mint.roots(), nil
+			},
+			build: func(pool *x509.CertPool) (CredentialSource, error) {
+				builds.Add(1)
+				return mintClientWithRoots(t, mint, tokenFile, pool), nil
+			},
+		}
+
+		for range 3 {
+			if _, err := source.Credential(context.Background()); err != nil {
+				t.Fatalf("an ask under the unchanged anchor was refused: %v", err)
+			}
+		}
+		if got := builds.Load(); got != 1 {
+			t.Errorf("the client was rebuilt %d times under an unchanged anchor, want 1: rebuilding per ask throws away the one credential per execution", got)
+		}
+
+		// Rotation. The next ask has to dial under the new trust, which means
+		// a new client, which means the pool is not captured for the life of
+		// the process.
+		useRotated.Store(true)
+		_, _ = source.Credential(context.Background())
+		if got := builds.Load(); got != 2 {
+			t.Errorf("the client was rebuilt %d times across a rotation, want 2: the SDK fixes its transport at construction, so an unrebuilt client keeps dialling under the old anchor", got)
+		}
+	})
+}
+
+// mintClientWithRoots is mintClientFor against a caller-supplied pool, for a
+// test about which anchor the mint is dialled under.
+func mintClientWithRoots(t *testing.T, mint *hostMint, tokenFile string, roots *x509.CertPool) CredentialSource {
+	t.Helper()
+	client, err := workcontext.NewMintClient(workcontext.MintOptions{
+		URL:                mint.URL + credentialMintPath,
+		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
+		Authority:          fixedAuthority{audience: testAudience},
+		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
+		ProjectionAudience: testProjectionAudience,
+		RootCAs:            roots,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }

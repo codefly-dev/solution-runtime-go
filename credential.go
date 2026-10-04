@@ -106,15 +106,76 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	anchor, err := s.peerTrustAnchor(identity)()
+	// The anchor is re-read before every ask, not captured once.
+	//
+	// NewMintClient takes RootCAs as a VALUE and builds its transport from it
+	// there and then (mintHTTPClient), so the pool a client is constructed
+	// with is the pool it uses for the life of that client. The path this
+	// replaced dialled the mint through this runtime's own outbound client,
+	// whose DialTLSContext re-read the anchor per dial — so removing a
+	// compromised root took effect on the next dial, which is the property
+	// AGENTS.md argues for in both directions.
+	//
+	// v0.3.0 exposes no per-dial anchor hook, and RootCAs is the only thing it
+	// lets a caller say about the transport. So the anchor is re-read here and
+	// a client is rebuilt when it has actually ROTATED — which is the one
+	// moment a fresh dial under new trust is wanted, and otherwise leaves the
+	// client, and its one credential per execution, alone.
+	return &anchorFreshSource{
+		anchor: s.peerTrustAnchor(identity),
+		build: func(pool *x509.CertPool) (CredentialSource, error) {
+			client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, pool))
+			if err != nil {
+				return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
+			}
+			return client, nil
+		},
+	}, nil
+}
+
+// anchorFreshSource holds the mint client to the anchor as it is NOW.
+//
+// It re-reads the trust anchor before each ask and rebuilds the client when the
+// pool has changed, because the SDK's client fixes its transport at
+// construction. An anchor that has become unreadable REFUSES rather than
+// falling back to the last good pool: the two failures are not symmetric, and
+// the asymmetry is the one this file already records for the inbound
+// direction — serving a stale leaf refuses callers who should be let in, while
+// dialling under a stale anchor sends the projected service-account token to
+// whatever now answers at that address.
+//
+// What this does NOT restore is the peer-role check the old path made: the
+// mint's own identity was held to MINT_PEERS_FILE through admitOnlyPlatform,
+// and the SDK presents no client certificate and offers no verifier hook, so
+// there is nowhere to make it. That is named in AGENTS.md and carried as an
+// sdk-go follow-up rather than reimplemented here behind the SDK's back.
+type anchorFreshSource struct {
+	anchor func() (*x509.CertPool, error)
+	build  func(*x509.CertPool) (CredentialSource, error)
+
+	mu    sync.Mutex
+	pool  *x509.CertPool
+	inner CredentialSource
+}
+
+func (a *anchorFreshSource) Credential(ctx context.Context) (workcontext.Credential, error) {
+	pool, err := a.anchor()
 	if err != nil {
-		return nil, fmt.Errorf("read the trust anchor the mint endpoint is verified against: %w", err)
+		return workcontext.Credential{}, fmt.Errorf("%w: the trust anchor the mint endpoint is verified against could not be read, so this process will not dial it: %w",
+			workcontext.ErrMintUnavailable, err)
 	}
-	client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, anchor))
-	if err != nil {
-		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
+	a.mu.Lock()
+	if a.inner == nil || !a.pool.Equal(pool) {
+		inner, err := a.build(pool)
+		if err != nil {
+			a.mu.Unlock()
+			return workcontext.Credential{}, err
+		}
+		a.inner, a.pool = inner, pool
 	}
-	return client, nil
+	inner := a.inner
+	a.mu.Unlock()
+	return inner.Credential(ctx)
 }
 
 // heldToTheFrozenAuthority rechecks the authority whenever a source hands back
