@@ -1653,3 +1653,64 @@ func (d *driftingCredentialSource) Credential(context.Context) (workcontext.Cred
 	}
 	return d.credential, nil
 }
+
+// TestAnAlreadyDriftedAuthorityIsNotMintedAgainst is the pre-ask recheck's own
+// property, which the post-ask one masks.
+//
+// Both rechecks refuse a value that drifted before the ask, so deleting the
+// first changed no outcome and no test noticed. What it changes is whether the
+// mint happens at all: without it a process whose authority has already
+// drifted sends the projected service-account token and spends an audited mint
+// to obtain a credential it will then throw away. "Before the ask, because the
+// ask is what mints" is the comment on it; this is the test that makes the
+// comment load-bearing.
+func TestAnAlreadyDriftedAuthorityIsNotMintedAgainst(t *testing.T) {
+	authorityValues(t)
+	ctx := context.Background()
+	authority, err := readAuthority(ctx)
+	if err != nil {
+		t.Fatalf("readAuthority: %v", err)
+	}
+	mint := newHostMint(t, &hostMint{})
+	minted := mintedCredential(t, mint, testProjectionAudience)
+
+	// Drifted before anything asks.
+	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
+		"spiffe://codefly.test/ns/apps/sa/somebody-else")
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		t.Fatal(err)
+	}
+
+	counted := &countingCredentialSource{credential: minted}
+	_, err = heldToTheFrozenAuthority(counted, authority).Credential(ctx)
+	if err == nil {
+		t.Fatal("a credential was obtained while an authority-bearing value had already drifted")
+	}
+	if !errors.Is(err, workcontext.ErrMintRefused) {
+		t.Errorf("the drift was refused with %v, want ErrMintRefused", err)
+	}
+	if asks := counted.count(); asks != 0 {
+		t.Errorf("the source was asked %d times while the authority had already drifted: the recheck before the ask exists so that no projected token is sent and no audited mint is spent for a credential that cannot be kept", asks)
+	}
+}
+
+// countingCredentialSource records how many times it was asked, so a test can
+// assert that it was not.
+type countingCredentialSource struct {
+	mu         sync.Mutex
+	asks       int
+	credential workcontext.Credential
+}
+
+func (c *countingCredentialSource) Credential(context.Context) (workcontext.Credential, error) {
+	c.mu.Lock()
+	c.asks++
+	c.mu.Unlock()
+	return c.credential, nil
+}
+
+func (c *countingCredentialSource) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.asks
+}
