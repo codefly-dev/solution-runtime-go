@@ -321,22 +321,42 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 // nothing resembling a registration.
 func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
+
+	// A listener of its own for every deleted URL, which boot cannot move.
+	//
+	// These pointed at mint.URL, captured before boot. The boot then calls
+	// hostMint.serveTLS, which CLOSES that server and starts another on a new
+	// port — so every deleted URL named an address nothing was listening on,
+	// and a surviving registration would have failed to connect and been
+	// counted by nobody. The test passed because nothing could be observed.
+	//
+	// This is the second time this test watched the wrong thing. The first
+	// version aimed the URLs at example.com, which a reviewer caught for the
+	// same reason: aimed somewhere nothing answers, it proved only that the
+	// old code never minted. The comment then said "every deleted URL points
+	// at the host this test counts requests on", which was true when it was
+	// written and stopped being true when serveTLS started replacing the
+	// server underneath it.
+	var legacyHits atomic.Int64
+	var legacyPaths sync.Map
+	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		legacyHits.Add(1)
+		legacyPaths.Store(r.URL.Path, r.Header.Clone())
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(legacy.Close)
+
 	// Every key the cutover deleted. If any of them still reaches a code path,
-	// the host below sees a second request — or a header it should never be
-	// shown again.
-	// Every deleted URL points at the host this test counts requests on, not at
-	// example.com. A second reviewer caught that: aimed elsewhere, a surviving
-	// registration would have been a connection to a domain that does not
-	// resolve and the host would have counted nothing, so the test passed
-	// because the old code never minted rather than because nothing registers.
+	// the observer above sees a request — or a header it should never be shown
+	// again.
 	for key, value := range map[string]string{
 		"PUBLIC_URL":                              "https://public.example.com",
 		"SELF_UPSTREAM":                           "https://self.example.com",
-		"HOST_REGISTER_URL":                       mint.URL + "/api/solutions/register",
-		"GATEWAY_REGISTER_URL":                    mint.URL + "/solutions/_register",
-		"GATEWAY_MODULE_REGISTER_URL":             mint.URL + "/modules/_register",
-		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   mint.URL + "/modules/_registration-token",
-		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": mint.URL + "/solutions/_registration-token",
+		"HOST_REGISTER_URL":                       legacy.URL + "/api/solutions/register",
+		"GATEWAY_REGISTER_URL":                    legacy.URL + "/solutions/_register",
+		"GATEWAY_MODULE_REGISTER_URL":             legacy.URL + "/modules/_register",
+		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   legacy.URL + "/modules/_registration-token",
+		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": legacy.URL + "/solutions/_registration-token",
 		"CODEFLY_INTERNAL_TOKEN":                  "internal-token-that-must-not-travel",
 		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "solution-secret-that-must-not-travel",
 		"CODEFLY__MODULE_REGISTRATION_SECRETS":    "things:module-secret-that-must-not-travel",
@@ -360,6 +380,32 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 		t.Fatalf("health = %d, want 200", status)
 	}
 
+	// FIRST: prove the observer is actually listening on the address those
+	// URLs name.
+	//
+	// The defect this replaced was a test concluding "nothing called it" while
+	// watching a closed port, so the conclusion has to rest on something
+	// checked rather than assumed. If this probe cannot reach the observer,
+	// neither could a surviving registration, and the count below would mean
+	// nothing.
+	probe, err := http.Get(legacy.URL + "/api/solutions/register")
+	if err != nil {
+		t.Fatalf("the observer for the deleted endpoints is not reachable, so a zero count below would prove nothing: %v", err)
+	}
+	drainAndClose(probe)
+	if got := legacyHits.Load(); got != 1 {
+		t.Fatalf("the observer counted %d of its own probe, want 1: it is not counting what reaches it", got)
+	}
+	legacyHits.Store(0)
+	legacyPaths.Range(func(k, _ any) bool { legacyPaths.Delete(k); return true })
+
+	// The observer is the one that can see a surviving registration, and it is
+	// still listening on the address those URLs name.
+	if got := legacyHits.Load(); got != 0 {
+		paths := []string{}
+		legacyPaths.Range(func(k, _ any) bool { paths = append(paths, k.(string)); return true })
+		t.Errorf("a deleted endpoint was called %d times, at %v: every registration, heartbeat and token exchange is gone, so nothing may reach one", got, paths)
+	}
 	if got := mint.count(); got != 1 {
 		t.Errorf("the host received %d requests, want exactly 1 (the mint): anything more is a registration that survived", got)
 	}

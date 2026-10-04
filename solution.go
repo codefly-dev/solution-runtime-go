@@ -3303,7 +3303,16 @@ func (g *Gateway) WorkContextPrincipals(ctx context.Context) (WorkContextPrincip
 	}
 	token, err := g.workContext(ctx)
 	if err != nil {
-		return WorkContextPrincipals{}, err
+		// Through surfaced, like ForModule's. This is ForModule's exported
+		// sibling and it reaches the same mint, so it produced the same
+		// errors — the mint URL, the status, the issuer's own message — and
+		// handed them back unsanitized. A tool calling it relayed the whole
+		// chain to an agent client, which is the disclosure ForModule's was
+		// fixed for; two callers of one mint, one of them sanitized.
+		//
+		// Found by driving every exported Gateway method that returns an
+		// error rather than by reading the one that had already been fixed.
+		return WorkContextPrincipals{}, g.surfaced(err)
 	}
 	principals, ok := g.contexts.principals(token)
 	if !ok || principals.OwnerPrincipalID == "" || principals.CurrentActorPrincipalID == "" || principals.OrgID == "" {

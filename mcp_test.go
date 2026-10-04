@@ -1481,3 +1481,71 @@ func TestNoMCPRefusalEverPrintsASecret(t *testing.T) {
 // they did not have. What the runtime owes them is not handing over what they
 // could not otherwise see, which is Gateway.surfaced's job and is covered by
 // TestAToolsOwnFailureIsSanitizedOnTheWayOut.
+
+// TestNoExportedGatewayMethodRelaysTheRuntimesError is round eleven's item 3,
+// and it is a gate rather than one more case.
+//
+// ForModule's mint errors were sanitized and its exported SIBLING's were not:
+// WorkContextPrincipals reaches the same mint, produced the same errors — the
+// status, the issuer's code, its message — and handed them straight back. A
+// tool relayed the whole chain to an agent client. Two callers of one mint,
+// one of them sanitized.
+//
+// So this drives every exported Gateway method that can return a runtime
+// error, on a gateway that asked for sanitizing, and asserts none of them
+// carries the issuer's words. A method added later is one line here, and the
+// one-by-one version of this test is how the second path was missed.
+func TestNoExportedGatewayMethodRelaysTheRuntimesError(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	server := New(Manifest{ID: testSolutionID}).Credential(attestingSource(t))
+	server.cfg = config{gatewayURL: gw.URL}
+
+	header := http.Header{}
+	header.Set("authorization", viewerBearer())
+	header.Set(orgHeader, viewerOrg)
+	header.Set(sessionHeader, viewerSession)
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+
+	viewer := server.gatewayFor(header)
+	// The MCP path, where a tool's error becomes content a client reads and
+	// nothing downstream can tell it from the author's own.
+	viewer.sanitizeErrors = true
+
+	// A derived gateway first, so the delegation exists; then the host starts
+	// refusing and the held capability lapses, which is what a tool holding a
+	// gateway hits mid-call.
+	acting, err := viewer.ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+	if err != nil {
+		t.Fatalf("the first derive failed, so nothing below is about sanitizing: %v", err)
+	}
+	gw.mintStatus = http.StatusServiceUnavailable
+	lapseCachedCapabilities(acting)
+
+	for _, probe := range []struct {
+		name string
+		call func() error
+	}{
+		{"ForModule", func() error {
+			_, err := viewer.ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+			return err
+		}},
+		{"WorkContextPrincipals", func() error {
+			_, err := acting.WorkContextPrincipals(context.Background())
+			return err
+		}},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			err := probe.call()
+			if err == nil {
+				t.Fatal("the refusing host was not reached, so this probe asserted nothing")
+			}
+			// The issuer's own words, the status it answered with, and the
+			// address this runtime dialled.
+			for _, leak := range []string{gw.URL, "StartTask", "503", "permission_denied", "no such authority", "rejected"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("%s relays %q to whoever the author hands this to: %v", probe.name, leak, err)
+				}
+			}
+		})
+	}
+}
