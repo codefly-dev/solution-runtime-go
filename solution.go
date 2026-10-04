@@ -664,7 +664,7 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 		// guessed address for that is the one thing fail-closed does not
 		// permit. It is refused at boot until something resolves it, which is
 		// how this package already treats a token-exchange URL it cannot pair.
-		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
+		mintURL:            env(CredentialMintURLEnvironmentVariable, gatewayURL+credentialMintPath),
 		dialled:            dialledAddresses(gatewayURL, strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, ""))),
 		projectedTokenPath: workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey),
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
