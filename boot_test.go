@@ -101,6 +101,11 @@ type hostMint struct {
 	recoverAfter int64
 	// ttl is how long the credential it issues is valid.
 	ttl time.Duration
+	// switchTo and switchAfter make this host answer with a DIFFERENT shape
+	// once switchAfter credentials have been minted: the renewal path, driven
+	// through the real client rather than by calling the wrapper directly.
+	switchTo    *hostMint
+	switchAfter int64
 	// cellRoots is set when serveTLS re-serves this mint under a cell's
 	// anchor, so roots() answers that rather than httptest's own certificate.
 	cellRoots *x509.CertPool
@@ -135,7 +140,14 @@ type hostMint struct {
 	headers   []http.Header
 }
 
-func newHostMint(t *testing.T, mint *hostMint) *hostMint {
+// prepareAuthority gives this fake mint the issuer its fields describe: core's
+// stand-in, or one whose seal source has been moved so it can attest a
+// different installation, a different build, or no execution at all.
+//
+// Separate from newHostMint so ONE mint can hold a second shape and switch to
+// it after the first credential — which is what a booted renewal test needs,
+// and the only way to exercise the renewal path through the real client.
+func (mint *hostMint) prepareAuthority(t *testing.T) {
 	t.Helper()
 	mint.authority = standInAuthority()
 	if mint.executionFree {
@@ -230,6 +242,14 @@ func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 		// behaviour ordinary rather than asserting a cap that does not exist.
 		mint.ttl = 10 * time.Minute
 	}
+}
+
+func newHostMint(t *testing.T, mint *hostMint) *hostMint {
+	t.Helper()
+	mint.prepareAuthority(t)
+	if mint.switchTo != nil {
+		mint.switchTo.prepareAuthority(t)
+	}
 	// TLS, not plaintext. The SDK's mint client refuses plain HTTP outright —
 	// the projected service-account token travels on that request — so a
 	// plaintext fake mint can no longer stand in for a real one at all.
@@ -281,6 +301,14 @@ func (m *hostMint) serveTLS(t *testing.T, c *cell) {
 
 // execution is the build this host attests for the credential it mints, or
 // nothing at all when the test asks for an execution-free one.
+// installationFor is the installation the shape in force seals to.
+func (m *hostMint) installationFor() string {
+	if m.switchTo != nil && atomic.LoadInt64(&m.mints) > m.switchAfter {
+		return m.switchTo.installation
+	}
+	return m.installation
+}
+
 func (m *hostMint) execution() corework.Execution {
 	if m.executionFree {
 		return corework.Execution{}
@@ -319,14 +347,18 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(m.status)
 		return
 	}
-	token, _, err := m.authority.Start(r.Context(), corework.StartInput{
+	issuer, execution := m.authority, m.execution()
+	if m.switchTo != nil && atomic.LoadInt64(&m.mints) > m.switchAfter {
+		issuer, execution = m.switchTo.authority, m.switchTo.execution()
+	}
+	token, _, err := issuer.Start(r.Context(), corework.StartInput{
 		TenantID:           corework.FixtureTenant,
 		OwnerPrincipalID:   corework.FixturePrincipal,
 		OwnerPrincipalKind: "human",
 		TaskID:             fmt.Sprintf("workload-execution-%d", atomic.LoadInt64(&m.mints)),
 		Audience:           testAudience,
 		OrganizationID:     corework.FixtureOrganization,
-		InstallationID:     cmp.Or(m.installation, testInstallation),
+		InstallationID:     cmp.Or(m.installationFor(), testInstallation),
 		TTL:                m.ttl,
 		// Core v0.9.0 requires the caller to attest the build it is running:
 		// a principal that exercises an approved execution must name the image
@@ -334,7 +366,7 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		// approved build it holds for that principal. The execution moved off
 		// the installation seal, where it described the OWNER's workload
 		// however many delegation hops had been added.
-		Execution: m.execution(),
+		Execution: execution,
 	})
 	if err != nil {
 		m.signErr = err
@@ -1355,5 +1387,87 @@ func TestTheListenerDoesNotNegotiateHTTP2(t *testing.T) {
 		if proto == "h2" {
 			t.Fatal("the listener advertises h2: net/http skips the StateActive ConnState hook for HTTP/2, so the identity a connection was admitted as would no longer be recorded before a handler runs — move the pin before enabling it")
 		}
+	}
+}
+
+// TestABootedRenewalToAnotherExecutionEndsTheProcess is B3: the renewal
+// evidence for R9-1, driven through a real boot and the real mint client
+// rather than by calling the wrapper directly.
+//
+// The unit tests prove authorityHeldSource refuses a renewal sealed to no
+// execution or to a different one. They do not prove the booted runtime
+// classifies that refusal as terminal, stops serving, and ends — which is the
+// behaviour an orchestrator depends on and the thing a wrapper test cannot
+// see. The executed round validated these in scratch; they belong here.
+//
+// The issuer answers correctly for the first credential and switches shape
+// afterwards. A credential whose whole remaining lifetime sits inside the
+// renewal lead cannot be installed at all (the SDK floors that lead at five
+// seconds), so the TTL is just above it: the first install succeeds and the
+// next ask renews.
+func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		after *hostMint
+	}{
+		{"a renewal sealing no execution", &hostMint{executionFree: true}},
+		{"a renewal sealing a different build", &hostMint{incarnation: 99}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mint := newHostMint(t, &hostMint{
+				ttl:         6 * time.Second,
+				switchAfter: 1,
+				switchTo:    tc.after,
+			})
+			var ran atomic.Bool
+			solution := boot(t, New(Manifest{ID: testSolutionID}).
+				HandleRequest("/thing", func(*http.Request, *Gateway) (any, error) {
+					ran.Store(true)
+					return map[string]string{"ok": "yes"}, nil
+				}), mint)
+
+			call := func() int {
+				request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("authorization", viewerBearer())
+				resp, err := solution.client.Do(request)
+				if err != nil {
+					return 0 // the listener is gone, which is the end state
+				}
+				defer drainAndClose(resp)
+				return resp.StatusCode
+			}
+
+			// The control: the first credential is sound and the route serves.
+			if got := call(); got != http.StatusOK {
+				t.Fatalf("the route answered %d before any renewal, so nothing below is about the renewal", got)
+			}
+			if !ran.Load() {
+				t.Fatal("the handler never ran on the first call")
+			}
+			ran.Store(false)
+
+			// Past the renewal lead, every ask renews — and the issuer has
+			// changed shape.
+			deadline := time.Now().Add(12 * time.Second)
+			for time.Now().Before(deadline) {
+				// Reset per call, not once: a call made while the FIRST
+				// credential is still valid runs the handler legitimately, so
+				// the question is whether the handler ran on the call that was
+				// refused — not whether it ran at all during the wait.
+				ran.Store(false)
+				status := call()
+				if status == http.StatusServiceUnavailable || status == 0 {
+					if ran.Load() {
+						t.Error("the handler ran on the refused call: the refusal has to come before anything author-written")
+					}
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			t.Fatalf("the route was still answering 200 twelve seconds after the issuer began sealing a different execution: a renewal that replaces this execution is terminal, so the process stops serving and ends for the orchestrator")
+		})
 	}
 }

@@ -220,6 +220,14 @@ func (s *Server) mcpHandler(env MCPEnvironment) (http.Handler, error) {
 		return nil, fmt.Errorf("solution %q declares no MCP server (ServeMCP)", s.manifest.ID)
 	}
 	s.cfg.gatewayURL, s.cfg.mcpIssuerURL, s.cfg.mcpPublicURL = env.GatewayURL, env.IssuerURL, env.PublicURL
+	// And the derived set, because this overwrites what it was derived FROM.
+	//
+	// cfg.dialled is assembled in loadConfig; assigning the gateway URL here
+	// without rebuilding it left the set empty on exactly the seam a consumer
+	// runs, so the net that stops a tool naming an address this runtime
+	// dialled was silently off there. A derived field whose sources are
+	// reassigned is stale until it is not.
+	s.cfg.dialled = dialledAddresses(s.cfg.gatewayURL, s.cfg.mintURL)
 	// The caller named both, so they are as explicit as the composition's
 	// declared values: what validate() refuses is an issuer nobody chose, and
 	// what a refusal has to name for a public URL is whoever set it.
@@ -369,6 +377,29 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 			}
 		}
 		result, err := next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
+		// An error RESULT, which is not an error at all as far as this
+		// middleware is concerned.
+		//
+		// The SDK's typed AddTool wrapper turns a tool's returned error into
+		// CallToolResult{IsError: true} and returns a NIL err, so the branch
+		// below never runs on that path and the text travels as content. The
+		// runtime's own errors are sanitized where they leave its hands now
+		// (Gateway.surfaced, bearerTransport), which removes the issuer's
+		// words — but http.Client.Do prepends the URL it dialled to whatever
+		// the transport returned, and the author did not author that.
+		//
+		// So this is a net over the one thing left: if what a tool is about to
+		// tell a client contains an address THIS RUNTIME configured, the
+		// content is replaced wholesale and the original goes to the log. It
+		// matches on exact values the runtime knows — its gateway and mint
+		// URLs — not on a pattern, so a tool's own message about its own
+		// domain is untouched.
+		//
+		// It is a net and not the boundary. The boundary is surfaced; this
+		// catches what net/http adds after it.
+		if err == nil {
+			result = s.withoutRuntimeAddresses(result, method)
+		}
 		if err != nil {
 			// Sanitized on the way out, through the same function the handler
 			// routes use. A tool that called ForModule and was refused handed
@@ -888,4 +919,37 @@ func usablePublishedURL(name, value, fixWith string, deployed bool) error {
 			name, redactedURL(value), fixWith)
 	}
 	return nil
+}
+
+// withoutRuntimeAddresses replaces an error result that names an address this
+// runtime dialled.
+//
+// Only an IsError result, and only when the text contains the gateway or mint
+// URL this process was configured with: a tool's own refusal is its own to
+// word, and rewriting every error result would take that away.
+func (s *Server) withoutRuntimeAddresses(result mcp.Result, method string) mcp.Result {
+	call, ok := result.(*mcp.CallToolResult)
+	if !ok || call == nil || !call.IsError {
+		return result
+	}
+	for _, content := range call.Content {
+		text, isText := content.(*mcp.TextContent)
+		if !isText {
+			continue
+		}
+		for _, dialled := range s.cfg.dialled {
+			if !strings.Contains(text.Text, dialled) {
+				continue
+			}
+			log.Printf("solution %q: an MCP %s error result named an address this runtime dialled; replaced: %s",
+				s.manifest.ID, method, text.Text)
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: "this solution could not complete the call",
+				}},
+			}
+		}
+	}
+	return result
 }

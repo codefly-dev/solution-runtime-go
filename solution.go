@@ -361,7 +361,15 @@ type Server struct {
 type config struct {
 	port       string
 	gatewayURL string
-	assetsDir  string
+	// dialled is every address this process talks to, assembled at boot.
+	//
+	// It exists so nothing has to re-read the configuration to ask "is this
+	// one of ours?" — which is both a deferred configuration read the
+	// environment boundary refuses, and work repeated per error result. Its
+	// one consumer is withoutRuntimeAddresses, the net that stops a tool
+	// telling an MCP client an address this runtime dialled.
+	dialled   []string
+	assetsDir string
 	// mintURL is the host endpoint that mints this execution's credential. The
 	// audience the projected token must be bound to is read through the SDK's
 	// authority reader and frozen (see openAuthority), not carried here: there
@@ -657,6 +665,7 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 		// permit. It is refused at boot until something resolves it, which is
 		// how this package already treats a token-exchange URL it cannot pair.
 		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
+		dialled:            dialledAddresses(gatewayURL, strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, ""))),
 		projectedTokenPath: workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey),
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
@@ -3495,10 +3504,26 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	token, err := t.acting.workContext(r.Context())
 	if err != nil {
-		return nil, err
+		// Through surfaced, because this is the mint's own error arriving by a
+		// route I had argued was safe.
+		//
+		// I reasoned that a transport error only names an address the author
+		// already holds from BaseURL(), and that is true of a dial failure. It
+		// is not true of this: a capability that lapses mid-call re-mints HERE,
+		// inside the round trip, so a refusal carries the issuer's status, its
+		// code and its words — and http.Client.Do then wraps the whole thing
+		// and hands it to the author.
+		//
+		// The MCP path made that a disclosure with no boundary left to catch
+		// it: the SDK's typed AddTool wrapper turns a tool's returned error
+		// into CallToolResult{IsError: true} and returns a NIL error, so the
+		// middleware's error branch never runs and the text travels as
+		// content. Sanitizing where the error leaves this runtime is the only
+		// place that works, which is the same conclusion ForModule reached.
+		return nil, t.acting.surfaced(err)
 	}
 	if err := workcontext.Attach(r, token); err != nil {
-		return nil, err
+		return nil, t.acting.surfaced(err)
 	}
 	resp, err := t.base.RoundTrip(r)
 	if err == nil && supersededCapability(resp) {
@@ -3620,4 +3645,22 @@ func deployedRuntimeContext(kind string) bool {
 // resolveGateway — host-module-name-agnostic.
 func resolveFrontend(ctx context.Context, module, frontend string) string {
 	return hostAddress(ctx, module, frontend, "http", "http")
+}
+
+// dialledAddresses is the non-empty addresses this process talks to, for the
+// one question asked of them: does a string a tool is about to hand a client
+// contain one?
+// The parameter and loop variable are deliberately NOT called `address`: the
+// package has a function of that name which reads the environment, and the
+// environment boundary keys its resolvers by bare name — so a local called
+// `address` reads to that gate as a reference to the resolver. Shadowing a
+// resolver's name is confusing on its own account; the gate just says so.
+func dialledAddresses(dialling ...string) []string {
+	dialled := []string{}
+	for _, one := range dialling {
+		if strings.TrimSpace(one) != "" {
+			dialled = append(dialled, one)
+		}
+	}
+	return dialled
 }

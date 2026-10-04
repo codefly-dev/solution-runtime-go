@@ -1556,3 +1556,133 @@ func TestNoExportedGatewayMethodRelaysTheRuntimesError(t *testing.T) {
 		})
 	}
 }
+
+// TestAToolResultNeverCarriesTheRuntimesInternals is B1: the path where the
+// middleware sees no error at all.
+//
+// The SDK's typed AddTool wrapper turns a tool's returned error into
+// CallToolResult{IsError: true} and returns a NIL error, so the middleware's
+// error branch never runs and whatever the tool was handed travels as content.
+// The shape that exposed it: a tool derives a gateway, the held capability
+// lapses, and the re-mint happens INSIDE the round trip — so the refusal
+// carries the issuer's status, its code and its words, and http.Client.Do
+// prepends the address it dialled.
+//
+// Measured before the fix, the client was told:
+//
+//	Get "http://127.0.0.1:50122/v1/documents/collection": work context mint
+//	for "documents" rejected (status 503, "permission_denied"): caller holds
+//	no such authority
+//
+// Two layers answer it, because one was not enough. bearerTransport sanitizes
+// the mint error where it leaves this runtime, which removes the issuer's
+// words; and the middleware replaces an error result that still names an
+// address this runtime dialled, which is what net/http added after the author
+// had no further say.
+//
+// My earlier reasoning is what let this through: I argued a transport error
+// only names an address the author already holds from BaseURL(), which is true
+// of a dial failure and false of a renewal that happens inside the transport.
+func TestAToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	register := func(srv *mcp.Server) {
+		mcp.AddTool(srv, &mcp.Tool{Name: "read", Description: "reads a module as the viewer"},
+			func(ctx context.Context, _ *mcp.CallToolRequest, _ askInput) (*mcp.CallToolResult, askOutput, error) {
+				viewer, err := ViewerFromContext(ctx)
+				if err != nil {
+					return nil, askOutput{}, err
+				}
+				acting, err := viewer.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+				if err != nil {
+					return nil, askOutput{}, err
+				}
+				// The host starts refusing and the capability lapses, so the
+				// re-mint lands inside the round trip below.
+				gw.mintStatus = http.StatusServiceUnavailable
+				lapseCachedCapabilities(acting)
+				request, err := http.NewRequestWithContext(ctx, http.MethodGet, acting.BaseURL()+modulePath, nil)
+				if err != nil {
+					return nil, askOutput{}, err
+				}
+				resp, err := acting.HTTPClient().Do(request)
+				if err != nil {
+					// Relayed verbatim, which is what an author does.
+					return nil, askOutput{}, err
+				}
+				drainAndClose(resp)
+				return nil, askOutput{Status: resp.StatusCode}, nil
+			})
+	}
+	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+		ServeMCP(mcpServerName, "v1.2.3", register).
+		Credential(attestingSource(t))
+	server.cfg.gatewayURL = gw.URL
+
+	handler, err := server.mcpHandler(MCPEnvironment{GatewayURL: gw.URL, IssuerURL: testIssuer})
+	if err != nil {
+		t.Fatalf("mount MCP: %v", err)
+	}
+	host := httptest.NewServer(handler)
+	t.Cleanup(host.Close)
+	session := connectMCP(t, host, viewerStamp())
+
+	result, callErr := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "read",
+		Arguments: map[string]any{"question": "anything"},
+	})
+	said := ""
+	switch {
+	case callErr != nil:
+		said = callErr.Error()
+	case result != nil && result.IsError:
+		said = toolErrorText(result)
+	default:
+		t.Fatal("the tool reported success though its module read could not be authenticated")
+	}
+	for _, leak := range []string{gw.URL, "127.0.0.1", modulePath, "StartTask", "503", "permission_denied", "no such authority", "work context mint"} {
+		if strings.Contains(said, leak) {
+			t.Errorf("the tool result discloses %q to the MCP client: %s", leak, said)
+		}
+	}
+	if said == "" {
+		t.Error("the client was told nothing at all")
+	}
+}
+
+// TestAToolsOwnRefusalIsLeftAlone is the other half of B1's fix: the net must
+// not rewrite what an author actually wrote.
+//
+// Replacing every error result would take a tool's own vocabulary away, and a
+// model driving it reads that text. The replacement fires only when the
+// content names an address this runtime dialled.
+func TestAToolsOwnRefusalIsLeftAlone(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	register := func(srv *mcp.Server) {
+		mcp.AddTool(srv, &mcp.Tool{Name: "ask", Description: "refuses in its own words"},
+			func(context.Context, *mcp.CallToolRequest, askInput) (*mcp.CallToolResult, askOutput, error) {
+				return nil, askOutput{}, errors.New("no such collection in this wiki")
+			})
+	}
+	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+		ServeMCP(mcpServerName, "v1.2.3", register).
+		Credential(attestingSource(t))
+	server.cfg.gatewayURL = gw.URL
+	handler, err := server.mcpHandler(MCPEnvironment{GatewayURL: gw.URL, IssuerURL: testIssuer})
+	if err != nil {
+		t.Fatalf("mount MCP: %v", err)
+	}
+	host := httptest.NewServer(handler)
+	t.Cleanup(host.Close)
+	session := connectMCP(t, host, viewerStamp())
+
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ask",
+		Arguments: map[string]any{"question": "anything"},
+	})
+	if err != nil {
+		t.Fatalf("tools/call: %v", err)
+	}
+	if !strings.Contains(toolErrorText(result), "no such collection in this wiki") {
+		t.Errorf("the tool's own refusal was rewritten: %q — a tool's vocabulary is its own, and a model driving it reads that text", toolErrorText(result))
+	}
+}
