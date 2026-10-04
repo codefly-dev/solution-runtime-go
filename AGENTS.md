@@ -5,8 +5,9 @@ deployed independently of the host they extend, with no build-time coupling. It
 owns what every solution needs identically: configuration resolution through the
 codefly SDK, self-registration with the host frontend and the gateway (the
 credential exchanges and their heartbeats), CORS, Module Federation asset
-serving, the capability handshake, the manifest, and the gateway client a
-handler uses to read composed modules on the viewer's behalf.
+serving, the capability handshake, the manifest, serving the solution's MCP
+server to agent clients, and the gateway client a handler uses to read composed
+modules on the viewer's behalf.
 
 It owns none of the counterparts it talks to. The registration surfaces and
 their admission rules belong to the host (`codefly-dev/module-saas-starter`) and
@@ -48,6 +49,13 @@ own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
 - A registration that cannot attest which publisher it speaks for is not a
   registration. There is no fallback to the shared cluster-internal token and no
   downgrade path when an exchange answers `404`.
+- The MCP surface verifies no token, and must not start: the gateway runs
+  ext_authz and stamps the identity, so a check here would be a second,
+  divergent copy of the host's admission rules. What `requireStampedViewer`
+  enforces is that the gateway did it — and the refusal for a credential with no
+  session is at that boundary, not inside a tool, because there it reads as a
+  broken tool. A tool's arguments are written by a model: no identity ever comes
+  from them.
 - Tests live beside the code in the same package. Every behaviour change brings
   one, and the counterpart it exercises is an `httptest` server, never a real
   host.
@@ -146,10 +154,12 @@ Keep this file short; add depth to the file that owns the subject.
 
 - [README.md](README.md) — the consumer-facing contract: handler errors, the
   full configuration and env-override table, self-registration and its
-  provisioning, consumed-module federation, and reading a
-  Work-Context-authenticated module.
-- The package doc comment and the comments in [`solution.go`](solution.go) —
-  why a refusal, a backoff cap or a cache lifetime is what it is. Several
+  provisioning, consumed-module federation, reading a Work-Context-authenticated
+  module, and the MCP surface (what is served, every refusal, and why the
+  resource identifier cannot be resolved here).
+- The package doc comment and the comments in [`solution.go`](solution.go) and
+  [`mcp.go`](mcp.go) — why a refusal, a backoff cap or a cache lifetime is what
+  it is. Several
   record a failure mode that is not obvious from the code; read the one next to
   what you are changing before you change it.
 - `.claude/skills/` — procedures an agent repeats, loaded only when relevant.

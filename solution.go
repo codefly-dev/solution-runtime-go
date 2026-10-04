@@ -2,12 +2,15 @@
 // deployed extensions that plug into a host at runtime with no build-time
 // coupling. It owns everything every solution needs identically: env/config,
 // self-registration with the host and the gateway (with a heartbeat), CORS,
-// static Module Federation asset serving, the capability handshake, and the
-// solution manifest. A solution author supplies a manifest and one or more
-// handlers; each handler receives a Gateway that forwards the caller's bearer.
+// static Module Federation asset serving, the capability handshake, the
+// solution manifest, and serving the solution's MCP server to agent clients. A
+// solution author supplies a manifest and one or more handlers; each handler
+// receives a Gateway that forwards the caller's bearer, and ServeMCP exposes
+// the same experience to an MCP client as the signed-in person.
 //
-// This package depends on nothing but the standard library and knows nothing
-// about any specific host or solution.
+// This package knows nothing about any specific host or solution: what it
+// depends on beyond the standard library is the codefly SDK it resolves
+// configuration through, Connect for the wire, and the official MCP SDK.
 package solution
 
 import (
@@ -222,7 +225,12 @@ type Server struct {
 	// resolved routes, checked by Serve before it listens.
 	consumed    []ConsumedModule
 	passthrough map[string]passthroughRoute
-	cfg         config
+	// mcp is the MCP server the solution declared with ServeMCP, nil when it
+	// declared none; mcpRedeclared records a second ServeMCP, which the boot
+	// refuses rather than letting the last call quietly be the only surface.
+	mcp           *mcpSurface
+	mcpRedeclared bool
+	cfg           config
 	// registrationInterval is how long a registration heartbeat waits between
 	// beats. Zero means defaultRegistrationInterval. Per-server rather than a
 	// package value so a test can drive several beats without every other
@@ -266,6 +274,22 @@ type config struct {
 	// apiConsumes is the api.consumes projection Codefly injected, which the
 	// passthrough declaration is checked against before the boot listens.
 	apiConsumes string
+	// mcp says the solution declared an MCP surface (ServeMCP), which is what
+	// makes the two values below load-bearing: validate() checks them only
+	// then, so a solution that serves no MCP is unaffected by a host whose
+	// issuer does not resolve.
+	mcp bool
+	// mcpIssuerURL is the host's OAuth issuer, published as the authorization
+	// server of the MCP resource (RFC 9728).
+	mcpIssuerURL string
+	// mcpPublicURL is the canonical public MCP URL an operator set, empty when
+	// none was (see mcpResource).
+	mcpPublicURL string
+	// mcpIssuerExplicit says the issuer came from the operator rather than from
+	// the SDK. It is what tells a deployment that resolved the host's
+	// in-cluster address — which validate() refuses — from one that was told
+	// the origin clients authenticate against.
+	mcpIssuerExplicit bool
 }
 
 func env(key, fallback string) string {
@@ -473,6 +497,15 @@ func loadConfig(ctx context.Context, id string) config {
 		moduleSecrets:      parseModuleRegistrationSecrets(env(ModuleRegistrationSecretsEnvironmentVariable, "")),
 		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
 		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
+		// The host is the authorization server an MCP client authenticates
+		// against, so its issuer is the host's own origin — resolved by role
+		// like every other host endpoint, never typed. The resolved address is
+		// the one this composition reaches the host at, which is right for a
+		// local run and is an in-cluster address in a deployment, where no
+		// public client could reach it: that is what the override is for.
+		mcpIssuerURL:      strings.TrimRight(env(hostIssuerURLEnvironmentVariable, frontendURL), "/"),
+		mcpIssuerExplicit: env(hostIssuerURLEnvironmentVariable, "") != "",
+		mcpPublicURL:      strings.TrimRight(env(mcpPublicURLEnvironmentVariable, ""), "/"),
 	}
 	cfg.registrationInterval, cfg.registrationIntervalErr = registrationIntervalFromEnv()
 	return cfg
@@ -695,6 +728,9 @@ func (c config) validate() error {
 				c.publicURL, c.runtimeContext)
 		}
 	}
+	if err := c.validateMCP(); err != nil {
+		return err
+	}
 	if c.registrationIntervalErr != nil {
 		return c.registrationIntervalErr
 	}
@@ -751,6 +787,9 @@ func (s *Server) Serve() error {
 	if err := s.manifest.validateSurfaces(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
+	if err := s.validateMCPDeclaration(); err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	// The SDK owns environment resolution: load Codefly's injected carriers so
 	// endpoint and workspace-secret lookups resolve from them (falling back to
 	// the local native workspace map when not running under the runtime).
@@ -763,6 +802,7 @@ func (s *Server) Serve() error {
 	}
 	s.cfg = loadConfig(ctx, s.manifest.ID)
 	s.cfg.environmentLoadErr = environmentLoadErr
+	s.cfg.mcp = s.mcp != nil
 	if err := s.cfg.validate(); err != nil {
 		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -794,6 +834,9 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	}
 	mux.Handle("/assets/", http.StripPrefix("/assets/", withCORSHandler(s.assetsHandler())))
 	if err := s.mountPassthrough(mux); err != nil {
+		return err
+	}
+	if err := s.mountMCP(mux); err != nil {
 		return err
 	}
 
