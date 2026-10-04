@@ -1600,3 +1600,56 @@ func TestTheBootsCredentialIsHeldByTheController(t *testing.T) {
 		t.Errorf("the host minted %d more times for the first route after boot: the boot's credential is what that route acts under", got-before)
 	}
 }
+
+// TestAnAuthorityDriftDuringTheAskIsRefused closes a real gap my own mutation
+// ledger found: removing the authority recheck that runs AFTER the ask was
+// caught by nothing.
+//
+// The wrapper rechecks twice, and the two catch different things. The check
+// before the ask refuses a value that had already drifted; only the check
+// after it refuses a value that drifted *during* the mint — which is the one
+// moment a credential could be sealed to values nobody approved and then held
+// for its whole life. Every existing test drifted the value before the ask, so
+// the pre-check answered all of them and the post-check could be deleted
+// silently. That is the sixth time in this review a test has passed through a
+// different check than the one it named.
+func TestAnAuthorityDriftDuringTheAskIsRefused(t *testing.T) {
+	authorityValues(t)
+	ctx := context.Background()
+	authority, err := readAuthority(ctx)
+	if err != nil {
+		t.Fatalf("readAuthority: %v", err)
+	}
+
+	mint := newHostMint(t, &hostMint{})
+	minted := mintedCredential(t, mint, testProjectionAudience)
+
+	// A source that drifts the principal while it is minting: the value is the
+	// approved one when the ask begins and another when it returns.
+	drifting := &driftingCredentialSource{t: t, credential: minted}
+
+	_, err = heldToTheFrozenAuthority(drifting, authority).Credential(ctx)
+	if err == nil {
+		t.Fatal("a credential minted while an authority-bearing value drifted was accepted: the credential is sealed to the values it was minted under, so a drift that lands during the ask is laundered into one this process then holds for its whole life — the recheck after the ask is the only thing that sees it")
+	}
+	if !errors.Is(err, workcontext.ErrMintRefused) {
+		t.Errorf("the drift was refused with %v, want ErrMintRefused: a drifted authority is a refusal, never a retry", err)
+	}
+}
+
+// driftingCredentialSource mints normally and changes an authority-bearing
+// value as it does, which is the only way to reach the recheck that runs after
+// the ask.
+type driftingCredentialSource struct {
+	t          *testing.T
+	credential workcontext.Credential
+}
+
+func (d *driftingCredentialSource) Credential(context.Context) (workcontext.Credential, error) {
+	d.t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
+		"spiffe://codefly.test/ns/apps/sa/somebody-else")
+	if err := codefly.LoadEnvironmentVariables(); err != nil {
+		return workcontext.Credential{}, err
+	}
+	return d.credential, nil
+}
