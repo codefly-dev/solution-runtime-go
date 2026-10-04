@@ -949,6 +949,20 @@ func TestABootRefusesAPlaintextMintBeforeSendingTheToken(t *testing.T) {
 	if !strings.Contains(err.Error(), "https") {
 		t.Errorf("the refusal %q does not say the destination has to be https", err)
 	}
+	// From THIS runtime's validate(), not from the SDK's own refusal.
+	//
+	// sdk-go v0.3.0 refuses a plaintext mint URL too, so this test passed with
+	// validate()'s check deleted — the mutation ledger caught it. Two
+	// refusals for one fact is fine; a test that cannot tell which one fired
+	// is not, because the boot's own check is what refuses BEFORE a mint
+	// client is built and names the variable an operator has to fix.
+	if !strings.Contains(err.Error(), CredentialMintURLEnvironmentVariable) {
+		t.Errorf("the refusal %q does not name %s, so it is not this runtime's boot check: the SDK refuses a plaintext mint as well, and a test that accepts either cannot tell whether validate() still does",
+			err, CredentialMintURLEnvironmentVariable)
+	}
+	if !strings.Contains(err.Error(), "credential mint URL") {
+		t.Errorf("the refusal %q is not validate()'s, which names the configuration it is refusing", err)
+	}
 	// And it did not reach the mint on the way to refusing.
 	if got := mint.count(); got != 0 {
 		t.Errorf("the boot minted %d times before refusing the configuration: the refusal has to come before the token is sent anywhere", got)
