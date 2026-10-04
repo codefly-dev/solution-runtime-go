@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -1396,6 +1398,17 @@ func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
 			if strings.Contains(err.Error(), leak) {
 				t.Errorf("the refusal discloses %q: %s", leak, err)
 			}
+		}
+		// And it carries the CODE, which is the whole point of item 8: a
+		// client that gets a generic protocol error cannot tell "this solution
+		// cannot act right now" from a broken tool, so it cannot back off.
+		// The mutation that drops the typed error survived until this.
+		var wire *jsonrpc.Error
+		if !errors.As(err, &wire) {
+			t.Fatalf("the refusal is %T, not a *jsonrpc.Error: without a code an MCP client cannot distinguish this from any other server error", err)
+		}
+		if wire.Code != mcpCredentialUnavailableCode {
+			t.Errorf("the refusal carries code %d, want %d", wire.Code, mcpCredentialUnavailableCode)
 		}
 	})
 
