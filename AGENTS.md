@@ -301,6 +301,27 @@ embedding it.
   workload is asking — and **`MINT_PEERS_FILE` does not govern that hop**, so
   the per-dial peer re-read applies to the gateway alone. A fake host that
   demands mTLS on the mint is asserting a property this runtime does not have.
+  **Live trust withdrawal is kept, and not by the SDK's doing.** `RootCAs` is a
+  value and `NewMintClient` builds its transport from it on the spot, so a
+  client fixes its anchor for its own lifetime. `anchorFreshSource` re-reads
+  the anchor before every ask, refuses when it has become unreadable rather
+  than falling back to the last good pool, and rebuilds the client only when
+  it has actually rotated — which is the one moment a fresh dial under new
+  trust is wanted and otherwise leaves the one credential per execution alone.
+  **The rest of the posture is unreachable, and the residual is exact:**
+  `MintOptions` has ten fields and `mint.go` contains no `VerifyConnection`,
+  `VerifyPeerCertificate`, `DialTLSContext`, `Transport`, peer-set or dialer
+  surface, with `NewMintClient` the only exported constructor. So for that hop
+  this runtime cannot check WHICH party answered, cannot re-verify an
+  established connection, and presents no certificate; and because the client
+  keeps up to two idle connections per host, a withdrawn root or a removed
+  peer takes effect on the next *dial*, which a renewal may satisfy from the
+  pool. Rebuilding on rotation cannot close the old client's connections,
+  because this runtime never holds that client. Reimplementing the rest means
+  taking the transport back, which is what the SDK refuses for reasons this
+  file agrees with — so it is an sdk-go issue, drafted at
+  `.lazybox/artifacts/sdk-go-mint-peer-posture-draft.md`, and not a local
+  workaround.
 - **Only 401 and 403 latch a credential refusal.** The rule was "429 and 5xx
   retry, everything else is terminal", and sdk-go v0.3.0 inverted it after
   measuring the cost: a 408 from a proxy, with a valid credential in hand,
