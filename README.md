@@ -114,7 +114,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 | Host issuer (MCP) | `codefly.For(ctx).WorkspaceConfiguration("mcp", "issuer-url")` — the declared value the composition supplies; without one, the resolved host frontend origin (see [Exposing an MCP server](#exposing-an-mcp-server)). Checked at boot only when `ServeMCP` is declared | — (declared configuration, no env override) |
-| Public MCP URL | derived by construction: `<PUBLIC_URL>/solutions/<id>/mcp`. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")` (must end in `/mcp`). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
+| Public MCP URL | **declared** (`mcp/public-url`) in a deployed runtime context, where a derived value is refused: the derivation encodes the route the *host* serves this solution on. Locally, derived from `<PUBLIC_URL>/solutions/<id>/mcp`. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")` (must end in `/mcp`). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
 
 Every `workload-identity` value is a **path, never material**, the three
 admission sets included — and that is what makes them live. They are admission
@@ -772,6 +772,46 @@ caller sent. That session is the one accounts sealed the selected organization
 into, so the Task it roots is attributable — the mint accounts journals names the
 session that asked for it. A session id the runtime invented would be a
 well-formed UUID naming no session, attributable to nothing.
+
+Every mint also **names the installation it acts under**. The host requires it
+(core's `StartInput.InstallationID`) and refuses a mint naming none, and an
+organization is not a substitute: one org may hold several installations, so a
+capability minted without naming one is attributable to the org and to no
+deployment inside it.
+
+For a viewer-driven mint it is the viewer's own, read from the **seal of the
+capability they arrived with** through the SDK's reader — not from the
+`x-codefly-installation-id` header beside it, which is consulted only when there
+is no capability to read a seal from. That order is the SDK's own rule, in its
+words: the installation that governs a call is the one inside the signature, and
+a header is caller-controlled while a seal is not. A request this runtime cannot
+read an installation for is refused, and the refusal is deliberately *not* a
+`ClientError`: the installation comes from the capability the gateway handed
+over, and no caller can seal one, so telling a viewer to fix it would point them
+at something that is not theirs.
+
+A background or delegated call would carry the installation its parent
+capability was sealed to, read off this execution's held credential. **This
+runtime has no such path today** — every mint it makes is driven by a viewer
+request, and `ForModule` refuses one without an organization and a session.
+
+This execution's own credential is sealed to an installation by the host, from
+the projected service-account token; the runtime names none on that mint and
+cannot, since the SDK's `MintOptions` carries no such field. What it does is
+refuse a credential sealed to no installation at all, and refuse a *renewal*
+sealed to a different one than the credential this process has been acting
+under: that is a different identity arriving through the renewal path, not a
+renewal, and it would make the mints before and after it name different
+deployments with nothing recording that they did.
+
+**An MCP tool call is held to the same credential as a handler.** A tool
+receives a gateway carrying the viewer's bearer, so running one while the issuer
+has withdrawn this execution's credential is acting for a viewer without
+authority — and a tool that mints nothing still sends that bearer wherever it
+dials. Every MCP method except the handshake, the keepalive, the listings and
+notifications goes through the same check a handler route does, and the viewer
+is told the same sanitized sentence. The list is of the methods that act for
+nobody, so a method a future MCP SDK adds is checked rather than exempt.
 
 Rooting the Task there does **not** make the capability revocable, and nothing
 here should be read as saying it does. The edge verifies a presented context's

@@ -2185,6 +2185,11 @@ type Gateway struct {
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
+	// installationID is the installation the viewer's capability is sealed to,
+	// which every mint this gateway runs names. Empty when the caller arrived
+	// with nothing a seal could be read from, which is a refusal rather than a
+	// mint under an unnamed installation.
+	installationID string
 	// sessionID is the viewer's session, which the bearer does not carry
 	// either. Accounts seals the selected organization into that session, so
 	// rooting a Task in it is what makes the mint accounts journals name the
@@ -2234,6 +2239,7 @@ func newGateway(baseURL, bearer, orgID, sessionID string) *Gateway {
 // mints it will run.
 func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
+	gw.installationID = viewerInstallation(header)
 	gw.id, gw.report = s.manifest.ID, &s.attestation
 	// Left nil when no source was supplied, so a mint is refused for want of
 	// one rather than panicking inside the controller.
@@ -2738,6 +2744,31 @@ const platformRequestTimeout = 10 * time.Second
 // reached on the same base URL the solution's module calls already use.
 const workContextStartTaskProcedure = "/saas.accounts.v1.WorkContextService/StartTask"
 
+// viewerInstallation is the installation a viewer's request acts under.
+//
+// From the seal of the capability they arrived with, through the SDK's own
+// reader, and only from the header beside it when there is no capability to
+// read. That order is the SDK's rule rather than a preference of this file: the
+// installation that governs a call is the one inside the signature, and a
+// receiver preferring the header would be trusting a value the caller set. This
+// runtime reads neither itself — SealedInstallation is the SDK's, which is also
+// why asking this question here is not the second Work Context implementation
+// this package is forbidden to grow.
+//
+// Returns "" when neither answers, which ForModule refuses. There is no
+// fallback to the organization: an org is not an installation, and minting
+// under the wrong one attributes a capability to a deployment that never asked
+// for it.
+func viewerInstallation(header http.Header) string {
+	bearer := strings.TrimSpace(strings.TrimPrefix(header.Get("authorization"), "Bearer "))
+	if bearer != "" {
+		if id, _, err := workcontext.SealedInstallation(bearer); err == nil && id != "" {
+			return id
+		}
+	}
+	return strings.TrimSpace(header.Get(workcontext.InstallationIDHeaderName))
+}
+
 // orgHeader carries the viewer's organization. The gateway injects it after it
 // authenticates the bearer, replacing anything the caller sent.
 const orgHeader = "x-org-id"
@@ -2881,8 +2912,19 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the verified session and stamps it empty for any caller that authenticates without one: %w",
 			audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
 	}
+	if g.installationID == "" {
+		// Not a status the caller can act on, so not a ClientError: the
+		// installation comes from the capability the gateway handed us, and a
+		// caller cannot seal one. A viewer seeing "pick an installation" would
+		// be told to fix something that is not theirs, so this surfaces as the
+		// runtime's generic failure with an operator-readable reason.
+		return nil, fmt.Errorf(
+			"cannot mint a work context for %q: this request names no installation. The host requires one on every mint and refuses a mint naming none, and an organization is not an installation — one org may hold several. It is read from the seal of the capability the caller arrived with, so either the gateway did not hand this request a sealed capability or it carried one sealed to nothing",
+			audience)
+	}
 	ask := startTaskRequest{
 		OrgID:           g.orgID,
+		InstallationID:  g.installationID,
 		SessionID:       g.sessionID,
 		Audience:        audience,
 		AuthorityScopes: workContextScopes(scopes),
@@ -3016,7 +3058,22 @@ func (e *WorkContextRefusal) Unwrap() error { return &GatewayError{StatusCode: e
 // a solution's host is not this package's dependency. Leaving actorPrincipalId
 // unset is what makes the viewer both owner and actor of the Task.
 type startTaskRequest struct {
-	OrgID           string             `json:"orgId"`
+	OrgID string `json:"orgId"`
+	// InstallationID is the installation this mint acts under, which the host
+	// requires and refuses a mint naming none (core's StartInput). An
+	// organization is not an installation: one org may hold several, and a
+	// capability minted without naming one is attributable to the org and to no
+	// deployment inside it.
+	//
+	// For a viewer-driven mint it is the viewer's own, taken from the seal of
+	// the capability they arrived with rather than from a header beside it —
+	// the SDK's rule, in its words: a header is caller-controlled and a seal is
+	// not. For a background or delegated call it would be the installation the
+	// parent capability was sealed to, read off this execution's held
+	// credential; this runtime has no such path today, because every mint it
+	// makes is driven by a viewer request and ForModule refuses one without an
+	// org and a session.
+	InstallationID  string             `json:"installationId"`
 	TaskID          string             `json:"taskId"`
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`

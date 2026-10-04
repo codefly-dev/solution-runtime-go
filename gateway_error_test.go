@@ -36,7 +36,7 @@ func TestUnaryErrorStatusAcrossHTTPBoundary(t *testing.T) {
 			upstream := httptest.NewServer(connect.NewUnaryHandler("/example.Service/Read",
 				func(_ context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
 					calls.Add(1)
-					if req.Header().Get("Authorization") != "Bearer viewer-token" {
+					if req.Header().Get("Authorization") != viewerBearer() {
 						t.Error("viewer credential lost")
 					}
 					return nil, connect.NewError(tc.code, errors.New("private upstream diagnostic"))

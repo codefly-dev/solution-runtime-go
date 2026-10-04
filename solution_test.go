@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
@@ -559,6 +560,7 @@ func send[T any](ch chan T, value T) {
 // is minted, and any capability that rode along, which none should.
 type mintRequest struct {
 	OrgID           string             `json:"orgId"`
+	InstallationID  string             `json:"installationId"`
 	TaskID          string             `json:"taskId"`
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`
@@ -739,6 +741,22 @@ func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, 
 	return server
 }
 
+// viewerBearer is the bearer a real gateway forwards: the viewer's own sealed
+// capability, minted by core's authority from core's fixture identities.
+//
+// It was the placeholder string viewerBearer(), which was enough while
+// nothing here read the bearer. Every mint now names the installation it acts
+// under, and the viewer's comes from the seal of the capability they arrived
+// with — so a placeholder bearer is a request no installation can be read from,
+// and a fixture that cannot answer the question the code asks is a fixture that
+// tests the refusal path forever.
+func viewerBearer() string { return sealedBearer("viewer") }
+
+// sealedBearer is a bearer for a named viewer, sealed the same way: a test that
+// needs two distinct callers gets two capabilities rather than one placeholder
+// string each.
+func sealedBearer(seed string) string { return "Bearer " + capability(seed) }
+
 const viewerOrg = "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11"
 
 // viewerSession is the session the gateway stamps from the verified claims —
@@ -753,7 +771,7 @@ func viewerRequest(t *testing.T, target string) *http.Response {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("authorization", "Bearer viewer-token")
+	req.Header.Set("authorization", viewerBearer())
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
 	resp, err := http.DefaultClient.Do(req)
@@ -786,7 +804,7 @@ func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
 	}
 
 	mint := <-gw.mints
-	if mint.Bearer != "Bearer viewer-token" {
+	if mint.Bearer != viewerBearer() {
 		t.Errorf("mint presented bearer %q, want the viewer's — accounts must resolve the viewer as owner", mint.Bearer)
 	}
 	if mint.OrgID != viewerOrg {
@@ -812,7 +830,7 @@ func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
 	if call.WorkContext != capability("context-documents.1") {
 		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
 	}
-	if call.Bearer != "Bearer viewer-token" {
+	if call.Bearer != viewerBearer() {
 		t.Errorf("module read carried bearer %q, want the viewer's — the context is presented alongside it, not instead", call.Bearer)
 	}
 }
@@ -1051,7 +1069,7 @@ func TestMintCarriesThisWorkloadsCredentialAndNoOthers(t *testing.T) {
 		if mint.WorkContext != workload.Token() {
 			t.Errorf("mint for %q carried work context %q, want this execution's own credential: the issuer has to know which module is asking", mint.Audience, mint.WorkContext)
 		}
-		if mint.Bearer != "Bearer viewer-token" {
+		if mint.Bearer != viewerBearer() {
 			t.Errorf("mint for %q carried bearer %q, want the viewer's", mint.Audience, mint.Bearer)
 		}
 	}
@@ -1183,7 +1201,7 @@ func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T
 	}
 	server.outbound = outbound
 
-	gateway := server.gatewayFor(http.Header{"authorization": {"Bearer viewer"}})
+	gateway := server.gatewayFor(http.Header{"authorization": {viewerBearer()}})
 	resp, err := gateway.HTTPClient().Get(host.URL + "/v1/things/search")
 	if err != nil {
 		t.Fatalf("a handler's gateway could not reach a platform host that requires this workload's certificate: %v\n"+
@@ -1243,7 +1261,7 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 // for a viewer with no organization selected.
 func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	_, err := newGateway(gw.URL, "Bearer viewer-token", "", viewerSession).
+	_, err := newGateway(gw.URL, viewerBearer(), "", viewerSession).
 		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 	if err == nil {
 		t.Fatal("ForModule minted a work context with no organization")
@@ -1274,7 +1292,7 @@ func TestGatewayWithoutAModuleCarriesOnlyTheBearer(t *testing.T) {
 	if call.WorkContext != "" {
 		t.Errorf("undelegated gateway sent work context %q, want none", call.WorkContext)
 	}
-	if call.Bearer != "Bearer viewer-token" {
+	if call.Bearer != viewerBearer() {
 		t.Errorf("undelegated gateway sent bearer %q, want the viewer's", call.Bearer)
 	}
 	if got := gw.mintCount(); got != 0 {
@@ -1325,7 +1343,7 @@ func TestMintRootsTheTaskInTheViewersVerifiedSession(t *testing.T) {
 // session to name at all — an API key.
 func TestForModuleRefusesWithoutTheViewersSession(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	_, err := newGateway(gw.URL, "Bearer viewer-token", viewerOrg, "").
+	_, err := newGateway(gw.URL, viewerBearer(), viewerOrg, "").
 		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 	if err == nil {
 		t.Fatal("ForModule minted a work context with no viewer session")
@@ -1355,7 +1373,7 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("authorization", "Bearer viewer-token")
+	req.Header.Set("authorization", viewerBearer())
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
 	req.Header.Set(workcontext.HeaderName, capability("forged"))
@@ -1404,7 +1422,7 @@ func TestRefusedBoundariesAnswerAStatusTheCallerCanAct(t *testing.T) {
 			if err != nil {
 				t.Fatalf("new request: %v", err)
 			}
-			req.Header.Set("authorization", "Bearer viewer-token")
+			req.Header.Set("authorization", viewerBearer())
 			req.Header.Set(orgHeader, tt.org)
 			req.Header.Set(sessionHeader, tt.session)
 			resp, err := http.DefaultClient.Do(req)
@@ -1850,8 +1868,22 @@ func TestAUsernameCredentialIsNotLogged(t *testing.T) {
 func clearSelfEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{"SELF_UPSTREAM", "PUBLIC_URL", "CODEFLY__RUNTIME_CONTEXT",
-		"CODEFLY__MODULE", "CODEFLY__SERVICE", "CODEFLY__ENVIRONMENT",
-		"CODEFLY__SELF_ENDPOINT__LASTLOGIN_GO__BACKEND__HTTP__HTTP"} {
+		"CODEFLY__MODULE", "CODEFLY__SERVICE", "CODEFLY__ENVIRONMENT"} {
 		t.Setenv(key, "")
+	}
+	// Every self-endpoint carrier, by prefix rather than by name.
+	//
+	// The restored version named one deployment's:
+	// CODEFLY__SELF_ENDPOINT__LASTLOGIN_GO__BACKEND__HTTP__HTTP. A carrier's
+	// name is built from the module and service it belongs to, so naming one
+	// puts a particular deployment in a runtime that is generic by rule — and
+	// it clears exactly that deployment's variable and no other, which is the
+	// weaker half of the problem: an operator running the suite with any other
+	// service's carrier exported still has it answering these assertions.
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, resources.SelfEndpointPrefix) {
+			t.Setenv(key, "")
+		}
 	}
 }

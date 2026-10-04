@@ -60,10 +60,28 @@ type Viewer struct {
 }
 
 // DefaultViewer is the viewer Solution.Client calls as.
-var DefaultViewer = Viewer{
-	Bearer:    "Bearer passthroughtest-viewer",
-	OrgID:     "passthroughtest-org",
-	SessionID: "passthroughtest-session",
+//
+// The bearer is a real sealed capability from core's authority, not a
+// placeholder string. Every mint the runtime runs names the installation it
+// acts under, and the viewer's comes from the seal of the capability they
+// arrived with — so a placeholder bearer is a request no installation can be
+// read from, and this seam would hand every consumer the refusal path instead
+// of the behaviour they are testing.
+//
+// A consumer supplying their own Viewer needs a sealed bearer too. SealedViewer
+// builds one, and the refusal names what is missing if they pass something
+// else.
+var DefaultViewer = SealedViewer("passthroughtest-viewer")
+
+// SealedViewer is a viewer whose bearer is a capability sealed to core's
+// fixture installation, which is what the runtime reads the mint's installation
+// from. seed names the capability so two viewers can differ.
+func SealedViewer(seed string) Viewer {
+	return Viewer{
+		Bearer:    "Bearer " + capability(seed),
+		OrgID:     "passthroughtest-org",
+		SessionID: "passthroughtest-session",
+	}
 }
 
 // Mint is one Work Context the host was asked to mint: the passthrough's

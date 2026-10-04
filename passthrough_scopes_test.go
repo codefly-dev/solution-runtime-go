@@ -40,10 +40,10 @@ func TestPassthroughMintsOnlyTheCalledMethodsScopes(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1"}`)
 	s := passthroughServer(t, gw.URL, perMethodModule())
 
-	if status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1"}`); status != http.StatusOK {
+	if status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1"}`); status != http.StatusOK {
 		t.Fatalf("search: status %d: %v", status, body)
 	}
-	if status, body := call(t, s, getPath, "Bearer viewer", `{"entryId":"e1"}`); status != http.StatusOK {
+	if status, body := call(t, s, getPath, viewerBearer(), `{"entryId":"e1"}`); status != http.StatusOK {
 		t.Fatalf("get: status %d: %v", status, body)
 	}
 	if len(gw.mints) != 2 {
@@ -69,8 +69,8 @@ func TestPassthroughMethodScopesReplaceTheModules(t *testing.T) {
 	module.Methods[0].Scopes = nil // Search falls back to the module's.
 	s := passthroughServer(t, gw.URL, module)
 
-	call(t, s, searchPath, "Bearer viewer", `{}`)
-	call(t, s, getPath, "Bearer viewer", `{"entryId":"e1"}`)
+	call(t, s, searchPath, viewerBearer(), `{}`)
+	call(t, s, getPath, viewerBearer(), `{"entryId":"e1"}`)
 	if len(gw.mints) != 2 || mintedActions(gw.mints[0]) != "things:read" || mintedActions(gw.mints[1]) != "things:inspect" {
 		t.Fatalf("mints = %+v, want module scope for search and method scope (alone) for get", gw.mints)
 	}
@@ -81,7 +81,7 @@ func TestPassthroughRefusesOnlyTheMethodWhoseAuthorityTheViewerLacks(t *testing.
 	gw.deny = "inspect"
 	s := passthroughServer(t, gw.URL, perMethodModule())
 
-	status, body := call(t, s, getPath, "Bearer member", `{"entryId":"e1"}`)
+	status, body := call(t, s, getPath, sealedBearer("member"), `{"entryId":"e1"}`)
 	if status != http.StatusForbidden || body["code"] != "permission_denied" {
 		t.Fatalf("get without inspect: status %d, body %v; want 403 permission_denied", status, body)
 	}
@@ -92,7 +92,7 @@ func TestPassthroughRefusesOnlyTheMethodWhoseAuthorityTheViewerLacks(t *testing.
 		t.Fatalf("the module was called without a capability: %v", gw.calls)
 	}
 	// The member's own method is unaffected, and its mint was not widened.
-	status, body = call(t, s, searchPath, "Bearer member", `{"entryId":"e1"}`)
+	status, body = call(t, s, searchPath, sealedBearer("member"), `{"entryId":"e1"}`)
 	if status != http.StatusOK || body["entryId"] != "e1" {
 		t.Fatalf("search after a refused get: status %d, body %v", status, body)
 	}

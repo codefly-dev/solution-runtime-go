@@ -136,6 +136,13 @@ func heldToTheFrozenAuthority(source CredentialSource, authority *codefly.Author
 type authorityHeldSource struct {
 	inner     CredentialSource
 	authority *codefly.Authority
+	// mu guards installation, the installation this execution's credential was
+	// first sealed to. It is frozen for the same reason the authority-bearing
+	// values are: every viewer mint this process runs names an installation,
+	// and a renewal that quietly moved to another one would attribute those
+	// mints to a deployment that never asked for them.
+	mu           sync.Mutex
+	installation string
 }
 
 func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Credential, error) {
@@ -171,7 +178,40 @@ func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Crede
 		return workcontext.Credential{}, fmt.Errorf("%w: this execution's credential was renewed while an authority-bearing value had drifted from the one this process froze at boot: %w",
 			workcontext.ErrMintRefused, err)
 	}
+	// And the installation the credential is sealed to, frozen at the first one
+	// and held there.
+	//
+	// usableCredential already refuses a credential sealed to no installation.
+	// This refuses one sealed to a *different* installation than the credential
+	// this process has been acting under — which is not a renewal but a
+	// different identity arriving through the renewal path. Every viewer mint
+	// names an installation; moving silently would make the mints before and
+	// after a renewal name different deployments with nothing recording that
+	// they did.
+	//
+	// Terminal, not transient: the host has answered about a different
+	// installation than the one this build was approved for, and no number of
+	// retries changes that.
+	if err := a.holdInstallation(credential.Seal().InstallationID); err != nil {
+		return workcontext.Credential{}, err
+	}
 	return credential, nil
+}
+
+// holdInstallation freezes the installation this execution acts under and
+// refuses a later credential sealed to another.
+func (a *authorityHeldSource) holdInstallation(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.installation == "" {
+		a.installation = id
+		return nil
+	}
+	if a.installation != id {
+		return fmt.Errorf("%w: this execution has been acting under installation %s and its credential renewed sealed to %s. That is a different installation, not a renewal: every work context this process mints for a viewer names the installation it acts under, so the mints before and after this point would name different deployments",
+			workcontext.ErrMintRefused, a.installation, id)
+	}
+	return nil
 }
 
 // mintOptions is how this runtime asks the SDK's mint client for a credential.

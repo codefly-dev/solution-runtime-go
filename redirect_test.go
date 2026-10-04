@@ -106,7 +106,7 @@ func TestACredentialBearingRequestIsNeverRedirected(t *testing.T) {
 			server.cfg.gatewayURL = gw.URL
 
 			header := http.Header{}
-			header.Set("authorization", "Bearer viewer-secret")
+			header.Set("authorization", viewerBearer())
 			header.Set(orgHeader, "org-1")
 			header.Set(sessionHeader, "session-1")
 
@@ -149,7 +149,7 @@ func TestEveryGatewayClientRefusesAForeignDestination(t *testing.T) {
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer-secret")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	gateway := server.gatewayFor(header)
@@ -228,7 +228,7 @@ func TestASameOriginRedirectIsNotFollowedEither(t *testing.T) {
 	server.cfg.gatewayURL = gw.URL
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer-secret")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",

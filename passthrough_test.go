@@ -152,7 +152,7 @@ func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1","big":"7","secret":"s3cret","sub":{"name":"x"}}`)
 	s := passthroughServer(t, gw.URL, passthroughModule())
 
-	status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1","pageSize":3}`)
+	status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1","pageSize":3}`)
 	if status != http.StatusOK {
 		t.Fatalf("status %d: %v", status, body)
 	}
@@ -171,7 +171,7 @@ func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
 	if got := gw.calls[0].Header.Get(workcontext.HeaderName); got != capability("context-things.1") {
 		t.Fatalf("work context = %q, want the one minted for the module", got)
 	}
-	if gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
+	if gw.calls[0].Header.Get("authorization") != viewerBearer() {
 		t.Fatal("the viewer's bearer was not forwarded")
 	}
 	if len(gw.mints) != 1 || gw.mints[0].Audience != "things" || gw.mints[0].OrgID != "org-1" || gw.mints[0].SessionID != "session-1" ||
@@ -186,13 +186,13 @@ func TestPassthroughForwardsOnlyTheBearerToAModuleThatAuthenticatesTheViewer(t *
 	module.Scopes, module.ViewerBearer = nil, true
 	s := passthroughServer(t, gw.URL, module)
 
-	if status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1"}`); status != http.StatusOK {
+	if status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1"}`); status != http.StatusOK {
 		t.Fatalf("status %d: %v", status, body)
 	}
 	if len(gw.mints) != 0 {
 		t.Fatalf("minted %d capabilities for a module that reads the bearer", len(gw.mints))
 	}
-	if gw.calls[0].Header.Get(workcontext.HeaderName) != "" || gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
+	if gw.calls[0].Header.Get(workcontext.HeaderName) != "" || gw.calls[0].Header.Get("authorization") != viewerBearer() {
 		t.Fatal("want the viewer's bearer and no capability")
 	}
 }
@@ -206,7 +206,7 @@ func TestPassthroughServesOnlyWhatIsDeclared(t *testing.T) {
 		"/modules/things/../things/x",              // not a procedure
 		"/modules/things/things.v1.Things/Search/", // not the procedure
 	} {
-		status, body := call(t, s, path, "Bearer viewer", `{}`)
+		status, body := call(t, s, path, viewerBearer(), `{}`)
 		if status != http.StatusNotFound || body["code"] != "not_found" {
 			t.Errorf("%s: status %d %v, want not_found", path, status, body)
 		}
@@ -234,7 +234,7 @@ func TestPassthroughForwardsOnlyTheMethodsOwnFields(t *testing.T) {
 	// A field the method's request does not declare is not the page's to add:
 	// the request is re-encoded from the method's message, so it never reaches
 	// the module, and it can name no path or prefix of its own.
-	status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1","path":"/v1/other","prefix":"/v1/admin"}`)
+	status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1","path":"/v1/other","prefix":"/v1/admin"}`)
 	if status != http.StatusOK {
 		t.Fatalf("status %d %v", status, body)
 	}
@@ -258,7 +258,7 @@ func TestPassthroughRelaysTheModulesRefusal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := newModuleGateway(t, tc.status, tc.reply)
 			s := passthroughServer(t, gw.URL, passthroughModule())
-			status, body := call(t, s, searchPath, "Bearer viewer", `{}`)
+			status, body := call(t, s, searchPath, viewerBearer(), `{}`)
 			if status != tc.wantStatus || body["code"] != tc.wantCode || body["message"] != tc.wantMessage {
 				t.Fatalf("status %d %v, want %d %s %q", status, body, tc.wantStatus, tc.wantCode, tc.wantMessage)
 			}
@@ -352,7 +352,7 @@ func TestPassthroughMergesTheDeclaredPinIntoEveryRequest(t *testing.T) {
 	module.Methods[0].Pin = pin
 	s := passthroughServer(t, gw.URL, module)
 
-	if status, body := call(t, s, searchPath, "Bearer viewer", `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
+	if status, body := call(t, s, searchPath, viewerBearer(), `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
 		t.Fatalf("status %d %v", status, body)
 	}
 	var sent struct {
@@ -428,7 +428,7 @@ func TestAViewerBearerRouteRefusesToActWithoutACredential(t *testing.T) {
 	}
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 

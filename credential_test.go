@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/solution/manifest"
+	corework "github.com/codefly-dev/core/workcontext"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
@@ -381,7 +382,7 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	server := New(Manifest{ID: testSolutionID}).Credential(source)
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	gateway := server.gatewayFor(header)
@@ -392,7 +393,7 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	if len(mints) != 1 {
 		t.Fatalf("observed %d mints, want 1", len(mints))
 	}
-	if mints[0].Bearer != "Bearer viewer" {
+	if mints[0].Bearer != viewerBearer() {
 		t.Errorf("the mint presented bearer %q, want the viewer's", mints[0].Bearer)
 	}
 	if mints[0].WorkContext != credential.Token() {
@@ -424,7 +425,7 @@ func TestAMintIsRefusedWhenThisWorkloadCannotAttest(t *testing.T) {
 	server.cfg.gatewayURL = gw.URL
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	for range 3 {
@@ -461,7 +462,7 @@ func TestAServerWithNoCredentialSourceMintsNothing(t *testing.T) {
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	_, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
@@ -609,7 +610,7 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 			}
 
 			header := http.Header{}
-			header.Set("authorization", "Bearer viewer")
+			header.Set("authorization", viewerBearer())
 			header.Set(orgHeader, "org-1")
 			header.Set(sessionHeader, "session-1")
 			_, err := server.gatewayFor(header).ForModule(context.Background(), "things",
@@ -745,7 +746,7 @@ func TestAPlainHandlerRefusesToActWithoutACredential(t *testing.T) {
 			})
 
 			request := httptest.NewRequest(http.MethodGet, "/thing", nil)
-			request.Header.Set("authorization", "Bearer viewer")
+			request.Header.Set("authorization", viewerBearer())
 			recorder := httptest.NewRecorder()
 			handler(recorder, request)
 
@@ -794,7 +795,7 @@ func TestAPlainHandlerStillServesWithAnApprovedCredential(t *testing.T) {
 		return map[string]string{"ok": "yes"}, nil
 	})
 	request := httptest.NewRequest(http.MethodGet, "/thing", nil)
-	request.Header.Set("authorization", "Bearer viewer")
+	request.Header.Set("authorization", viewerBearer())
 	recorder := httptest.NewRecorder()
 	handler(recorder, request)
 	if recorder.Code != http.StatusOK {
@@ -1039,7 +1040,7 @@ func TestAStreamOfViewerRequestsDoesNotMintPerRequest(t *testing.T) {
 
 	// The first request takes the credential, which is valid for a while yet.
 	request := httptest.NewRequest(http.MethodGet, "/thing", nil)
-	request.Header.Set("authorization", "Bearer viewer")
+	request.Header.Set("authorization", viewerBearer())
 	first := httptest.NewRecorder()
 	handler(first, request)
 	if first.Code != http.StatusOK {
@@ -1052,7 +1053,7 @@ func TestAStreamOfViewerRequestsDoesNotMintPerRequest(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		handler(recorder, httptest.NewRequest(http.MethodGet, "/thing", nil).WithContext(request.Context()))
 		served := httptest.NewRequest(http.MethodGet, "/thing", nil)
-		served.Header.Set("authorization", "Bearer viewer")
+		served.Header.Set("authorization", viewerBearer())
 		recorder = httptest.NewRecorder()
 		handler(recorder, served)
 		if recorder.Code != http.StatusOK {
@@ -1327,7 +1328,7 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 	server.contract, server.contractResolved = contract, true
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
@@ -1374,7 +1375,7 @@ func TestAViewersMintGoesThroughTheOneController(t *testing.T) {
 	server.contract, server.contractResolved = contract, true
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	mintFor := func(t *testing.T) error {
@@ -1713,4 +1714,137 @@ func (c *countingCredentialSource) count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.asks
+}
+
+// TestAViewerMintNamesTheInstallationItActsUnder is the installation seam.
+//
+// The host requires an installation on every mint (core's StartInput) and
+// refuses one naming none. An organization is not a substitute: one org may
+// hold several installations, so a capability minted without naming one is
+// attributable to the org and to no deployment inside it.
+//
+// The viewer's installation comes from the SEAL of the capability they arrived
+// with, not from the x-codefly-installation-id header beside it. That order is
+// the SDK's own rule, in its words: the installation that governs a call is the
+// one inside the signature, and a header is caller-controlled while a seal is
+// not. This runtime reads neither itself — SealedInstallation is the SDK's.
+func TestAViewerMintNamesTheInstallationItActsUnder(t *testing.T) {
+	t.Run("from the seal of the capability the viewer arrived with", func(t *testing.T) {
+		gw := newWorkContextGateway(t, &workContextGateway{})
+		solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+			_, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+			return nil, err
+		})
+		resp := viewerRequest(t, solution.URL)
+		_ = resp.Body.Close()
+
+		if got := gw.mintCount(); got != 1 {
+			t.Fatalf("the viewer's mint ran %d times, want 1", got)
+		}
+		mint := <-gw.mints
+		if mint.InstallationID != corework.FixtureInstallation {
+			t.Errorf("the mint named installation %q, want %q — the one sealed into the capability the viewer arrived with",
+				mint.InstallationID, corework.FixtureInstallation)
+		}
+	})
+
+	t.Run("a request with no readable installation mints nothing", func(t *testing.T) {
+		gw := newWorkContextGateway(t, &workContextGateway{})
+		server := New(Manifest{ID: "notes"}).Credential(attestingSource(t))
+		server.cfg = config{gatewayURL: gw.URL}
+
+		// Everything a mint needs except an installation: the bearer is an
+		// opaque string, which is what a caller arriving without a sealed
+		// capability looks like.
+		header := http.Header{}
+		header.Set("authorization", "Bearer an-opaque-session-token")
+		header.Set(orgHeader, viewerOrg)
+		header.Set(sessionHeader, viewerSession)
+
+		_, err := server.gatewayFor(header).ForModule(context.Background(), "documents",
+			Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err == nil {
+			t.Fatal("a work context was minted for a request naming no installation: the host refuses such a mint, and an org is not an installation")
+		}
+		if !strings.Contains(err.Error(), "installation") {
+			t.Errorf("the refusal %q does not name what is missing", err)
+		}
+		// Not a ClientError: no caller can seal an installation, so this is not
+		// a status a viewer could act on.
+		var client *ClientError
+		if errors.As(err, &client) {
+			t.Errorf("the refusal carries %d, telling the caller to fix something no caller can seal", client.StatusCode)
+		}
+		if got := gw.mintCount(); got != 0 {
+			t.Errorf("the host saw %d mints for a request naming no installation, want 0", got)
+		}
+	})
+
+	t.Run("the header answers only when there is no seal to read", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("authorization", "Bearer an-opaque-session-token")
+		header.Set(workcontext.InstallationIDHeaderName, "installation-from-a-header")
+		if got := viewerInstallation(header); got != "installation-from-a-header" {
+			t.Errorf("with no sealed capability the header is the only source, got %q", got)
+		}
+
+		// And the seal outranks it when both are present, because a header is
+		// caller-controlled and a seal is not.
+		header.Set("authorization", viewerBearer())
+		header.Set(workcontext.InstallationIDHeaderName, "an-installation-the-caller-chose")
+		if got := viewerInstallation(header); got != corework.FixtureInstallation {
+			t.Errorf("the caller's header decided the installation (%q): the seal has to win, or a caller names the deployment its mint is attributed to", got)
+		}
+	})
+}
+
+// TestARenewalToADifferentInstallationIsRefused: usableCredential refuses a
+// credential sealed to NO installation; this refuses one sealed to a DIFFERENT
+// installation than the credential this process has been acting under.
+//
+// That is not a renewal, it is a different identity arriving through the
+// renewal path, and every viewer mint names the installation this execution
+// acts under — so the mints either side of it would name different deployments
+// with nothing recording that they did.
+func TestARenewalToADifferentInstallationIsRefused(t *testing.T) {
+	authorityValues(t)
+	ctx := context.Background()
+	authority, err := readAuthority(ctx)
+	if err != nil {
+		t.Fatalf("readAuthority: %v", err)
+	}
+	mint := newHostMint(t, &hostMint{})
+	first := mintedCredential(t, mint, testProjectionAudience)
+
+	source := &movingInstallationSource{credential: first}
+	held := heldToTheFrozenAuthority(source, authority)
+
+	if _, err := held.Credential(ctx); err != nil {
+		t.Fatalf("the first credential was refused: %v", err)
+	}
+
+	// The same process, renewing, and the host answers with a credential
+	// sealed to another installation.
+	moved := newHostMint(t, &hostMint{installation: "installation-somewhere-else"})
+	source.credential = mintedCredential(t, moved, testProjectionAudience)
+	_, err = held.Credential(ctx)
+	if err == nil {
+		t.Fatal("a renewal sealed to a different installation was accepted: the mints before and after it would name different deployments")
+	}
+	if !errors.Is(err, workcontext.ErrMintRefused) {
+		t.Errorf("the refusal is %v, want ErrMintRefused: the host has answered about a different installation than this build was approved for, which no retry changes", err)
+	}
+}
+
+// movingInstallationSource hands out whatever credential the test last set, so
+// a renewal can answer with one sealed elsewhere.
+type movingInstallationSource struct {
+	mu         sync.Mutex
+	credential workcontext.Credential
+}
+
+func (m *movingInstallationSource) Credential(context.Context) (workcontext.Credential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.credential, nil
 }

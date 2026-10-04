@@ -122,7 +122,7 @@ func watchRequest(entry string) *connect.Request[dynamicpb.Message] {
 	msg := thingMessage("GetThingRequest")
 	setField(msg, "entry_id", protoreflect.ValueOfString(entry))
 	req := connect.NewRequest(msg)
-	req.Header().Set("authorization", "Bearer viewer")
+	req.Header().Set("authorization", viewerBearer())
 	req.Header().Set(orgHeader, "org-1")
 	req.Header().Set(sessionHeader, "session-1")
 	return req
@@ -192,7 +192,7 @@ func TestPassthroughStreamForwardsOnlyTheBearerForAModuleThatAuthenticatesTheVie
 	if err := stream.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(gw.mints) != 0 || gw.watches[0].Header.Get(workcontext.HeaderName) != "" || gw.watches[0].Header.Get("authorization") != "Bearer viewer" {
+	if len(gw.mints) != 0 || gw.watches[0].Header.Get(workcontext.HeaderName) != "" || gw.watches[0].Header.Get("authorization") != viewerBearer() {
 		t.Fatalf("want the viewer's bearer and no capability: mints %d, headers %v", len(gw.mints), gw.watches[0].Header)
 	}
 }

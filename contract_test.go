@@ -400,7 +400,7 @@ func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request.Header.Set("authorization", "Bearer viewer")
+			request.Header.Set("authorization", viewerBearer())
 			request.Header.Set(orgHeader, "org-1")
 			request.Header.Set(sessionHeader, "session-1")
 			resp, err := solution.client.Do(request)
@@ -486,7 +486,7 @@ func TestTheCeilingRefusesAsksThatStateNoAuthority(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request.Header.Set("authorization", "Bearer viewer")
+			request.Header.Set("authorization", viewerBearer())
 			request.Header.Set(orgHeader, "org-1")
 			request.Header.Set(sessionHeader, "session-1")
 			resp, err := solution.client.Do(request)
@@ -554,7 +554,7 @@ func TestAViewerBearerAudienceCannotBeMintedFor(t *testing.T) {
 	}
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	_, err = server.gatewayFor(header).ForModule(context.Background(), "pages",
@@ -627,7 +627,7 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 		server.contractResolved = true
 
 		header := http.Header{}
-		header.Set("authorization", "Bearer viewer")
+		header.Set("authorization", viewerBearer())
 		header.Set(orgHeader, "org-1")
 		header.Set(sessionHeader, "session-1")
 		// With a stated scope, so the ask reaches the ceiling rather than the

@@ -1,6 +1,7 @@
 package solution
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -100,6 +101,10 @@ type hostMint struct {
 	recoverAfter int64
 	// ttl is how long the credential it issues is valid.
 	ttl time.Duration
+	// installation overrides the installation it seals credentials to, so a
+	// test can have a renewal answer about a different one. Empty means
+	// testInstallation.
+	installation string
 
 	mints int64
 	// mu guards what serve records. The viewer's mint and this workload's
@@ -119,6 +124,31 @@ type hostMint struct {
 func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 	t.Helper()
 	mint.authority = standInAuthority()
+	if mint.installation != "" {
+		// An issuer that seals to a different installation, for the renewal
+		// refusal. Built from CORE's fixture seal source with one entry
+		// overridden rather than from a seal source of this repo's own: the
+		// rest of what that fixture configures — epochs, approved builds,
+		// bindings — is core's to define, and duplicating it here is how a
+		// fixture drifts from the thing it stands in for.
+		seals := corework.FixtureSeals()
+		if err := seals.Put(corework.FixturePrincipal, corework.Seal{
+			PrincipalEpoch:       corework.FixturePrincipalEpoch,
+			InstallationID:       mint.installation,
+			InstallationRevision: corework.FixtureInstallationRevision,
+			BuildIncarnation:     corework.FixtureBuildIncarnation,
+		}); err != nil {
+			t.Fatalf("seal the stand-in issuer to %s: %v", mint.installation, err)
+		}
+		_, key := corework.FixtureKeyPair()
+		mint.authority = &corework.Authority{
+			Issuer:    corework.FixtureIssuer,
+			KeyID:     corework.FixtureKeyID,
+			Key:       key,
+			Revisions: corework.FixtureRevisions(),
+			Seals:     seals,
+		}
+	}
 	if mint.ttl == 0 {
 		// Core imposes no maximum lifetime — how long a credential lives is the
 		// issuing host's decision, and this runtime's renewal arithmetic simply
@@ -184,7 +214,7 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		TaskID:             fmt.Sprintf("workload-execution-%d", atomic.LoadInt64(&m.mints)),
 		Audience:           testAudience,
 		OrganizationID:     corework.FixtureOrganization,
-		InstallationID:     testInstallation,
+		InstallationID:     cmp.Or(m.installation, testInstallation),
 		TTL:                m.ttl,
 	})
 	if err != nil {
@@ -571,7 +601,7 @@ func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			request.Header.Set("authorization", "Bearer viewer")
+			request.Header.Set("authorization", viewerBearer())
 			// The identity headers the gateway stamps from the verified bearer;
 			// ForModule needs both to mint.
 			request.Header.Set(orgHeader, "org-1")
@@ -941,7 +971,7 @@ func TestACredentialThatCannotBePresentedRefusesTheMint(t *testing.T) {
 	server.contractResolved = true
 
 	header := http.Header{}
-	header.Set("authorization", "Bearer viewer")
+	header.Set("authorization", viewerBearer())
 	header.Set(orgHeader, "org-1")
 	header.Set(sessionHeader, "session-1")
 	_, err = server.gatewayFor(header).ForModule(context.Background(), "things",

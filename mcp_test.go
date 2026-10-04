@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -57,7 +59,7 @@ func (s stampedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 // same org and session every other test's viewer acts under.
 func viewerStamp() stampedTransport {
 	return stampedTransport{
-		bearer:         "Bearer viewer-token",
+		bearer:         viewerBearer(),
 		userID:         "viewer-principal",
 		orgID:          viewerOrg,
 		sessionID:      viewerSession,
@@ -167,7 +169,7 @@ func TestMCPToolCallRunsAsTheViewer(t *testing.T) {
 	}
 
 	mint := <-host.mints
-	if mint.Bearer != "Bearer viewer-token" {
+	if mint.Bearer != viewerBearer() {
 		t.Errorf("mint presented bearer %q, want the viewer's — accounts must resolve the viewer as owner", mint.Bearer)
 	}
 	if mint.OrgID != viewerOrg {
@@ -740,11 +742,31 @@ func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
 		t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPIssuerURLKey))
 	}
 
-	told := addressed
-	told.mcpIssuerExplicit = true
-	told.mcpIssuerURL = "https://app.example.com"
+	// An operator who declared the issuer but let the identifier be derived is
+	// still refused, and this is the case that used to pass.
+	//
+	// The derived value is <PUBLIC_URL>/solutions/<id>/mcp: this runtime
+	// encoding the route the HOST serves it on. That assumption is what the
+	// Module Federation manifest URL was changed to stop making in this
+	// cutover, for the same reason — the route a client reaches a solution
+	// through is the host's to resolve, and a runtime guessing it is right
+	// only on the machine of whoever wrote the guess. A derived value also
+	// satisfied the "a public URL is set" check above, so nothing refused it.
+	halfTold := addressed
+	halfTold.mcpIssuerExplicit = true
+	halfTold.mcpIssuerURL = "https://app.example.com"
+	err = halfTold.validateMCP()
+	if err == nil {
+		t.Fatal("a deployed MCP surface was accepted with an identifier derived from PUBLIC_URL: a client binds its token to the URL it dialled, and this one is this runtime's guess about the host's route")
+	}
+	if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+		t.Errorf("refusal %q does not name %s, the configuration that fixes it", err, mcpConfigurationValue(MCPPublicURLKey))
+	}
+
+	told := halfTold
+	told.mcpPublicExplicit = true
 	if err := told.validateMCP(); err != nil {
-		t.Errorf("a deployed MCP surface an operator addressed was refused: %v", err)
+		t.Errorf("a deployed MCP surface an operator addressed in full was refused: %v", err)
 	}
 
 	// A local run resolves a host it can actually reach and is unaffected: the
@@ -1048,19 +1070,171 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 		}
 	})
 
-	t.Run("the one declared value is enough", func(t *testing.T) {
+	t.Run("a derived identifier is refused however well PUBLIC_URL resolved", func(t *testing.T) {
+		// This test asserted the opposite: that declaring the issuer alone was
+		// enough, because the identifier is "derived by construction" from
+		// PUBLIC_URL. The derivation builds <PUBLIC_URL>/solutions/<id>/mcp,
+		// which is this runtime encoding the route the HOST serves it on — the
+		// same assumption the Module Federation manifest URL was changed to
+		// stop making in this cutover, for the same reason: the route a client
+		// reaches a solution through is the host's to resolve, and a runtime
+		// guessing it is right only on the machine of whoever wrote the guess.
+		//
+		// A derived value satisfied the old "a public URL is set" check, so the
+		// deployed refusal never fired in the one case that matters.
 		declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
-		// For the deployed environment it sets, not the config it returns:
-		// PUBLIC_URL lands after it, so the config has to be loaded again.
 		deployed(t)
 		t.Setenv("PUBLIC_URL", "https://app.example.com")
 		cfg := loadConfig(context.Background(), "wiki", nil)
 		cfg.mcp = true
-		if err := cfg.validateMCP(); err != nil {
-			t.Fatalf("a deployed MCP surface with the issuer declared and PUBLIC_URL resolved was refused: %v", err)
+		err := cfg.validateMCP()
+		if err == nil {
+			t.Fatal("a deployed MCP surface was accepted with an identifier derived from PUBLIC_URL: a client binds its token to the URL it dialled, and this one is a guess about the host's route layout")
 		}
-		if want := "https://app.example.com/solutions/wiki" + MCPPath; cfg.mcpPublicURL != want {
-			t.Errorf("mcpPublicURL = %q, want the derived %q", cfg.mcpPublicURL, want)
+		if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+			t.Errorf("the refusal %q does not name %s, the configuration that fixes it", err, mcpConfigurationValue(MCPPublicURLKey))
+		}
+	})
+
+	t.Run("both declared values are enough", func(t *testing.T) {
+		declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
+		declareMCPConfiguration(t, MCPPublicURLKey, "https://app.example.com/wiki"+MCPPath)
+		deployed(t)
+		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg.mcp = true
+		if err := cfg.validateMCP(); err != nil {
+			t.Fatalf("a deployed MCP surface with both values declared was refused: %v", err)
+		}
+		if want := "https://app.example.com/wiki" + MCPPath; cfg.mcpPublicURL != want {
+			t.Errorf("mcpPublicURL = %q, want the declared %q", cfg.mcpPublicURL, want)
+		}
+	})
+
+	t.Run("a published URL is held to what a dialled one is", func(t *testing.T) {
+		for _, tc := range []struct{ name, value, names string }{
+			{"userinfo", "https://ops:s3cr3t@app.example.com/wiki" + MCPPath, "userinfo"},
+			{"a query string", "https://app.example.com/wiki" + MCPPath + "?token=s3cr3t", "query"},
+			{"a fragment", "https://app.example.com/wiki" + MCPPath + "#frag", "fragment"},
+			{"plaintext", "http://app.example.com/wiki" + MCPPath, "https"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
+				declareMCPConfiguration(t, MCPPublicURLKey, tc.value)
+				deployed(t)
+				cfg := loadConfig(context.Background(), "wiki", nil)
+				cfg.mcp = true
+				err := cfg.validateMCP()
+				if err == nil {
+					t.Fatalf("a deployed MCP surface published %q: it is the identifier clients bind a token to and dial, so it is held to what the addresses this runtime dials are held to", tc.value)
+				}
+				if !strings.Contains(err.Error(), tc.names) {
+					t.Errorf("the refusal %q does not say what is wrong (%s)", err, tc.names)
+				}
+				if strings.Contains(err.Error(), "s3cr3t") {
+					t.Errorf("the refusal %q repeats the secret it is refusing", err)
+				}
+			})
+		}
+	})
+}
+
+// TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential is R4-3 on the
+// MCP path, which the integration of main reopened.
+//
+// A plain handler and a ViewerBearer passthrough are both refused while the
+// issuer has withdrawn this execution's credential — "fail closed, with no
+// exception for a counterpart's current state". A tool call was not: it
+// received a gateway carrying the viewer's bearer and ran author code with it,
+// which is acting for a viewer without authority. A tool that mints nothing
+// still sends that bearer wherever it dials.
+//
+// The gate is an allowlist of the methods that act for nobody, so a method the
+// MCP SDK adds is held by default. Both refusal classes are driven here,
+// because the boot and the run have to classify them the same way and have not
+// always: a terminal refusal ends the process, a transient one does not, and
+// neither may let a tool run.
+func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"a terminal refusal", workcontext.ErrMintRefused},
+		{"a transient unavailability", workcontext.ErrMintUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ran atomic.Bool
+			register := func(srv *mcp.Server) {
+				mcp.AddTool(srv, &mcp.Tool{Name: "act", Description: "must not run"},
+					func(ctx context.Context, _ *mcp.CallToolRequest, _ askInput) (*mcp.CallToolResult, askOutput, error) {
+						ran.Store(true)
+						return nil, askOutput{Status: 200}, nil
+					})
+			}
+			server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+				ServeMCP(mcpServerName, "v1.2.3", register).
+				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/platform/_credential", tc.err)})
+
+			handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
+			if err != nil {
+				t.Fatalf("mount MCP: %v", err)
+			}
+			host := httptest.NewServer(handler)
+			t.Cleanup(host.Close)
+			session := connectMCP(t, host, viewerStamp())
+
+			_, err = session.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "act",
+				Arguments: map[string]any{"question": "anything"},
+			})
+			if err == nil {
+				t.Fatal("a tool call was answered while this execution held no usable credential: the viewer's bearer went to author code under authority this process does not have")
+			}
+			if ran.Load() {
+				t.Error("the tool ran: the gate has to refuse before anything author-written executes, not report afterwards")
+			}
+			// Sanitized, like every other viewer-facing refusal. The source's
+			// error names an internal mint address; a client must not learn it.
+			if strings.Contains(err.Error(), "mint.internal.example") {
+				t.Errorf("the refusal %q discloses the runtime's own mint address to an MCP client", err)
+			}
+			if strings.Contains(err.Error(), "_credential") {
+				t.Errorf("the refusal %q discloses the runtime's credential path", err)
+			}
+		})
+	}
+
+	t.Run("a listing still answers, because it acts for nobody", func(t *testing.T) {
+		// The allowlist's other half: refusing the handshake and the listings
+		// would make a withdrawn credential indistinguishable from a solution
+		// that serves no MCP at all, and neither runs anything for a viewer.
+		server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+			ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
+			Credential(refusingSource{err: workcontext.ErrMintRefused})
+		handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
+		if err != nil {
+			t.Fatalf("mount MCP: %v", err)
+		}
+		host := httptest.NewServer(handler)
+		t.Cleanup(host.Close)
+		session := connectMCP(t, host, viewerStamp())
+		if _, err := session.ListTools(context.Background(), nil); err != nil {
+			t.Errorf("tools/list was refused while no credential was held: it runs nothing for the viewer, and refusing it hides a withdrawn credential behind a surface that looks absent: %v", err)
+		}
+	})
+
+	t.Run("every method that is not allowlisted is gated", func(t *testing.T) {
+		// The property, not an enumeration: a method this file has never heard
+		// of is held to the credential. A denylist over the SDK's method set is
+		// the mistake the TLS posture made three times.
+		for _, method := range []string{"tools/call", "resources/read", "prompts/get", "completion/complete", "some/method-added-next-release"} {
+			if actsForNobody(method) {
+				t.Errorf("%q is treated as acting for nobody, so a viewer action on it would skip the credential gate", method)
+			}
+		}
+		for _, method := range []string{"initialize", "ping", "tools/list", "prompts/list", "resources/list", "notifications/cancelled"} {
+			if !actsForNobody(method) {
+				t.Errorf("%q is gated though it runs nothing for a viewer", method)
+			}
 		}
 	})
 }

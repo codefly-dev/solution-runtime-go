@@ -880,7 +880,7 @@ func TestAnAuthenticatedCallerIsNotAutomaticallyAnAuthorisedOne(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Header.Set("authorization", "Bearer viewer")
+		request.Header.Set("authorization", viewerBearer())
 		// The headers a caller must not be able to assert for itself.
 		request.Header.Set(orgHeader, "org-the-caller-chose")
 		request.Header.Set(sessionHeader, "session-the-caller-chose")

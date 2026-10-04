@@ -207,6 +207,51 @@ embedding it.
   listener that verifies every caller and admits all of them lets a consumed
   module set its own `x-org-id`/`x-session-id` and drive mints under this
   workload's attestation.
+- **Every mint names the installation it acts under.** The host requires it
+  (core's `StartInput.InstallationID`) and refuses a mint naming none; an
+  organization is not an installation, since one org may hold several. A
+  viewer-driven mint takes it from the **seal** of the capability the caller
+  arrived with, through the SDK's reader, and from the
+  `x-codefly-installation-id` header only when there is no capability to read —
+  the SDK's own rule, because the installation that governs a call is the one
+  inside the signature and a header is caller-controlled. A request with no
+  readable installation is refused, and not as a `ClientError`: no caller can
+  seal one, so it is not theirs to fix. A background or delegated call would
+  take it from the parent capability's seal on the held credential; no such path
+  exists here, because every mint is viewer-driven and `ForModule` already
+  refuses a caller without an org and a session. This execution's own credential
+  is sealed by the host from the projected token — the SDK's `MintOptions`
+  carries no installation field — so what this runtime owns is refusing one
+  sealed to no installation and refusing a renewal sealed to a *different* one,
+  which is a different identity arriving through the renewal path.
+- **Every surface that acts for a viewer is held to this execution's
+  credential, and the MCP methods are held by an allowlist.** A plain handler
+  and a `ViewerBearer` passthrough were gated and a tool call was not, so an
+  MCP tool received a gateway carrying the viewer's bearer and ran while the
+  issuer had withdrawn this process's credential — the same fail-closed defect,
+  arriving with a surface rather than being missed in one. `actsForNobody`
+  lists the methods that run nothing for anyone (the handshake, the keepalive,
+  the listings, notifications) and **everything else** goes through
+  `actingForAViewer`: a method the MCP SDK adds is gated by default, because a
+  denylist over a set this package does not own is the mistake the TLS posture
+  made three times. The refusal carries the sanitized sentence, never the
+  source's error — an MCP client is a viewer's channel like a browser is. The
+  SDK's wire-error type is internal, so the call fails as a protocol error
+  without a specific JSON-RPC code.
+- **What a composition supplies is declared configuration, and a published URL
+  is held to what a dialled one is.** A Codefly render cannot set a bare
+  environment variable on a service, so anything the composition owns is a
+  workspace-configuration group read through the SDK (`mcp/issuer-url`,
+  `mcp/public-url`) and a refusal names that group/key. In a deployed runtime
+  context the MCP resource identifier must be **declared, not derived**: the
+  derivation builds `<PUBLIC_URL>/solutions/<id>/mcp`, which is this runtime
+  encoding the route the *host* serves it on — the assumption the Module
+  Federation manifest URL was changed to stop making, for the same reason. A
+  derived value satisfied the older "a public URL is set" check, so nothing
+  refused it in the one case that mattered. Both MCP URLs are refused for
+  userinfo, a query, a fragment, and plaintext in a deployment, and those
+  refusals redact: the pairing refusal printed an identifier's `?token=` into
+  the boot log.
 - **Nothing mints per request.** One credential per execution plus the renewals
   its own expiry dictates, and that has to survive the checks added in front of
   it: a route gate that asked the source on every viewer request turned a
