@@ -665,3 +665,79 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 		}
 	})
 }
+
+// TestTheDeclaredCeilingIsFrozenAtDeclaration is round fifteen's first major.
+//
+// Contract() stored the caller's value — the caller's maps, and the caller's
+// backing arrays inside every Scope. Resolution and every gateway built
+// afterwards retain the ceiling's slices, so keeping the `actions :=
+// []string{"read"}` used in the declaration and writing "delete" into it after
+// boot changed the ceiling every later request is checked against, and the
+// contract this process publishes with it.
+//
+// The previous round froze the ASK. This is the other operand, and a ceiling a
+// caller can still edit is not a ceiling.
+func TestTheDeclaredCeilingIsFrozenAtDeclaration(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+
+	// The slices the caller keeps, on BOTH sides of the comparison.
+	ceilingActions := []string{"read"}
+	askedActions := []string{"read"}
+	module := passthroughModule()
+	module.Methods = nil
+	module.Scopes = []Scope{{ResourceKind: "things", Actions: askedActions}}
+
+	server := New(Manifest{ID: testSolutionID}).Consumes(module).
+		Credential(mintClientFor(t, mint, tokenFile)).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: ceilingActions}}},
+		}})
+	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, apiConsumes: consumesThings}
+	server.principal = testPrincipal
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolve the published contract: %v", err)
+	}
+	server.contract, server.contractResolved = contract, true
+
+	// After boot, after resolution: the caller writes through its own slices.
+	ceilingActions[0] = "delete"
+	askedActions[0] = "delete"
+
+	// What this process PUBLISHES must still be the declaration.
+	published, err := json.Marshal(server.contract)
+	if err != nil {
+		t.Fatalf("render the published contract: %v", err)
+	}
+	if strings.Contains(string(published), "delete") {
+		t.Errorf("the published contract names an action the declaration never contained: %s", published)
+	}
+
+	// And what it ENFORCES must still be the declaration.
+	header := http.Header{}
+	header.Set("authorization", viewerBearer())
+	header.Set(orgHeader, viewerOrg)
+	header.Set(sessionHeader, viewerSession)
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+	gateway := server.gatewayFor(header)
+
+	if _, err := gateway.ForModule(context.Background(), "things",
+		Scope{ResourceKind: "things", Actions: []string{"delete"}}); err == nil {
+		t.Error("an ask for delete was accepted: the ceiling was edited after boot through the caller's own slice, so the published contract and the authority this process mints no longer agree with each other or with what a reviewer approved")
+	}
+	select {
+	case got := <-gw.mints:
+		t.Errorf("a mint reached the issuer for %+v after the ceiling was edited: a refusal that happens after the ask is on the wire is not a ceiling", got.AuthorityScopes)
+	default:
+	}
+
+	// The control: the declaration's own ask still works, so this froze the
+	// values rather than breaking the comparison.
+	if _, err := gateway.ForModule(context.Background(), "things",
+		Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+		t.Errorf("the declared ask was refused after the freeze, which would make every contract unusable: %v", err)
+	}
+}

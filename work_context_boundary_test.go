@@ -60,8 +60,7 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 		// capability-message construction rule, the verifier rule, the JOSE
 		// rule and the declaration-name rule — and
 		// TestTheSigningRelaxationIsConditional pins that.
-		issuesTLSMaterialOnly := strings.HasPrefix(name, "passthroughtest/") &&
-			len(workContextImports(file)) == 0 && dotImportedWorkContext(file) == ""
+		issuesTLSMaterialOnly := issuesTLSMaterialOnly(name, file)
 		for _, imported := range file.Imports {
 			path := strings.Trim(imported.Path.Value, `"`)
 			switch path {
@@ -109,7 +108,7 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 		// the type name appears legitimately: holdSealedIdentity takes a
 		// *workcontext.SealedValues and reads it through GetInstallationId.
 		// Decoding into one requires allocating it; reading one never does.
-		for _, built := range coreCapabilityConstructions(file) {
+		for _, built := range coreCapabilityConstructions(file, localCapability) {
 			t.Errorf("%s constructs %s: allocating one of core's capability messages is what decoding into it requires, and a second decoder of that encoding is this boundary's whole subject. Read the seal through the SDK's Credential.Seal() accessor.",
 				name, built)
 		}
@@ -599,7 +598,7 @@ func servableExports(name string, file *ast.File, local map[string]bool) (findin
 // GetInstallationId. Decoding into one requires allocating it; reading one
 // never does. Factored out so TestTheCapabilityDecodeGateCatchesTheSDKAlias
 // drives this rule rather than a copy of it.
-func coreCapabilityConstructions(file *ast.File) []string {
+func coreCapabilityConstructions(file *ast.File, local map[string]bool) []string {
 	aliases := importedAs(file)
 	var built []string
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -630,7 +629,10 @@ func coreCapabilityConstructions(file *ast.File) []string {
 		if allocated == nil {
 			return true
 		}
-		if rendered := renderedTypeIn(aliases, allocated); coreCapabilityType(rendered) {
+		// Local aliases resolve here as well: `type hiddenSeal =
+		// workcontext.SealedValues` renders as its own spelling, which no
+		// fixed set contains.
+		if rendered := renderedTypeIn(aliases, allocated); coreCapabilityType(rendered) || local[rendered] {
 			built = append(built, rendered)
 		}
 		return true
@@ -691,14 +693,58 @@ func capabilityDecodes(file *ast.File, localCapability map[string]bool) []string
 		record(fn.Type.Params)
 		record(fn.Type.Results)
 		record(fn.Recv)
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			if spec, ok := node.(*ast.ValueSpec); ok && capability(spec.Type) {
-				for _, name := range spec.Names {
-					bound[name.Name] = true
+		// Declarations with an explicit type, and then ASSIGNMENT ALIASES, to
+		// a fixpoint.
+		//
+		// `target := dst` put the destination in a name the scanner had never
+		// heard of, with no allocation for the construction rule to catch
+		// either. The previous round closed the direct-parameter form and this
+		// adjacent one walked straight past it, which is the third time a
+		// premise about where the destination comes from has been wrong here.
+		//
+		// The fixpoint is because an alias can alias an alias. The coverage is
+		// bounded deliberately and the bound is stated: a name assigned from
+		// another NAME (optionally through & or *) is followed; a destination
+		// arriving through a field selector, an index, a function result or an
+		// interface is not. Closing those means go/types, which is the honest
+		// next step and is named in the gate's own comment rather than left to
+		// be discovered.
+		for changed := true; changed; {
+			changed = false
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.ValueSpec:
+					if capability(typed.Type) {
+						for _, name := range typed.Names {
+							if !bound[name.Name] {
+								bound[name.Name], changed = true, true
+							}
+						}
+					}
+					// `var target = dst`, which is an assignment in a
+					// declaration's clothing.
+					for i, name := range typed.Names {
+						if i < len(typed.Values) && bound[rootName(typed.Values[i])] && !bound[name.Name] {
+							bound[name.Name], changed = true, true
+						}
+					}
+				case *ast.AssignStmt:
+					for i, left := range typed.Lhs {
+						if i >= len(typed.Rhs) {
+							break
+						}
+						target, ok := left.(*ast.Ident)
+						if !ok || bound[target.Name] {
+							continue
+						}
+						if bound[rootName(typed.Rhs[i])] {
+							bound[target.Name], changed = true, true
+						}
+					}
 				}
-			}
-			return true
-		})
+				return true
+			})
+		}
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
@@ -727,6 +773,27 @@ func capabilityDecodes(file *ast.File, localCapability map[string]bool) []string
 		})
 	}
 	return decoded
+}
+
+// rootName is the identifier an expression ultimately refers to, through any
+// number of address-of and dereference operators: `dst`, `&dst` and `*dst` all
+// give "dst". Anything else — a selector, an index, a call — gives "", which is
+// the bound this scanner states rather than pretends to cover.
+func rootName(expr ast.Expr) string {
+	for {
+		switch typed := expr.(type) {
+		case *ast.Ident:
+			return typed.Name
+		case *ast.UnaryExpr:
+			expr = typed.X
+		case *ast.StarExpr:
+			expr = typed.X
+		case *ast.ParenExpr:
+			expr = typed.X
+		default:
+			return ""
+		}
+	}
 }
 
 // localCapabilityTypes is every type name the module declares that resolves to
@@ -1601,7 +1668,8 @@ var scratchSeal workcontext.SealedValues`,
 	}
 	for _, probe := range caught {
 		t.Run(probe.shape, func(t *testing.T) {
-			if built := coreCapabilityConstructions(parse(t, probe.source)); len(built) == 0 {
+			file := parse(t, probe.source)
+			if built := coreCapabilityConstructions(file, localCapabilityTypes(map[string]*ast.File{"probe.go": file})); len(built) == 0 {
 				t.Errorf("the gate did not catch %s, so a second decoder of core's encoding can grow here:\n%s", probe.shape, probe.source)
 			}
 		})
@@ -1611,7 +1679,7 @@ var scratchSeal workcontext.SealedValues`,
 		// What credential.go actually does. The type is named, in a parameter
 		// and a result, and nothing is allocated — so a rule on the NAME would
 		// refuse the supported way to read a seal, and this one does not.
-		built := coreCapabilityConstructions(parse(t, `package solution
+		control := parse(t, `package solution
 import "github.com/codefly-dev/sdk-go/workcontext"
 func holdSealedIdentity(seal *workcontext.SealedValues) sealedIdentity {
 	return sealedIdentity{
@@ -1619,11 +1687,27 @@ func holdSealedIdentity(seal *workcontext.SealedValues) sealedIdentity {
 		digest:       seal.GetImageDigest(),
 		incarnation:  seal.GetBuildIncarnation(),
 	}
-}`))
+}`)
+		built := coreCapabilityConstructions(control, localCapabilityTypes(map[string]*ast.File{"probe.go": control}))
 		if len(built) != 0 {
 			t.Errorf("the gate refused reading a seal through the SDK's accessor, which is the one supported way to do it: %v", built)
 		}
 	})
+}
+
+// issuesTLSMaterialOnly is THE condition the signing-primitive relaxation
+// turns on, as one function.
+//
+// It was a copy: the gate computed the condition inline and the test that
+// claimed to pin it recomputed the same expression. An executed round changed
+// the real gate to permit a signing import in every passthroughtest file and
+// the test still passed — which makes it worthless as evidence for the gate,
+// and it is the exact failure I had written into the gate's own comments as
+// the thing to avoid ("a probe that re-implements the check proves only that
+// two copies agree"). Struck as evidence and replaced by this.
+func issuesTLSMaterialOnly(name string, file *ast.File) bool {
+	return strings.HasPrefix(name, "passthroughtest/") &&
+		len(workContextImports(file)) == 0 && dotImportedWorkContext(file) == ""
 }
 
 // TestTheSigningRelaxationIsConditional pins the one relaxation in the
@@ -1644,12 +1728,10 @@ func TestTheSigningRelaxationIsConditional(t *testing.T) {
 		}
 		return file
 	}
-	// The rule, restated here exactly as the gate computes it, because the
-	// gate's own loop reports through t.Errorf over the real tree.
-	relaxed := func(name string, file *ast.File) bool {
-		return strings.HasPrefix(name, "passthroughtest/") &&
-			len(workContextImports(file)) == 0 && dotImportedWorkContext(file) == ""
-	}
+	// THE rule the gate uses, not a copy of it. The copy survived the real
+	// condition being removed, which is why this calls the function the
+	// scanner calls.
+	relaxed := issuesTLSMaterialOnly
 
 	tlsOnly := parse(t, `package passthroughtest
 import (
@@ -1741,6 +1823,60 @@ import (
 )
 func decode(raw []byte, dst *workcontext.WorkContextV1) error { return proto.Unmarshal(raw, dst) }`,
 		},
+		{
+			// Round fifteen: the destination is put in a name the scanner had
+			// never heard of, and there is no allocation either.
+			"the destination is assigned to another name first",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(raw []byte, dst *workcontext.SealedValues) error {
+	target := dst
+	return proto.Unmarshal(raw, target)
+}`,
+		},
+		{
+			"the same, two assignments deep",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(raw []byte, dst *workcontext.SealedValues) error {
+	a := dst
+	b := a
+	return proto.Unmarshal(raw, b)
+}`,
+		},
+		{
+			"an assignment in a declaration's clothing",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(raw []byte, dst *workcontext.SealedValues) error {
+	var target = dst
+	return proto.Unmarshal(raw, target)
+}`,
+		},
+		{
+			// The executed round's second shape: a local type alias, and the
+			// zero value it declares.
+			"a local type alias for the seal, decoded into its zero value",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+type hiddenSeal = workcontext.SealedValues
+func decodeAlias(raw []byte) error {
+	var seal hiddenSeal
+	return proto.Unmarshal(raw, &seal)
+}`,
+		},
 	}
 	for _, probe := range caught {
 		t.Run(probe.shape, func(t *testing.T) {
@@ -1765,6 +1901,19 @@ func holdSealedIdentity(seal *workcontext.SealedValues) sealedIdentity {
 }`)
 		if len(found) != 0 {
 			t.Errorf("the gate refused reading a seal through the SDK's accessor, which is the one supported way to do it: %v", found)
+		}
+	})
+
+	t.Run("passes: an accessor read through an assignment", func(t *testing.T) {
+		// The alias-following must not turn an ordinary local into a decode.
+		found := decodes(t, `package solution
+import "github.com/codefly-dev/sdk-go/workcontext"
+func hold(seal *workcontext.SealedValues) string {
+	s := seal
+	return s.GetInstallationId()
+}`)
+		if len(found) != 0 {
+			t.Errorf("the gate refused reading a seal through a local, which decodes nothing: %v", found)
 		}
 	})
 

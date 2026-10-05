@@ -145,7 +145,24 @@ const (
 // chainable and may be called more than once; Serve refuses a declaration that
 // cannot be served before it listens.
 func (s *Server) Consumes(modules ...ConsumedModule) *Server {
-	s.consumed = append(s.consumed, modules...)
+	// Frozen at the declaration boundary, for the reason Contract() gives:
+	// `append` copies the structs and leaves every slice inside them pointing
+	// at the caller's arrays. These are the ASKED scopes — the other operand
+	// of the ceiling comparison and what the published contract reports — so a
+	// caller editing one after boot changes what this process claims to ask
+	// for.
+	for _, module := range modules {
+		module.Scopes = frozenScopes(module.Scopes)
+		methods := make([]ConsumedMethod, len(module.Methods))
+		for i, method := range module.Methods {
+			method.Scopes = frozenScopes(method.Scopes)
+			methods[i] = method
+		}
+		if module.Methods != nil {
+			module.Methods = methods
+		}
+		s.consumed = append(s.consumed, module)
+	}
 	return s
 }
 

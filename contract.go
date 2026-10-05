@@ -95,8 +95,58 @@ type ModuleContract struct {
 // id the host's handshake reads. This one is about authority: which audiences
 // this solution holds bindings for, and how much it may ever ask of each.
 func (s *Server) Contract(contract ModuleContract) *Server {
-	s.declaredContract = contract
+	// FROZEN here, at the declaration boundary.
+	//
+	// This stored the caller's value, which means the caller's maps and the
+	// caller's backing arrays. Resolution and every gateway built afterwards
+	// retain the ceiling's slices, so keeping an `actions := []string{"read"}`
+	// used in the declaration and writing "delete" into it after boot changed
+	// the ceiling every later request is checked against — AND the contract
+	// this process publishes. The ask-copying fix hardened one side of that
+	// comparison; this is the other side, and a ceiling a caller can still
+	// edit is not a ceiling.
+	//
+	// At Contract() rather than at resolution, because that is the moment the
+	// value stops being the caller's business: a copy taken later leaves a
+	// window, and there is no second place to remember to take one.
+	s.declaredContract = frozenContract(contract)
 	return s
+}
+
+// frozenContract is a deep copy of a declaration: the profile map, each
+// audience map, each ceiling slice, and the Actions and ResourceIDs inside
+// every Scope. Nothing in it aliases anything the caller still holds.
+func frozenContract(contract ModuleContract) ModuleContract {
+	if contract.Ceilings == nil {
+		return contract
+	}
+	frozen := ModuleContract{Ceilings: make(map[string]map[string][]Scope, len(contract.Ceilings))}
+	for profile, ceilings := range contract.Ceilings {
+		audiences := make(map[string][]Scope, len(ceilings))
+		for audience, ceiling := range ceilings {
+			audiences[audience] = frozenScopes(ceiling)
+		}
+		frozen.Ceilings[profile] = audiences
+	}
+	return frozen
+}
+
+// frozenScopes is a deep copy of a scope slice, including the two string
+// slices inside each Scope — which a plain append copies the headers of and
+// nothing else.
+func frozenScopes(scopes []Scope) []Scope {
+	if scopes == nil {
+		return nil
+	}
+	frozen := make([]Scope, len(scopes))
+	for i, scope := range scopes {
+		frozen[i] = Scope{
+			ResourceKind: scope.ResourceKind,
+			Actions:      append([]string(nil), scope.Actions...),
+			ResourceIDs:  append([]string(nil), scope.ResourceIDs...),
+		}
+	}
+	return frozen
 }
 
 // effectiveContract is the contract of the one profile this process runs under:

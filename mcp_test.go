@@ -1686,3 +1686,73 @@ func TestAToolsOwnRefusalIsLeftAlone(t *testing.T) {
 		t.Errorf("the tool's own refusal was rewritten: %q — a tool's vocabulary is its own, and a model driving it reads that text", toolErrorText(result))
 	}
 }
+
+// TestAStructuredToolResultNeverCarriesTheRuntimesInternals is round fifteen's
+// minor, and it narrows a closure claim I made.
+//
+// withoutRuntimeAddresses read only Content. The pinned SDK serializes
+// StructuredContent too, so a result with generic text and
+// StructuredContent{"error": err.Error()} reached the agent client with the
+// mint's address in it. The net was installed for exactly that disclosure and
+// was looking in one of the two places the SDK sends.
+func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{
+		gatewayURL: "https://gateway.internal.test",
+		mintURL:    "https://mint.internal.test/platform/_credential",
+	}
+	server.cfg.dialled = dialledAddresses(server.cfg.gatewayURL, server.cfg.mintURL)
+
+	t.Run("the address is in the structured content alone", func(t *testing.T) {
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
+			StructuredContent: map[string]any{
+				"error": `Post "https://mint.internal.test/platform/_credential": dial tcp 127.0.0.1:1 connect: connection refused`,
+			},
+		}, "tools/call")
+		call, ok := result.(*mcp.CallToolResult)
+		if !ok {
+			t.Fatalf("the filter returned %T", result)
+		}
+		if call.StructuredContent != nil {
+			t.Errorf("the replaced result still carries structured content: %v", call.StructuredContent)
+		}
+		rendered, err := json.Marshal(call)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"mint.internal.test", "gateway.internal.test"} {
+			if strings.Contains(string(rendered), secret) {
+				t.Errorf("the serialized result names %q, which is an address this runtime dialled and nothing a viewer's agent client may be told: %s", secret, rendered)
+			}
+		}
+	})
+
+	t.Run("a tool's own structured refusal is left alone", func(t *testing.T) {
+		// The net matches on exact configured values, so an author's own
+		// structured error about their own domain is untouched.
+		own := &mcp.CallToolResult{
+			IsError:           true,
+			Content:           []mcp.Content{&mcp.TextContent{Text: "the wiki rejected that page title"}},
+			StructuredContent: map[string]any{"error": "title must not be empty", "field": "title"},
+		}
+		if got := server.withoutRuntimeAddresses(own, "tools/call"); got != mcp.Result(own) {
+			t.Errorf("a tool's own structured refusal was replaced: %+v", got)
+		}
+	})
+
+	t.Run("structured content this runtime cannot read is replaced", func(t *testing.T) {
+		// It cannot be cleared if it cannot be read, and the SDK is about to
+		// serialize it either way.
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError:           true,
+			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
+			StructuredContent: map[string]any{"error": func() {}},
+		}, "tools/call")
+		call, ok := result.(*mcp.CallToolResult)
+		if !ok || call.StructuredContent != nil {
+			t.Errorf("unreadable structured content survived the filter: %+v", result)
+		}
+	})
+}

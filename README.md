@@ -1113,11 +1113,18 @@ solution.New(solution.Manifest{ID: "wiki", Title: "Wiki"}).
     Serve()
 ```
 
-A composition that renders this solution supplies **one** declared value for it,
-and only in a deployment: `issuer-url` in the `mcp` workspace-configuration
-group, declared as a workspace-configuration dependency of the solution's
-backend — the origin MCP clients authenticate against. Everything else is
-derived or resolved; see [The resource identifier and the
+A composition that renders this solution supplies **two** declared values for
+it, and only in a deployment, both in the `mcp` workspace-configuration group,
+declared as a workspace-configuration dependency of the solution's backend:
+
+- `issuer-url` — the origin MCP clients authenticate against;
+- `public-url` — the URL clients dial, ending in `/mcp`.
+
+**This said *one* value, and a deployment following it does not boot.** The
+public URL is derived from `PUBLIC_URL` **for a local run only**: a deployed
+runtime context refuses a derived identifier, because the derivation encodes
+the route the *host* serves this solution on. Both keys are required there, and
+the boot names whichever is missing. See [The resource identifier and the
 issuer](#the-resource-identifier-and-the-issuer).
 
 `register` receives the official SDK's own `*mcp.Server`

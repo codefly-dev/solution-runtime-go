@@ -2,6 +2,7 @@ package solution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -815,8 +816,17 @@ func (c config) validateMCP() error {
 		if c.mcpPublicURL == "" {
 			// Only reachable with PUBLIC_URL unresolved and no override
 			// declared: the identifier is otherwise derived by construction.
-			return fmt.Errorf("no public MCP URL in the deployed runtime context %q: it is derived as <PUBLIC_URL>%s<id>%s, and PUBLIC_URL resolved nothing — so the identifier would be reconstructed per request from the forwarded headers, missing the route the gateway strips (and naming the scheme of the hop, not the client's), and an MCP client binds its token to the identifier it dialled and rejects any other. Set PUBLIC_URL to the origin clients reach this product at, or provision the workspace configuration %s with the URL they dial, ending in %s",
-				c.runtimeContext, gatewaySolutionsRoute, MCPPath, mcpConfigurationValue(MCPPublicURLKey), MCPPath)
+			//
+			// And this must NOT offer PUBLIC_URL as the remedy. It did, and
+			// setting it in a deployment reaches the very next refusal below —
+			// a derived identifier is refused in a deployed context, because
+			// the derivation encodes the route the host serves this solution
+			// on. So the diagnostic sent an operator one step further and then
+			// failed the boot again, which is worse than the first refusal
+			// because it reads as progress. There is one remedy in a
+			// deployment and this names only that one.
+			return fmt.Errorf("no public MCP URL in the deployed runtime context %q: the identifier an MCP client binds its token to has to be the one it dialled, and nothing here knows that — PUBLIC_URL resolved nothing, so it would be reconstructed per request from the forwarded headers, missing the route the gateway strips and naming the scheme of the hop rather than the client's. Provision the workspace configuration %s with the URL clients dial, ending in %s, and declare the %s group as a workspace-configuration dependency of this backend. Setting PUBLIC_URL does not answer this in a deployment: a derived identifier is refused here too, because the derivation encodes the route the HOST serves this solution on",
+				c.runtimeContext, mcpConfigurationValue(MCPPublicURLKey), MCPPath, MCPConfigurationGroup)
 		}
 		if !c.mcpIssuerExplicit {
 			return fmt.Errorf("no %s provisioned in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Provision that workspace configuration with the origin clients authenticate against and declare the %s group as a workspace-configuration dependency of this backend",
@@ -932,23 +942,55 @@ func (s *Server) withoutRuntimeAddresses(result mcp.Result, method string) mcp.R
 	if !ok || call == nil || !call.IsError {
 		return result
 	}
+	// The TEXT content, and the STRUCTURED content.
+	//
+	// This read only Content. The pinned SDK serializes StructuredContent as
+	// well, so a result with generic text and
+	// StructuredContent{"error": err.Error()} went to the agent client with
+	// the mint's address in it — the net was installed for exactly that
+	// disclosure and looked in one of the two places the SDK sends.
+	//
+	// Structured content is arbitrary JSON, so it is rendered once and
+	// searched as a whole rather than walked field by field: a rule that
+	// inspected a field named "error" would be a rule about this round's
+	// example.
+	named := func(text string) (string, bool) {
+		for _, dialled := range s.cfg.dialled {
+			if dialled != "" && strings.Contains(text, dialled) {
+				return dialled, true
+			}
+		}
+		return "", false
+	}
+	replaced := func(where, offending string) mcp.Result {
+		log.Printf("solution %q: an MCP %s error result named an address this runtime dialled (in its %s); replaced: %s",
+			s.manifest.ID, method, where, offending)
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{
+				Text: "this solution could not complete the call",
+			}},
+		}
+	}
 	for _, content := range call.Content {
 		text, isText := content.(*mcp.TextContent)
 		if !isText {
 			continue
 		}
-		for _, dialled := range s.cfg.dialled {
-			if !strings.Contains(text.Text, dialled) {
-				continue
-			}
-			log.Printf("solution %q: an MCP %s error result named an address this runtime dialled; replaced: %s",
-				s.manifest.ID, method, text.Text)
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: "this solution could not complete the call",
-				}},
-			}
+		if _, found := named(text.Text); found {
+			return replaced("text content", text.Text)
+		}
+	}
+	if call.StructuredContent != nil {
+		// Marshalling failure is itself a reason to replace: a structured
+		// value this runtime cannot read is one it cannot clear either, and
+		// the SDK is about to serialize it.
+		rendered, err := json.Marshal(call.StructuredContent)
+		if err != nil {
+			return replaced("structured content", "unreadable structured content: "+err.Error())
+		}
+		if _, found := named(string(rendered)); found {
+			return replaced("structured content", string(rendered))
 		}
 	}
 	return result
