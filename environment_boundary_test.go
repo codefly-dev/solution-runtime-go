@@ -12,18 +12,22 @@ import (
 )
 
 // retiredServeTimeRead named the one function that used to read the
-// environment outside boot resolution: it parsed the consumed-API projection
-// when the server started, so a malformed value disabled the consumed-module
-// federation with a log line while the solution served on. It registered a
-// facade route for each consumed module, which is not a solution's to claim,
-// and went with that capability — so the exception it was went with it too.
+// environment outside boot resolution. It claimed a facade route for each
+// consumed module, which is not a solution's to claim, so it went — and the
+// exception it was went with it.
 const retiredServeTimeRead = "registerConsumedAPIs"
 
 // AGENTS.md tells an agent that configuration is resolved in one place and
 // refused at boot, with no exception. Prose cannot notice an exception
 // appearing underneath it, and an agent-context file is followed literally, so
 // the claim is pinned here: every environment read sits in loadConfig's call
-// tree, where validate() governs the result.
+// tree.
+//
+// Sitting there is necessary and not sufficient — loadConfig resolving a value
+// says nothing about validate() judging it, and the projection that used to be
+// read here was resolved at boot for a release while still reaching no check.
+// What validate() does with it is pinned separately, in
+// projection_boundary_test.go.
 func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 	pkg := parsePackage(t)
 	boot := pkg.reachableFrom("loadConfig")

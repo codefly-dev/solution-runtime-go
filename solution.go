@@ -269,6 +269,14 @@ type config struct {
 	// apiConsumes is the api.consumes projection Codefly injected, which the
 	// passthrough declaration is checked against before the boot listens.
 	apiConsumes string
+	// consumedAPIs is that projection decoded, and apiConsumesErr why it could
+	// not be. Decoded here, at boot, rather than where it is used: it used to
+	// be parsed only on the paths that needed it, so a solution declaring no
+	// Consumes served on with a projection nothing had ever looked at. A
+	// malformed one is now refused by validate() whatever the solution
+	// declares.
+	consumedAPIs   []manifest.ConsumedAPI
+	apiConsumesErr error
 	// mcp says the solution declared an MCP surface (ServeMCP), which is what
 	// makes the two values below load-bearing: validate() checks them only
 	// then, so a solution that serves no MCP is unaffected by a host whose
@@ -495,10 +503,27 @@ func loadConfig(ctx context.Context, id string) config {
 	// in-cluster address in a deployment, where no public client could reach
 	// it: that is what the declared configuration is for. The public MCP URL
 	// needs no declaration at all, being derived from the two values above it.
+	cfg.consumedAPIs, cfg.apiConsumesErr = parseAPIConsumes(cfg.apiConsumes)
 	cfg.mcpIssuerURL, cfg.mcpIssuerExplicit = resolveMCPIssuer(ctx, frontendURL)
 	cfg.mcpPublicURL, cfg.mcpPublicExplicit = resolveMCPPublicURL(ctx, public, id)
 	cfg.registrationInterval, cfg.registrationIntervalErr = registrationIntervalFromEnv()
 	return cfg
+}
+
+// parseAPIConsumes decodes the api.consumes projection Codefly injects.
+//
+// Whitespace alone is not a projection, and not a defect either: a render that
+// emits a bare newline for a value this solution does not set means "consumes
+// nothing", so it decodes to no entries rather than to a JSON error. Anything
+// else that will not decode is a defect in what the composition projected, and
+// the error is kept for validate() to refuse by name — the alternative, which
+// is what used to happen, is that nothing looks at it and the solution serves
+// with a federation it silently dropped.
+func parseAPIConsumes(raw string) ([]manifest.ConsumedAPI, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	return manifest.ParseConsumedAPIs(raw)
 }
 
 // selfEndpointCarrierPrefix names the carrier Codefly injects with this
@@ -720,6 +745,15 @@ func (c config) validate() error {
 	}
 	if c.registrationIntervalErr != nil {
 		return c.registrationIntervalErr
+	}
+	// Refused whether or not this solution declares a passthrough. The
+	// projection is only ever read by the code that consumes it, so before
+	// this a solution declaring no Consumes booted and served with a
+	// projection nothing had parsed — and the one place that did parse it
+	// logged a line and carried on.
+	if c.apiConsumesErr != nil {
+		return fmt.Errorf("the api.consumes projection in %s cannot be decoded: %w — it is projected by the composition (`codefly run solution`), so it is fixed there; a solution that consumes nothing leaves it unset",
+			manifest.APIConsumesEnvironmentVariable, c.apiConsumesErr)
 	}
 	if c.solutionSecret == "" {
 		// An empty secret has two causes that look identical here, and sending

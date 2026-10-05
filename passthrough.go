@@ -279,11 +279,13 @@ func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
 	if err != nil || len(s.consumed) == 0 {
 		return routes, err
 	}
-	consumed, err := manifest.ParseConsumedAPIs(s.cfg.apiConsumes)
-	if err != nil {
-		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", err)
+	// Decoded at boot (loadConfig), and validate() has already refused a
+	// malformed one by name. Still reported here rather than assumed away: a
+	// caller that builds a config itself has not been through validate().
+	if s.cfg.apiConsumesErr != nil {
+		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", s.cfg.apiConsumesErr)
 	}
-	return routes, checkConsumed(s.consumed, consumed)
+	return routes, checkConsumed(s.consumed, s.cfg.consumedAPIs)
 }
 
 // mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix,
@@ -335,6 +337,9 @@ func (s *Server) PassthroughHandler(env PassthroughEnvironment) (http.Handler, e
 		return nil, err
 	}
 	s.cfg.gatewayURL, s.cfg.apiConsumes = env.GatewayURL, string(projection)
+	// The caller handed us the decoded projection, so there is nothing to
+	// decode and nothing that could have failed to.
+	s.cfg.consumedAPIs, s.cfg.apiConsumesErr = env.Consumes, nil
 	routes, err := s.validatePassthrough()
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)

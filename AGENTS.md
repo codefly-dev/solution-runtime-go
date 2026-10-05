@@ -45,10 +45,17 @@ own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
   the boot refused with the name of something nobody could set (#48).
   There is no exception: every environment read sits in `loadConfig`'s call
   tree, and `environment_boundary_test.go` fails the suite if one appears
-  outside it. There used to be one — the consumed-API projection, read at serve
-  time and never seen by `validate()`, so a malformed one disabled the
-  federation with a log line while the solution served on — and it went with the
-  code that read it (#51).
+  outside it. There used to be one, and it went with the code that read it
+  (#51).
+- Reading a value in `loadConfig` is not the same as checking it, and the
+  difference is where a gap hides. The `api.consumes` projection was resolved
+  at boot while still being *parsed* only by the code that consumed it, so a
+  solution declaring no `Consumes` booted and served with a projection nothing
+  had ever decoded. `validate()` now decodes it whatever the solution declares
+  (`parseAPIConsumes`, `projection_boundary_test.go`). When you add
+  configuration, resolving it in `loadConfig` is half the rule — the other half
+  is a refusal in `validate()` that fires whether or not the feature using it
+  is switched on.
 - A solution registers nothing but itself. It claims no facade route for a
   module it consumes and holds no credential that would let it: the route for a
   module is claimed by the module that serves it, under a credential bound to

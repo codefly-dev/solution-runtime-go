@@ -255,12 +255,9 @@ rather than preferences:
   delivers one anyway, this runtime reads nothing from it — the carrier has no
   reader here.
 
-The reason is what such a credential decides. A route claim says where every
-authenticated request on a prefix is proxied; a solution holding one holds the
-routing of traffic that is not its own, and a claim surface that admits a
-caller attesting to something other than the module itself admits whoever
-claims the prefix first. Neither is a solution's to hold, so the capability is
-not on this runtime's surface at all. See [codefly-dev/module-saas-starter#1018](https://github.com/codefly-dev/module-saas-starter/issues/1018)
+Routing is a platform concern, not a solution's, so the capability is not on
+this runtime's surface at all — there is no narrower version of it to offer.
+See [codefly-dev/module-saas-starter#1018](https://github.com/codefly-dev/module-saas-starter/issues/1018)
 for where a module's own claim is being built, and
 [#953](https://github.com/codefly-dev/module-saas-starter/issues/953) for the
 lifecycle rework that replaces the heartbeat writer.
@@ -274,8 +271,20 @@ reported where it happens rather than papered over by claiming the prefix here.
 
 Codefly still projects the consumed targets into `CODEFLY__API_CONSUMES`, and
 the runtime still reads it — at boot, through `loadConfig`, to check the
-`Consumes` declaration against it before the listener exists. It is used for
-nothing else.
+[`Consumes`](#letting-the-page-call-a-consumed-module-the-passthrough)
+declaration against it before the listener exists. It is used for nothing else.
+
+A projection that cannot be decoded now **fails the boot**, naming
+`CODEFLY__API_CONSUMES`, whether or not the solution declares a passthrough.
+Previously it was decoded only by the code that consumed it, so a solution
+declaring no `Consumes` served on with a projection nothing had looked at, and
+one that did declare a passthrough was refused — the same broken value, two
+answers. Unset is not malformed: a solution that consumes nothing leaves the
+variable empty, and whitespace alone counts as empty, so a render emitting a
+bare newline for it does not fail a boot. Fixing a malformed one is the
+composition's job (`codefly run solution`), which is why the refusal names the
+variable it arrived in rather than a workspace-configuration group — nothing an
+operator provisions can repair it.
 
 ### Reading a Work-Context-authenticated module
 
