@@ -1489,8 +1489,26 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 		{"a renewal sealing a different build", &hostMint{incarnation: 99}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// The TTL sets the margin between the boot and the renewal, and
+			// six seconds was not a margin at all.
+			//
+			// The SDK floors the renewal lead at five seconds
+			// (minRenewalLeadTime), so a six-second credential is due for
+			// renewal ONE second after it is issued. The control call below
+			// has to land before that, and on a loaded CI runner the boot —
+			// cert generation, the TLS listener, the first mint — does not
+			// finish within a second, so the control call itself triggered the
+			// renewal, the switched issuer answered it, the process went
+			// terminal mid-request and the control saw a closed connection.
+			// It failed in CI with "the route answered 0 before any renewal"
+			// and passes six times out of six locally, which is what a margin
+			// that depends on machine speed looks like.
+			//
+			// Twelve seconds puts the renewal at ~7s and leaves the control
+			// call seven seconds of room. The wall-clock cost is the price of
+			// a test that does not depend on the boot being fast.
 			mint := newHostMint(t, &hostMint{
-				ttl:         6 * time.Second,
+				ttl:         12 * time.Second,
 				switchAfter: 1,
 				switchTo:    tc.after,
 			})
@@ -1501,7 +1519,13 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 					return map[string]string{"ok": "yes"}, nil
 				}), mint)
 
-			call := func() int {
+			// call reports the status, or 0 with the reason the request did
+			// not complete. The reason is carried rather than swallowed: this
+			// test read a bare 0 as "the listener is gone", and a 0 is also
+			// what a refused handshake, a closed connection mid-request and a
+			// not-yet-bound port look like — so the one failure this test hit
+			// in CI reported only "answered 0" and said nothing about why.
+			call := func() (int, error) {
 				request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
 				if err != nil {
 					t.Fatal(err)
@@ -1509,15 +1533,15 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 				request.Header.Set("authorization", viewerBearer())
 				resp, err := solution.client.Do(request)
 				if err != nil {
-					return 0 // the listener is gone, which is the end state
+					return 0, err
 				}
 				defer drainAndClose(resp)
-				return resp.StatusCode
+				return resp.StatusCode, nil
 			}
 
 			// The control: the first credential is sound and the route serves.
-			if got := call(); got != http.StatusOK {
-				t.Fatalf("the route answered %d before any renewal, so nothing below is about the renewal", got)
+			if got, err := call(); got != http.StatusOK {
+				t.Fatalf("the route answered %d (%v) before any renewal, so nothing below is about the renewal", got, err)
 			}
 			if !ran.Load() {
 				t.Fatal("the handler never ran on the first call")
@@ -1547,7 +1571,7 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 				// the question is whether the handler ran on the call that was
 				// refused — not whether it ran at all during the wait.
 				ran.Store(false)
-				status := call()
+				status, _ := call()
 				if status == http.StatusServiceUnavailable || status == 0 {
 					if ran.Load() {
 						t.Error("the handler ran on the refused call: the refusal has to come before anything author-written")
