@@ -45,19 +45,43 @@ rule is the gate, which is a compiler rather than a naming convention;
 `TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot` fails if an
 exported path reappears.
 
-Beside it, `TestNoExportedPathHandsOutAServableHandler` is the type-based half,
-and it has been falsified four times by a shape nobody had written down —
+Beside it, the handler-export, capability-decoder and seal-construction gates
+are **built on `go/types`**, in `typed_boundary_test.go`, and the fixtures that
+drive them are **compiled** into this package through a `packages.Load`
+overlay. Two rules follow from resolution that no list could express:
+"servable" means **implements `net/http.Handler`**, not a set of types that
+happen to; and "core's wire message" means **from core's generated package
+path**. What resolution still cannot decide is in that file: a decode
+destination whose static type is an interface (`proto.Message`, `any`) is not a
+capability by its type, which is the same residual core's own verifier has.
+
+They were syntactic until round sixteen, and that history is the reason for the
+rewrite — the old rule was falsified by a shape nobody had written down, six
+times over:
 `Routes() func(http.ResponseWriter, *http.Request)`, a named collection, an
-import-aliased `nh.Handler`, and this package's own bare `Handler`, which the
-servable set had always named and never matched because the renderer had no
-identifier case at all. A gate cannot be mutation-tested — the harness asks
-"mutate the code, does the suite fail?", and a gate only fails when the
-counterexample it exists to refuse is in the tree — so its acceptance criterion
-is a probe per shape, driving the rule itself rather than a copy of it, and the
-probes are the record of what it has been wrong about. The same applies to the
-seam's refusal: the defeat check (`recover()`, a branch that cannot be taken)
-ran only where `mustBeATest()` was called directly, so the identical defeat one
-hop away was *inherited* as a refusal and passed.
+import-aliased `nh.Handler`, this package's own bare `Handler` (which the
+servable set had always named and never matched, because the renderer had no
+identifier case at all), an unexported alias, an unexported struct field, an
+anonymous struct result, a supplied decode destination, a zero-value
+declaration, an assignment alias, a function-local alias, and `Decode` instead
+of `Unmarshal`. Every fix was correct and the next spelling arrived anyway. A
+rule that reads syntax is a rule about names, and the author picks the names —
+so the rules read types now and there is no list to extend.
+
+Worse than any single shape: two probes asserted against
+`workcontext.WorkContextV1`, which the SDK **does not export**, and because a
+probe only PARSED its fixture, a name that cannot compile supplied three rounds
+of evidence that the whole-capability rule worked. The fixtures compile now.
+
+A gate cannot be mutation-tested — the harness asks "mutate the code, does the
+suite fail?", and a gate only fails when the counterexample it exists to refuse
+is in the tree — so its acceptance criterion is the compiled fixture set,
+driving the rule itself rather than a copy of it. A copy is not evidence: the
+signing-relaxation test checked its own copy of the condition and survived the
+real condition being removed. The same applies to the seam's refusal: the
+defeat check (`recover()`, a branch that cannot be taken) ran only where
+`mustBeATest()` was called directly, so the identical defeat one hop away was
+*inherited* as a refusal and passed.
 
 `passthroughtest` is itself importable by any module, so that rule alone did not
 close this: `passthroughtest.Handler` was an exported, production-importable
@@ -96,16 +120,20 @@ embedding it.
   core's needs the issuer's live revision, replay, grant and seal sources, which
   a solution does not have. `work_context_boundary_test.go` fails on a signing
   primitive, on a `WorkContext`-named declaration of this package's own, on a
-  call to a verifier, on an import of core's generated wire types, and on
-  **constructing** one of core's capability messages — the escape the other
-  four do not close, because `proto.Unmarshal(raw, &workcontext.SealedValues{})`
-  needs no generated import, no signer and no verifier: `SealedValues` is a
-  type *alias* for core's `WorkSealV1`, so the one SDK import this package
-  already has is enough to allocate one and decode into it. The rule is on
-  construction rather than on the name, because the name appears legitimately —
-  `holdSealedIdentity` takes a `*SealedValues` and reads it through
-  `GetInstallationId`; decoding into one requires allocating it and reading one
-  never does. This is not a style rule: a second signed encoding grew
+  call to a verifier and on an import of core's generated wire types — the
+  syntactic half. `typed_boundary_test.go` fails on **constructing** one of
+  core's wire messages and on **decoding into** one, by RESOLVED TYPE: that is
+  the escape the import and verifier rules cannot close, because
+  `proto.Unmarshal(raw, &workcontext.SealedValues{})` needs no generated
+  import, no signer and no verifier — `SealedValues` is a type *alias* for
+  core's `WorkSealV1`, so the one SDK import this package already has is enough
+  to allocate one and decode into it. The rule is on allocation and on decode
+  DESTINATIONS rather than on the type appearing, because the type appears
+  legitimately: `holdSealedIdentity` takes a `*SealedValues` and reads it
+  through `GetInstallationId`. It keys on core's generated PACKAGE PATH rather
+  than a set of message names, so an alias — the SDK's `Claims`, a
+  function-local one, anything — resolves to the same type and a message core
+  adds is covered the day it exists. This is not a style rule: a second signed encoding grew
   inside an SDK beside core's once, with its own payload struct, signer,
   verifier and error taxonomy, and 3,532 lines had to be deleted to get back to
   one. Every step of that was locally reasonable.
