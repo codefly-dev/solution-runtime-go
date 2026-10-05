@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -978,30 +979,61 @@ func TestTheBootedListenerDropsACallerItNoLongerAdmits(t *testing.T) {
 	solution := boot(t, New(Manifest{ID: testSolutionID}).
 		Handle("/thing", func(context.Context, *Gateway) (any, error) { return map[string]string{"ok": "yes"}, nil }), mint)
 
-	call := func() error {
+	// AUTHORIZED, STATUS-CHECKED, DRAINED, AND ON ONE CONNECTION.
+	//
+	// This sent no bearer, ignored the status, closed the body without
+	// draining it and never looked at reuse — so "an admitted caller is
+	// served" was really "the request did not error", which a 401 satisfies,
+	// and an undrained body means the connection goes back to nobody rather
+	// than to the pool. The claim this control makes is that a handler ran
+	// over an existing BUSY connection, and none of those three omissions let
+	// it make that claim.
+	var reused atomic.Int64
+	call := func() (int, error) {
 		request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
 		if err != nil {
-			return err
+			return 0, err
 		}
+		request.Header.Set("authorization", viewerBearer())
+		request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if info.Reused {
+					reused.Add(1)
+				}
+			},
+		}))
 		resp, err := solution.client.Do(request)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		_ = resp.Body.Close()
-		return nil
+		status := resp.StatusCode
+		drainAndClose(resp)
+		return status, nil
 	}
 
-	// The control: an admitted caller is served, and stays served on one busy
-	// connection across more than a recheck interval.
-	if err := call(); err != nil {
+	// The control: an admitted caller is SERVED — 200, body drained — and
+	// stays served on one busy connection across more than a recheck interval.
+	if status, err := call(); err != nil {
 		t.Fatalf("an admitted caller was refused: %v", err)
+	} else if status != http.StatusOK {
+		t.Fatalf("an admitted caller got %d, want 200: a refusal satisfies 'did not error', so without this the control proves nothing about the handler running", status)
 	}
 	quiet := time.Now().Add(2 * inboundTrustRecheckInterval)
 	for time.Now().Before(quiet) {
-		if err := call(); err != nil {
+		status, err := call()
+		if err != nil {
 			t.Fatalf("a request failed while this caller was still admitted, so nothing below is about admission: %v", err)
 		}
+		if status != http.StatusOK {
+			t.Fatalf("a request answered %d while this caller was still admitted", status)
+		}
 		time.Sleep(inboundTrustRecheckInterval / 10)
+	}
+	// ON ONE CONNECTION. The claim is that a handler ran over an existing BUSY
+	// connection — not that a fresh connection was made each time, which no
+	// per-connection recheck would need to notice.
+	if reused.Load() == 0 {
+		t.Fatal("not one request reused a connection, so this test never exercised an ESTABLISHED connection: a per-dial check alone would satisfy everything below")
 	}
 
 	// The platform removes this caller from the provisioned file. Nothing
@@ -1014,7 +1046,7 @@ func TestTheBootedListenerDropsACallerItNoLongerAdmits(t *testing.T) {
 
 	deadline := time.Now().Add(5 * inboundTrustRecheckInterval)
 	for {
-		if err := call(); err != nil {
+		if _, err := call(); err != nil {
 			return // the connection stopped being served, which is the point
 		}
 		if time.Now().After(deadline) {

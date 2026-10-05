@@ -931,6 +931,50 @@ func usablePublishedURL(name, value, fixWith string, deployed bool) error {
 	return nil
 }
 
+// namedInJSON decodes one JSON document and reports the first string value or
+// key inside it that names something the given test matches.
+//
+// Decoded rather than textual, because JSON escaping means the serialized form
+// and the form a client reads are not the same string: `https:\/\/host` and
+// `https://host` are one value with two spellings, and a search over the bytes
+// sees only the one it was given. A document this runtime cannot decode is
+// reported as offending for the same reason an unmarshalable value is — it
+// cannot be cleared if it cannot be read.
+func namedInJSON(document []byte, named func(string) (string, bool)) (string, bool) {
+	var decoded any
+	if err := json.Unmarshal(document, &decoded); err != nil {
+		return "undecodable structured content: " + err.Error(), true
+	}
+	var walk func(any) (string, bool)
+	walk = func(value any) (string, bool) {
+		switch typed := value.(type) {
+		case string:
+			if _, found := named(typed); found {
+				return typed, true
+			}
+		case []any:
+			for _, item := range typed {
+				if offending, found := walk(item); found {
+					return offending, true
+				}
+			}
+		case map[string]any:
+			for key, item := range typed {
+				// The KEY as well: a map keyed by the address discloses it
+				// just as a value does.
+				if _, found := named(key); found {
+					return key, true
+				}
+				if offending, found := walk(item); found {
+					return offending, true
+				}
+			}
+		}
+		return "", false
+	}
+	return walk(decoded)
+}
+
 // withoutRuntimeAddresses replaces an error result that names an address this
 // runtime dialled.
 //
@@ -989,8 +1033,17 @@ func (s *Server) withoutRuntimeAddresses(result mcp.Result, method string) mcp.R
 		if err != nil {
 			return replaced("structured content", "unreadable structured content: "+err.Error())
 		}
-		if _, found := named(string(rendered)); found {
-			return replaced("structured content", string(rendered))
+		// The DECODED strings, not the serialization.
+		//
+		// This searched the marshalled bytes for the configured URL, and JSON
+		// has more than one spelling for the same string: a
+		// json.RawMessage holding {"error":"https:\/\/mint…"} keeps those
+		// escapes through Marshal, the search for "https://mint…" misses, and
+		// the client decodes the address back out. So the bytes are decoded
+		// and every string inside them is checked — which is the
+		// representation the client actually sees.
+		if offending, found := namedInJSON(rendered, named); found {
+			return replaced("structured content", offending)
 		}
 	}
 	return result

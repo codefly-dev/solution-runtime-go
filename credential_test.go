@@ -2673,3 +2673,71 @@ func TestEachSealedFieldIsComparedOnItsOwn(t *testing.T) {
 		}
 	})
 }
+
+// TestTheCredentialBackoffGrowsAndBreaksPhase is round sixteen's second major.
+//
+// The quiet period after a failed acquisition was a flat second, reset to the
+// same value every time. Under sustained traffic against a fast-failing issuer
+// that is one audited mint attempt per replica per second for the length of the
+// outage — and every replica on the same period, so they arrive together.
+// Single-flight bounds how many asks one replica makes at once; it says
+// nothing about the rate, and nothing about the fleet.
+func TestTheCredentialBackoffGrowsAndBreaksPhase(t *testing.T) {
+	// It grows, and it is capped.
+	previous := time.Duration(0)
+	for failures := 1; failures <= 12; failures++ {
+		quiet := credentialAskQuiet(failures)
+		if quiet <= 0 {
+			t.Fatalf("after %d failures the quiet period is %s, which asks again immediately", failures, quiet)
+		}
+		if quiet > credentialAskBackoffCeiling {
+			t.Errorf("after %d failures the quiet period is %s, past the %s ceiling: a backoff longer than a renewal lead would stop a held credential renewing on its own schedule",
+				failures, quiet, credentialAskBackoffCeiling)
+		}
+		if failures <= 5 && failures > 1 && quiet <= previous {
+			t.Errorf("the quiet period did not grow between %d and %d failures (%s then %s): a flat period is one attempt per replica per interval for as long as the outage lasts",
+				failures-1, failures, previous, quiet)
+		}
+		previous = quiet
+	}
+	// The ceiling is reached and held.
+	if got := credentialAskQuiet(20); got > credentialAskBackoffCeiling || got < credentialAskBackoffCeiling/2 {
+		t.Errorf("after 20 failures the quiet period is %s, want it pinned near the %s ceiling", got, credentialAskBackoffCeiling)
+	}
+	// And it is jittered, so replicas that failed together stop being in
+	// phase. Without jitter every one of these is identical.
+	seen := map[time.Duration]bool{}
+	for range 40 {
+		seen[credentialAskQuiet(8)] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("40 backoffs at the same failure count produced %d distinct value(s): un-jittered, every replica retries on the same tick and an issuer outage becomes an issuer stampede", len(seen))
+	}
+	// The jitter only ever shortens, so the ceiling is a real ceiling.
+	for quiet := range seen {
+		if quiet > credentialAskBackoffCeiling {
+			t.Errorf("jitter produced %s, past the %s ceiling", quiet, credentialAskBackoffCeiling)
+		}
+	}
+}
+
+// TestASuccessfulAcquisitionResetsTheBackoff: an outage that ends must not
+// leave the next failure starting from the ceiling.
+func TestASuccessfulAcquisitionResetsTheBackoff(t *testing.T) {
+	server := New(Manifest{ID: testSolutionID})
+	server.credentialAskFailures = 7
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	server.credential = mintClientFor(t, mint, tokenFile)
+
+	if _, err := server.acquireCredential(context.Background()); err != nil {
+		t.Fatalf("the acquisition failed, so this says nothing about the reset: %v", err)
+	}
+	if got := server.credentialAskFailures; got != 0 {
+		t.Errorf("after a successful acquisition the failure count is %d, want 0: an issuer that recovers and fails again would start from the ceiling rather than from a second", got)
+	}
+	if !server.credentialQuietUntil.IsZero() {
+		t.Errorf("a successful acquisition left a quiet period until %s, so the next ask is held off for no reason", server.credentialQuietUntil)
+	}
+}

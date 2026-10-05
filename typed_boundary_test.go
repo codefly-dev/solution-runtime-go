@@ -403,6 +403,34 @@ func inspectForCapabilities(decl ast.Node, where string, info *types.Info, repor
 				}
 				return true
 			}
+			// HANDING A CAPABILITY TO SOMETHING THAT TAKES IT AS AN OPAQUE
+			// MESSAGE is handing it to a codec, and that is decided by the
+			// callee's SIGNATURE rather than its name.
+			//
+			// The name check below needs a selector, so a decoder reached
+			// through a function variable — `decode := proto.Unmarshal;
+			// decode(raw, dst)` — escaped it. This rule needs no spelling at
+			// all: it asks what the parameter's type is.
+			// `proto.Unmarshal(b []byte, m proto.Message)` takes the
+			// capability as an INTERFACE; `holdSealedIdentity(seal
+			// *workcontext.SealedValues)` takes it concretely and is the
+			// supported way to read one, so it is not flagged.
+			if signature, ok := types.Unalias(info.TypeOf(typed.Fun)).(*types.Signature); ok {
+				for i, arg := range typed.Args {
+					path := coreWireType(derefOnce(info.TypeOf(arg)))
+					if path == "" {
+						continue
+					}
+					parameter := parameterAt(signature, i)
+					if parameter == nil {
+						continue
+					}
+					if _, opaque := types.Unalias(parameter).Underlying().(*types.Interface); opaque {
+						report("%s hands a %s to something that takes it as an opaque message (parameter %d is an interface): that is a codec, whatever the call is spelled like. Read the seal through Credential.Seal().",
+							where, path, i)
+					}
+				}
+			}
 			selector, ok := typed.Fun.(*ast.SelectorExpr)
 			if !ok {
 				return true
@@ -605,6 +633,26 @@ func fixtureAccessorOnly(seal *wc.SealedValues) string { return seal.GetInstalla
 	}
 }
 
+// parameterAt is the type of the parameter one argument lands on, accounting
+// for a variadic tail.
+func parameterAt(signature *types.Signature, i int) types.Type {
+	params := signature.Params()
+	if i < params.Len() {
+		if signature.Variadic() && i == params.Len()-1 {
+			if slice, ok := params.At(i).Type().(*types.Slice); ok {
+				return slice.Elem()
+			}
+		}
+		return params.At(i).Type()
+	}
+	if signature.Variadic() && params.Len() > 0 {
+		if slice, ok := params.At(params.Len() - 1).Type().(*types.Slice); ok {
+			return slice.Elem()
+		}
+	}
+	return nil
+}
+
 // gateFindings loads this package with one extra COMPILED file and returns
 // whatever the given rule reports about it.
 func gateFindings(t *testing.T, path, source string, rule func(*testing.T, *packages.Package) []string) string {
@@ -673,5 +721,62 @@ func fixtureNonexistent() *wc.WorkContextV1 { return nil }
 	<-done
 	if !refused.Failed() {
 		t.Error("gatePackages accepted a package that does not type-check, so a non-compiling fixture could still supply findings")
+	}
+}
+
+// TestTheTypedDecodeGateNeedsNoSpelling pins the shapes round sixteen named,
+// where the destination or the callee is written in a way no name-matching
+// rule follows.
+//
+// Each of these was reported as an escape of the syntactic rule, and each is
+// one case here rather than a branch: a parenthesized destination and a call
+// inside a function literal are resolved by `info.TypeOf`, and a decoder
+// reached through a function VARIABLE is caught by the callee's signature —
+// it takes the capability as an opaque interface, which is what a codec does.
+func TestTheTypedDecodeGateNeedsNoSpelling(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_typed_spelling_fixture.go")
+	source := `package solution
+
+import (
+	"google.golang.org/protobuf/proto"
+	wc "github.com/codefly-dev/sdk-go/workcontext"
+)
+
+// A parenthesized destination.
+func fixtureParenthesized(raw []byte, dst *wc.SealedValues) error {
+	return proto.Unmarshal(raw, (dst))
+}
+
+// The decoder reached through a function VARIABLE, so there is no selector to
+// match and no name to read.
+func fixtureThroughAVariable(raw []byte, dst *wc.SealedValues) error {
+	decode := proto.Unmarshal
+	return decode(raw, dst)
+}
+
+// Inside a function literal, with its own binding.
+func fixtureInsideAClosure(raw []byte) func() error {
+	return func() error {
+		var dst wc.SealedValues
+		return proto.Unmarshal(raw, &dst)
+	}
+}
+
+// The supported read, which must stay unflagged: a concrete parameter, not an
+// opaque one.
+func fixtureSpellingAccessor(seal *wc.SealedValues) string { return seal.GetImageDigest() }
+`
+	found := gateFindings(t, fixture, source, reportCapabilityShapes)
+	for _, want := range []string{"fixtureParenthesized", "fixtureThroughAVariable", "fixtureInsideAClosure"} {
+		if !strings.Contains(found, want) {
+			t.Errorf("the capability gate did not flag %s, so that spelling still escapes:\n%s", want, found)
+		}
+	}
+	if strings.Contains(found, "fixtureSpellingAccessor") {
+		t.Errorf("the capability gate flagged a read through the SDK's accessors, which takes the seal as a CONCRETE parameter and is the one supported way to read one:\n%s", found)
 	}
 }

@@ -372,8 +372,14 @@ func TestANilPerConnectionAnswerCannotDropTheTrustAnchor(t *testing.T) {
 		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
+	// THIS FIXTURE MUST BOOT. The early return here read "refused at boot is
+	// also fail-closed" and let ANY boot error pass the test — which is how
+	// the missing PeerAnchor made every assertion below unreachable for
+	// several rounds. That fixture defect is fixed; this closes the door it
+	// came through, so an unrelated boot regression fails here instead of
+	// quietly passing.
 	if err != nil {
-		return // refused at boot is also fail-closed
+		t.Fatalf("this source boots: it implements PeerAnchorSource and carries a usable anchor, so a refusal here means something unrelated broke and every assertion below would otherwise be skipped: %v", err)
 	}
 	outcome := servedTo(t, config, caller, "")
 	if !outcome.refused() {

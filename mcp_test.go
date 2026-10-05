@@ -1742,6 +1742,50 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		}
 	})
 
+	t.Run("the address is JSON-escaped, which is the same string to a client", func(t *testing.T) {
+		// Round sixteen's escape: json.RawMessage keeps `https:\/\/host`
+		// through Marshal, so a search over the serialized bytes for
+		// "https://host" misses — and the client decodes the address straight
+		// back out. The decoded strings are what get checked now.
+		escaped := json.RawMessage(`{"error":"https:\/\/mint.internal.test\/platform\/_credential failed"}`)
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError:           true,
+			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
+			StructuredContent: escaped,
+		}, "tools/call")
+		call, ok := result.(*mcp.CallToolResult)
+		if !ok {
+			t.Fatalf("the filter returned %T", result)
+		}
+		if call.StructuredContent != nil {
+			t.Errorf("the escaped address survived the filter: %v", call.StructuredContent)
+		}
+		// And what a client would actually read must not contain it either.
+		rendered, err := json.Marshal(call)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var asAClientSeesIt any
+		if err := json.Unmarshal(rendered, &asAClientSeesIt); err != nil {
+			t.Fatal(err)
+		}
+		again, _ := json.Marshal(asAClientSeesIt)
+		if strings.Contains(string(again), "mint.internal.test") {
+			t.Errorf("a client decoding this result reads the mint's address: %s", again)
+		}
+	})
+
+	t.Run("an address used as a structured KEY is caught too", func(t *testing.T) {
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError:           true,
+			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
+			StructuredContent: map[string]any{"https://mint.internal.test/platform/_credential": "refused"},
+		}, "tools/call")
+		if call, ok := result.(*mcp.CallToolResult); !ok || call.StructuredContent != nil {
+			t.Errorf("an address in a structured KEY survived the filter: %+v", result)
+		}
+	})
+
 	t.Run("structured content this runtime cannot read is replaced", func(t *testing.T) {
 		// It cannot be cleared if it cannot be read, and the SDK is about to
 		// serialize it either way.

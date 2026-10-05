@@ -318,9 +318,11 @@ embedding it.
   `actingForAViewer`: a method the MCP SDK adds is gated by default, because a
   denylist over a set this package does not own is the mistake the TLS posture
   made three times. The refusal carries the sanitized sentence, never the
-  source's error — an MCP client is a viewer's channel like a browser is. The
-  SDK's wire-error type is internal, so the call fails as a protocol error
-  without a specific JSON-RPC code.
+  source's error — an MCP client is a viewer's channel like a browser is. It
+  carries a JSON-RPC code, `-32001`: this file said the SDK's wire-error type
+  was internal and that no code could be set, which was false —
+  `jsonrpc.Error` is an exported alias for it, mutant `R10-8` holds the code,
+  and the claim survived here for two rounds after the code landed.
 - **What a composition supplies is declared configuration, and a published URL
   is held to what a dialled one is.** A Codefly render cannot set a bare
   environment variable on a service, so anything the composition owns is a

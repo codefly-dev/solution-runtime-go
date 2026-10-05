@@ -440,8 +440,13 @@ which establishes the principal, the installation and the build from that token
 and its own records, never from anything this process reports — answers with a
 credential sealed to this build incarnation and this installation.
 
-The runtime holds no mint of its own and runs no timer that is not the
-credential's own expiry. Every use goes through the client, which hands back the
+The runtime holds no mint of its own, and it runs **no registration
+heartbeat** — which is the claim this cutover is about. It does run other
+timers, and saying otherwise here was wrong twice: the inbound and outbound
+trust watchers re-verify an established peer once a second, the credential
+acquisition holds off after a failure (capped, jittered), and the listener has
+idle and header bounds. None of them tells the host this process exists, which
+is the property; "no timers at all" was never it. Every use goes through the client, which hands back the
 credential it holds while that one is current and renews it once it has entered
 its renewal lead, re-reading the rotated projection and rechecking the frozen
 authority values first. A process that runs for a week under credentials the
@@ -1144,7 +1149,7 @@ func askWiki(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallTo
     if err != nil {
         return nil, askOut{}, err
     }
-    robin, err := gw.ForModule(ctx, "robin", solution.Scope{ResourceKind: "conversations", Actions: []string{"create"}})
+    notes, err := gw.ForModule(ctx, "notes", solution.Scope{ResourceKind: "conversations", Actions: []string{"create"}})
     if err != nil {
         return nil, askOut{}, err
     }

@@ -49,6 +49,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -324,6 +325,9 @@ type Server struct {
 	credentialAskErr     error
 	credentialHeld       workcontext.Credential
 	credentialQuietUntil time.Time
+	// credentialAskFailures counts consecutive failed acquisitions, which is
+	// what the backoff grows on and a success resets.
+	credentialAskFailures int
 	// boundListener is a listener this process was handed instead of binding
 	// one itself. Nil in every deployment: the port comes from the SDK and
 	// listen() binds it.
@@ -1867,10 +1871,12 @@ func (s *Server) resolveCredential(ctx context.Context, flight *credentialFlight
 	s.credentialMu.Lock()
 	s.credentialAskErr = err
 	if err != nil {
-		s.credentialQuietUntil = time.Now().Add(credentialAskBackoff)
+		s.credentialAskFailures++
+		s.credentialQuietUntil = time.Now().Add(credentialAskQuiet(s.credentialAskFailures))
 	} else {
 		s.credentialHeld = credential
 		s.credentialQuietUntil = time.Time{}
+		s.credentialAskFailures = 0
 	}
 	s.credentialAsk = nil
 	s.credentialMu.Unlock()
@@ -1884,12 +1890,54 @@ type credentialFlight struct {
 	err        error
 }
 
-// credentialAskBackoff is how long a failed ask quiets the next one.
+// credentialAskBackoff is the FIRST quiet period after a failed ask, and
+// credentialAskBackoffCeiling is the longest one.
 //
-// Shorter than any renewal lead, so the renewal a credential's own expiry
-// dictates still happens on time; long enough that a stream of viewer requests
-// against an unavailable issuer is one ask rather than one per request.
-const credentialAskBackoff = time.Second
+// Shorter than any renewal lead at the start, so the renewal a credential's
+// own expiry dictates still happens on time; long enough that a stream of
+// viewer requests against an unavailable issuer is one ask rather than one per
+// request.
+const (
+	credentialAskBackoff        = time.Second
+	credentialAskBackoffCeiling = 30 * time.Second
+	credentialAskBackoffJitter  = 0.2
+)
+
+// credentialAskQuiet is how long the next ask is held off after `failures`
+// consecutive failures: doubling, capped, with jitter.
+//
+// It was a FLAT one second, reset to the same value after every failure. Under
+// sustained traffic against a fast-failing issuer that is one audited mint
+// attempt per replica per second for as long as the outage lasts, and every
+// replica on the same period — so they arrive together, which is the shape
+// that turns an issuer outage into an issuer stampede. Single-flight bounds
+// how many asks one replica makes at once; it does nothing about the rate, and
+// nothing about the fleet.
+//
+// Capped at 30s, which is under every renewal lead this runtime can see, so a
+// credential still renews on its own schedule once the issuer answers again. A
+// credential already in hand and unexpired keeps serving throughout, which is
+// why waiting longer costs nothing a viewer can see.
+//
+// Jitter is multiplicative and one-sided-down, so a backoff never exceeds the
+// ceiling and replicas that started together stop being in phase.
+func credentialAskQuiet(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	quiet := credentialAskBackoff
+	for range failures - 1 {
+		quiet *= 2
+		if quiet >= credentialAskBackoffCeiling {
+			quiet = credentialAskBackoffCeiling
+			break
+		}
+	}
+	// Deterministic enough to reason about, random enough to break phase:
+	// subtract up to 20%.
+	spread := 1 - credentialAskBackoffJitter*rand.Float64()
+	return time.Duration(float64(quiet) * spread)
+}
 
 // usableCredential refuses a credential that authorises nothing.
 //
@@ -3579,7 +3627,7 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, t.acting.surfaced(err)
 	}
 	resp, err := t.base.RoundTrip(r)
-	if err == nil && supersededCapability(resp) {
+	if err == nil && supersededCapability(resp, token) {
 		// The far end says the capability it was shown is sealed to state that
 		// has moved. Dropping it here is what makes the next call mint instead
 		// of presenting the same one until its clock ran out: a capability the
@@ -3599,9 +3647,42 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 // is what the issuer answers for a revision that has moved — distinct from the
 // 401 of a capability that never verified and the 403 of authority the viewer
 // does not hold, neither of which another mint would fix.
-func supersededCapability(resp *http.Response) bool {
-	return resp.StatusCode == http.StatusConflict &&
-		resp.Header.Get(workcontext.InstallationIDHeaderName) != ""
+func supersededCapability(resp *http.Response, presented string) bool {
+	if resp.StatusCode != http.StatusConflict {
+		return false
+	}
+	// The installation the far end names has to be the one the capability we
+	// PRESENTED is sealed to.
+	//
+	// This accepted any 409 carrying a non-empty installation header, and a
+	// 409 is an ordinary business answer — a duplicate, a lost update, a
+	// version conflict. A module answering one with installation metadata
+	// beside it therefore evicted a perfectly valid cached capability, and the
+	// next call minted again: needless mints and needless audit traffic, on a
+	// path whose whole purpose is one mint per execution. Worse, it is
+	// indistinguishable from the case this is for.
+	//
+	// So the header is matched against the seal of the capability that was
+	// actually shown. A conflict about some other installation says nothing
+	// about this one, and a conflict naming no installation says nothing at
+	// all.
+	named := resp.Header.Get(workcontext.InstallationIDHeaderName)
+	if named == "" {
+		return false
+	}
+	// Through the SDK's own accessor, not a parser of this package's own:
+	// SealedInstallation is to a capability what Credential.Seal() is to a
+	// credential, and the one-implementation rule is about writing a second
+	// reader, not about asking the SDK.
+	sealed, _, err := workcontext.SealedInstallation(presented)
+	if err != nil || sealed == "" {
+		// Nothing to compare against: refuse to infer. A capability whose own
+		// installation this runtime cannot read is not one it can conclude has
+		// been superseded, and guessing here is what makes an ordinary
+		// conflict a re-mint.
+		return false
+	}
+	return named == sealed
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
