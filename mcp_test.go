@@ -1737,8 +1737,29 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 			Content:           []mcp.Content{&mcp.TextContent{Text: "the wiki rejected that page title"}},
 			StructuredContent: map[string]any{"error": "title must not be empty", "field": "title"},
 		}
-		if got := server.withoutRuntimeAddresses(own, "tools/call"); got != mcp.Result(own) {
-			t.Errorf("a tool's own structured refusal was replaced: %+v", got)
+		// The CONTENT survives, which is what "left alone" means. Pointer
+		// identity used to stand in for it and no longer can: the filter
+		// returns the bytes it checked, so what a client reads is exactly
+		// what was inspected rather than a re-serialization of a value this
+		// runtime does not own.
+		got, ok := server.withoutRuntimeAddresses(own, "tools/call").(*mcp.CallToolResult)
+		if !ok {
+			t.Fatalf("the filter returned %T", got)
+		}
+		if !got.IsError || len(got.Content) != 1 {
+			t.Fatalf("the filter reshaped a tool's own refusal: %+v", got)
+		}
+		if text, isText := got.Content[0].(*mcp.TextContent); !isText || text.Text != "the wiki rejected that page title" {
+			t.Errorf("the filter replaced a tool's own message: %+v", got.Content[0])
+		}
+		rendered, err := json.Marshal(got.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"title must not be empty", "title"} {
+			if !strings.Contains(string(rendered), want) {
+				t.Errorf("a tool's own structured refusal lost %q: %s", want, rendered)
+			}
 		}
 	})
 
@@ -1786,6 +1807,32 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		}
 	})
 
+	t.Run("a marshaler that answers differently the second time cannot disclose", func(t *testing.T) {
+		// The confirming round's finding: the filter inspected ONE
+		// serialization and returned the original object, which the SDK then
+		// serialized again. A MarshalJSON that answers `{}` first and the
+		// mint's address afterwards passed the check and disclosed on the
+		// second call. No concurrency needed — marshalling is not a pure
+		// function of a value this runtime did not write.
+		shifty := &shiftingMarshaler{later: `{"error":"https://mint.internal.test/platform/_credential"}`}
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError:           true,
+			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
+			StructuredContent: shifty,
+		}, "tools/call")
+		// What a client reads is the SDK's serialization of what came back.
+		published, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(published), "mint.internal.test") {
+			t.Errorf("the published result names the mint's address, which the filter had approved on an earlier serialization: %s", published)
+		}
+		if shifty.calls > 1 {
+			t.Errorf("the value was marshalled %d times, so the bytes that were checked are not the bytes that were published", shifty.calls)
+		}
+	})
+
 	t.Run("structured content this runtime cannot read is replaced", func(t *testing.T) {
 		// It cannot be cleared if it cannot be read, and the SDK is about to
 		// serialize it either way.
@@ -1799,4 +1846,19 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 			t.Errorf("unreadable structured content survived the filter: %+v", result)
 		}
 	})
+}
+
+// shiftingMarshaler answers `{}` the first time and something else after, which
+// is the shape that defeats checking one serialization and publishing another.
+type shiftingMarshaler struct {
+	calls int
+	later string
+}
+
+func (s *shiftingMarshaler) MarshalJSON() ([]byte, error) {
+	s.calls++
+	if s.calls == 1 {
+		return []byte(`{}`), nil
+	}
+	return []byte(s.later), nil
 }

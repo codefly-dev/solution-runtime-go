@@ -74,6 +74,17 @@ func gatePackages(t *testing.T, overlay map[string][]byte) []*packages.Package {
 	return loaded
 }
 
+// resolved reports whether a type is a real one. go/types gives the INVALID
+// type for an expression it could not resolve, and types.Implements says an
+// invalid type implements anything.
+func resolved(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	basic, ok := types.Unalias(t).(*types.Basic)
+	return !ok || basic.Kind() != types.Invalid
+}
+
 // namedPath is "<import path>.<Name>" for a named type, after resolving
 // aliases. Empty for anything unnamed.
 func namedPath(t types.Type) string {
@@ -103,7 +114,10 @@ func coreWireType(t types.Type) string {
 // mountableHandlerType reports whether a caller holding this type can serve it
 // as-is.
 func (g typedGate) mountableHandlerType(t types.Type) bool {
-	if t == nil {
+	if !resolved(t) {
+		// An unresolved expression — a package name, a callee identifier —
+		// has the invalid type, and types.Implements answers TRUE for it.
+		// Without this guard every exported function "held a handler".
 		return false
 	}
 	// IMPLEMENTS http.Handler — the actual definition of servable, rather than
@@ -184,11 +198,31 @@ func declaredHandlerType(t types.Type) bool {
 	return false
 }
 
+// derefOnce strips ONE pointer, for a parameter like *http.Request where the
+// level matters.
 func derefOnce(t types.Type) types.Type {
 	if pointer, ok := types.Unalias(t).(*types.Pointer); ok {
 		return pointer.Elem()
 	}
 	return t
+}
+
+// deref strips EVERY pointer.
+//
+// The decode rule used derefOnce, so a destination of type **SealedValues —
+// which is what `dst := alloc[wc.SealedValues](); decode(raw, &dst)` produces
+// — still had a pointer on it when coreWireType asked for its name, and a
+// named type behind two pointers has no name at one. Indirection is not a
+// shape to enumerate: whatever a value points at, through however many levels,
+// is what a decoder writes into.
+func deref(t types.Type) types.Type {
+	for {
+		pointer, ok := types.Unalias(t).(*types.Pointer)
+		if !ok {
+			return t
+		}
+		t = pointer.Elem()
+	}
 }
 
 // exposesMountableHandler reports whether a caller holding this type can reach
@@ -235,6 +269,15 @@ func (g typedGate) exposesMountableHandler(t types.Type, seen map[types.Type]boo
 		}
 	}
 	switch under := types.Unalias(t).Underlying().(type) {
+	case *types.Signature:
+		// A CALLABLE that hands one back. `func() http.Handler` in a field or
+		// a result is a handler one call away, and the walk had no signature
+		// case at all.
+		for i := range under.Results().Len() {
+			if g.exposesMountableHandler(under.Results().At(i).Type(), seen, depth+1) {
+				return true
+			}
+		}
 	case *types.Pointer:
 		return g.exposesMountableHandler(under.Elem(), seen, depth+1)
 	case *types.Slice:
@@ -305,6 +348,47 @@ func reportHandlerShapes(_ *testing.T, pkg *packages.Package) []string {
 			}
 		}
 	}
+	// A HANDLER FLOWING INTO AN OPAQUE RESULT.
+	//
+	// `func (s *Server) Routes() struct{ H any } { return struct{ H any }{H:
+	// s.wrapRequest(…)} }` cannot be decided from the result type: `any`
+	// carries no handler statically, and refusing every interface-typed field
+	// would refuse Operation.Request and Operation.Response, which are `any`
+	// by design and hold a consumer's message rather than anything built here.
+	//
+	// So the VALUE is followed instead of the declaration. If an exported
+	// function's results contain an interface anywhere — the point at which
+	// the type system stops being able to answer — and its body has a value in
+	// hand whose type IS mountable, then this function demonstrably builds a
+	// handler and hands it out through a hole static types cannot see into.
+	// That is the fail-closed direction, and it is narrow: a function whose
+	// results are all concrete is judged by the walk, and a function that
+	// builds no handler is not judged at all.
+	for _, file := range pkg.Syntax {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || !fn.Name.IsExported() || fn.Type.Results == nil {
+				continue
+			}
+			if !resultsHoldAnInterface(gateFor(pkg), pkg.TypesInfo, fn.Type.Results) {
+				continue
+			}
+			g := gateFor(pkg)
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				expr, ok := node.(ast.Expr)
+				if !ok {
+					return true
+				}
+				held := pkg.TypesInfo.TypeOf(expr)
+				if held == nil || !g.mountableHandlerType(held) {
+					return true
+				}
+				report("%s exports %s, whose results carry an interface and whose body holds a %s: a handler built here is handed out through a field or result no static type can see into, and a caller asserts it back out. Let Serve mount it.",
+					pkg.PkgPath, fn.Name.Name, types.TypeString(held, nil))
+				return false
+			})
+		}
+	}
 	scope := pkg.Types.Scope()
 	for _, name := range scope.Names() {
 		object := scope.Lookup(name)
@@ -332,6 +416,54 @@ func reportHandlerShapes(_ *testing.T, pkg *packages.Package) []string {
 		}
 	}
 	return findings
+}
+
+// resultsHoldAnInterface reports whether a result list contains an interface
+// anywhere inside it — directly, or in a field of a struct it returns.
+//
+// This is the point where the type system stops being able to say what a value
+// carries, which is why it is the point where the rule stops trusting types
+// and starts looking at what the function actually built.
+func resultsHoldAnInterface(g typedGate, info *types.Info, results *ast.FieldList) bool {
+	var opaque func(types.Type, int) bool
+	opaque = func(t types.Type, depth int) bool {
+		if !resolved(t) || depth > 6 {
+			return false
+		}
+		switch under := types.Unalias(t).Underlying().(type) {
+		case *types.Interface:
+			// Only an interface a HANDLER COULD BE STORED IN. `any` can hold
+			// one; `error` cannot, and treating every interface as opaque made
+			// every function returning an error qualify — which is all of
+			// them. Asking whether http.Handler implements the interface is
+			// the type-driven form of "could a handler hide here".
+			return g.handler != nil && types.Implements(g.handler, under)
+		case *types.Pointer:
+			return opaque(under.Elem(), depth+1)
+		case *types.Slice:
+			return opaque(under.Elem(), depth+1)
+		case *types.Array:
+			return opaque(under.Elem(), depth+1)
+		case *types.Map:
+			return opaque(under.Elem(), depth+1)
+		case *types.Chan:
+			return opaque(under.Elem(), depth+1)
+		case *types.Struct:
+			for i := range under.NumFields() {
+				field := under.Field(i)
+				if (field.Exported() || field.Embedded()) && opaque(field.Type(), depth+1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, result := range results.List {
+		if opaque(info.TypeOf(result.Type), 0) {
+			return true
+		}
+	}
+	return false
 }
 
 func isEmptyInterface(t types.Type) bool {
@@ -362,6 +494,22 @@ func reportCapabilityShapes(_ *testing.T, pkg *packages.Package) []string {
 		findings = append(findings, fmt.Sprintf(format, args...))
 	}
 	info := pkg.TypesInfo
+	// A GENERIC INSTANTIATED WITH ONE OF CORE'S WIRE MESSAGES.
+	//
+	// `alloc[wc.SealedValues]()` where `func alloc[T any]() *T { return new(T)
+	// }` allocates a capability, and at the `new(T)` the scanner sees a type
+	// PARAMETER: there is no concrete type at the allocation site to ask
+	// about. The instantiation is where the concrete type appears, and
+	// info.Instances records it — so the question is asked where the answer
+	// exists rather than where the allocation is written.
+	for ident, instance := range info.Instances {
+		for i := range instance.TypeArgs.Len() {
+			if path := coreWireType(deref(instance.TypeArgs.At(i))); path != "" {
+				report("%s instantiates %s with %s: a generic over one of core's wire messages allocates and decodes one wherever it is used, and the allocation site sees only a type parameter. Read the seal through Credential.Seal().",
+					pkg.PkgPath, ident.Name, path)
+			}
+		}
+	}
 	for _, file := range pkg.Syntax {
 		// Per declaration, so a finding names the function it is in. An
 		// assertion per SHAPE is possible then, where a count over the whole
@@ -417,7 +565,7 @@ func inspectForCapabilities(decl ast.Node, where string, info *types.Info, repor
 			// supported way to read one, so it is not flagged.
 			if signature, ok := types.Unalias(info.TypeOf(typed.Fun)).(*types.Signature); ok {
 				for i, arg := range typed.Args {
-					path := coreWireType(derefOnce(info.TypeOf(arg)))
+					path := coreWireType(deref(info.TypeOf(arg)))
 					if path == "" {
 						continue
 					}
@@ -444,7 +592,7 @@ func inspectForCapabilities(decl ast.Node, where string, info *types.Info, repor
 				return true
 			}
 			for _, arg := range typed.Args {
-				if path := coreWireType(derefOnce(info.TypeOf(arg))); path != "" {
+				if path := coreWireType(deref(info.TypeOf(arg))); path != "" {
 					report("%s decodes into a %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through Credential.Seal().",
 						where, path)
 				}
@@ -795,5 +943,101 @@ func fixtureSpellingAccessor(seal *wc.SealedValues) string { return seal.GetImag
 	}
 	if strings.Contains(found, "fixtureSpellingAccessor") {
 		t.Errorf("the capability gate flagged a read through the SDK's accessors, which takes the seal as a CONCRETE parameter and is the one supported way to read one:\n%s", found)
+	}
+}
+
+// TestTheTypedGatesFollowValuesNotShapes pins the confirming round's two gate
+// findings, in the reviewer's own shapes.
+//
+// Both were the class the go/types rebuild was meant to close, and both got
+// past it because the traversal was still enumerating shapes it knew — a
+// struct, a slice, a map — rather than following every value whose TYPE
+// carries a handler or a decoder. An interface-typed field is where the type
+// system stops answering, and a generic's allocation site sees a type
+// parameter rather than the concrete instantiation.
+func TestTheTypedGatesFollowValuesNotShapes(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A handler built HERE, handed out through `any`. The caller mounts
+	// `Routes().H.(http.Handler)` and has the wrapper without the boot.
+	opaque := filepath.Join(dir, "zz_typed_opaque_fixture.go")
+	handlers := gateFindings(t, opaque, `package solution
+
+import "net/http"
+
+func (s *Server) FixtureOpaqueField() struct{ H any } {
+	return struct{ H any }{H: s.wrapRequest(func(*http.Request, *Gateway) (any, error) { return nil, nil })}
+}
+
+func (s *Server) FixtureCallableResult() struct{ H func() http.Handler } {
+	return struct{ H func() http.Handler }{}
+}
+`, reportHandlerShapes)
+	for _, want := range []string{"FixtureOpaqueField", "FixtureCallableResult"} {
+		if !strings.Contains(handlers, want) {
+			t.Errorf("the handler gate did not flag %s:\n%s", want, handlers)
+		}
+	}
+
+	// A generic allocation, and a decoder reached through a function variable
+	// whose destination is a DOUBLE pointer.
+	generic := filepath.Join(dir, "zz_typed_generic_fixture.go")
+	capabilities := gateFindings(t, generic, `package solution
+
+import (
+	"encoding/json"
+
+	wc "github.com/codefly-dev/sdk-go/workcontext"
+)
+
+func fixtureAlloc[T any]() *T { return new(T) }
+
+func fixtureReadSeal(raw []byte) (*wc.SealedValues, error) {
+	dst := fixtureAlloc[wc.SealedValues]()
+	decode := json.Unmarshal
+	err := decode(raw, &dst)
+	return dst, err
+}
+`, reportCapabilityShapes)
+	// The instantiation is the construction, and the double-pointer
+	// destination is the decode. Both must be named.
+	if !strings.Contains(capabilities, "fixtureAlloc") {
+		t.Errorf("the capability gate did not flag the generic instantiated with core's wire message, so a generic allocation still escapes:\n%s", capabilities)
+	}
+	if !strings.Contains(capabilities, "fixtureReadSeal") {
+		t.Errorf("the capability gate did not flag the decode into a **SealedValues, so indirection still escapes:\n%s", capabilities)
+	}
+
+	// CONTROLS, because both new rules are the fail-closed kind and a gate
+	// nobody can satisfy gets loosened by whoever hits it next.
+	controls := filepath.Join(dir, "zz_typed_control_fixture.go")
+	clean := gateFindings(t, controls, `package solution
+
+import wc "github.com/codefly-dev/sdk-go/workcontext"
+
+// `+"`error`"+` is an interface, and every function here returns one. A handler
+// cannot be stored in it, so it is not a hole a handler hides in.
+func FixtureReturnsAnError() error { return nil }
+
+// `+"`any`"+` fields that hold a consumer's message, which is Operation.Request
+// and Operation.Response. Nothing mountable is built here.
+func FixtureDeclaresBodies() struct {
+	Request  any
+	Response any
+} {
+	return struct {
+		Request  any
+		Response any
+	}{}
+}
+
+// Reading a seal through the SDK's accessors.
+func FixtureReadsASeal(seal *wc.SealedValues) string { return seal.GetInstallationId() }
+`, reportHandlerShapes)
+	if clean != "\n" && strings.TrimSpace(clean) != "" {
+		t.Errorf("the handler gate refused shapes that are the documented way to use this package:\n%s", clean)
 	}
 }

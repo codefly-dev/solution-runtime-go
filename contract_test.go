@@ -409,7 +409,16 @@ func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_ = resp.Body.Close()
+			// DRAINED, not just closed.
+			//
+			// mintErr is written by the HANDLER goroutine and read here. An
+			// undrained Close can return before the handler has finished, so
+			// nothing ordered that write before this read — a flake that
+			// surfaced once in a full run and reproduced in none of twelve
+			// isolated ones, which is what an unsynchronised read looks like.
+			// Draining waits for the response to complete, which is the
+			// happens-before this needs.
+			drainAndClose(resp)
 
 			// The mint the boot itself ran is request-independent; what matters
 			// is whether the viewer's mint was attempted on top of it.
@@ -496,7 +505,9 @@ func TestTheCeilingRefusesAsksThatStateNoAuthority(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_ = resp.Body.Close()
+			// Drained, for the reason the sibling test above now gives:
+			// mintErr is the HANDLER's write and this is the reader.
+			drainAndClose(resp)
 
 			if mintErr == nil {
 				t.Fatalf("ForModule(%q, %+v) minted: an ask the published ceiling cannot govern must be refused locally", tc.ask.audience, tc.ask.scopes)

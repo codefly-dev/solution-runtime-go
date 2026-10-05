@@ -55,6 +55,21 @@ path**. What resolution still cannot decide is in that file: a decode
 destination whose static type is an interface (`proto.Message`, `any`) is not a
 capability by its type, which is the same residual core's own verifier has.
 
+Where the type system stops answering, the rules **follow the value instead of
+the declaration**, and that is the lesson of the round after the rewrite. A
+handler handed out through a `struct{ H any }` cannot be decided from the
+result type — and refusing every interface-typed field would refuse
+`Operation.Request`/`Response`, which are `any` by design — so the rule asks
+whether an exported function whose results carry an interface **a handler could
+be stored in** also has a mountable value in hand. `error` is an interface and
+every function returns one; a handler cannot be stored in it, and asking
+whether `http.Handler` implements the interface is what tells the two apart. A
+generic is the same shape one level up: `alloc[SealedValues]()` sees a type
+PARAMETER at its `new(T)`, so the question is asked at the INSTANTIATION, where
+the concrete type exists (`types.Info.Instances`). And indirection is not a
+shape to enumerate — a `**SealedValues` destination is dereferenced all the way
+down, not once.
+
 They were syntactic until round sixteen, and that history is the reason for the
 rewrite — the old rule was falsified by a shape nobody had written down, six
 times over:
@@ -407,7 +422,20 @@ embedding it.
   found this file still saying it was: the mint client does not return it at all
   (see `credential.go`) — it comes back from a *callee* rejecting a capability
   this runtime minted for a viewer, where it is a 409 on that request and no
-  statement about this execution's own credential. The boot and the run have to
+  statement about this execution's own credential.
+  **Nothing is inferred from that 409, and the code now matches what this file
+  has said all along.** A cached capability was dropped when a module answered
+  409 with an installation header, and that was wrong three times over: any 409
+  with any header; then any 409 whose header named the installation the
+  capability is sealed to — and a module answering an ordinary business
+  conflict IS in that installation, so a duplicate or a lost update evicted a
+  valid capability and the next call minted again. 409 means "the state you
+  were sealed to has moved" and it means "that page already exists"; nothing on
+  the wire says which, and matching installation metadata identifies the SCOPE
+  of a conflict rather than establishing supersession. A genuinely superseded
+  capability is refused call by call by the far end, correct if noisy, until its
+  own expiry. A sound inference needs a host-side discriminator, which is
+  nobody's to invent here. The boot and the run have to
   classify these the same way — they did not, and the result was a solution
   answering 503 forever while reporting itself healthy.
 - **Fail closed, with no exception for a counterpart's current state.** A mint

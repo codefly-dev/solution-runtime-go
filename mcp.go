@@ -1045,6 +1045,22 @@ func (s *Server) withoutRuntimeAddresses(result mcp.Result, method string) mcp.R
 		if offending, found := namedInJSON(rendered, named); found {
 			return replaced("structured content", offending)
 		}
+		// AND THE CHECKED BYTES ARE WHAT GETS PUBLISHED.
+		//
+		// This inspected one serialization and returned the original object,
+		// and the SDK then serialized that object AGAIN into the response. A
+		// value whose MarshalJSON does not answer the same thing twice —
+		// returning `{}` first and the mint's address after — passed the check
+		// and disclosed on the second call, with no concurrent mutation
+		// involved. Marshalling is not guaranteed to be a pure function of a
+		// value this runtime did not write.
+		//
+		// So the inspected bytes are kept, as a json.RawMessage this runtime
+		// owns. What the client reads is then exactly what was checked, and a
+		// marshaler cannot answer twice because it is not asked twice.
+		clean := *call
+		clean.StructuredContent = json.RawMessage(rendered)
+		return &clean
 	}
 	return result
 }

@@ -676,7 +676,11 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		if conflict {
 			// An ordinary conflict, with an installation header about an
 			// installation this capability is not sealed to.
-			w.Header().Set(workcontext.InstallationIDHeaderName, "installation-somebody-else")
+			// The SAME installation the capability is sealed to, which is what
+			// a real module answering a business conflict carries. A foreign
+			// id here is what hid the finding: it made the installation
+			// comparison look sufficient.
+			w.Header().Set(workcontext.InstallationIDHeaderName, corework.FixtureInstallation)
 			w.Header().Set(workcontext.InstallationRevisionHeaderName, "9")
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "that page already exists"})
 			return
@@ -1100,16 +1104,25 @@ func TestMintCarriesThisWorkloadsCredentialAndNoOthers(t *testing.T) {
 	}
 }
 
-// TestASupersededCapabilityIsDroppedNotReused closes the other half of
-// classifying a refusal as ErrRevoked.
+// TestA409IsNotReadAsSupersessionAtAll replaces
+// TestASupersededCapabilityIsDroppedNotReused, and the replacement is the
+// finding rather than a weakening of it.
 //
-// That sentinel means the capability was sound when it was minted and the state
-// moved under it, so the holder's answer is to mint again. Classifying the
-// error and keeping the capability until its own clock ran out would answer
-// every call in that window with the same refusal — the cache handing back a
-// credential the issuer had already stopped honouring, and a caller that
-// re-asked getting it straight back.
-func TestASupersededCapabilityIsDroppedNotReused(t *testing.T) {
+// That test asserted the capability is DROPPED when a module answers 409 with
+// an installation header, and the behaviour it pinned was wrong in three
+// successive ways: any 409 with any installation header; then any 409 whose
+// header named the installation the capability is sealed to — and a module
+// answering an ordinary business conflict IS in that installation, so a
+// duplicate or a lost update evicted a valid capability and the next call
+// minted again.
+//
+// The two cases cannot be told apart on the wire: 409 means "the state you
+// were sealed to has moved" and it means "that page already exists". So this
+// runtime infers nothing from one. A genuinely superseded capability is
+// refused call by call by the far end, which is correct if noisy, and the
+// renewal replaces it on the credential's own schedule. What would make an
+// inference sound is a host-side discriminator — follow-up 11.
+func TestA409IsNotReadAsSupersessionAtAll(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{supersedeFirstCall: true})
 	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
 		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
@@ -1128,11 +1141,14 @@ func TestASupersededCapabilityIsDroppedNotReused(t *testing.T) {
 	defer drainAndClose(resp)
 
 	first, second := <-gw.calls, <-gw.calls
-	if first.WorkContext == second.WorkContext {
-		t.Error("the second read presented the capability the far end said was superseded: the cache reused a credential the issuer had stopped honouring")
+	if first.WorkContext == "" || second.WorkContext == "" {
+		t.Fatal("a module call arrived with no capability at all")
 	}
-	if got := gw.mintCount(); got != 2 {
-		t.Errorf("minted %d capabilities, want 2: a superseded one costs exactly one re-mint", got)
+	if first.WorkContext != second.WorkContext {
+		t.Error("the 409 retired the cached capability: a module's conflict is not a statement this runtime can read as supersession, and acting on it costs an audited mint per business conflict")
+	}
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("minted %d capabilities, want 1: one ask mints once, and a 409 from a callee does not change that", got)
 	}
 }
 

@@ -3627,62 +3627,32 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, t.acting.surfaced(err)
 	}
 	resp, err := t.base.RoundTrip(r)
-	if err == nil && supersededCapability(resp, token) {
-		// The far end says the capability it was shown is sealed to state that
-		// has moved. Dropping it here is what makes the next call mint instead
-		// of presenting the same one until its clock ran out: a capability the
-		// issuer has stopped honouring is not a capability to reuse, however
-		// much of its validity window is left.
-		t.acting.contexts.supersede(t.acting.delegation.key, token)
-	}
+	// NOTHING IS INFERRED FROM A 409, and that is the whole of this runtime's
+	// position on it.
+	//
+	// A capability was dropped from the cache when a module answered 409 with
+	// an installation header. That was wrong in three successive ways: any 409
+	// with any installation header; then any 409 whose header named the
+	// installation the capability is sealed to — and a module answering an
+	// ordinary business conflict IS in that installation, so a duplicate or a
+	// lost update still evicted a perfectly valid capability and the next call
+	// minted again. Needless audited mints, on the one path whose purpose is
+	// one mint per execution.
+	//
+	// The two cases are indistinguishable on the wire: a 409 means "the state
+	// you were sealed to has moved" and it means "that page already exists",
+	// and nothing in the response says which. Matching installation metadata
+	// identifies the SCOPE of a conflict; it does not establish supersession.
+	// So this runtime infers nothing and holds the capability until its own
+	// expiry. A genuinely superseded one is refused call by call by the far
+	// end — correct if noisy — and the renewal that replaces it happens on the
+	// credential's own schedule.
+	//
+	// What would make an inference sound is a machine-readable discriminator
+	// from the host or the verifier: follow-up 11, and nobody's to invent here.
+	// AGENTS.md and this PR's body both already said there was no inference;
+	// the code is what had not caught up.
 	return resp, err
-}
-
-// supersededCapability reads a far end saying the capability presented is
-// sealed to state it has moved past.
-//
-// The signal is the status and the installation headers the carrier puts beside
-// a capability, which is all a caller gets: the far end verifies, this runtime
-// does not, so what reaches here is an HTTP refusal and not a sentinel. A 409
-// is what the issuer answers for a revision that has moved — distinct from the
-// 401 of a capability that never verified and the 403 of authority the viewer
-// does not hold, neither of which another mint would fix.
-func supersededCapability(resp *http.Response, presented string) bool {
-	if resp.StatusCode != http.StatusConflict {
-		return false
-	}
-	// The installation the far end names has to be the one the capability we
-	// PRESENTED is sealed to.
-	//
-	// This accepted any 409 carrying a non-empty installation header, and a
-	// 409 is an ordinary business answer — a duplicate, a lost update, a
-	// version conflict. A module answering one with installation metadata
-	// beside it therefore evicted a perfectly valid cached capability, and the
-	// next call minted again: needless mints and needless audit traffic, on a
-	// path whose whole purpose is one mint per execution. Worse, it is
-	// indistinguishable from the case this is for.
-	//
-	// So the header is matched against the seal of the capability that was
-	// actually shown. A conflict about some other installation says nothing
-	// about this one, and a conflict naming no installation says nothing at
-	// all.
-	named := resp.Header.Get(workcontext.InstallationIDHeaderName)
-	if named == "" {
-		return false
-	}
-	// Through the SDK's own accessor, not a parser of this package's own:
-	// SealedInstallation is to a capability what Credential.Seal() is to a
-	// credential, and the one-implementation rule is about writing a second
-	// reader, not about asking the SDK.
-	sealed, _, err := workcontext.SealedInstallation(presented)
-	if err != nil || sealed == "" {
-		// Nothing to compare against: refuse to infer. A capability whose own
-		// installation this runtime cannot read is not one it can conclude has
-		// been superseded, and guessing here is what makes an ordinary
-		// conflict a re-mint.
-		return false
-	}
-	return named == sealed
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
