@@ -118,7 +118,31 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), leaf))
+	// HELD TO THE FROZEN PRINCIPAL, at the moment it is presented.
+	//
+	// outboundLeaf is the raw reader — on the default path, the SDK's reloader
+	// over the projected files — and handing it to the SDK unwrapped was the
+	// identity binding this hop lost. The gateway's configuration gets the
+	// same hold through holdPresentedCertificate; this is the other outbound
+	// reader, and it is the one that carries the projected service-account
+	// token. A same-CA rotation to a neighbouring workload's certificate was
+	// presented to the mint while the frozen principal was still this one, and
+	// the SDK cannot catch it: it checks that a certificate is non-empty and
+	// has a key, which is the right division of labour and not a statement
+	// about whose certificate it is.
+	held := heldToTheFrozenPrincipal(leaf, s.principal, "the credential mint")
+	// Refused at boot as well, for the reason holdPresentedCertificate
+	// records: a mismatch found at the first dial is a mismatch found after
+	// the projected token has gone out under it. Only a MISMATCH refuses here
+	// — a read error is the reloader's business and it keeps the last good
+	// pair, so failing the boot on one would refuse a rotation that is merely
+	// half-written.
+	if pair, readErr := leaf(&tls.CertificateRequestInfo{}); readErr == nil && pair != nil {
+		if err := pairPresentsThisWorkload(pair, s.principal); err != nil {
+			return nil, fmt.Errorf("this workload would present a certificate the host has not approved it under to the credential mint: %w", err)
+		}
+	}
+	client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), held))
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
 	}

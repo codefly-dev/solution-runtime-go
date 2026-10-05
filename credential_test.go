@@ -2439,3 +2439,113 @@ func TestARenewalSealedToADifferentExecutionIsRefused(t *testing.T) {
 		}
 	})
 }
+
+// TestTheMintRefusesToPresentARotatedIdentity is round fourteen's blocker, on
+// the production path rather than through a hand-built client.
+//
+// platformCredentialSource handed outboundLeaf — the SDK's reloader over the
+// projected files — straight to MintOptions.ClientCertificate. The gateway's
+// configuration gets holdPresentedCertificate; this reader got nothing. So
+// after a same-CA rotation to a neighbouring workload's certificate, the mint
+// hop presented THAT identity while the frozen principal was still this one,
+// and the SDK cannot catch it: it checks that a certificate is non-empty and
+// has a key, which is the right division of labour and not a statement about
+// whose certificate it is.
+//
+// The three steps the reviewer asked for, in order: A mints; a rotation to B
+// produces NO mint request; a fresh certificate for A mints again. The middle
+// one is the finding — and "no request" rather than "an error" is the
+// assertion, because the refusal has to happen before the projected
+// service-account token is on the wire.
+func TestTheMintRefusesToPresentARotatedIdentity(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	// The boot's own environment and projected material, under the anchor the
+	// fake host is served with — this test is about the production path, so it
+	// uses what a boot uses rather than a hand-built client.
+	certFile, keyFile, bundleFile, _, _, c := bootIdentityIn(t, mint, testPrincipal)
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{
+		identityCertFile:   certFile,
+		identityKeyFile:    keyFile,
+		trustBundleFile:    bundleFile,
+		allowedCallersFile: identitiesFile(t, testGatewayPrincipal),
+		mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile:   identitiesFile(t, testGatewayPrincipal),
+		mintURL:            mint.URL + credentialMintPath,
+		projectedTokenPath: tokenFile,
+	}
+	server.principal = testPrincipal
+	// The frozen authority, read through the SDK the way a boot reads it.
+	server.authority = authorityFor(t, context.Background())
+	source, err := server.platformCredentialSource()
+	if err != nil {
+		t.Fatalf("configure the production credential source: %v", err)
+	}
+
+	// A mints.
+	held, err := source.Credential(context.Background())
+	if err != nil {
+		t.Fatalf("the mint refused this workload's own identity: %v", err)
+	}
+	if got := mint.count(); got != 1 {
+		t.Fatalf("the issuer served %d requests for the first credential, want 1", got)
+	}
+
+	// rotate replaces the projected pair in place, as a projected Secret
+	// update does, and advances the modification time so the SDK's reloader
+	// observes it (it refreshes on mtime, per handshake).
+	rotate := func(spiffeID string) {
+		t.Helper()
+		leafPEM, keyPEM, _ := issueLeaf(t, c.anchor, c.anchorKey, spiffeID)
+		writeFile(t, certFile, string(leafPEM))
+		writeFile(t, keyFile, string(keyPEM))
+		ahead := time.Now().Add(time.Minute)
+		for _, path := range []string{certFile, keyFile} {
+			if err := os.Chtimes(path, ahead, ahead); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// THE FINDING: a valid, same-CA certificate for another workload.
+	rotate(rivalPrincipal)
+	before := mint.count()
+	if _, err := freshMint(t, source, held); err == nil {
+		t.Fatal("the mint was dialled presenting a certificate issued for another workload: the host holds this process to the identity its presence document approved, and this hop is the one that carries the projected service-account token")
+	} else if !strings.Contains(err.Error(), "another workload") && !strings.Contains(err.Error(), "issued for") {
+		t.Errorf("the refusal %q does not say the certificate names another workload", err)
+	}
+	if got := mint.count(); got != before {
+		t.Errorf("the issuer served %d more requests while this workload was presenting another identity: the refusal has to come before the projected service-account token is on the wire, not after", got-before)
+	}
+
+	// And a rotation that is ordinary — a fresh certificate for the same
+	// principal — still works, so the check is about the identity and not
+	// about the pair having changed.
+	rotate(testPrincipal)
+	// Through the SDK's hold-off, not around it.
+	//
+	// The refusal above is a failed ask, and the mint client backs off after
+	// one — "held off until …" — so the next attempt is refused by the backoff
+	// rather than by anything about the certificate. That is correct behaviour
+	// and it is also the reason this step waits: asserting the recovery
+	// against a brand-new client would prove that a fresh client works, which
+	// is not what is in question.
+	var recovered error
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, recovered = freshMint(t, source, held); recovered == nil {
+			break
+		}
+		if !strings.Contains(recovered.Error(), "held off until") || time.Now().After(deadline) {
+			t.Fatalf("an ordinary rotation to a fresh certificate for this workload was refused, which would make every projected-pair renewal fatal: %v", recovered)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if got := mint.count(); got <= before {
+		t.Errorf("the issuer served %d requests after a valid rotation, want more than %d", got, before)
+	}
+}

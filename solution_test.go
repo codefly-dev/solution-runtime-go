@@ -1899,3 +1899,79 @@ func clearSelfEnvironment(t *testing.T) {
 		}
 	}
 }
+
+// TestAnAskCannotBeEditedAfterItsCeilingIsChecked is round fourteen's B2.
+//
+// workContextScopes converted Scope to its wire form, which copies the struct
+// and leaves both pointing at the CALLER's backing arrays. The ask is retained
+// on the delegation and its JSON is the cache key, computed once — so a caller
+// could hand over Actions: []string{"read"}, take the delegated gateway, write
+// "delete" into that array, and wait for the cached capability to expire. The
+// next mint serialized "delete", under the key computed for "read", with the
+// ceiling having been checked against "read". No concurrency, no second call
+// to ForModule, and nothing in the published contract to stop it.
+func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	module := passthroughModule()
+	module.Scopes = []Scope{{ResourceKind: "things", Actions: []string{"read"}}}
+	module.Methods = nil
+	server := New(Manifest{ID: testSolutionID}).Consumes(module).
+		Credential(mintClientFor(t, mint, tokenFile)).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}})
+	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, apiConsumes: consumesThings}
+	server.principal = testPrincipal
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolve the published contract: %v", err)
+	}
+	server.contract, server.contractResolved = contract, true
+
+	header := http.Header{}
+	header.Set("authorization", viewerBearer())
+	header.Set(orgHeader, viewerOrg)
+	header.Set(sessionHeader, viewerSession)
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+	gateway := server.gatewayFor(header)
+
+	// The ask the ceiling is checked against, in a slice the caller keeps.
+	actions := []string{"read"}
+	acting, err := gateway.ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: actions})
+	if err != nil {
+		t.Fatalf("the declared ask was refused: %v", err)
+	}
+	first := <-gw.mints
+	if len(first.AuthorityScopes) != 1 || len(first.AuthorityScopes[0].Actions) != 1 ||
+		first.AuthorityScopes[0].Actions[0] != "read" {
+		t.Fatalf("the first mint asked for %+v, want read", first.AuthorityScopes)
+	}
+
+	// The caller edits the array it still holds, and the capability it was
+	// handed is retired — which is what expiry does, with no second call to
+	// ForModule and no concurrency.
+	actions[0] = "delete"
+	held, err := acting.workContext(context.Background())
+	if err != nil {
+		t.Fatalf("read the delegated capability: %v", err)
+	}
+	acting.contexts.supersede(acting.delegation.key, held)
+
+	// A refusal here is also a correct answer. What must not happen is a
+	// silent mint for "delete".
+	if _, err := acting.workContext(context.Background()); err != nil {
+		t.Logf("the renewal was refused, which is the other acceptable answer: %v", err)
+		return
+	}
+	second := <-gw.mints
+	for _, scope := range second.AuthorityScopes {
+		for _, action := range scope.Actions {
+			if action == "delete" {
+				t.Fatalf("a mint asked the issuer for %q after the ceiling had been checked against read: the ask was retained with the caller's own backing array, so editing it changed what was minted under a cache key computed for something else — and the published ceiling is the guarantee that cannot hold", action)
+			}
+		}
+	}
+}

@@ -2939,15 +2939,47 @@ type workContextScope struct {
 	ResourceIDs  []string `json:"resourceIds,omitempty"`
 }
 
+// workContextScopes is the wire form of an ask's scopes, DEEP-copied.
+//
+// A conversion for the struct, because the two types have the same shape by
+// construction and spelling the fields out meant a field added to Scope would
+// silently stop travelling — but a conversion copies the slice HEADERS and
+// leaves both types pointing at the caller's backing arrays. The ask is
+// retained on the delegation and its JSON is the cache key, computed once, so
+// a caller could hand over Scope{Actions: []string{"read"}}, take the
+// delegated gateway, write "delete" into that array, and wait for the cached
+// capability to expire: the next mint serialized "delete" under the key
+// computed for "read", and the ceiling had been checked against "read". No
+// concurrency and no second call to ForModule.
+//
+// So the slices are copied too. What was checked and what is minted are then
+// the same bytes for the life of the delegation, which is what makes the
+// published ceiling a guarantee rather than a check on a value the caller can
+// still edit.
 func workContextScopes(scopes []Scope) []workContextScope {
 	wire := make([]workContextScope, len(scopes))
 	for i, scope := range scopes {
-		// A conversion, not a field-by-field copy: the two types have the
-		// same shape by construction, and spelling the fields out meant a
-		// field added to Scope would silently stop travelling.
-		wire[i] = workContextScope(scope)
+		wire[i] = workContextScope{
+			ResourceKind: scope.ResourceKind,
+			Actions:      append([]string(nil), scope.Actions...),
+			ResourceIDs:  append([]string(nil), scope.ResourceIDs...),
+		}
 	}
 	return wire
+}
+
+// scopesOfAsk is an ask's scopes back in this package's own type, for a check
+// that has to run against what will actually be minted. (askedScopes is taken:
+// contract.go uses it for a declaration's union of asks.)
+func scopesOfAsk(wire []workContextScope) []Scope {
+	scopes := make([]Scope, len(wire))
+	for i, scope := range wire {
+		// A conversion: this direction only reads the ask, and the ceiling
+		// check does not retain what it is handed, so sharing the arrays is
+		// safe here — the copy that matters is the one on the way IN.
+		scopes[i] = Scope(scope)
+	}
+	return scopes
 }
 
 // ForModule returns a Gateway that acts for the viewer against one composed
@@ -3168,6 +3200,18 @@ type delegation struct {
 func (g *Gateway) workContext(ctx context.Context) (string, error) {
 	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (string, time.Time, error) {
 		ask := g.delegation.ask
+		// The ceiling, against the ask that is about to be MINTED.
+		//
+		// ForModule checks before it returns, and with the scopes deep-copied
+		// the two can no longer disagree — so this is not what closes that
+		// hole. It is here because the check belongs at the boundary the
+		// authority actually crosses: every mint passes through this function,
+		// a delegation reaching it by some future path would otherwise carry
+		// an unchecked ask, and the cost is a comparison against a declaration
+		// already in memory.
+		if err := g.withinPublishedCeiling(ask.Audience, scopesOfAsk(ask.AuthorityScopes)); err != nil {
+			return "", time.Time{}, err
+		}
 		ask.TaskID = uuid.NewString()
 		return g.mint(ctx, ask)
 	})

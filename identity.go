@@ -1202,6 +1202,43 @@ func presentedIdentities(uris []string) string {
 	return "the identities [" + strings.Join(uris, ", ") + "]"
 }
 
+// heldToTheFrozenPrincipal wraps ONE certificate reader so the pair it hands
+// back is checked against the frozen principal every time it answers.
+//
+// This exists as a function rather than only inside holdPresentedCertificate
+// because there are now two outbound readers and only one of them was a
+// *tls.Config. The mint's transport belongs to the SDK and takes a reader
+// directly (MintOptions.ClientCertificate), so the runtime passed
+// outboundLeaf — the raw projected-file reloader — straight to it, and the hold
+// that the gateway's configuration gets was simply absent on the hop that
+// carries the projected service-account token. After a same-CA rotation to a
+// neighbouring workload's identity, the mint presented that identity while the
+// frozen principal was still this one; the SDK checks that a certificate is
+// non-empty and has a key, which is the right division of labour and not a
+// check of WHOSE it is.
+//
+// Both callers run through this, rather than one of them running through a copy
+// of its reasoning, because that is how the half-covered check above happened
+// in the first place.
+func heldToTheFrozenPrincipal(
+	read func(*tls.CertificateRequestInfo) (*tls.Certificate, error),
+	principal, destination string,
+) func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		pair, err := read(info)
+		if err != nil {
+			return nil, fmt.Errorf("the identity source could not produce the certificate this runtime presents to %s: %w", destination, err)
+		}
+		if principal == "" {
+			return nil, fmt.Errorf("this workload has no frozen principal to hold the certificate it presents to %s against: the authority-bearing values must be read before any outbound act", destination)
+		}
+		if err := pairPresentsThisWorkload(pair, principal); err != nil {
+			return nil, err
+		}
+		return pair, nil
+	}
+}
+
 // holdPresentedCertificate holds an *outbound* configuration's certificate to
 // the frozen principal, at the moment it is presented.
 //
@@ -1231,16 +1268,7 @@ func holdPresentedCertificate(config *tls.Config, principal string) error {
 		}
 	}
 	if get := config.GetClientCertificate; get != nil {
-		config.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			pair, err := get(info)
-			if err != nil {
-				return nil, fmt.Errorf("the identity source could not produce the certificate this runtime presents to the platform: %w", err)
-			}
-			if err := pairPresentsThisWorkload(pair, principal); err != nil {
-				return nil, err
-			}
-			return pair, nil
-		}
+		config.GetClientCertificate = heldToTheFrozenPrincipal(get, principal, "the platform")
 		// Refused at boot as well, for the reason holdServedCertificate
 		// records: a mismatch found at the first dial is a mismatch found after
 		// the projected token has gone out under it.
