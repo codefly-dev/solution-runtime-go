@@ -1199,10 +1199,16 @@ So it is **derived by construction** from the two things the runtime already
 has: the origin this product is reachable at and this solution's id —
 `<PUBLIC_URL>/solutions/<id>/mcp`. This is the one place the runtime encodes the
 gateway's solution route (see [Where the host reaches the
-solution](#where-the-host-reaches-the-solution)), and the reason it is worth
-encoding is that it makes a composition declare nothing: a deployment that
-already sets `PUBLIC_URL` to the origin browsers reach the product at has
-addressed the MCP surface too.
+solution](#where-the-host-reaches-the-solution)).
+
+**That derivation is for a local run only, and this said otherwise.** It read
+as "a deployment that already sets `PUBLIC_URL` … has addressed the MCP surface
+too", and a **deployed runtime context refuses a derived value at boot**
+(`mcp.go`, `validateMCP`): the derivation encodes the route the *host* serves
+this solution on, which this runtime does not know. So following that sentence
+in a deployment failed the boot. In a deployed context the identifier is
+**declared** — `mcp/public-url` in the workspace configuration, ending in
+`/mcp` — and `PUBLIC_URL` addresses nothing about MCP there.
 
 A host whose gateway fronts solutions under some other route declares
 `public-url` in the `mcp` group instead. It must end in `/mcp` — the metadata
@@ -1313,175 +1319,12 @@ production code satisfy it. `testing.Testing()` is wrong for the root package �
 where the legitimate caller is production code — and exactly right here, where
 every legitimate caller is a test.
 
-### Exposing an MCP server
+> **This whole section was duplicated.** Two near-identical copies of
+> "Exposing an MCP server" sat 200 lines apart, which is why correcting one
+> passage left the same error in place — the `mcpHandler` example was removed
+> twice and the `PUBLIC_URL` claim corrected twice before the cause was
+> obvious. The stale copy is deleted.
 
-A solution exposes its experience to an agent client — Claude Code, Claude
-Desktop, any MCP client — the way it exposes it to a browser: as the signed-in
-person, through the host's gateway, with the same authority. The solution owns
-its tool surface; this runtime owns serving it. These are the three lines:
-
-```go
-solution.New(solution.Manifest{ID: "wiki", Title: "Wiki"}).
-    ServeMCP("wiki", "v1.0.0", func(srv *mcp.Server) {
-        mcp.AddTool(srv, &mcp.Tool{Name: "ask_wiki", Description: "ask the wiki a question"}, askWiki)
-    }).
-    Serve()
-```
-
-A composition that renders this solution supplies **one** declared value for it,
-and only in a deployment: `issuer-url` in the `mcp` workspace-configuration
-group, declared as a workspace-configuration dependency of the solution's
-backend — the origin MCP clients authenticate against. Everything else is
-derived or resolved; see [The resource identifier and the
-issuer](#the-resource-identifier-and-the-issuer).
-
-`register` receives the official SDK's own `*mcp.Server`
-(`github.com/modelcontextprotocol/go-sdk`, pinned in this module's `go.mod`), so
-tools, prompts and resources are declared exactly as that SDK documents them and
-this runtime adds nothing to them. It is called once, when the endpoint is
-mounted.
-
-A tool call runs as the viewer who made the request. `ViewerFromContext` returns
-the same caller-bound `Gateway` a `Handler` is given, so a tool reads a composed
-module through `ForModule` under the viewer's own Work Context — the identical
-call the page makes, with the identical typed refusals:
-
-```go
-func askWiki(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
-    gw, err := solution.ViewerFromContext(ctx)
-    if err != nil {
-        return nil, askOut{}, err
-    }
-    robin, err := gw.ForModule(ctx, "robin", solution.Scope{ResourceKind: "conversations", Actions: []string{"create"}})
-    if err != nil {
-        return nil, askOut{}, err
-    }
-    ...
-}
-```
-
-The viewer comes from the identity headers the gateway stamped, never from the
-tool's arguments: those are written by a model, and a session id taken from them
-would be a client asking for another viewer's authority. `ViewerFromContext`
-errors only for a handler invoked outside a request this runtime served — a
-harness of its own, or an `*mcp.Server` mounted without `ServeMCP`.
-
-#### What is served, and what is refused
-
-| Path | What |
-| --- | --- |
-| `/mcp` (`solution.MCPPath`) | Stateless Streamable HTTP. `/solutions/<id>/mcp` through the gateway, a route it already fronts. `POST` only: `GET` and `DELETE` are `405` and no `Mcp-Session-Id` is ever issued, because the gateway is a reverse proxy with no sticky routing — a session held in one replica's memory is unreachable from the next request. The SDK's DNS-rebinding protection is left on, so a request reaching a loopback listener with a non-loopback `Host` header is refused `403`: on a developer's machine that protection is the one that still applies, since a rebound page is same-origin and can forge identity headers that a cross-origin page cannot. |
-| `/.well-known/oauth-protected-resource` (`solution.ProtectedResourceMetadataPath`) | The OAuth 2.0 Protected Resource Metadata document (RFC 9728): the `resource` a client binds its token to, the host issuer in `authorization_servers`, and `bearer_methods_supported: ["header"]`. Served unauthenticated, with `Access-Control-Allow-Origin: *`, because discovery is public (RFC 9728 §3.1). |
-
-The MCP endpoint itself carries **no** CORS. The runtime's policy for a
-solution's own API admits any origin with an authorization header, which is the
-right answer there and the wrong one for the single route that acts with the
-viewer's full authority; an MCP client is not a browser page.
-
-The runtime verifies no token: the gateway strips caller identity headers, runs
-ext_authz on the bearer and stamps what it resolved, so verifying it again here
-would be a second, divergent implementation of the host's admission rules, with
-its own JWKS fetch, its own audience logic and its own bugs. What is enforced is
-that the gateway did it:
-
-| The request | Answer |
-| --- | --- |
-| No `authorization` | `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. |
-| A bearer, but none of `x-user-id`, `x-org-id`, `x-session-id` stamped | `401` with the same challenge: nothing but the gateway may reach this endpoint, so either the request did not come through it or it did not authenticate the bearer. |
-| `x-session-id` stamped empty | `403`, naming the `x-credential-kind` the gateway stamped. A credential that authenticates without a session cannot act for a viewer, and every tool call that does mints a Work Context rooted in one — so this is refused at the boundary rather than once per tool call, where the same refusal would read as the tool being broken. Another token cannot fix it, so it carries no challenge. |
-
-**Which caller sees those two 401s.** Not an MCP client coming through the
-gateway: the gateway strips the caller's identity headers and runs ext_authz on
-the bearer *before* proxying, so an unauthenticated request is denied there with
-its own `401 authentication required` and never reaches the solution. The
-runtime's 401 is what a caller reaching this solution directly sees — a local
-run, a port-forward, a composition dialling the backend — and it is the shape
-the gateway's own challenge has to match for discovery to work at all. Emitting
-it at the gateway is the host's half
-([codefly-dev/module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003));
-the document that challenge must point at is served here either way.
-
-#### The resource identifier and the issuer
-
-The `resource` in the metadata document is what a client asks the authorization
-server for a token for (RFC 8707) and what its token is audience-bound to, so it
-must be the **public** MCP URL — not this process's listen address, not the
-in-cluster address the gateway dials. A client that is handed any other
-identifier rejects it, and unlike the manifest URL nobody downstream can resolve
-it on the solution's behalf.
-
-So it is **derived by construction** from the two things the runtime already
-has: the origin this product is reachable at and this solution's id —
-`<PUBLIC_URL>/solutions/<id>/mcp`. This is the one place the runtime encodes the
-gateway's solution route (see [Where the host reaches the
-solution](#where-the-host-reaches-the-solution)), and the reason it is worth
-encoding is that it makes a composition declare nothing: a deployment that
-already sets `PUBLIC_URL` to the origin browsers reach the product at has
-addressed the MCP surface too.
-
-A host whose gateway fronts solutions under some other route declares
-`public-url` in the `mcp` group instead. It must end in `/mcp` — the metadata
-document's own URL is derived from it by swapping that suffix, the same pairing
-the registration token URLs use, refused at boot for the same reason when it
-cannot be made. With neither — no `PUBLIC_URL`, no declared override — the
-identifier is reconstructed per request from `x-forwarded-proto`,
-`x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
-is doing so: a proxy that forwards no prefix yields an identifier missing the
-path it stripped, which a conforming client rejects and a tolerant one binds to
-the wrong resource. In a deployed runtime context that state is refused at boot
-rather than logged.
-
-`authorization_servers` is the host issuer resolved at boot, never derived from
-a request, so a crafted `Host` header cannot point a client at an authorization
-server of someone's choosing. It is `issuer-url` in the `mcp` group when the
-composition declares one, and otherwise the host frontend's origin resolved by
-role like every other host endpoint. That resolved value is the address this
-composition reaches the host at: right for a local run, and in a deployment an
-in-cluster address no public client could reach — so a deployed solution that
-declares `ServeMCP` must supply `mcp`/`issuer-url`, and is refused at boot
-naming it when it does not. It stops being the composition's to supply when
-[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003)
-settles what `iss` is. A solution that declares `ServeMCP` and resolves no
-issuer at all is refused at boot; one that declares no MCP server is unaffected.
-
-Both values are read with `codefly.For(ctx).WorkspaceConfiguration("mcp", …)`,
-never from the environment. `MCP_PUBLIC_URL` and `HOST_ISSUER_URL` were bare
-environment variables when `ServeMCP` landed, and a render cannot project one —
-so the boot refused with the name of something no composition could set
-(codefly-dev/solution-runtime-go#48). Provisioned locally with `codefly config
-generate`, and from the cell's configuration when deployed, exactly as the
-`solution-registration` group is.
-
-Three things about discovery belong to the host, not to this runtime, all of them
-tracked by
-[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003).
-The gateway emits the 401 challenge, as above. It must admit an unauthenticated
-`GET` on `/solutions/<id>/.well-known/oauth-protected-resource`, or no client can
-read the document that challenge points at. And that is where the document is —
-on the solution's own path — whereas RFC 9728 §3.1 also defines a location
-derived from the resource's path,
-`/.well-known/oauth-protected-resource/solutions/<id>/mcp`, at the **host's**
-root. A client that follows `resource_metadata` reaches the document either way;
-one that only guesses the derived location needs the host to serve it there.
-
-#### Connecting
-
-Until the host is an MCP-conformant OAuth 2.1 authorization server, a client
-presents a token it already has, which the gateway already accepts:
-
-```sh
-claude mcp add --transport http wiki https://<host>/solutions/<id>/mcp \
-    --header "Authorization: Bearer <access token>"
-```
-
-Once the host supports it, the gateway's 401 challenge and the metadata document
-above are the whole of what a client needs to authenticate on its own.
-
-#### Testing the tools
-
-This section appeared twice, and both copies documented the same uncompilable
-example; see [Testing the tools: there is no supported path
-yet](#testing-the-tools-there-is-no-supported-path-yet) above.
 
 ### Generated messages in a response
 

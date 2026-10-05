@@ -30,11 +30,18 @@ import (
 // HTTP bodies, lives in the SDK client and not here.
 func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 	fset := token.NewFileSet()
+	// Every source first: a capability type can be aliased in one file and
+	// decoded into in another.
+	sources := map[string]*ast.File{}
 	for _, name := range moduleSources(t) {
 		file, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		sources[name] = file
+	}
+	localCapability := localCapabilityTypes(sources)
+	for name, file := range sources {
 		// issuesTLSMaterialOnly relaxes the signing-primitive rule for ONE
 		// narrow shape, and the condition is checked rather than asserted.
 		//
@@ -105,6 +112,10 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 		for _, built := range coreCapabilityConstructions(file) {
 			t.Errorf("%s constructs %s: allocating one of core's capability messages is what decoding into it requires, and a second decoder of that encoding is this boundary's whole subject. Read the seal through the SDK's Credential.Seal() accessor.",
 				name, built)
+		}
+		for _, decoded := range capabilityDecodes(file, localCapability) {
+			t.Errorf("%s decodes %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through the SDK's Credential.Seal() accessor.",
+				name, decoded)
 		}
 		// A declaration of this package's own that names itself after the thing
 		// core owns. The two this package legitimately has are a refusal it
@@ -524,7 +535,7 @@ func servableExports(name string, file *ast.File, local map[string]bool) (findin
 					// those here would refuse the documented inbound
 					// direction; they stay refused as a RESULT below, which is
 					// the direction that hands something out.
-					if !mountableHandler[named] && !serves(field.Type) {
+					if !mountableHandler[named] && !local[named] && !serves(field.Type) {
 						continue
 					}
 					for _, fieldName := range field.Names {
@@ -627,6 +638,132 @@ func coreCapabilityConstructions(file *ast.File) []string {
 	return built
 }
 
+// capabilityDecodes is every place a file DECODES into one of core's
+// capability messages, by the name of the destination.
+//
+// The construction rule is not enough, and the premise behind it was wrong
+// twice. I asserted that decoding requires an allocation; a reviewer showed
+// the zero-value declaration, which ValueSpec now covers, and then showed that
+// the allocation need not be in the inspected code at all:
+//
+//	func decodeSeal(raw []byte, dst *workcontext.SealedValues) error {
+//		return proto.Unmarshal(raw, dst)
+//	}
+//
+// no literal, no new, no declaration, no generated import, no signing
+// primitive, no verifier, no prohibited name. The destination arrives as a
+// parameter and the caller allocated it.
+//
+// So this rule is on the DECODE rather than on the allocation: any call to an
+// Unmarshal whose destination is a name bound to a capability type — a
+// parameter, a result, a local declaration, or a local alias for one. It stays
+// a syntactic rule, which is the honest limit: a destination reached through
+// an interface, a field selector or a function call is not resolved here, and
+// the construction rule covers the shapes where this package would have had to
+// allocate one itself.
+func capabilityDecodes(file *ast.File, localCapability map[string]bool) []string {
+	aliases := importedAs(file)
+	capability := func(expr ast.Expr) bool {
+		rendered := renderedTypeIn(aliases, expr)
+		return coreCapabilityType(rendered) || localCapability[rendered]
+	}
+	var decoded []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		// Every name in this function bound to a capability type.
+		bound := map[string]bool{}
+		record := func(fields *ast.FieldList) {
+			if fields == nil {
+				return
+			}
+			for _, field := range fields.List {
+				if !capability(field.Type) {
+					continue
+				}
+				for _, name := range field.Names {
+					bound[name.Name] = true
+				}
+			}
+		}
+		record(fn.Type.Params)
+		record(fn.Type.Results)
+		record(fn.Recv)
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if spec, ok := node.(*ast.ValueSpec); ok && capability(spec.Type) {
+				for _, name := range spec.Names {
+					bound[name.Name] = true
+				}
+			}
+			return true
+		})
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !strings.Contains(selector.Sel.Name, "Unmarshal") {
+				return true
+			}
+			for _, arg := range call.Args {
+				// `dst`, `&dst`, or a capability constructed inline.
+				reference := arg
+				if unary, ok := arg.(*ast.UnaryExpr); ok {
+					reference = unary.X
+				}
+				if named, ok := reference.(*ast.Ident); ok && bound[named.Name] {
+					decoded = append(decoded, fn.Name.Name+" into "+named.Name)
+					return false
+				}
+				if capability(reference) {
+					decoded = append(decoded, fn.Name.Name+" into an inline "+renderedTypeIn(aliases, reference))
+					return false
+				}
+			}
+			return true
+		})
+	}
+	return decoded
+}
+
+// localCapabilityTypes is every type name the module declares that resolves to
+// one of core's capability messages, so an alias cannot hide the destination.
+func localCapabilityTypes(files map[string]*ast.File) map[string]bool {
+	local := map[string]bool{}
+	under := map[string]string{}
+	for _, file := range files {
+		aliases := importedAs(file)
+		for _, decl := range file.Decls {
+			declared, ok := decl.(*ast.GenDecl)
+			if !ok || declared.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range declared.Specs {
+				typed, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				under[typed.Name.Name] = renderedTypeIn(aliases, typed.Type)
+			}
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for name, target := range under {
+			if local[name] {
+				continue
+			}
+			if coreCapabilityType(target) || local[target] {
+				local[name], changed = true, true
+			}
+		}
+	}
+	return local
+}
+
 // coreCapabilityType reports whether a rendered type is one of core's
 // capability messages, under any of the names it is reachable by: core's own
 // generated spelling, and the SDK's aliases for it.
@@ -668,6 +805,21 @@ func coreCapabilityType(rendered string) bool {
 func localHandlerTypes(files map[string]*ast.File) map[string]bool {
 	under := map[string]string{}
 	servable := map[string]bool{}
+	// fields[name] is every type an exported field of `name` has, by rendered
+	// name. A struct that CARRIES a mountable handler in an exported field
+	// hands one out as soon as a caller holds the struct, so returning it is
+	// returning the handler with a type in the way:
+	//
+	//	type hidden = http.Handler
+	//	type Mounted struct{ H hidden }
+	//	func (s *Server) Routes() Mounted { ... }
+	//
+	// walked past every rule: `hidden` was skipped as an unexported
+	// declaration, `H hidden` missed the field predicate because that one
+	// matched only the literal mountable set, and `Mounted` was never recorded
+	// as servable at all. An unexported struct with an exported handler field
+	// is the same shape with one more step.
+	fields := map[string][]string{}
 	for _, file := range files {
 		aliases := importedAs(file)
 		for _, decl := range file.Decls {
@@ -688,10 +840,31 @@ func localHandlerTypes(files map[string]*ast.File) map[string]bool {
 					continue
 				}
 				under[typed.Name.Name] = renderedTypeIn(aliases, typed.Type)
+				structure, ok := typed.Type.(*ast.StructType)
+				if !ok || structure.Fields == nil {
+					continue
+				}
+				for _, field := range structure.Fields.List {
+					exported := len(field.Names) == 0 // an embedded field is reachable
+					for _, name := range field.Names {
+						if name.IsExported() {
+							exported = true
+						}
+					}
+					if !exported {
+						continue
+					}
+					if servesHTTP(aliases, field.Type) {
+						servable[typed.Name.Name] = true
+						continue
+					}
+					fields[typed.Name.Name] = append(fields[typed.Name.Name], renderedTypeIn(aliases, field.Type))
+				}
 			}
 		}
 	}
-	// To a fixpoint, because an alias may name an alias.
+	// To a fixpoint, because an alias may name an alias and a struct may
+	// carry a struct that carries a handler.
 	for changed := true; changed; {
 		changed = false
 		for name, target := range under {
@@ -700,6 +873,22 @@ func localHandlerTypes(files map[string]*ast.File) map[string]bool {
 			}
 			if handedOut(target) || servable[target] {
 				servable[name], changed = true, true
+			}
+		}
+		for name, carried := range fields {
+			if servable[name] {
+				continue
+			}
+			for _, target := range carried {
+				// MOUNTABLE only for a field, for the reason the field rule in
+				// servableExports gives: this package's own Handler needs a
+				// *Gateway that only a booted request produces, so one carried
+				// in a declaration type is inert and is how a consumer
+				// declares a route.
+				if mountableHandler[target] || servable[target] {
+					servable[name], changed = true, true
+					break
+				}
 			}
 		}
 	}
@@ -1175,6 +1364,38 @@ import "net/http"
 type hiddenHandler = http.Handler
 func (s *Server) Routes() map[string]hiddenHandler { return nil }`,
 		},
+		{
+			// Round fourteen's B4: the alias hides inside an exported field,
+			// and the struct carrying it is what the exported method returns.
+			"an exported struct whose exported field is an aliased handler",
+			`package solution
+import "net/http"
+type hidden = http.Handler
+type Mounted struct{ H hidden }
+func (s *Server) Routes() Mounted { return Mounted{} }`,
+		},
+		{
+			"an UNEXPORTED struct with an exported handler field, returned by an exported method",
+			`package solution
+import "net/http"
+type mounted struct{ H http.Handler }
+func (s *Server) Routes() mounted { return mounted{} }`,
+		},
+		{
+			"a struct carrying a struct that carries a handler",
+			`package solution
+import "net/http"
+type inner struct{ H http.Handler }
+type outer struct{ In inner }
+func (s *Server) Routes() outer { return outer{} }`,
+		},
+		{
+			"an embedded handler, which has no field name to be unexported",
+			`package solution
+import "net/http"
+type Mounted struct{ http.Handler }
+func (s *Server) Routes() Mounted { return Mounted{} }`,
+		},
 	}
 	exports := func(t *testing.T, source string) []string {
 		t.Helper()
@@ -1452,4 +1673,108 @@ func sign(seal *workcontext.SealedValues, key *ecdsa.PrivateKey) []byte { return
 	if relaxed("passthroughtest/identity.go", alsoCapabilities) {
 		t.Error("a passthroughtest file holding BOTH a signing primitive and a work-context import is relaxed: that is a capability signer in the test seam, which is the shape this gate was written for and the one most likely to be argued for as harmless")
 	}
+}
+
+// TestTheCapabilityDecodeGateCatchesADestinationItDidNotAllocate is round
+// fourteen's B3.
+//
+// I asserted that decoding requires an allocation. A reviewer showed the
+// zero-value declaration, which `ValueSpec` closed, and then showed the
+// premise was wrong a second way: the allocation need not be in the inspected
+// code at all. The destination arrives as a parameter and the caller allocated
+// it, so there is no literal, no `new`, no declaration, no generated import,
+// no signing primitive, no verifier and no prohibited name.
+func TestTheCapabilityDecodeGateCatchesADestinationItDidNotAllocate(t *testing.T) {
+	parse := func(t *testing.T, source string) *ast.File {
+		t.Helper()
+		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
+		if err != nil {
+			t.Fatalf("parse the probe: %v", err)
+		}
+		return file
+	}
+	decodes := func(t *testing.T, source string) []string {
+		t.Helper()
+		file := parse(t, source)
+		return capabilityDecodes(file, localCapabilityTypes(map[string]*ast.File{"probe.go": file}))
+	}
+
+	caught := []struct{ shape, source string }{
+		{
+			"the destination is a parameter the caller allocated",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(raw []byte, dst *workcontext.SealedValues) error {
+	return proto.Unmarshal(raw, dst)
+}`,
+		},
+		{
+			"the same, through a local alias for the capability type",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+type mySeal = workcontext.SealedValues
+func decodeSeal(raw []byte, dst *mySeal) error { return proto.Unmarshal(raw, dst) }`,
+		},
+		{
+			"protojson rather than proto",
+			`package solution
+import (
+	"google.golang.org/protobuf/encoding/protojson"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(raw []byte, dst *workcontext.SealedValues) error {
+	return protojson.Unmarshal(raw, dst)
+}`,
+		},
+		{
+			"a whole capability, not just its seal",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decode(raw []byte, dst *workcontext.WorkContextV1) error { return proto.Unmarshal(raw, dst) }`,
+		},
+	}
+	for _, probe := range caught {
+		t.Run(probe.shape, func(t *testing.T) {
+			if found := decodes(t, probe.source); len(found) == 0 {
+				t.Errorf("the gate did not catch a decode where %s, so a second reader of core's encoding can grow here:\n%s", probe.shape, probe.source)
+			}
+		})
+	}
+
+	t.Run("passes: reading a seal through the accessor", func(t *testing.T) {
+		// What credential.go does. The type is named in a parameter and
+		// nothing is decoded, so a rule on the NAME would refuse the one
+		// supported way to read a seal.
+		found := decodes(t, `package solution
+import "github.com/codefly-dev/sdk-go/workcontext"
+func holdSealedIdentity(seal *workcontext.SealedValues) sealedIdentity {
+	return sealedIdentity{
+		installation: seal.GetInstallationId(),
+		digest:       seal.GetImageDigest(),
+		incarnation:  seal.GetBuildIncarnation(),
+	}
+}`)
+		if len(found) != 0 {
+			t.Errorf("the gate refused reading a seal through the SDK's accessor, which is the one supported way to do it: %v", found)
+		}
+	})
+
+	t.Run("passes: decoding something that is not a capability", func(t *testing.T) {
+		// This package decodes module responses for a living.
+		found := decodes(t, `package solution
+import "google.golang.org/protobuf/proto"
+func decode(raw []byte, msg proto.Message) error { return proto.Unmarshal(raw, msg) }`)
+		if len(found) != 0 {
+			t.Errorf("the gate refused an ordinary protobuf decode, which is most of what this package does: %v", found)
+		}
+	})
 }

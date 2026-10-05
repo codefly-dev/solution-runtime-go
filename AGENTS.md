@@ -347,14 +347,19 @@ embedding it.
   controls through a real handshake: a peer the anchor signed but the set does
   not name, peer withdrawal with the anchor unchanged, an unreadable anchor,
   and a certificate reader that cannot answer.
-  **What is still not bounded is an ESTABLISHED mint connection.** The readers
-  run per handshake, and the client keeps idle connections, so a withdrawal
-  takes effect on the next handshake and not on a connection already open —
-  the inbound and gateway directions re-verify an established peer once a
-  second and close what stops verifying, and this hop has no equivalent
-  because this runtime never holds that connection. That is the remaining
-  difference, it is stated here rather than implied to be closed, and it is the
-  SDK's to close.
+  **There is no established mint connection to bound, and this file said there
+  was.** It recorded a residual — "the client keeps idle connections, so a
+  withdrawal takes effect on the next handshake and not on a connection already
+  open" — which was true of `v0.3.0` and is not true of the pinned leaf. That
+  transport sets `DisableKeepAlives`, `MaxIdleConnsPerHost: 0` and
+  `ForceAttemptHTTP2: false`, so **every mint is a fresh handshake**; and after
+  the handshake completes it re-reads the anchor and the peer set and verifies
+  the peer again, because `GetClientCertificate` and the server's own
+  processing run *after* the first admission decision and a withdrawal landing
+  in that window must not authorize the HTTP write. It also refuses an endpoint
+  that did not request a client certificate, so this hop cannot silently become
+  anonymous. The residual to carry is narrower and belongs to the SDK: the
+  interval between that post-handshake recheck and the write itself.
 - **Only 401 and 403 latch a credential refusal.** The rule was "429 and 5xx
   retry, everything else is terminal", and sdk-go v0.3.0 inverted it after
   measuring the cost: a 408 from a proxy, with a valid credential in hand,
