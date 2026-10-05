@@ -62,9 +62,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Host frontend URL | resolved by role — the single module owning the `frontend` `http`/`http` endpoint, discovered the same way | — (feeds the host register URL) |
 | Host register URL | `<frontend>/api/solutions/register` | `HOST_REGISTER_URL` |
 | Gateway register URL | `<gateway>/solutions/_register` | `GATEWAY_REGISTER_URL` (must end in `/solutions/_register`, see below) |
-| Gateway module register URL | `<gateway>/modules/_register` | `GATEWAY_MODULE_REGISTER_URL` |
-| Gateway module token URL | the module register URL above with `/modules/_register` swapped for `/modules/_registration-token`, so it keeps that gateway's base path | `GATEWAY_MODULE_REGISTRATION_TOKEN_URL` |
-| Gateway solution token URL | the gateway register URL above with `/solutions/_register` swapped for `/solutions/_registration-token`, same reasoning | `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL` |
+| Gateway solution token URL | the gateway register URL above with `/solutions/_register` swapped for `/solutions/_registration-token`, so it keeps that gateway's base path | `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL` |
 | Internal-auth token | `codefly.For(ctx).WorkspaceSecret("internal-auth", "CODEFLY_INTERNAL_TOKEN")` — the namespaced secret Codefly injects | `CODEFLY_INTERNAL_TOKEN` |
 | Solution registration secret | `codefly.For(ctx).WorkspaceSecret("solution-registration", "SECRET")` — see [Self-registration](#self-registration) | `CODEFLY__SOLUTION_REGISTRATION_SECRET` |
 | Registration beat interval | `15s` | `CODEFLY__SOLUTION_REGISTRATION_INTERVAL` |
@@ -149,16 +147,21 @@ obtains that token by presenting its **solution registration secret** (plus the
 internal token, the gateway's perimeter check) to
 `/solutions/_registration-token`, and presents it as
 `X-Codefly-Solution-Registration` on both registrations. Each surface burns a
-token on use, so — unlike the module credential below — nothing is cached: a
-fresh token is minted for every beat, on each surface.
+token on use, so nothing is cached: a fresh token is minted for every beat, on
+each surface.
+
+This is the only registration a solution makes. It registers **itself** — its
+manifest with the host frontend, its own dialable upstream with the gateway —
+and nothing else. It claims no facade route for a module it consumes, and holds
+no credential that would let it: see [Consumed-module
+federation](#consumed-module-federation).
 
 Provisioning both halves is the composition's job, and works the same for a
 local `codefly run solution` and a deployed cell:
 
 - **host side** — declare `<solution-id>:sha256hex` in the saas `federation`
-  group's `SOLUTION_REGISTRATION_SECRETS` (separately from
-  `MODULE_REGISTRATION_SECRETS`: a solution credential additionally publishes
-  host-origin code, so the two are never shared);
+  group's `SOLUTION_REGISTRATION_SECRETS`. It is a solution's own credential and
+  is never shared with, or derived from, any module's;
 - **solution side** — provision the plaintext as the `SECRET` key of the
   `solution-registration` workspace secret group
   (`codefly config generate solution-registration SECRET` locally; the cell's
@@ -211,11 +214,17 @@ one:
   unreachable dependency produces none, so paying it there would only keep this
   solution out of a healthy host's nav for longer than necessary.
 
-Every registration request refuses to follow redirects, for the same reason none
-of them may be proxied: `net/http` strips only `Authorization`, `WWW-Authenticate`
-and `Cookie` when a redirect crosses hosts, so the `X-Codefly-*` headers these
-requests carry — the plaintext registration secret and the cluster-internal
-token — would be handed to whatever a `Location` named.
+Registration traffic — the exchange and both heartbeats — never goes through an
+HTTP proxy: every target is composition-local, and these requests carry the
+registration secret, the internal token and the signed token in headers, so
+`HTTP(S)_PROXY` with a `NO_PROXY` that misses the host's in-cluster names would
+dial them to an arbitrary egress host.
+
+Every registration request also refuses to follow redirects, for the same
+reason: `net/http` strips only `Authorization`, `WWW-Authenticate` and `Cookie`
+when a redirect crosses hosts, so the `X-Codefly-*` headers these requests carry
+— the plaintext registration secret and the cluster-internal token — would be
+handed to whatever a `Location` named.
 
 A beat is not free any more: each self-registration beat runs an exchange whose
 every success is an audited mint on the issuer, so at the 15s default across two
@@ -232,50 +241,41 @@ to assume them; a host checks both before activating a remote.
 
 ### Consumed-module federation
 
-A solution that declares `api.consumes` also registers each consumed module's
-upstream with the gateway, so `/v1/<as>/*` proxies to it. Codefly projects the
-targets into `CODEFLY__API_CONSUMES`; each gets its own 15s registration
-heartbeat alongside the two above.
+A solution that declares `api.consumes` **reads** each consumed module through
+the gateway, at the REST prefix `/v1/<as>/*` that module is federated under. It
+does not create that route, and this runtime holds no credential that could.
 
-The gateway does **not** accept the shared internal token on `/modules/_register`
-— it admits a registration only against a short-lived token signed by accounts
-and bound to a single prefix, so holding the credential for one module never lets
-you claim another's route. The runtime obtains that token per consumed module by
-presenting the module's own **registration secret** to
-`/modules/_registration-token`, which the gateway brokers to accounts (a composed
-module cannot reach accounts' internal listener itself). The token is reused
-until shortly before it expires — or until half its life is gone, if the issuer
-chose a lifetime shorter than that lead, since how long a credential lives is
-the issuer's call and not this runtime's to veto.
+A facade route for a module is claimed only by the module that serves it, under
+a credential bound to that module. Two things follow, and both are invariants
+rather than preferences:
 
-Obtaining one is an audited security event on accounts, so the runtime does not
-answer every failure by obtaining another. A refusal buys exactly one fresh
-token: the gateway refusing a token minted moments earlier is not refusing it for
-being stale, and re-minting cannot fix whatever it is refusing it for. Beats that
-fail also back off, doubling up to two minutes, so a broken gateway costs a
-bounded number of exchanges however long it stays broken — and the runtime keeps
-retrying, at a rate that will not flood the issuer's audit log, until it
-recovers. A response carrying no usable expiry is refused rather than cached, and
-its two causes — an issuer that sent no `expiresAt` at all, and a clock skewed
-past the credential's lifetime — are reported separately, because they have
-different fixes.
+- a solution never registers or claims a prefix on the gateway's module
+  route-claim surface, for a module it consumes or any other;
+- a solution is delivered no module's route-claim secret. If a composition
+  delivers one anyway, this runtime reads nothing from it — the carrier has no
+  reader here.
 
-No registration request is unbounded: a gateway that accepts one and never
-answers surfaces as a failed beat rather than silently parking that heartbeat
-for the life of the process.
+The reason is what such a credential decides. A route claim says where every
+authenticated request on a prefix is proxied; a solution holding one holds the
+routing of traffic that is not its own, and a claim surface that admits a
+caller attesting to something other than the module itself admits whoever
+claims the prefix first. Neither is a solution's to hold, so the capability is
+not on this runtime's surface at all. See [codefly-dev/module-saas-starter#1018](https://github.com/codefly-dev/module-saas-starter/issues/1018)
+for where a module's own claim is being built, and
+[#953](https://github.com/codefly-dev/module-saas-starter/issues/953) for the
+lifecycle rework that replaces the heartbeat writer.
 
-Registration traffic — the exchange and all three heartbeats — never goes
-through an HTTP proxy: every target is composition-local, and these requests
-carry the registration secret, the internal token, and the signed token in
-headers.
+What stays here is the reading side, unchanged: `Gateway.Transcoded` and the
+[passthrough](#letting-the-page-call-a-consumed-module-the-passthrough) call a
+consumed module at `/v1/<as>/*` as the viewer. Both depend on that route
+existing; neither decides where it points. A solution whose consumed module has
+no route gets the gateway's `404`, which is a composition or module-side gap,
+reported where it happens rather than papered over by claiming the prefix here.
 
-Those secrets arrive in `CODEFLY__MODULE_REGISTRATION_SECRETS` as
-comma-separated `prefix:secret` entries — the plaintext twin of the
-`prefix:sha256hex` digests the same composition declares to accounts
-(`MODULE_REGISTRATION_SECRETS`). A consumed module with no secret cannot be
-registered, so the runtime skips it with a log naming this variable rather than
-beating against a guaranteed 401. Provisioning both halves is the composition's
-job (`codefly run solution`).
+Codefly still projects the consumed targets into `CODEFLY__API_CONSUMES`, and
+the runtime still reads it — at boot, through `loadConfig`, to check the
+`Consumes` declaration against it before the listener exists. It is used for
+nothing else.
 
 ### Reading a Work-Context-authenticated module
 

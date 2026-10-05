@@ -43,14 +43,20 @@ own: it builds on `Server.PassthroughHandler`, the handler `Serve` mounts.
   `mcp/public-url`), and a refusal names that group/key, never a variable name.
   `MCP_PUBLIC_URL` and `HOST_ISSUER_URL` were bare variables for one release and
   the boot refused with the name of something nobody could set (#48).
-- The exception is the consumed-API projection, read at serve time in
-  `registerConsumedAPIs` and never seen by `validate()`. A malformed one is not
-  refused: the runtime logs that the federation is disabled and serves on, so
-  every consumed facade 404s at the gateway while the solution looks healthy.
-  Anything you add on that path inherits that property — it degrades silently
-  unless you make it loud, and a log line is the only signal there is. Both
-  halves of this bullet are pinned by `environment_boundary_test.go`, so a
-  second exception fails the suite until this file describes it.
+  There is no exception: every environment read sits in `loadConfig`'s call
+  tree, and `environment_boundary_test.go` fails the suite if one appears
+  outside it. There used to be one — the consumed-API projection, read at serve
+  time and never seen by `validate()`, so a malformed one disabled the
+  federation with a log line while the solution served on — and it went with the
+  code that read it (#51).
+- A solution registers nothing but itself. It claims no facade route for a
+  module it consumes and holds no credential that would let it: the route for a
+  module is claimed by the module that serves it, under a credential bound to
+  that module, so a solution holding one would hold the thing that decides where
+  another module's traffic goes. The passthrough and the gateway client *read* a
+  consumed module at `/v1/<as>/*`; nothing here decides that the prefix points
+  there. `facade_claim_test.go` pins both halves — the boot that claims nothing,
+  and the package carrying neither the claim surface nor the credential.
 - Validate at the boundary — boot, and the headers a request arrives with — not
   between internal callers. `validate()` is the model: each refusal names the
   variable or the provisioning path that fixes it.

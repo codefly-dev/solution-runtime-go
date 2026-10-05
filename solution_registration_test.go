@@ -179,8 +179,6 @@ func bootAgainst(t *testing.T, h *fakeHost, secret string) func() {
 		publicURL:          "http://127.0.0.1",
 		hostRegisterURL:    h.URL + "/api/solutions/register",
 		gatewayRegisterURL: h.URL + solutionRegisterPath,
-		moduleRegisterURL:  h.URL + moduleRegisterPath,
-		moduleTokenURL:     h.URL + moduleRegistrationTokenPath,
 		solutionTokenURL:   h.URL + solutionRegistrationTokenPath,
 		internalToken:      internalTokenTest,
 		solutionSecret:     secret,
@@ -521,8 +519,6 @@ func TestValidateRequiresASolutionSecret(t *testing.T) {
 		gatewayURL:         "http://gateway:42152",
 		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
 		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
-		moduleRegisterURL:  "http://gateway:42152/modules/_register",
-		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
 		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
 		selfUpstream:       "http://backend:8080",
 	}
@@ -697,8 +693,6 @@ func TestValidateBlamesTheEnvironmentLoadNotTheProvisioning(t *testing.T) {
 		gatewayURL:         "http://gateway:42152",
 		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
 		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
-		moduleRegisterURL:  "http://gateway:42152/modules/_register",
-		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
 		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
 		environmentLoadErr: fmt.Errorf("carrier %q is unreadable", "/var/run/codefly/env"),
 	}
@@ -713,7 +707,7 @@ func TestValidateBlamesTheEnvironmentLoadNotTheProvisioning(t *testing.T) {
 		t.Errorf("with the environment unloaded the secret may well be provisioned; the message must not send the operator to provision it: %v", err)
 	}
 	// Unloaded environments also empty the URLs; same misattribution.
-	cfg.solutionSecret, cfg.moduleTokenURL = "s3cret", ""
+	cfg.solutionSecret, cfg.solutionTokenURL = "s3cret", ""
 	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "carrier") {
 		t.Errorf("an unresolved URL under a failed environment load must name the load: %v", err)
 	}
@@ -885,8 +879,6 @@ func TestRegistrationIntervalIsConfigurable(t *testing.T) {
 				gatewayURL:              "http://gateway:42152",
 				hostRegisterURL:         "http://frontend:21931/api/solutions/register",
 				gatewayRegisterURL:      "http://gateway:42152/solutions/_register",
-				moduleRegisterURL:       "http://gateway:42152/modules/_register",
-				moduleTokenURL:          "http://gateway:42152/modules/_registration-token",
 				solutionTokenURL:        "http://gateway:42152/solutions/_registration-token",
 				solutionSecret:          "s3cret",
 				registrationIntervalErr: fmt.Errorf("unusable"),
@@ -976,8 +968,6 @@ func TestSolutionRegistrationKeepsRetryingAnUnavailableHost(t *testing.T) {
 		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
 		hostRegisterURL:    srv.URL + "/api/solutions/register",
 		gatewayRegisterURL: srv.URL + solutionRegisterPath,
-		moduleRegisterURL:  srv.URL + moduleRegisterPath,
-		moduleTokenURL:     srv.URL + moduleRegistrationTokenPath,
 		solutionTokenURL:   srv.URL + solutionRegistrationTokenPath,
 		internalToken:      internalTokenTest,
 		solutionSecret:     "s3cret",
