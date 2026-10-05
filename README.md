@@ -518,10 +518,19 @@ approval is not authorization at use. The refusal is logged once per distinct
 failure rather than once per request, and once more when it recovers; what a
 caller gets is not throttled, because every affected call is refused.
 
-A capability the far end reports as **superseded** (its sealed state has moved)
-is dropped from the request's cache rather than reused until its own clock runs
-out, so the next call mints instead of presenting a credential the issuer has
-stopped honouring.
+**Nothing is inferred from a module's 409.** A capability is held until its own
+expiry, whatever a callee answers. A 409 means "the state you were sealed to
+has moved" and it means "that page already exists", and nothing on the wire
+says which — so a runtime that read one as supersession evicted a perfectly
+valid capability every time a module reported a duplicate or a lost update, and
+the next call minted again. Matching installation metadata identifies the
+*scope* of a conflict; it does not establish supersession.
+
+A genuinely superseded capability is therefore refused call by call by the far
+end — correct if noisy — and the renewal that replaces it happens on the
+credential's own schedule. Acting on a conflict needs a machine-readable
+discriminator from the host or the verifier, which nothing publishes today;
+what a viewer sees meanwhile is the 409 itself.
 
 A consumer whose issuer is reached another way supplies its own source:
 
@@ -569,9 +578,10 @@ reasonable, which is why the first step fails a test here.
 A module's refusal of a presented capability reaches a handler by kind:
 `ErrRevoked` — the capability was sound when minted and the state moved under
 it (an installation revision, a principal's epoch, a build incarnation, a
-binding) — is reported as `aborted`, because the answer to every one of those
-is to mint again rather than to retry or to tell the viewer their authorization
-failed. `ErrInvalid` and `ErrNotACoreToken` are reported as `internal`: a
+binding) — is reported as `aborted`, because the call was not made and
+retrying the same call will not make it. It does **not** retire the capability:
+see "Nothing is inferred from a module's 409" above, since that answer is
+indistinguishable from an ordinary business conflict. `ErrInvalid` and `ErrNotACoreToken` are reported as `internal`: a
 credential this solution could not present is this solution's problem, not a
 module that is briefly unreachable. There are two, not three: core v0.9.0
 **deleted** `ErrUnsealed`, because the seal is now required by the schema and
