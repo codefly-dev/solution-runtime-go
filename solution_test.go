@@ -674,12 +674,11 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		g.conflictFirstCall = false
 		g.mu.Unlock()
 		if conflict {
-			// An ordinary conflict, with an installation header about an
-			// installation this capability is not sealed to.
-			// The SAME installation the capability is sealed to, which is what
-			// a real module answering a business conflict carries. A foreign
-			// id here is what hid the finding: it made the installation
-			// comparison look sufficient.
+			// An ordinary business conflict, carrying the SAME installation
+			// the capability is sealed to — which is what a real module
+			// answers with, because a module handling this viewer's call IS in
+			// their installation. A foreign id here is what hid the finding:
+			// it made comparing the installation look sufficient.
 			w.Header().Set(workcontext.InstallationIDHeaderName, corework.FixtureInstallation)
 			w.Header().Set(workcontext.InstallationRevisionHeaderName, "9")
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "that page already exists"})
@@ -1985,11 +1984,17 @@ func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
 	// handed is retired — which is what expiry does, with no second call to
 	// ForModule and no concurrency.
 	actions[0] = "delete"
-	held, err := acting.workContext(context.Background())
-	if err != nil {
+	if _, err := acting.workContext(context.Background()); err != nil {
 		t.Fatalf("read the delegated capability: %v", err)
 	}
-	acting.contexts.supersede(acting.delegation.key, held)
+	// Expire the held capability, which is what forces the next read to mint.
+	// This used the cache's supersede primitive, which existed only to serve
+	// the 409 inference and went with it; expiring the entry directly says
+	// what the test means — a LATER mint must not carry the edited slice —
+	// without a production method nothing calls.
+	acting.contexts.mu.Lock()
+	delete(acting.contexts.minted, acting.delegation.key)
+	acting.contexts.mu.Unlock()
 
 	// A refusal here is also a correct answer. What must not happen is a
 	// silent mint for "delete".

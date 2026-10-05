@@ -1001,14 +1001,30 @@ func fixtureReadSeal(raw []byte) (*wc.SealedValues, error) {
 	err := decode(raw, &dst)
 	return dst, err
 }
+
+// The DESTINATION rule on its own. This codec's parameter is concrete, so the
+// opaque-parameter rule does not fire and only dereferencing the destination
+// all the way down reaches the wire type. Without it the two rules overlapped
+// on one fixture and neither was pinned alone.
+type fixtureCodec struct{}
+
+func (fixtureCodec) UnmarshalInto(dst **wc.SealedValues) {}
+
+func fixtureHandRoundAboutDestination() {
+	dst := fixtureAlloc[wc.SealedValues]()
+	var codec fixtureCodec
+	codec.UnmarshalInto(&dst)
+}
 `, reportCapabilityShapes)
 	// The instantiation is the construction, and the double-pointer
 	// destination is the decode. Both must be named.
 	if !strings.Contains(capabilities, "fixtureAlloc") {
 		t.Errorf("the capability gate did not flag the generic instantiated with core's wire message, so a generic allocation still escapes:\n%s", capabilities)
 	}
-	if !strings.Contains(capabilities, "fixtureReadSeal") {
-		t.Errorf("the capability gate did not flag the decode into a **SealedValues, so indirection still escapes:\n%s", capabilities)
+	for _, want := range []string{"fixtureReadSeal", "fixtureHandRoundAboutDestination"} {
+		if !strings.Contains(capabilities, want) {
+			t.Errorf("the capability gate did not flag %s, so a destination behind two pointers still escapes:\n%s", want, capabilities)
+		}
 	}
 
 	// CONTROLS, because both new rules are the fail-closed kind and a gate
@@ -1016,11 +1032,23 @@ func fixtureReadSeal(raw []byte) (*wc.SealedValues, error) {
 	controls := filepath.Join(dir, "zz_typed_control_fixture.go")
 	clean := gateFindings(t, controls, `package solution
 
-import wc "github.com/codefly-dev/sdk-go/workcontext"
+import (
+	"net/http"
+
+	wc "github.com/codefly-dev/sdk-go/workcontext"
+)
 
 // `+"`error`"+` is an interface, and every function here returns one. A handler
-// cannot be stored in it, so it is not a hole a handler hides in.
-func FixtureReturnsAnError() error { return nil }
+// cannot be stored in it, so it is not a hole a handler hides in — and this
+// one BUILDS a mountable value, which is what makes it discriminating: a rule
+// that treated every interface as opaque would flag it, and a mutant that
+// removes the "a handler could be stored in it" condition is caught here.
+// That is Serve's own shape.
+func FixtureBuildsAMuxAndReturnsAnError() error {
+	mux := http.NewServeMux()
+	_ = mux
+	return nil
+}
 
 // `+"`any`"+` fields that hold a consumer's message, which is Operation.Request
 // and Operation.Response. Nothing mountable is built here.

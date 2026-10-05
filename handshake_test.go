@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -946,48 +945,6 @@ func TestEveryPlatformConnectionIsWatched(t *testing.T) {
 			t.Fatalf("a connection the transport dialled was still open %s after the platform's root was removed: a connection whose trust is never re-verified is bounded only by how long it stays idle, which traffic prevents",
 				5*outboundTrustRecheckInterval)
 		}
-	}
-}
-
-// TestALateSupersessionDoesNotEvictANewerCapability: the cache evicted by key
-// alone, and two concurrent calls reach that without anything unusual. Both
-// present carrier-1; the first refusal evicts it; a third call mints carrier-2;
-// then the second, late refusal — still about carrier-1 — deleted carrier-2. The
-// result is a third audited mint and a discarded capability nothing refused.
-func TestALateSupersessionDoesNotEvictANewerCapability(t *testing.T) {
-	cache := newWorkContextCache()
-	var minted int
-	issue := func(context.Context) (string, time.Time, error) {
-		minted++
-		return fmt.Sprintf("carrier-%d", minted), time.Now().Add(time.Hour), nil
-	}
-	const key = "things"
-
-	first, err := cache.resolve(context.Background(), key, issue)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Two outstanding requests hold first. One is refused, which evicts it.
-	cache.supersede(key, first)
-	second, err := cache.resolve(context.Background(), key, issue)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second == first {
-		t.Fatalf("a superseded capability was served again: %q", second)
-	}
-	// The other request's refusal arrives now. It is about first.
-	cache.supersede(key, first)
-
-	third, err := cache.resolve(context.Background(), key, issue)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if third != second {
-		t.Errorf("the cache minted %q after a late refusal naming a capability it no longer held: a refusal for one carrier evicted a newer one by key alone, costing an audited mint and discarding a capability nothing had refused", third)
-	}
-	if minted != 2 {
-		t.Errorf("minted %d capabilities, want 2: one for the ask and one for the supersession it actually had", minted)
 	}
 }
 

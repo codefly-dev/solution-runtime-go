@@ -686,9 +686,11 @@ func (r *attestationReport) recovered(id string) {
 // no test noticed; a dead branch that would do the wrong thing if it ever woke
 // up is worse than no branch.
 //
-// A callee's ErrRevoked is handled where it actually arrives: the far end
-// answers 409 with the installation headers, and the capability is dropped from
-// the cache so the next call mints (see supersededCapability).
+// A callee's ErrRevoked arrives on a viewer's own request and is answered
+// there, as a 409 to that viewer. Nothing is inferred from it about the
+// capability or about this execution's credential: a 409 means "the state you
+// were sealed to has moved" and it means "that page already exists", and
+// nothing on the wire says which (see the RoundTrip comment in solution.go).
 //
 // Everything else, ErrMintUnavailable above all, is transient by construction
 // and must not end the process: an issuer that cannot reach its own policy log

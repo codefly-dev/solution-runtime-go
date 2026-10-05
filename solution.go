@@ -3548,33 +3548,6 @@ func (c *workContextCache) resolve(
 	return token, err
 }
 
-// supersede drops the capability held for one ask — the one that was refused,
-// and only if it is still the one held — so the next call mints instead of
-// presenting it again.
-//
-// It is the other half of classifying a refusal as ErrRevoked. That sentinel
-// means the capability was sound when it was minted and the state moved under
-// it — an installation revision, a principal's epoch, a build incarnation, a
-// binding — and the holder's answer is to mint again. Classifying the error and
-// then keeping the capability until its *time* ran out would answer every call
-// in that window with the same refusal: the cache reused a credential the
-// issuer had already stopped honouring, and a caller that re-asked got it back.
-//
-// The presented token is what makes this conditional, and deleting by key alone
-// was a defect a concurrent pair of calls reaches without anything unusual: two
-// requests present carrier-1, the first refusal evicts it, a third call mints
-// carrier-2, and then the *second* late refusal — still about carrier-1 —
-// deleted carrier-2, costing a third audited mint and discarding a capability
-// nothing had refused. Comparing the token needs no generation counter: the
-// token is the generation.
-func (c *workContextCache) supersede(key, presented string) {
-	c.mu.Lock()
-	if issued, ok := c.minted[key]; ok && issued.token == presented {
-		delete(c.minted, key)
-	}
-	c.mu.Unlock()
-}
-
 // Unary makes a typed Connect call to a fully-qualified procedure through the
 // gateway. Req and Resp are generated protobuf messages; the gateway URL, the
 // bearer, and the wire protocol are hidden so a handler only names a procedure
