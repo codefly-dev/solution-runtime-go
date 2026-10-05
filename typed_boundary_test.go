@@ -212,24 +212,6 @@ func derefOnce(t types.Type) types.Type {
 	return t
 }
 
-// deref strips EVERY pointer.
-//
-// The decode rule used derefOnce, so a destination of type **SealedValues —
-// which is what `dst := alloc[wc.SealedValues](); decode(raw, &dst)` produces
-// — still had a pointer on it when coreWireType asked for its name, and a
-// named type behind two pointers has no name at one. Indirection is not a
-// shape to enumerate: whatever a value points at, through however many levels,
-// is what a decoder writes into.
-func deref(t types.Type) types.Type {
-	for {
-		pointer, ok := types.Unalias(t).(*types.Pointer)
-		if !ok {
-			return t
-		}
-		t = pointer.Elem()
-	}
-}
-
 // typeWalk is THE traversal, and every rule in this file asks its question
 // through it.
 //
@@ -873,7 +855,7 @@ func inspectForCapabilities(g typedGate, decl ast.Node, where string, info *type
 					if _, opaque := types.Unalias(parameter).Underlying().(*types.Interface); !opaque {
 						continue
 					}
-					destination(deref(info.TypeOf(arg)),
+					destination(info.TypeOf(arg),
 						"%s hands a value carrying %s to something that takes it as an opaque message (parameter %d is an interface): that is a codec, whatever the call is spelled like. Read the seal through Credential.Seal().",
 						where, i)
 				}
@@ -892,7 +874,7 @@ func inspectForCapabilities(g typedGate, decl ast.Node, where string, info *type
 			// `*box` decodes into box, and only the arguments were examined.
 			destinations := append([]ast.Expr{selector.X}, typed.Args...)
 			for _, arg := range destinations {
-				destination(deref(info.TypeOf(arg)),
+				destination(info.TypeOf(arg),
 					"%s decodes into a value carrying %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through Credential.Seal().",
 					where)
 			}
