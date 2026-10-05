@@ -855,8 +855,14 @@ func inspectForCapabilities(g typedGate, decl ast.Node, where string, info *type
 					if _, opaque := types.Unalias(parameter).Underlying().(*types.Interface); !opaque {
 						continue
 					}
+					// The carried path is the LAST argument reportCarrier
+					// appends, so it is the last placeholder here. It was
+					// second, and the refusal printed
+					// `%!s(int=1)` and `%!d(string=…/WorkSealV1)` — a garbled
+					// message on the one path whose job is to tell an author
+					// exactly what they did.
 					destination(info.TypeOf(arg),
-						"%s hands a value carrying %s to something that takes it as an opaque message (parameter %d is an interface): that is a codec, whatever the call is spelled like. Read the seal through Credential.Seal().",
+						"%s hands a value to something that takes it as an opaque message (parameter %d is an interface), and that value carries %s: that is a codec, whatever the call is spelled like. Read the seal through Credential.Seal().",
 						where, i)
 				}
 			}
