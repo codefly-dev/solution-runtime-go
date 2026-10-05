@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -583,6 +584,14 @@ func servableExports(name string, file *ast.File, local map[string]bool) (findin
 				if handedOut(named) {
 					report("%s exports %s returning %s: a servable handler obtained outside Serve has skipped validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, and whoever mounts it serves the viewer's bearer and this workload's credential over whatever it is mounted on. Let Serve mount it.",
 						name, fn.Name.Name, named)
+					continue
+				}
+				// An ANONYMOUS struct carrying one. There is no declaration
+				// for the name-based analysis to visit, so the expression is
+				// inspected directly.
+				if carriesAMountableHandler(aliases, local, result.Type, 0) {
+					report("%s exports %s returning an unnamed type that carries a servable handler in a reachable field: a caller mounts that field and has a handler built without validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound. Let Serve mount it.",
+						name, fn.Name.Name)
 				}
 			}
 		}
@@ -665,12 +674,13 @@ func coreCapabilityConstructions(file *ast.File, local map[string]bool) []string
 // allocate one itself.
 func capabilityDecodes(file *ast.File, localCapability map[string]bool) []string {
 	aliases := importedAs(file)
-	capability := func(expr ast.Expr) bool {
+	base := func(expr ast.Expr) bool {
 		rendered := renderedTypeIn(aliases, expr)
 		return coreCapabilityType(rendered) || localCapability[rendered]
 	}
 	var decoded []string
 	for _, decl := range file.Decls {
+		capability := base
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
 			continue
@@ -693,6 +703,36 @@ func capabilityDecodes(file *ast.File, localCapability map[string]bool) []string
 		record(fn.Type.Params)
 		record(fn.Type.Results)
 		record(fn.Recv)
+		// Aliases declared INSIDE the function.
+		//
+		// localCapabilityTypes reads package-level declarations, so a
+		// function-local `type localSeal = workcontext.SealedValues` was a
+		// name the scanner had never heard of — and `var dst localSeal`
+		// bound nothing. Collected per function because that is the scope the
+		// name exists in.
+		lexical := map[string]bool{}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			declared, ok := node.(*ast.GenDecl)
+			if !ok || declared.Tok != token.TYPE {
+				return true
+			}
+			for _, spec := range declared.Specs {
+				typed, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				if rendered := renderedTypeIn(aliases, typed.Type); coreCapabilityType(rendered) || localCapability[rendered] || lexical[rendered] {
+					lexical[typed.Name.Name] = true
+				}
+			}
+			return true
+		})
+		if len(lexical) > 0 {
+			outer := capability
+			capability = func(expr ast.Expr) bool {
+				return outer(expr) || lexical[renderedTypeIn(aliases, expr)]
+			}
+		}
 		// Declarations with an explicit type, and then ASSIGNMENT ALIASES, to
 		// a fixpoint.
 		//
@@ -751,7 +791,12 @@ func capabilityDecodes(file *ast.File, localCapability map[string]bool) []string
 				return true
 			}
 			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !strings.Contains(selector.Sel.Name, "Unmarshal") {
+			// Unmarshal AND Decode. This matched only "Unmarshal", so
+			// `json.NewDecoder(r).Decode(dst)` — an ordinary shape, with the
+			// destination a capability — walked past it. The rule is about
+			// reading core's encoding into one of core's messages; which
+			// decoder library does it is not the question.
+			if !ok || (!strings.Contains(selector.Sel.Name, "Unmarshal") && !strings.Contains(selector.Sel.Name, "Decode")) {
 				return true
 			}
 			for _, arg := range call.Args {
@@ -843,7 +888,21 @@ func coreCapabilityType(rendered string) bool {
 		bare = bare[cut+1:]
 	}
 	switch bare {
-	case "WorkSealV1", "WorkContextV1", "SealedValues", "WorkContext", "Capability":
+	// Core's own generated spellings.
+	case "WorkContextV1", "WorkSealV1", "WorkOperationBindingV1":
+		return true
+	// The SDK's exported aliases for them. `Claims` is the whole capability
+	// and was MISSING from this list, which is the gap that mattered: the SDK
+	// does not export `WorkContextV1` at all, so the probes that claimed to
+	// cover the whole-capability case named a type that does not exist. They
+	// only parsed their source, so nothing failed and the omission was
+	// invisible for three rounds. TestEverySDKCapabilityAliasIsInTheGatesList
+	// derives this set from the pinned SDK now.
+	case "Claims", "SealedValues", "SealedOperationBinding":
+		return true
+	// Names this package must never declare for one of its own, kept so a
+	// local type called WorkContext or Capability is refused on sight.
+	case "WorkContext", "Capability":
 		return true
 	}
 	return false
@@ -960,6 +1019,59 @@ func localHandlerTypes(files map[string]*ast.File) map[string]bool {
 		}
 	}
 	return servable
+}
+
+// carriesAMountableHandler reports whether a type EXPRESSION hands out a
+// mountable handler through a field a caller can reach — including an
+// anonymous struct, which has no declaration for localHandlerTypes to visit.
+//
+// That was the hole: localHandlerTypes follows named structs, aliases,
+// exported fields and embedding, and
+//
+//	func (s *Server) Routes() struct{ H http.Handler } { ... }
+//
+// has no type name at all, so there was nothing to record and renderedTypeIn
+// returns "" for it. A caller mounts `Routes().H` and has the wrapper without
+// the boot. Recursive, because the struct can nest.
+func carriesAMountableHandler(aliases map[string]string, local map[string]bool, expr ast.Expr, depth int) bool {
+	if depth > 6 {
+		// A type cannot nest in itself without a name, and a name is
+		// localHandlerTypes' job; this only bounds a pathological expression.
+		return false
+	}
+	switch typed := expr.(type) {
+	case *ast.StarExpr:
+		return carriesAMountableHandler(aliases, local, typed.X, depth+1)
+	case *ast.ArrayType:
+		return carriesAMountableHandler(aliases, local, typed.Elt, depth+1)
+	case *ast.MapType:
+		return carriesAMountableHandler(aliases, local, typed.Value, depth+1)
+	case *ast.ChanType:
+		return carriesAMountableHandler(aliases, local, typed.Value, depth+1)
+	case *ast.StructType:
+		if typed.Fields == nil {
+			return false
+		}
+		for _, field := range typed.Fields.List {
+			reachable := len(field.Names) == 0 // embedded: reachable by its own type name
+			for _, name := range field.Names {
+				if name.IsExported() {
+					reachable = true
+				}
+			}
+			if !reachable {
+				continue
+			}
+			rendered := renderedTypeIn(aliases, field.Type)
+			if mountableHandler[rendered] || local[rendered] || servesHTTP(aliases, field.Type) {
+				return true
+			}
+			if carriesAMountableHandler(aliases, local, field.Type, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // mountableHandler is what a caller can serve the moment they hold it, keyed
@@ -1463,6 +1575,39 @@ import "net/http"
 type Mounted struct{ http.Handler }
 func (s *Server) Routes() Mounted { return Mounted{} }`,
 		},
+		{
+			// F2: an ANONYMOUS struct has no declaration for the name-based
+			// analysis to visit, and renders as "".
+			"an anonymous struct result carrying a handler",
+			`package solution
+import "net/http"
+func (s *Server) Routes() struct{ H http.Handler } { return struct{ H http.Handler }{} }`,
+		},
+		{
+			"an anonymous struct whose field is an aliased handler",
+			`package solution
+import "net/http"
+type hidden = http.Handler
+func (s *Server) Routes() struct{ H hidden } { return struct{ H hidden }{} }`,
+		},
+		{
+			"an anonymous struct nesting another",
+			`package solution
+import "net/http"
+func (s *Server) Routes() struct{ In struct{ H http.Handler } } { return struct{ In struct{ H http.Handler } }{} }`,
+		},
+		{
+			"an anonymous struct embedding a handler",
+			`package solution
+import "net/http"
+func (s *Server) Routes() struct{ http.Handler } { return struct{ http.Handler }{} }`,
+		},
+		{
+			"a slice of anonymous carriers",
+			`package solution
+import "net/http"
+func (s *Server) Routes() []struct{ H http.Handler } { return nil }`,
+		},
 	}
 	exports := func(t *testing.T, source string) []string {
 		t.Helper()
@@ -1511,6 +1656,19 @@ func (s *Server) Serve() error { return nil }`,
 			"an interface result that is not the empty one",
 			`package solution
 func (s *Server) Source() IdentitySource { return nil }`,
+		},
+		{
+			// The anonymous-struct rule must look at REACHABLE fields only,
+			// or every exported method returning a small struct is refused.
+			"an anonymous struct whose handler field is unexported",
+			`package solution
+import "net/http"
+func (s *Server) Routes() struct{ h http.Handler } { return struct{ h http.Handler }{} }`,
+		},
+		{
+			"an anonymous struct carrying no handler at all",
+			`package solution
+func (s *Server) Describe() struct{ Name string } { return struct{ Name string }{} }`,
 		},
 	}
 	for _, probe := range passes {
@@ -1640,7 +1798,7 @@ func build() *pb.WorkSealV1 { return &pb.WorkSealV1{} }`,
 			"a whole capability, not just its seal",
 			`package solution
 import "github.com/codefly-dev/sdk-go/workcontext"
-func build() any { return &workcontext.WorkContextV1{} }`,
+func build() any { return &workcontext.Claims{} }`,
 		},
 		{
 			// Round thirteen's major 3: no literal, no new(), and the decode
@@ -1821,7 +1979,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
-func decode(raw []byte, dst *workcontext.WorkContextV1) error { return proto.Unmarshal(raw, dst) }`,
+func decode(raw []byte, dst *workcontext.Claims) error { return proto.Unmarshal(raw, dst) }`,
 		},
 		{
 			// Round fifteen: the destination is put in a name the scanner had
@@ -1917,6 +2075,34 @@ func hold(seal *workcontext.SealedValues) string {
 		}
 	})
 
+	t.Run("passes: an ordinary json Decode", func(t *testing.T) {
+		// Adding Decode to the matched names must not refuse every decoder in
+		// the package, which serves and reads JSON for a living.
+		found := decodes(t, `package solution
+import (
+	"encoding/json"
+	"io"
+)
+func decode(r io.Reader, dst *struct{ A int }) error { return json.NewDecoder(r).Decode(dst) }`)
+		if len(found) != 0 {
+			t.Errorf("the gate refused an ordinary json decode: %v", found)
+		}
+	})
+
+	t.Run("passes: an ordinary json Decode", func(t *testing.T) {
+		// Matching "Decode" as well as "Unmarshal" must not refuse every
+		// decoder in a package that reads JSON for a living.
+		found := decodes(t, `package solution
+import (
+	"encoding/json"
+	"io"
+)
+func decode(r io.Reader, dst *struct{ A int }) error { return json.NewDecoder(r).Decode(dst) }`)
+		if len(found) != 0 {
+			t.Errorf("the gate refused an ordinary json decode: %v", found)
+		}
+	})
+
 	t.Run("passes: decoding something that is not a capability", func(t *testing.T) {
 		// This package decodes module responses for a living.
 		found := decodes(t, `package solution
@@ -1926,4 +2112,70 @@ func decode(raw []byte, msg proto.Message) error { return proto.Unmarshal(raw, m
 			t.Errorf("the gate refused an ordinary protobuf decode, which is most of what this package does: %v", found)
 		}
 	})
+}
+
+// TestEverySDKCapabilityAliasIsInTheGatesList derives the gate's capability
+// names from the PINNED SDK rather than trusting the list.
+//
+// This is the test that would have caught F1 three rounds earlier. The gate
+// knew "WorkContextV1" and the SDK does not export that name at all — it
+// exports `Claims`, an alias for core's `basev0.WorkContextV1` — so the whole
+// capability was never covered, and both probes that claimed to cover it named
+// a nonexistent type. They only PARSED their source, so a name that cannot
+// compile supplied the evidence that the rule worked.
+//
+// Reading the SDK's own source means an alias it adds later fails this test
+// instead of silently widening the hole.
+func TestEverySDKCapabilityAliasIsInTheGatesList(t *testing.T) {
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/codefly-dev/sdk-go/workcontext").Output()
+	if err != nil {
+		t.Skipf("the pinned workcontext module is not resolvable here, so this cannot check the list: %v", err)
+	}
+	dir := strings.TrimSpace(string(out))
+	sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil || len(sources) == 0 {
+		t.Fatalf("found %d sources in the pinned SDK at %q: a check that reads nothing passes", len(sources), dir)
+	}
+
+	// Core's capability messages. An alias for one of these is an alias for a
+	// thing only core may encode or decode.
+	capabilityMessages := map[string]bool{
+		"WorkContextV1": true, "WorkSealV1": true, "WorkOperationBindingV1": true,
+	}
+	fset := token.NewFileSet()
+	found := 0
+	for _, name := range sources {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse the pinned SDK's %s: %v", filepath.Base(name), err)
+		}
+		for _, decl := range file.Decls {
+			declared, ok := decl.(*ast.GenDecl)
+			if !ok || declared.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range declared.Specs {
+				typed, ok := spec.(*ast.TypeSpec)
+				if !ok || typed.Assign == 0 || !typed.Name.IsExported() {
+					continue // a definition, or unexported: neither is a name a consumer can write
+				}
+				target, ok := typed.Type.(*ast.SelectorExpr)
+				if !ok || !capabilityMessages[target.Sel.Name] {
+					continue
+				}
+				found++
+				if !coreCapabilityType(typed.Name.Name) {
+					t.Errorf("the pinned SDK exports %s = %s, an alias for one of core's capability messages, and the gate's name list does not contain it: a decode into that name escapes every rule here, which is exactly how the whole capability went uncovered while two probes claimed otherwise",
+						typed.Name.Name, target.Sel.Name)
+				}
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatal("found no capability aliases in the pinned SDK at all, so this check proves nothing: the SDK re-exports core's WorkContextV1 and WorkSealV1 and this test is the thing that notices when it stops")
+	}
+	t.Logf("checked %d exported capability aliases in the pinned SDK", found)
 }
