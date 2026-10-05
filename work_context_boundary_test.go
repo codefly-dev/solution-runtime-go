@@ -35,10 +35,33 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		// issuesTLSMaterialOnly relaxes the signing-primitive rule for ONE
+		// narrow shape, and the condition is checked rather than asserted.
+		//
+		// sdk-go#51 holds the mint endpoint to the SPIFFE ID in its single URI
+		// SAN, so the fake host in passthroughtest has to issue a certificate
+		// carrying one — httptest's shared certificate has no URI SAN at all,
+		// and a client with AdmittedPeers refuses it, correctly. The seam's
+		// code lives in non-test files because a consumer imports it from
+		// their tests, so it cannot hide behind the _test.go exclusion the
+		// root package's own cell helpers use.
+		//
+		// The relaxation is conditional on the file touching NOTHING
+		// capability-shaped: issuing TLS material has no business importing a
+		// work-context package, and a file that does both is exactly what this
+		// gate is for. Every other rule below still applies to it — the
+		// capability-message construction rule, the verifier rule, the JOSE
+		// rule and the declaration-name rule — and
+		// TestTheSigningRelaxationIsConditional pins that.
+		issuesTLSMaterialOnly := strings.HasPrefix(name, "passthroughtest/") &&
+			len(workContextImports(file)) == 0 && dotImportedWorkContext(file) == ""
 		for _, imported := range file.Imports {
 			path := strings.Trim(imported.Path.Value, `"`)
 			switch path {
 			case "crypto/ed25519", "crypto/ecdsa", "crypto/hmac", "crypto/rsa", "crypto/ed25519/internal/edwards25519":
+				if issuesTLSMaterialOnly {
+					continue
+				}
 				t.Errorf("%s imports %s: signing a capability is core's, and a runtime that can sign one is a second implementation waiting to happen. Carry the credential the mint client hands you.",
 					name, path)
 			}
@@ -1220,4 +1243,53 @@ func holdSealedIdentity(seal *workcontext.SealedValues) sealedIdentity {
 			t.Errorf("the gate refused reading a seal through the SDK's accessor, which is the one supported way to do it: %v", built)
 		}
 	})
+}
+
+// TestTheSigningRelaxationIsConditional pins the one relaxation in the
+// signing-primitive rule, in both directions.
+//
+// A file under passthroughtest that issues TLS material may hold a key
+// primitive, because sdk-go#51 requires the fake mint endpoint to present a
+// SPIFFE ID and httptest's shared certificate has none. The same file may NOT
+// hold one once it touches anything capability-shaped — a file doing both is
+// precisely what this gate exists to refuse, and "it is only the test seam" is
+// how that would arrive.
+func TestTheSigningRelaxationIsConditional(t *testing.T) {
+	parse := func(t *testing.T, source string) *ast.File {
+		t.Helper()
+		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
+		if err != nil {
+			t.Fatalf("parse the probe: %v", err)
+		}
+		return file
+	}
+	// The rule, restated here exactly as the gate computes it, because the
+	// gate's own loop reports through t.Errorf over the real tree.
+	relaxed := func(name string, file *ast.File) bool {
+		return strings.HasPrefix(name, "passthroughtest/") &&
+			len(workContextImports(file)) == 0 && dotImportedWorkContext(file) == ""
+	}
+
+	tlsOnly := parse(t, `package passthroughtest
+import (
+	"crypto/ecdsa"
+	"crypto/x509"
+)
+func leaf() (*x509.Certificate, *ecdsa.PrivateKey) { return nil, nil }`)
+	if !relaxed("passthroughtest/identity.go", tlsOnly) {
+		t.Error("the relaxation does not cover a passthroughtest file that only issues TLS material, so the seam cannot present the SPIFFE ID the SDK now requires of the mint endpoint")
+	}
+	if relaxed("credential.go", tlsOnly) {
+		t.Error("the relaxation reaches the root package: this is where the runtime lives, and a signing primitive here is the first step of the duplication this gate exists to refuse")
+	}
+
+	alsoCapabilities := parse(t, `package passthroughtest
+import (
+	"crypto/ecdsa"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func sign(seal *workcontext.SealedValues, key *ecdsa.PrivateKey) []byte { return nil }`)
+	if relaxed("passthroughtest/identity.go", alsoCapabilities) {
+		t.Error("a passthroughtest file holding BOTH a signing primitive and a work-context import is relaxed: that is a capability signer in the test seam, which is the shape this gate was written for and the one most likely to be argued for as harmless")
+	}
 }

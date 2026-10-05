@@ -2,6 +2,7 @@ package solution
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -106,76 +107,22 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The anchor is re-read before every ask, not captured once.
+	// ONE long-lived reloader for the leaf, built here and closed over.
 	//
-	// NewMintClient takes RootCAs as a VALUE and builds its transport from it
-	// there and then (mintHTTPClient), so the pool a client is constructed
-	// with is the pool it uses for the life of that client. The path this
-	// replaced dialled the mint through this runtime's own outbound client,
-	// whose DialTLSContext re-read the anchor per dial — so removing a
-	// compromised root took effect on the next dial, which is the property
-	// AGENTS.md argues for in both directions.
-	//
-	// v0.3.0 exposes no per-dial anchor hook, and RootCAs is the only thing it
-	// lets a caller say about the transport. So the anchor is re-read here and
-	// a client is rebuilt when it has actually ROTATED — which is the one
-	// moment a fresh dial under new trust is wanted, and otherwise leaves the
-	// client, and its one credential per execution, alone.
-	return &anchorFreshSource{
-		anchor: s.peerTrustAnchor(identity),
-		build: func(pool *x509.CertPool) (CredentialSource, error) {
-			client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, pool))
-			if err != nil {
-				return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
-			}
-			return client, nil
-		},
-	}, nil
-}
-
-// anchorFreshSource holds the mint client to the anchor as it is NOW.
-//
-// It re-reads the trust anchor before each ask and rebuilds the client when the
-// pool has changed, because the SDK's client fixes its transport at
-// construction. An anchor that has become unreadable REFUSES rather than
-// falling back to the last good pool: the two failures are not symmetric, and
-// the asymmetry is the one this file already records for the inbound
-// direction — serving a stale leaf refuses callers who should be let in, while
-// dialling under a stale anchor sends the projected service-account token to
-// whatever now answers at that address.
-//
-// What this does NOT restore is the peer-role check the old path made: the
-// mint's own identity was held to MINT_PEERS_FILE through admitOnlyPlatform,
-// and the SDK presents no client certificate and offers no verifier hook, so
-// there is nowhere to make it. That is named in AGENTS.md and carried as an
-// sdk-go follow-up rather than reimplemented here behind the SDK's back.
-type anchorFreshSource struct {
-	anchor func() (*x509.CertPool, error)
-	build  func(*x509.CertPool) (CredentialSource, error)
-
-	mu    sync.Mutex
-	pool  *x509.CertPool
-	inner CredentialSource
-}
-
-func (a *anchorFreshSource) Credential(ctx context.Context) (workcontext.Credential, error) {
-	pool, err := a.anchor()
+	// The thing that keeps a rotated leaf presented is the reloader's own
+	// re-read, not a fresh reloader: the SDK's swallows a half-written pair
+	// and keeps the last good one, and a constructor per handshake would
+	// report that error instead of surviving it. outboundLeaf says the same
+	// about the dial path for the same reason.
+	leaf, err := s.outboundLeaf(identity)
 	if err != nil {
-		return workcontext.Credential{}, fmt.Errorf("%w: the trust anchor the mint endpoint is verified against could not be read, so this process will not dial it: %w",
-			workcontext.ErrMintUnavailable, err)
+		return nil, err
 	}
-	a.mu.Lock()
-	if a.inner == nil || !a.pool.Equal(pool) {
-		inner, err := a.build(pool)
-		if err != nil {
-			a.mu.Unlock()
-			return workcontext.Credential{}, err
-		}
-		a.inner, a.pool = inner, pool
+	client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), leaf))
+	if err != nil {
+		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
 	}
-	inner := a.inner
-	a.mu.Unlock()
-	return inner.Credential(ctx)
+	return client, nil
 }
 
 // heldToTheFrozenAuthority rechecks the authority whenever a source hands back
@@ -322,7 +269,11 @@ type sealedIdentity struct {
 // would otherwise be laundered into a credential nobody approved. Dropping it
 // leaves the boot and the first mint working perfectly and only renewals wrong,
 // which is not a shape a test over the happy path can see.
-func (s *Server) mintOptions(projectionAudience string, anchor *x509.CertPool) workcontext.MintOptions {
+func (s *Server) mintOptions(
+	projectionAudience string,
+	anchor func() (*x509.CertPool, error),
+	leaf func(*tls.CertificateRequestInfo) (*tls.Certificate, error),
+) workcontext.MintOptions {
 	return workcontext.MintOptions{
 		URL: s.cfg.mintURL,
 		// The pinned value the audience is READ from, not an audience this
@@ -336,21 +287,37 @@ func (s *Server) mintOptions(projectionAudience string, anchor *x509.CertPool) w
 		// The frozen reader, not a value read again here: it is what rechecks
 		// the authority-bearing values before each mint, including the first.
 		Authority: s.authority,
-		// The anchor, and nothing else about the transport.
+		// The transport's three judgements, as READERS rather than values.
 		//
-		// This used to hand over this runtime's own authenticated client, so
-		// the mint presented this workload's X.509-SVID and went through the
-		// per-dial peer admission. The SDK now builds and owns that transport
-		// and takes only the roots, and its reasoning is sound: a supplied
-		// client is a hole it cannot inspect — a nil Transport means the
-		// global mutable default, a DialTLSContext bypasses TLSClientConfig
-		// entirely, and a caller holding the same *http.Transport can turn
-		// verification off after construction.
+		// This is sdk-go#51, and it is the shape this runtime argued for from
+		// both ends. The SDK still builds and owns the transport — a supplied
+		// *http.Client is a hole it cannot inspect, since a nil Transport
+		// means the global mutable default, a DialTLSContext bypasses
+		// TLSClientConfig entirely, and a caller holding the same transport
+		// can turn verification off after construction — but it no longer
+		// takes a pool by value and fixes it for the client's lifetime.
 		//
-		// What that costs here is stated rather than glossed: the mint request
-		// no longer presents a client certificate, and MINT_PEERS_FILE no
-		// longer governs it. See admittedAt.
-		RootCAs: anchor,
+		// Every one of these is called DURING the handshake, so withdrawal
+		// takes effect on the next handshake rather than on the next process:
+		//
+		//   - TrustAnchor is the same reader the listener and the gateway dial
+		//     use, read before and after each handshake and never cached, so a
+		//     removed root stops this process dialling the mint.
+		//   - ClientCertificate makes the mint request present this workload's
+		//     X.509-SVID again. The projected service-account token is no
+		//     longer the whole of what attests who is asking.
+		//   - AdmittedPeers is MINT_PEERS_FILE, read per handshake, so the
+		//     mint endpoint is held to WHICH party it is and not merely to a
+		//     certificate from the right CA. Every workload in the trust
+		//     domain holds one of those, which is why authentication was never
+		//     authorisation here.
+		TrustAnchor: anchor,
+		// Asked with an empty request rather than nil: a consumer's own
+		// GetClientCertificate may read the acceptable CAs off it, and handing
+		// it nil would be this runtime choosing a dereference on somebody
+		// else's code path.
+		ClientCertificate: func() (*tls.Certificate, error) { return leaf(&tls.CertificateRequestInfo{}) },
+		AdmittedPeers:     s.admittedMint(),
 	}
 }
 

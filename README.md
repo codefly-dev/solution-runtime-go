@@ -106,7 +106,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
 | Allowed callers | `workload-identity`/`ALLOWED_CALLERS_FILE` — **required**, a **path** to a file of identities, one per line (normally the gateway's); re-read per handshake. Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE` |
-| Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per dial and per connection check. The mint hop itself is the SDK's transport, so this set applies where the mint and the gateway answer at the **same address**, which is the one case a dial cannot be attributed: what is admitted there is the intersection of this set and the gateway's | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
+| Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per handshake. This is the set the credential mint endpoint is admitted by: the SDK's mint client reads it during the handshake and refuses a peer whose single URI SAN is not in it, even when the certificate was signed by the accepted anchor. It also narrows the shared-address case, where the mint and the gateway answer at one address and a dial cannot be attributed: what is admitted there is the intersection of this set and the gateway's | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
 | Gateway peer | `workload-identity`/`GATEWAY_PEERS_FILE` — **required**, same shape. One set **per destination**: the mint and the gateway are two parties, and a single set spanning both authorises each to stand in for the other at the other's address — and the mint is the destination that receives the projected service-account token. A dial to an address that is neither has no set and is refused. When the two are at the **same** host and port — the brokered shape — a dial there cannot be attributed to one of them, so it is held to the **intersection** of both sets, and an empty intersection is refused at boot | `CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
@@ -165,8 +165,15 @@ even for that is an open follow-up.
 `GATEWAY_MODULE_REGISTER_URL`, `GATEWAY_MODULE_REGISTRATION_TOKEN_URL`,
 `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, `CODEFLY_INTERNAL_TOKEN`,
 `CODEFLY__SOLUTION_REGISTRATION_SECRET`, `CODEFLY__MODULE_REGISTRATION_SECRETS`,
-`CODEFLY__SOLUTION_REGISTRATION_INTERVAL`, and `CODEFLY_HOST_FRONTEND`. Setting
-any of them now does nothing. Nothing reads the shared cluster-internal token or
+and `CODEFLY__SOLUTION_REGISTRATION_INTERVAL`. Setting any of them now does
+nothing.
+
+`CODEFLY_HOST_FRONTEND` is **not** in that list, and this said it was. It went
+with the registrations and then came back for one consumer, the same way
+`PUBLIC_URL` did: it names the host's frontend service, whose resolved URL is
+the fallback the MCP issuer identifier is derived from when no `mcp/issuer-url`
+is declared (`resolveMCPIssuer`). It is read in `loadConfig` like every other
+value here. Nothing reads the shared cluster-internal token or
 a per-solution registration secret any more: the credential this runtime
 presents attests which workload it is, and there is no fallback to one that
 attests nothing.
@@ -451,8 +458,8 @@ runtime replaced, because the heartbeat at least minted on a timer.
 **A refused first mint fails the boot and is never retried. An unavailable one
 is waited for, within a bound.** The two are different answers:
 
-- a **refusal** (`ErrMintRefused`, the host's `403`, or `404` from a host that
-  serves no mint) is the issuer judging this workload: this build is not the one
+- a **refusal** (`ErrMintRefused`, which the SDK latches for exactly two
+  statuses, `401` and `403`) is the issuer judging this workload: this build is not the one
   its presence document approved, the pod's identity does not match, the token
   attests to another subject. No number of attempts changes any of those
   answers, so the boot reports what the issuer said and exits non-zero. A loop
@@ -460,13 +467,23 @@ is waited for, within a bound.** The two are different answers:
   refusal by beating again, minting a fresh single-use token each time, so one
   undeployable solution produced an audited mint every 15 seconds for as long as
   it ran.
-- an **unavailable** mint (`ErrMintUnavailable`, the host's `503`, `429` or
-  other `5xx`) is not a judgement. A workload may legitimately start before its
+- an **unavailable** mint (`ErrMintUnavailable`: the host's `503`, `429`, any
+  other `5xx`, **and a `404`**) is not a judgement. A workload may legitimately start before its
   presence generation has been applied, and then there is no incarnation to mint
   against yet; the issuer may also be unable to reach the Kubernetes API or its
   own policy log, and a host that issues nothing in those cases is behaving
   correctly. So the boot asks again, backing off, for up to **two minutes**, and
   then exits non-zero.
+
+  A `404` is in this set, and that is a deliberate change rather than an
+  oversight: the rule here was "`429` and `5xx` retry, everything else is
+  terminal", and sdk-go v0.3.0 inverted it after measuring the cost — a `408`
+  from a proxy, with a valid credential in hand, latched for the life of the
+  process, and a `404` from an ingress mid-rollout would do the same. `401` and
+  `403` are the two statuses the host signs. So **an old runtime against a host
+  of this generation waits out its bounded window and exits non-zero for the
+  orchestrator rather than failing on the first answer.** It still does not
+  recover; what changed is the shape, not the outcome.
 
 The bound is what keeps the second case from being the heartbeat again: it is a
 boot waiting for a dependency, with no steady state, nothing minted on success
@@ -527,7 +544,7 @@ not the party deciding on one. So there is no verifier here to configure, and a
 change that adds one has to answer where those four sources come from.
 
 Core's conformance kit is still run, through the boundary this package does own:
-all 21 fixtures are offered to the carrier, and each one's refusal is attributed
+all 39 fixtures are offered to the carrier, and each one's refusal is attributed
 to a side. A capability whose bytes are visibly not a capability — no separator,
 an unreadable payload, no seal, another encoding — is refused here, before a
 request is sent, with Core's own sentinel. A tampered payload, an unknown key,
@@ -1245,33 +1262,226 @@ claude mcp add --transport http wiki https://<host>/solutions/<id>/mcp \
 Once the host supports it, the gateway's 401 challenge and the metadata document
 above are the whole of what a client needs to authenticate on its own.
 
-#### Testing the tools: `mcpHandler`
+#### Testing the tools: there is no supported path yet
 
-`Serve` resolves the gateway and the issuer from the composition and registers
-with the host, so a solution cannot drive its own tools in a test through it.
-`Server.mcpHandler` serves the MCP surface exactly as `Serve` serves it — the
-same endpoint, the same metadata document, the same refusals, mounted by the same
-code — against an environment the test supplies. Nothing else of the solution is
-served and nothing registers anywhere:
+**This section documented `s.mcpHandler`, and a consumer cannot call it.** The
+method is unexported, so the example could not compile from a consuming
+package; it also said `Serve` "registers with the host", which is the thing
+this cutover deleted.
+
+It was exported once, as `Server.MCPHandler`, and unexporting it was not a
+tidy-up: an exported method handing back a servable handler built without the
+boot is the `PassthroughHandler` incident verbatim — a handler that has skipped
+`validate()`, the mTLS boot, the caller allow-list, the published ceiling and
+authenticated outbound, carrying the viewer's bearer and this workload's own
+credential over whatever it is mounted on. `TestNoExportedPathHandsOutAServableHandler`
+fails if it comes back. So the example is removed rather than repaired, and
+restoring the export to make it compile is the one fix that is not available.
+
+What a consumer can do today is drive their tools as ordinary functions and
+test the authority each one asks for. What is missing is the MCP equivalent of
+`passthroughtest` — a seam reached through `internal/seam`, whose constructors
+panic outside a test binary, that runs the real MCP surface against a fake
+host. That is a follow-up on #45, not a capability this README should describe
+as existing.
+
+What a green test there proves is the solution's side: the declaration, the
+authority each method mints, the fields that reach the page, stream bounds and
+cancellation. It never proves that a real host admits the solution, that
+accounts grants the scopes, or that the real module answers its binding the way
+the test's stand-in does.
+
+**This seam is reachable only from here.** `Server.PassthroughHandler` was
+exported until this change, and that made it a production bypass: a solution
+could build a usable, credential-bearing handler that had skipped `validate()`,
+the mTLS boot, the caller allow-list, the published ceiling and authenticated
+outbound — a deployment calling it completed a viewer mint and a module call
+over plaintext and answered 200, with the viewer's bearer and this workload's
+own credential on the wire. Supplying a credential source, which a deployment
+does, defeated the "no source, nothing to mint with" mitigation. It is reached
+through `internal/seam` now, which Go's internal-package rule keeps inside this
+module. The fake host is still plaintext and still has no contract, and those
+are now properties of this module's own tests rather than of an API. A consumer
+that called `PassthroughHandler` directly uses `passthroughtest.Handler`
+instead.
+
+`passthroughtest` itself is importable by any module, so its own constructors
+**panic outside a test binary** (`testing.Testing()`). Taking a `testing.TB` is
+not the gate it resembles: `testing.TB`'s unexported method stops a type
+*declaring* the interface, not a type that embeds it, so a few lines of
+production code satisfy it. `testing.Testing()` is wrong for the root package —
+where the legitimate caller is production code — and exactly right here, where
+every legitimate caller is a test.
+
+### Exposing an MCP server
+
+A solution exposes its experience to an agent client — Claude Code, Claude
+Desktop, any MCP client — the way it exposes it to a browser: as the signed-in
+person, through the host's gateway, with the same authority. The solution owns
+its tool surface; this runtime owns serving it. These are the three lines:
 
 ```go
-handler, err := s.mcpHandler(solution.MCPEnvironment{
-    GatewayURL: fakeHost.URL, // answers the accounts StartTask mint and /v1/<as>/*
-    IssuerURL:  "https://host.test",
-})
-server := httptest.NewServer(handler)
-session, err := mcp.NewClient(&mcp.Implementation{Name: "agent", Version: "v0"}, nil).
-    Connect(ctx, &mcp.StreamableClientTransport{
-        Endpoint:   server.URL + solution.MCPPath,
-        HTTPClient: &http.Client{Transport: stampsTheViewersIdentity{}},
-    }, nil)
+solution.New(solution.Manifest{ID: "wiki", Title: "Wiki"}).
+    ServeMCP("wiki", "v1.0.0", func(srv *mcp.Server) {
+        mcp.AddTool(srv, &mcp.Tool{Name: "ask_wiki", Description: "ask the wiki a question"}, askWiki)
+    }).
+    Serve()
 ```
 
-What a green test there proves is the solution's side: the tools it offers, the
-authority each one mints, and the refusals its callers get. It never proves that
-a real gateway stamps what the test's `RoundTripper` stamps, that accounts mints
-a Work Context, or that a real MCP client's OAuth flow completes against the
-host.
+A composition that renders this solution supplies **one** declared value for it,
+and only in a deployment: `issuer-url` in the `mcp` workspace-configuration
+group, declared as a workspace-configuration dependency of the solution's
+backend — the origin MCP clients authenticate against. Everything else is
+derived or resolved; see [The resource identifier and the
+issuer](#the-resource-identifier-and-the-issuer).
+
+`register` receives the official SDK's own `*mcp.Server`
+(`github.com/modelcontextprotocol/go-sdk`, pinned in this module's `go.mod`), so
+tools, prompts and resources are declared exactly as that SDK documents them and
+this runtime adds nothing to them. It is called once, when the endpoint is
+mounted.
+
+A tool call runs as the viewer who made the request. `ViewerFromContext` returns
+the same caller-bound `Gateway` a `Handler` is given, so a tool reads a composed
+module through `ForModule` under the viewer's own Work Context — the identical
+call the page makes, with the identical typed refusals:
+
+```go
+func askWiki(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
+    gw, err := solution.ViewerFromContext(ctx)
+    if err != nil {
+        return nil, askOut{}, err
+    }
+    robin, err := gw.ForModule(ctx, "robin", solution.Scope{ResourceKind: "conversations", Actions: []string{"create"}})
+    if err != nil {
+        return nil, askOut{}, err
+    }
+    ...
+}
+```
+
+The viewer comes from the identity headers the gateway stamped, never from the
+tool's arguments: those are written by a model, and a session id taken from them
+would be a client asking for another viewer's authority. `ViewerFromContext`
+errors only for a handler invoked outside a request this runtime served — a
+harness of its own, or an `*mcp.Server` mounted without `ServeMCP`.
+
+#### What is served, and what is refused
+
+| Path | What |
+| --- | --- |
+| `/mcp` (`solution.MCPPath`) | Stateless Streamable HTTP. `/solutions/<id>/mcp` through the gateway, a route it already fronts. `POST` only: `GET` and `DELETE` are `405` and no `Mcp-Session-Id` is ever issued, because the gateway is a reverse proxy with no sticky routing — a session held in one replica's memory is unreachable from the next request. The SDK's DNS-rebinding protection is left on, so a request reaching a loopback listener with a non-loopback `Host` header is refused `403`: on a developer's machine that protection is the one that still applies, since a rebound page is same-origin and can forge identity headers that a cross-origin page cannot. |
+| `/.well-known/oauth-protected-resource` (`solution.ProtectedResourceMetadataPath`) | The OAuth 2.0 Protected Resource Metadata document (RFC 9728): the `resource` a client binds its token to, the host issuer in `authorization_servers`, and `bearer_methods_supported: ["header"]`. Served unauthenticated, with `Access-Control-Allow-Origin: *`, because discovery is public (RFC 9728 §3.1). |
+
+The MCP endpoint itself carries **no** CORS. The runtime's policy for a
+solution's own API admits any origin with an authorization header, which is the
+right answer there and the wrong one for the single route that acts with the
+viewer's full authority; an MCP client is not a browser page.
+
+The runtime verifies no token: the gateway strips caller identity headers, runs
+ext_authz on the bearer and stamps what it resolved, so verifying it again here
+would be a second, divergent implementation of the host's admission rules, with
+its own JWKS fetch, its own audience logic and its own bugs. What is enforced is
+that the gateway did it:
+
+| The request | Answer |
+| --- | --- |
+| No `authorization` | `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. |
+| A bearer, but none of `x-user-id`, `x-org-id`, `x-session-id` stamped | `401` with the same challenge: nothing but the gateway may reach this endpoint, so either the request did not come through it or it did not authenticate the bearer. |
+| `x-session-id` stamped empty | `403`, naming the `x-credential-kind` the gateway stamped. A credential that authenticates without a session cannot act for a viewer, and every tool call that does mints a Work Context rooted in one — so this is refused at the boundary rather than once per tool call, where the same refusal would read as the tool being broken. Another token cannot fix it, so it carries no challenge. |
+
+**Which caller sees those two 401s.** Not an MCP client coming through the
+gateway: the gateway strips the caller's identity headers and runs ext_authz on
+the bearer *before* proxying, so an unauthenticated request is denied there with
+its own `401 authentication required` and never reaches the solution. The
+runtime's 401 is what a caller reaching this solution directly sees — a local
+run, a port-forward, a composition dialling the backend — and it is the shape
+the gateway's own challenge has to match for discovery to work at all. Emitting
+it at the gateway is the host's half
+([codefly-dev/module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003));
+the document that challenge must point at is served here either way.
+
+#### The resource identifier and the issuer
+
+The `resource` in the metadata document is what a client asks the authorization
+server for a token for (RFC 8707) and what its token is audience-bound to, so it
+must be the **public** MCP URL — not this process's listen address, not the
+in-cluster address the gateway dials. A client that is handed any other
+identifier rejects it, and unlike the manifest URL nobody downstream can resolve
+it on the solution's behalf.
+
+So it is **derived by construction** from the two things the runtime already
+has: the origin this product is reachable at and this solution's id —
+`<PUBLIC_URL>/solutions/<id>/mcp`. This is the one place the runtime encodes the
+gateway's solution route (see [Where the host reaches the
+solution](#where-the-host-reaches-the-solution)), and the reason it is worth
+encoding is that it makes a composition declare nothing: a deployment that
+already sets `PUBLIC_URL` to the origin browsers reach the product at has
+addressed the MCP surface too.
+
+A host whose gateway fronts solutions under some other route declares
+`public-url` in the `mcp` group instead. It must end in `/mcp` — the metadata
+document's own URL is derived from it by swapping that suffix, the same pairing
+the registration token URLs use, refused at boot for the same reason when it
+cannot be made. With neither — no `PUBLIC_URL`, no declared override — the
+identifier is reconstructed per request from `x-forwarded-proto`,
+`x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
+is doing so: a proxy that forwards no prefix yields an identifier missing the
+path it stripped, which a conforming client rejects and a tolerant one binds to
+the wrong resource. In a deployed runtime context that state is refused at boot
+rather than logged.
+
+`authorization_servers` is the host issuer resolved at boot, never derived from
+a request, so a crafted `Host` header cannot point a client at an authorization
+server of someone's choosing. It is `issuer-url` in the `mcp` group when the
+composition declares one, and otherwise the host frontend's origin resolved by
+role like every other host endpoint. That resolved value is the address this
+composition reaches the host at: right for a local run, and in a deployment an
+in-cluster address no public client could reach — so a deployed solution that
+declares `ServeMCP` must supply `mcp`/`issuer-url`, and is refused at boot
+naming it when it does not. It stops being the composition's to supply when
+[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003)
+settles what `iss` is. A solution that declares `ServeMCP` and resolves no
+issuer at all is refused at boot; one that declares no MCP server is unaffected.
+
+Both values are read with `codefly.For(ctx).WorkspaceConfiguration("mcp", …)`,
+never from the environment. `MCP_PUBLIC_URL` and `HOST_ISSUER_URL` were bare
+environment variables when `ServeMCP` landed, and a render cannot project one —
+so the boot refused with the name of something no composition could set
+(codefly-dev/solution-runtime-go#48). Provisioned locally with `codefly config
+generate`, and from the cell's configuration when deployed, exactly as the
+`solution-registration` group is.
+
+Three things about discovery belong to the host, not to this runtime, all of them
+tracked by
+[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003).
+The gateway emits the 401 challenge, as above. It must admit an unauthenticated
+`GET` on `/solutions/<id>/.well-known/oauth-protected-resource`, or no client can
+read the document that challenge points at. And that is where the document is —
+on the solution's own path — whereas RFC 9728 §3.1 also defines a location
+derived from the resource's path,
+`/.well-known/oauth-protected-resource/solutions/<id>/mcp`, at the **host's**
+root. A client that follows `resource_metadata` reaches the document either way;
+one that only guesses the derived location needs the host to serve it there.
+
+#### Connecting
+
+Until the host is an MCP-conformant OAuth 2.1 authorization server, a client
+presents a token it already has, which the gateway already accepts:
+
+```sh
+claude mcp add --transport http wiki https://<host>/solutions/<id>/mcp \
+    --header "Authorization: Bearer <access token>"
+```
+
+Once the host supports it, the gateway's 401 challenge and the metadata document
+above are the whole of what a client needs to authenticate on its own.
+
+#### Testing the tools
+
+This section appeared twice, and both copies documented the same uncompilable
+example; see [Testing the tools: there is no supported path
+yet](#testing-the-tools-there-is-no-supported-path-yet) above.
 
 ### Generated messages in a response
 
@@ -1302,8 +1512,9 @@ descriptor, with protobuf JSON names.
 > **no `replace` directive** — both are ordinary pseudo-version `require`s, so
 > this module builds from its own tag for anyone.
 >
-> Those two pins are currently unreleased branches (core#692 and
-> codefly-dev/sdk-go#48, the Work Context single-implementation fix) and must
-> move to the releases at merge, core first. Every capability's format changes
-> in that cutover, so verifiers upgrade before minters or calls fail closed in
-> the window.
+> Both pins are **released** now: `core v0.9.0` and `sdk-go v0.3.0`, with the
+> `sdk-go/workcontext` leaf at a `main` pseudo-version because that leaf module
+> has no tag by design. This said they were unreleased branches that "must move
+> to the releases at merge"; they moved. Every capability's format changed in
+> that cutover, so verifiers upgrade before minters or calls fail closed in the
+> window — which is a statement about the rollout order, not about these pins.

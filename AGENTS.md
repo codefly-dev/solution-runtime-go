@@ -213,12 +213,12 @@ embedding it.
   `GATEWAY_PEERS_FILE`): the mint and the gateway are two parties, and a single
   set spanning both authorises each to stand in for the other at the other's
   address — the mint being the one that receives the projected token.
-  `MINT_PEERS_FILE` is kept rather than deleted for one reason: it is consumed
-  rather than reserved — sdk-go owns the mint's transport, so the per-dial peer
-  re-read reaches the gateway alone, but where the two answer at the **same
-  address** this runtime cannot attribute a dial and what it admits there is
-  the intersection of both sets, so a gateway dial at a shared address is
-  refused unless the mint's set admits it too. A dial to
+  `MINT_PEERS_FILE` governs the mint hop again, per handshake, through the
+  SDK's `AdmittedPeers` reader (sdk-go#51) — so the question it was kept open
+  for is settled: it is the authorization set for the destination that receives
+  the projected service-account token. It also still narrows the shared-address
+  case, where the mint and the gateway answer at one address and a dial cannot
+  be attributed, and what is admitted there is the intersection of both sets. A dial to
   a third address has no set and is refused, because this runtime talks to
   exactly two destinations.
   An admission set answered by **both** the env override and the platform's
@@ -317,40 +317,44 @@ embedding it.
   answer is recorded **where the answer lands** rather than by whichever caller
   was still waiting — the ask is detached, so it can finish with nobody
   listening.
-- **The mint hop is the SDK's transport, not this runtime's.** `MintOptions`
-  takes `RootCAs` and nothing else about how the mint is dialled: the client
-  builds and owns that transport, and its reasoning for refusing a
-  caller-supplied one is sound — a supplied client is a hole it cannot inspect,
-  since a nil `Transport` means the global mutable default, a `DialTLSContext`
-  bypasses `TLSClientConfig` entirely, and a caller holding the same
-  `*http.Transport` can turn verification off after construction. Two
-  consequences, recorded because they are properties this cutover argued for
-  and no longer owns: **the mint request presents no client certificate** — the
-  projected service-account token it carries is the whole of what attests which
-  workload is asking — and **`MINT_PEERS_FILE` does not govern that hop**, so
-  the per-dial peer re-read applies to the gateway alone. A fake host that
-  demands mTLS on the mint is asserting a property this runtime does not have.
-  **Live trust withdrawal is kept, and not by the SDK's doing.** `RootCAs` is a
-  value and `NewMintClient` builds its transport from it on the spot, so a
-  client fixes its anchor for its own lifetime. `anchorFreshSource` re-reads
-  the anchor before every ask, refuses when it has become unreadable rather
-  than falling back to the last good pool, and rebuilds the client only when
-  it has actually rotated — which is the one moment a fresh dial under new
-  trust is wanted and otherwise leaves the one credential per execution alone.
-  **The rest of the posture is unreachable, and the residual is exact:**
-  `MintOptions` has ten fields and `mint.go` contains no `VerifyConnection`,
-  `VerifyPeerCertificate`, `DialTLSContext`, `Transport`, peer-set or dialer
-  surface, with `NewMintClient` the only exported constructor. So for that hop
-  this runtime cannot check WHICH party answered, cannot re-verify an
-  established connection, and presents no certificate; and because the client
-  keeps up to two idle connections per host, a withdrawn root or a removed
-  peer takes effect on the next *dial*, which a renewal may satisfy from the
-  pool. Rebuilding on rotation cannot close the old client's connections,
-  because this runtime never holds that client. Reimplementing the rest means
-  taking the transport back, which is what the SDK refuses for reasons this
-  file agrees with — so it is an sdk-go issue, drafted at
-  `.lazybox/artifacts/sdk-go-mint-peer-posture-draft.md`, and not a local
-  workaround.
+- **The mint hop is held to the same three things the gateway hop is, and the
+  SDK owns the transport that holds it.** `MintOptions` takes no pool, no
+  client and no dialler: it takes `TrustAnchor`, `ClientCertificate` and
+  `AdmittedPeers` as **readers**, each consulted during the handshake
+  (sdk-go#51). So the mint request presents this workload's X.509-SVID, the
+  endpoint is admitted by the SPIFFE ID in its single URI SAN against
+  `MINT_PEERS_FILE`, and the anchor is re-read before and after every
+  handshake and never cached. Withdrawal of a root or of a peer takes effect on
+  the next handshake rather than on the next process.
+  The SDK still refuses a caller-supplied `*http.Client`, and that reasoning is
+  sound and worth keeping in mind: a supplied client is a hole it cannot
+  inspect — a nil `Transport` means the global mutable default, a
+  `DialTLSContext` bypasses `TLSClientConfig` entirely, and a caller holding
+  the same `*http.Transport` can turn verification off after construction. The
+  answer was never for this runtime to take the transport back; it was for the
+  transport to take readers instead of values, which is what it now does.
+  **This paragraph said the opposite, and said it was unreachable.** It
+  recorded that the mint presented no certificate, that `MINT_PEERS_FILE` did
+  not govern that hop, and that the rest of the posture could not be restored
+  from outside the SDK — accurate at `v0.3.0`, and the reason it was an sdk-go
+  issue rather than a local workaround. What was wrong was not the diagnosis
+  but treating the resulting gap as a property of this runtime: a reviewer
+  pointed out that the fixtures had been weakened to accommodate it
+  (`VerifyClientCertIfGiven`, the mint caller's identity expected to be empty),
+  which establishes a changed behaviour rather than closing a finding. The
+  fixtures demand the certificate again, and
+  `TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs` drives the negative
+  controls through a real handshake: a peer the anchor signed but the set does
+  not name, peer withdrawal with the anchor unchanged, an unreadable anchor,
+  and a certificate reader that cannot answer.
+  **What is still not bounded is an ESTABLISHED mint connection.** The readers
+  run per handshake, and the client keeps idle connections, so a withdrawal
+  takes effect on the next handshake and not on a connection already open —
+  the inbound and gateway directions re-verify an established peer once a
+  second and close what stops verifying, and this hop has no equivalent
+  because this runtime never holds that connection. That is the remaining
+  difference, it is stated here rather than implied to be closed, and it is the
+  SDK's to close.
 - **Only 401 and 403 latch a credential refusal.** The rule was "429 and 5xx
   retry, everything else is terminal", and sdk-go v0.3.0 inverted it after
   measuring the cost: a 408 from a proxy, with a valid credential in hand,

@@ -26,6 +26,7 @@ package passthroughtest
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
@@ -161,6 +162,9 @@ type Host struct {
 	// fidelity gap seam.go already names; this closes the half the SDK now
 	// requires rather than pretending to close both.
 	mintServer *httptest.Server
+	// cell is the fake host's own CA, because the mint endpoint is now held to
+	// WHICH party it is and not merely to a certificate from an accepted root.
+	cell *mintCell
 }
 
 // NewHost starts a fake host, closed when the test ends.
@@ -170,7 +174,28 @@ func NewHost(t testing.TB) *Host {
 	h := &Host{modules: map[string]*httputil.ReverseProxy{}, dir: t.TempDir()}
 	h.server = httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	t.Cleanup(h.server.Close)
-	h.mintServer = httptest.NewTLSServer(http.HandlerFunc(h.serveHTTP))
+	cell, err := newMintCell()
+	if err != nil {
+		t.Fatalf("start the fake host: %v", err)
+	}
+	h.cell = cell
+	// mTLS, with the client certificate REQUIRED and verified.
+	//
+	// The real endpoint receives the projected service-account token, and
+	// sdk-go#51 makes the client present this workload's X.509-SVID on that
+	// request. A fake host that merely tolerated a client certificate would
+	// let a consumer's green run mean less than it looks like: the seam is
+	// where a consumer finds out their passthrough works against the posture
+	// a deployment has.
+	mint := httptest.NewUnstartedServer(http.HandlerFunc(h.serveHTTP))
+	mint.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cell.mint},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    cell.roots,
+	}
+	mint.StartTLS()
+	h.mintServer = mint
 	t.Cleanup(h.mintServer.Close)
 	return h
 }
@@ -423,8 +448,6 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 	if err := os.WriteFile(tokenFile, []byte("passthroughtest-projected-token"), 0o600); err != nil {
 		return nil, err
 	}
-	roots := x509.NewCertPool()
-	roots.AddCert(h.mintServer.Certificate())
 	return workcontext.NewMintClient(workcontext.MintOptions{
 		URL: h.mintServer.URL + workloadMintPath,
 		// The audience is named as a pinned value now, not passed as a string
@@ -433,7 +456,13 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 		Authority:          fixedAuthority{audience: WorkloadAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: "accounts",
-		RootCAs:            roots,
+		// The three readers sdk-go#51 takes in place of a pool by value. They
+		// are readers here for the same reason they are readers in a booted
+		// runtime: each is consulted during the handshake, so what this seam
+		// exercises is the check and not a snapshot of it.
+		TrustAnchor:       func() (*x509.CertPool, error) { return h.cell.roots, nil },
+		ClientCertificate: func() (*tls.Certificate, error) { return &h.cell.workload, nil },
+		AdmittedPeers:     func() ([]string, error) { return []string{mintPeerIdentity}, nil },
 	})
 }
 
