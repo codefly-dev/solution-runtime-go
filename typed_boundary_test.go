@@ -766,12 +766,29 @@ func fixtureInsideAClosure(raw []byte) func() error {
 	}
 }
 
-// The supported read, which must stay unflagged: a concrete parameter, not an
-// opaque one.
+// A decoder whose destination parameter is CONCRETE. The signature rule does
+// not fire — nothing is being handed over as an opaque message — so this is
+// the shape the name check still earns its keep on, and the reason both rules
+// exist. A generated UnmarshalVT-style method has exactly this shape.
+type fixtureCodec struct{}
+
+func (fixtureCodec) DecodeSeal(raw []byte, dst *wc.SealedValues) error { return nil }
+
+func fixtureConcreteDecoder(raw []byte, dst *wc.SealedValues) error {
+	return fixtureCodec{}.DecodeSeal(raw, dst)
+}
+
+// The supported read, which must stay unflagged: a concrete parameter, and no
+// decoder in sight.
 func fixtureSpellingAccessor(seal *wc.SealedValues) string { return seal.GetImageDigest() }
 `
 	found := gateFindings(t, fixture, source, reportCapabilityShapes)
-	for _, want := range []string{"fixtureParenthesized", "fixtureThroughAVariable", "fixtureInsideAClosure"} {
+	for _, want := range []string{
+		"fixtureParenthesized", "fixtureThroughAVariable", "fixtureInsideAClosure",
+		// Caught by the NAME rule alone: its destination parameter is
+		// concrete, so the signature rule has nothing to say about it.
+		"fixtureConcreteDecoder",
+	} {
 		if !strings.Contains(found, want) {
 			t.Errorf("the capability gate did not flag %s, so that spelling still escapes:\n%s", want, found)
 		}
