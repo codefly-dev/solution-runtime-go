@@ -363,51 +363,67 @@ func reportCapabilityShapes(_ *testing.T, pkg *packages.Package) []string {
 	}
 	info := pkg.TypesInfo
 	for _, file := range pkg.Syntax {
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch typed := node.(type) {
-			case *ast.CompositeLit:
-				if path := coreWireType(info.TypeOf(typed)); path != "" {
-					report("%s constructs %s: allocating one of core's wire messages is what decoding into it requires, and a second reader of that encoding is this boundary's whole subject. Read the seal through Credential.Seal().",
-						pkg.PkgPath, path)
-				}
-			case *ast.ValueSpec:
-				if typed.Type == nil {
-					return true
-				}
-				if path := coreWireType(info.TypeOf(typed.Type)); path != "" {
-					report("%s declares a %s, whose zero value is an allocation of core's wire message: see Credential.Seal().",
-						pkg.PkgPath, path)
-				}
-			case *ast.CallExpr:
-				if called, ok := typed.Fun.(*ast.Ident); ok && called.Name == "new" && len(typed.Args) == 1 {
-					if path := coreWireType(info.TypeOf(typed.Args[0])); path != "" {
-						report("%s allocates a %s with new(): see Credential.Seal().", pkg.PkgPath, path)
-					}
-					return true
-				}
-				selector, ok := typed.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				// Any decoder, by the shape of its name. The DESTINATION is
-				// what decides, and its type is resolved — so an assignment, a
-				// parameter, a field, a package-level alias and a
-				// function-local alias are all one case here, which is why
-				// this rule no longer grows a branch per spelling.
-				if !strings.Contains(selector.Sel.Name, "Unmarshal") && !strings.Contains(selector.Sel.Name, "Decode") {
-					return true
-				}
-				for _, arg := range typed.Args {
-					if path := coreWireType(derefOnce(info.TypeOf(arg))); path != "" {
-						report("%s decodes into a %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through Credential.Seal().",
-							pkg.PkgPath, path)
-					}
-				}
+		// Per declaration, so a finding names the function it is in. An
+		// assertion per SHAPE is possible then, where a count over the whole
+		// file let a missing rule hide behind the other shapes' findings —
+		// which is exactly what mutant T6 showed: dropping `Decode` from the
+		// matcher removed one finding and the count still passed.
+		for _, decl := range file.Decls {
+			where := pkg.PkgPath
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				where += "." + fn.Name.Name
 			}
-			return true
-		})
+			inspectForCapabilities(decl, where, info, report)
+		}
 	}
 	return findings
+}
+
+// inspectForCapabilities is the capability rule over one declaration.
+func inspectForCapabilities(decl ast.Node, where string, info *types.Info, report func(string, ...any)) {
+	ast.Inspect(decl, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CompositeLit:
+			if path := coreWireType(info.TypeOf(typed)); path != "" {
+				report("%s constructs %s: allocating one of core's wire messages is what decoding into it requires, and a second reader of that encoding is this boundary's whole subject. Read the seal through Credential.Seal().",
+					where, path)
+			}
+		case *ast.ValueSpec:
+			if typed.Type == nil {
+				return true
+			}
+			if path := coreWireType(info.TypeOf(typed.Type)); path != "" {
+				report("%s declares a %s, whose zero value is an allocation of core's wire message: see Credential.Seal().",
+					where, path)
+			}
+		case *ast.CallExpr:
+			if called, ok := typed.Fun.(*ast.Ident); ok && called.Name == "new" && len(typed.Args) == 1 {
+				if path := coreWireType(info.TypeOf(typed.Args[0])); path != "" {
+					report("%s allocates a %s with new(): see Credential.Seal().", where, path)
+				}
+				return true
+			}
+			selector, ok := typed.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			// Any decoder, by the shape of its name. The DESTINATION is
+			// what decides, and its type is resolved — so an assignment, a
+			// parameter, a field, a package-level alias and a
+			// function-local alias are all one case here, which is why
+			// this rule no longer grows a branch per spelling.
+			if !strings.Contains(selector.Sel.Name, "Unmarshal") && !strings.Contains(selector.Sel.Name, "Decode") {
+				return true
+			}
+			for _, arg := range typed.Args {
+				if path := coreWireType(derefOnce(info.TypeOf(arg))); path != "" {
+					report("%s decodes into a %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through Credential.Seal().",
+						where, path)
+				}
+			}
+		}
+		return true
+	})
 }
 
 // TestTheTypedGatesCatchEveryKnownShape drives the typed rules against every
@@ -442,6 +458,13 @@ type fixtureServes func(nh.ResponseWriter, *nh.Request)
 type fixtureCarrier struct{ H fixtureHidden }
 type fixtureNested struct{ In fixtureCarrier }
 type fixtureEmbeds struct{ nh.Handler }
+
+// An embedded type whose own NAME is unexported still promotes its exported
+// field, so a caller reaches .H. The field walk's embedded-field clause is
+// what covers it: without this shape, mutant T4 (dropping that clause) went
+// uncaught, because every other embedded fixture happened to have an exported
+// type name. (No backticks here: this comment lives inside a raw string.)
+type fixtureEmbedsUnexported struct{ fixtureCarrier }
 type fixtureUnexported struct{ H nh.Handler }
 type fixtureByMethod struct{}
 
@@ -457,6 +480,9 @@ func (s *Server) FixtureCollection() map[string]fixtureHidden       { return nil
 func (s *Server) FixtureCarrier() fixtureCarrier                    { return fixtureCarrier{} }
 func (s *Server) FixtureNested() fixtureNested                      { return fixtureNested{} }
 func (s *Server) FixtureEmbeds() fixtureEmbeds                      { return fixtureEmbeds{} }
+func (s *Server) FixtureEmbedsUnexported() fixtureEmbedsUnexported {
+	return fixtureEmbedsUnexported{}
+}
 func (s *Server) FixtureUnexportedCarrier() fixtureUnexported       { return fixtureUnexported{} }
 func (s *Server) FixtureAnonymous() struct{ H nh.Handler }          { return struct{ H nh.Handler }{} }
 func (s *Server) FixtureAnonymousAliased() struct{ H fixtureHidden } { return struct{ H fixtureHidden }{} }
@@ -485,7 +511,7 @@ func (s *Server) FixtureDeclaration() []fixtureDeclaration { return nil }
 		"FixtureBareHandler", "FixtureRequestHandler", "FixtureCollection",
 		"FixtureCarrier", "FixtureNested", "FixtureEmbeds", "FixtureUnexportedCarrier",
 		"FixtureAnonymous", "FixtureAnonymousAliased", "FixtureAnonymousNested",
-		"FixtureAnonymousEmbeds", "FixtureAnonymousSlice",
+		"FixtureAnonymousEmbeds", "FixtureAnonymousSlice", "FixtureEmbedsUnexported",
 		"FixtureByMethod", "FixtureAny", "FixtureRoundTripper",
 	}
 	flagged := gateFindings(t, fixture, handlers, reportHandlerShapes)
@@ -557,16 +583,25 @@ func fixtureThroughAField(raw []byte, holder *struct{ Seal *wc.SealedValues }) e
 func fixtureAccessorOnly(seal *wc.SealedValues) string { return seal.GetInstallationId() }
 `
 	decoded := gateFindings(t, fixture, capabilities, reportCapabilityShapes)
+	// ONE ASSERTION PER SHAPE, by the function it is in.
+	//
+	// This was a count, and mutant T6 showed why that is not enough: dropping
+	// `Decode` from the matcher removed one finding out of thirteen and the
+	// count still passed. A missing rule hid behind the other shapes.
 	for _, want := range []string{
-		"WorkSealV1", "WorkContextV1", "WorkOperationBindingV1",
+		"fixtureSupplied", "fixtureZeroValue", "fixtureAssigned", "fixtureTwoHops",
+		"fixturePackageAlias", "fixtureLexicalAlias", "fixtureWholeCapability",
+		"fixtureOperationBinding", "fixtureJSONDecode", "fixtureLiteral",
+		"fixtureNew", "fixtureThroughAField",
 	} {
 		if !strings.Contains(decoded, want) {
-			t.Errorf("the capability gate flagged nothing naming %s, so one of the decode or construction shapes escaped: %s", want, decoded)
+			t.Errorf("the capability gate did not flag %s, so that construction or decode shape escapes:\n%s", want, decoded)
 		}
 	}
-	// Twelve shapes construct or decode; the accessor-only one does not.
-	if got := strings.Count(decoded, "\n"); got < 12 {
-		t.Errorf("the capability gate produced %d findings for 13 shapes, 12 of which must be flagged:\n%s", got, decoded)
+	// And the one that must NOT be flagged: reading a seal through the SDK's
+	// accessors, which is what credential.go does.
+	if strings.Contains(decoded, "fixtureAccessorOnly") {
+		t.Errorf("the capability gate flagged reading a seal through Credential.Seal()'s accessors, which is the one supported way to do it:\n%s", decoded)
 	}
 }
 
