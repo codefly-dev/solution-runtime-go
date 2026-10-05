@@ -605,6 +605,11 @@ type workContextGateway struct {
 	// answers a capability sealed to state it has moved past: 409, with the
 	// installation headers the carrier put beside it.
 	supersedeFirstCall bool
+	// conflictFirstCall answers the first module call with an ORDINARY 409 —
+	// a duplicate, a lost update — carrying an installation header that names
+	// somebody else's installation. It is the shape the supersession check
+	// used to accept, and it must retire nothing.
+	conflictFirstCall bool
 
 	mu     sync.Mutex
 	minted int
@@ -665,7 +670,17 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		supersede := g.supersedeFirstCall
 		g.supersedeFirstCall = false
+		conflict := g.conflictFirstCall
+		g.conflictFirstCall = false
 		g.mu.Unlock()
+		if conflict {
+			// An ordinary conflict, with an installation header about an
+			// installation this capability is not sealed to.
+			w.Header().Set(workcontext.InstallationIDHeaderName, "installation-somebody-else")
+			w.Header().Set(workcontext.InstallationRevisionHeaderName, "9")
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "that page already exists"})
+			return
+		}
 		if supersede {
 			w.Header().Set(workcontext.InstallationIDHeaderName, corework.FixtureInstallation)
 			w.Header().Set(workcontext.InstallationRevisionHeaderName, "4")
@@ -1973,5 +1988,58 @@ func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
 				t.Fatalf("a mint asked the issuer for %q after the ceiling had been checked against read: the ask was retained with the caller's own backing array, so editing it changed what was minted under a cache key computed for something else — and the published ceiling is the guarantee that cannot hold", action)
 			}
 		}
+	}
+}
+
+// TestAnOrdinaryConflictDoesNotRetireAValidCapability is round sixteen's first
+// major.
+//
+// supersededCapability accepted ANY 409 carrying a non-empty installation
+// header, and a 409 is an ordinary business answer: a duplicate, a lost
+// update, a version conflict. A module answering one with installation
+// metadata beside it therefore evicted a perfectly valid cached capability,
+// and the next call minted again — needless mints and needless audit traffic
+// on the one path whose whole purpose is one mint per execution.
+//
+// The header is matched against the installation the capability THAT WAS
+// PRESENTED is sealed to now, so a conflict about somebody else's
+// installation says nothing about this one.
+func TestAnOrdinaryConflictDoesNotRetireAValidCapability(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{conflictFirstCall: true})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		// Two reads: the first gets the ordinary 409, the second must present
+		// the SAME capability rather than a freshly minted one.
+		if _, err := getThrough(ctx, docs); err != nil {
+			return nil, err
+		}
+		status, err := getThrough(ctx, docs)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]int{"status": status}, nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the handler answered %d, want 200", resp.StatusCode)
+	}
+
+	// ONE mint. An ordinary conflict that retired the capability would show up
+	// here as two.
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("the issuer minted %d capabilities for one ask, want 1: an ordinary 409 retired a valid capability, so every business conflict a module answers costs this solution a fresh audited mint", got)
+	}
+	// And the second call presented the same capability.
+	first, second := <-gw.calls, <-gw.calls
+	if first.WorkContext == "" || second.WorkContext == "" {
+		t.Fatal("a module call arrived with no capability at all")
+	}
+	if first.WorkContext != second.WorkContext {
+		t.Error("the second call presented a different capability than the first: the ordinary conflict evicted the cached one, which is the re-mint this check exists to prevent")
 	}
 }
