@@ -1251,8 +1251,22 @@ func TestACredentialThatCannotBePresentedRefusesTheMint(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		}}).
-		// A credential that holds no token: Attach cannot seal a request with
-		// it, which is the shape a half-initialised source produces.
+		// A credential that holds no token.
+		//
+		// WHAT THIS COVERS, NARROWED. The comment said this exercises the
+		// Attach error branch, and it does not: usableCredential refuses a
+		// zero credential before anything is attached, so removing the Attach
+		// error check leaves this test green. A reviewer named that twice and
+		// was right both times.
+		//
+		// What it does cover is the property the test is named for — a
+		// credential this runtime cannot present produces no mint, reported as
+		// this solution failing to attest itself — reached through the
+		// usability check rather than through Attach. The Attach branch itself
+		// is unreachable behind that check and is documented as defence in
+		// depth in credential.go rather than as covered: reaching it would
+		// need a credential that passes usability and then fails to attach,
+		// which means inventing a capability shape the SDK does not produce.
 		Credential(stubCredentialSource{credential: workcontext.Credential{}})
 	server.cfg.profile = localProfile
 	server.cfg.gatewayURL = gw.URL

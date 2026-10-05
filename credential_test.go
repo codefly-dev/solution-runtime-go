@@ -1447,7 +1447,12 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 	// answer that cannot be told apart from "the credential you presented is
 	// superseded".
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	gw.deny = "read"
+	// 409, which is what this test is named after and what it was NOT doing.
+	// `deny` answers 403 — "this viewer lacks that authority" — so a
+	// 409-specific regression, inferring supersession from the one status that
+	// is genuinely ambiguous, would have survived this test. A reviewer named
+	// that twice.
+	gw.conflict = "read"
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
 	mint := newHostMint(t, &hostMint{})
@@ -1486,6 +1491,21 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 	}
 	if server.terminalErr.Load() != nil {
 		t.Error("an ambiguous conflict was recorded as a judgement about this build")
+	}
+
+	// THE CONTROL a reviewer asked for: another viewer, asking for something
+	// the issuer does not conflict on, is still served. Without it the three
+	// assertions above hold for a process that has stopped working entirely
+	// for reasons none of them inspects.
+	gw.conflict = ""
+	another := http.Header{}
+	another.Set("authorization", viewerBearer())
+	another.Set(orgHeader, "org-2")
+	another.Set(sessionHeader, "session-2")
+	another.Set(workcontext.InstallationIDHeaderName, testInstallation)
+	if _, err := server.gatewayFor(another).ForModule(context.Background(), "things",
+		Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+		t.Errorf("a second viewer was refused after the first viewer's conflict, so one viewer's 409 did become a process-wide outage after all: %v", err)
 	}
 }
 
@@ -2149,12 +2169,15 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 
 		var ran atomic.Bool
 		server := New(Manifest{ID: testSolutionID}).
-			Credential(mintClientFor(t, mint, tokenFile)).
-			HandleRequest("/thing", func(*http.Request, *Gateway) (any, error) {
-				ran.Store(true)
-				return map[string]string{"ok": "yes"}, nil
-			})
+			Credential(mintClientFor(t, mint, tokenFile))
 		server.cfg = config{gatewayURL: gw.URL}
+		// wrapRequest is what Serve mounts each route through
+		// (mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))), so this
+		// drives the route's own gate rather than calling the gate directly.
+		route := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+			ran.Store(true)
+			return map[string]string{"ok": "yes"}, nil
+		})
 
 		header := http.Header{}
 		header.Set("authorization", viewerBearer())
@@ -2162,19 +2185,55 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 		header.Set(sessionHeader, viewerSession)
 		header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 
-		if err := server.actingForAViewer(context.Background()); err == nil {
-			t.Fatal("a route acted for a viewer under a credential sealing no execution")
-		} else if !errors.Is(err, ErrCredentialRefused) {
-			t.Errorf("the route refused with %v, want one wrapping ErrCredentialRefused", err)
+		// THROUGH THE REGISTERED ROUTE, not by calling the gate.
+		//
+		// This called actingForAViewer directly, which proves the gate
+		// refuses and nothing about whether a route consults it: removing the
+		// gate from the route left the handler uncalled and every count at
+		// zero, because nothing ever reached the route at all. A reviewer
+		// named it twice.
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/thing", nil)
+		request.Header = header
+		route(recorder, request)
+
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Errorf("the route answered %d under a credential sealing no execution, want 503: it attests no approved build, so there is nothing for a host to hold a mint to", recorder.Code)
 		}
 		if ran.Load() {
-			t.Error("the handler ran")
+			t.Error("the handler ran under a credential sealing no execution: the refusal has to come before anything author-written")
 		}
 		if got := gw.mintCount(); got != 0 {
 			t.Errorf("the gateway saw %d viewer mints, want 0", got)
 		}
 		if got := len(gw.calls); got != 0 {
 			t.Errorf("a module was called %d times under a credential attesting no build, want 0", got)
+		}
+
+		// And the gate itself, named, because the route's 503 does not say
+		// WHICH refusal produced it.
+		if err := server.actingForAViewer(context.Background()); err == nil {
+			t.Fatal("a route acted for a viewer under a credential sealing no execution")
+		} else if !errors.Is(err, ErrCredentialRefused) {
+			t.Errorf("the route refused with %v, want one wrapping ErrCredentialRefused", err)
+		}
+
+		// THE POSITIVE CONTROL: the same route, the same headers, a credential
+		// that does seal an execution. Without it the 503 above is satisfied
+		// by a route that answers 503 to everything.
+		sound := newHostMint(t, &hostMint{})
+		healthy := New(Manifest{ID: testSolutionID}).
+			Credential(mintClientFor(t, sound, tokenFile))
+		healthy.cfg = config{gatewayURL: gw.URL}
+		controlRoute := healthy.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+			return map[string]string{"ok": "yes"}, nil
+		})
+		control := httptest.NewRecorder()
+		controlRequest := httptest.NewRequest(http.MethodGet, "/thing", nil)
+		controlRequest.Header = header
+		controlRoute(control, controlRequest)
+		if control.Code != http.StatusOK {
+			t.Errorf("the control route answered %d with a sound credential, want 200: so the 503 above says nothing about the execution-free one", control.Code)
 		}
 	})
 
@@ -2548,4 +2607,69 @@ func TestTheMintRefusesToPresentARotatedIdentity(t *testing.T) {
 	if got := mint.count(); got <= before {
 		t.Errorf("the issuer served %d requests after a valid rotation, want more than %d", got, before)
 	}
+}
+
+// TestEachSealedFieldIsComparedOnItsOwn isolates the three comparisons that
+// hold this execution's credential to what it was first sealed to.
+//
+// TestARenewalSealedToADifferentExecutionIsRefused drives real credentials, and
+// its digest case advances the incarnation as well — not an oversight but
+// core's own rule: a new digest at a reused incarnation is refused outright
+// ("a new build is a new run, so advance the incarnation — reusing it lets a
+// swap back to the earlier digest re-admit every capability sealed to it",
+// core@v0.9.0/workcontext/seal.go:861). So a credential differing ONLY in
+// digest is not a thing core will mint, and a reviewer's suggested fixture
+// cannot be built without inventing a shape core refuses.
+//
+// What can be isolated is the comparison, which is where the finding actually
+// lands: removing the digest field from sealedIdentity leaves the integration
+// test green because the incarnation moved too. This drives
+// holdSealedIdentity directly, one field at a time.
+func TestEachSealedFieldIsComparedOnItsOwn(t *testing.T) {
+	const digest = "sha256:" + "a"
+	seal := func(installation, image string, incarnation uint64) *workcontext.SealedValues {
+		// InstallationId is a plain string on the message; the other two are
+		// pointer scalars, which is why the production code reads all three
+		// through the Get accessors rather than the fields.
+		return &workcontext.SealedValues{
+			InstallationId:   installation,
+			ImageDigest:      &image,
+			BuildIncarnation: &incarnation,
+		}
+	}
+	first := seal(testInstallation, digest, 11)
+
+	for _, tc := range []struct {
+		field string
+		moved *workcontext.SealedValues
+	}{
+		{"the image digest alone", seal(testInstallation, "sha256:b", 11)},
+		{"the build incarnation alone", seal(testInstallation, digest, 12)},
+		{"the installation alone", seal("installation-somewhere-else", digest, 11)},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			held := &authorityHeldSource{}
+			if err := held.holdSealedIdentity(first); err != nil {
+				t.Fatalf("the first seal was refused: %v", err)
+			}
+			err := held.holdSealedIdentity(tc.moved)
+			if err == nil {
+				t.Fatalf("a renewal that moved %s was accepted: every work context this process mints is attested by this credential, so the mints either side would name a different deployment or a different build", tc.field)
+			}
+			if !errors.Is(err, workcontext.ErrMintRefused) {
+				t.Errorf("the refusal is %v, want ErrMintRefused", err)
+			}
+		})
+	}
+
+	t.Run("and the same seal twice is a renewal", func(t *testing.T) {
+		// The control: this refuses on CHANGE, not on every renewal.
+		held := &authorityHeldSource{}
+		if err := held.holdSealedIdentity(first); err != nil {
+			t.Fatalf("the first seal was refused: %v", err)
+		}
+		if err := held.holdSealedIdentity(seal(testInstallation, digest, 11)); err != nil {
+			t.Errorf("an ordinary renewal to the same execution was refused, which would end every process at its first renewal: %v", err)
+		}
+	})
 }
