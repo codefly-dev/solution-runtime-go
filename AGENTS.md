@@ -55,9 +55,47 @@ path**. What resolution still cannot decide is in that file: a decode
 destination whose static type is an interface (`proto.Message`, `any`) is not a
 capability by its type, which is the same residual core's own verifier has.
 
-Where the type system stops answering, the rules **follow the value instead of
-the declaration**, and that is the lesson of the round after the rewrite. A
-handler handed out through a `struct{ H any }` cannot be decided from the
+**There is ONE traversal, `typeWalk`, and every rule asks its question through
+it.** Four rounds of findings were the same defect — a walk that enumerated the
+carriers it knew: a struct, then a map, then a signature result, then an
+interface-typed field, then a generic's type argument, then a concrete wrapper
+around a capability. Each fix was correct and the next carrier arrived, because
+the author picks the carrier. So the walk reaches a **fixed point** over
+resolved types: pointer, slice, array, map key and element, channel, struct
+field, signature result, interface method result, exported method result, a
+named type's underlying type, a generic's type arguments, a type parameter's
+constraint. There is no list to extend because there is no list.
+
+It **fails closed in both directions a traversal can go wrong.** Cycles are
+guarded by identity, not by a depth cap: the two walks this replaced returned
+false past depth 8 and depth 6, so nine nested arrays around an `http.Handler`
+escaped both — a traversal that gives up quietly is a gate that can be
+exhausted by nesting. And what it cannot resolve is **reported**, not skipped;
+every caller turns `unresolved` into a finding, because a gate that cannot see
+is not a gate that passes. `TestTheWalkRefusesWhatItCannotFinish` asks that
+branch directly, since no fixture can exhaust a 50,000-node budget.
+
+Two distinctions in it are load-bearing, and both were found by the walk's own
+first run flagging real code:
+
+- **What a value HANDS BACK is not what its memory HOLDS.** Construction
+  follows struct fields and array elements — inline memory — and nothing else:
+  a method result, and what a pointer, slice, map or channel refers to, are not
+  allocated by allocating the value. Expanding every carrier reported
+  `&authorityHeldSource{…}` as constructing a capability, because its
+  `CredentialSource` field is an interface whose method returns the SDK's
+  credential, which is an alias for one of core's wire messages. A **decode
+  destination** does reach through indirection, because a decoder allocates
+  through it.
+- **A foreign package's type is its own API.** What this boundary forbids is
+  THIS package building a carrier for core's wire message; the SDK's
+  `Credential` transitively contains them by design. So a named type from
+  another package is not expanded into its fields — while a core wire type is
+  still matched wherever it appears, however deep, because the match runs
+  before any expansion.
+
+The value-flow half is the same walk with a different predicate. A handler
+handed out through `struct{ H any }` or `func() any` cannot be decided from the
 result type — and refusing every interface-typed field would refuse
 `Operation.Request`/`Response`, which are `any` by design — so the rule asks
 whether an exported function whose results carry an interface **a handler could
@@ -66,9 +104,12 @@ every function returns one; a handler cannot be stored in it, and asking
 whether `http.Handler` implements the interface is what tells the two apart. A
 generic is the same shape one level up: `alloc[SealedValues]()` sees a type
 PARAMETER at its `new(T)`, so the question is asked at the INSTANTIATION, where
-the concrete type exists (`types.Info.Instances`). And indirection is not a
-shape to enumerate — a `**SealedValues` destination is dereferenced all the way
-down, not once.
+the concrete type exists (`types.Info.Instances`) — and the type ARGUMENT is
+then walked, which is how `alloc[box, *box]()` is caught through `box`'s own
+field, two type parameters and an alias deep. Indirection is not a shape
+either: a `**SealedValues` destination is dereferenced all the way down, and
+the RECEIVER of a `Decode`/`Unmarshal` method is a destination as much as its
+arguments are.
 
 They were syntactic until round sixteen, and that history is the reason for the
 rewrite — the old rule was falsified by a shape nobody had written down, six

@@ -1016,51 +1016,76 @@ func (s *Server) withoutRuntimeAddresses(result mcp.Result, method string) mcp.R
 			}},
 		}
 	}
-	for _, content := range call.Content {
-		text, isText := content.(*mcp.TextContent)
-		if !isText {
-			continue
-		}
-		if _, found := named(text.Text); found {
-			return replaced("text content", text.Text)
-		}
-	}
+	// SERIALIZE EVERYTHING FIRST, THEN INSPECT, THEN PUBLISH AN OWNED SNAPSHOT.
+	//
+	// The order is the whole fix, and getting it wrong twice is why it is
+	// spelled out. First this inspected the object and returned it for the SDK
+	// to serialize later, so a MarshalJSON answering differently the second
+	// time disclosed on the second call. Then the structured half was frozen
+	// and the text half was not — and the text was read BEFORE the structured
+	// marshalling ran, so a structured value holding a pointer to the result's
+	// own *mcp.TextContent could rewrite the text, from inside MarshalJSON,
+	// after it had passed inspection. `{}` is a clean serialization of a value
+	// whose side effect put the mint's address in a sibling field.
+	//
+	// So: every marshaller runs first, then nothing is inspected that is not
+	// about to be published, and what is published is a value built here from
+	// strings and bytes this runtime owns. Nothing the caller still holds a
+	// pointer to can change it, and no marshaller is asked twice.
+	var rendered []byte
 	if call.StructuredContent != nil {
 		// Marshalling failure is itself a reason to replace: a structured
 		// value this runtime cannot read is one it cannot clear either, and
 		// the SDK is about to serialize it.
-		rendered, err := json.Marshal(call.StructuredContent)
-		if err != nil {
+		var err error
+		if rendered, err = json.Marshal(call.StructuredContent); err != nil {
 			return replaced("structured content", "unreadable structured content: "+err.Error())
 		}
+	}
+	// Only now are the texts read, and they are COPIED as they are read, so
+	// what is inspected below and what is published are the same strings.
+	snapshot := make([]mcp.Content, 0, len(call.Content))
+	for _, content := range call.Content {
+		text, isText := content.(*mcp.TextContent)
+		if !isText {
+			// Content this runtime cannot read is content it cannot clear.
+			// Replacing is the fail-closed answer: the alternative is
+			// publishing a type whose serialization nothing here inspected.
+			return replaced("non-text content", fmt.Sprintf("%T", content))
+		}
+		snapshot = append(snapshot, &mcp.TextContent{
+			Text:        text.Text,
+			Annotations: text.Annotations,
+			Meta:        text.Meta,
+		})
+	}
+	for _, content := range snapshot {
+		text := content.(*mcp.TextContent)
+		if _, found := named(text.Text); found {
+			return replaced("text content", text.Text)
+		}
+	}
+	if rendered != nil {
 		// The DECODED strings, not the serialization.
 		//
 		// This searched the marshalled bytes for the configured URL, and JSON
-		// has more than one spelling for the same string: a
-		// json.RawMessage holding {"error":"https:\/\/mint…"} keeps those
-		// escapes through Marshal, the search for "https://mint…" misses, and
-		// the client decodes the address back out. So the bytes are decoded
-		// and every string inside them is checked — which is the
+		// has more than one spelling for the same string: a json.RawMessage
+		// holding {"error":"https:\/\/mint…"} keeps those escapes through
+		// Marshal, the search for "https://mint…" misses, and the client
+		// decodes the address back out. So the bytes are decoded and every
+		// string inside them — and every key — is checked, which is the
 		// representation the client actually sees.
 		if offending, found := namedInJSON(rendered, named); found {
 			return replaced("structured content", offending)
 		}
-		// AND THE CHECKED BYTES ARE WHAT GETS PUBLISHED.
-		//
-		// This inspected one serialization and returned the original object,
-		// and the SDK then serialized that object AGAIN into the response. A
-		// value whose MarshalJSON does not answer the same thing twice —
-		// returning `{}` first and the mint's address after — passed the check
-		// and disclosed on the second call, with no concurrent mutation
-		// involved. Marshalling is not guaranteed to be a pure function of a
-		// value this runtime did not write.
-		//
-		// So the inspected bytes are kept, as a json.RawMessage this runtime
-		// owns. What the client reads is then exactly what was checked, and a
-		// marshaler cannot answer twice because it is not asked twice.
-		clean := *call
-		clean.StructuredContent = json.RawMessage(rendered)
-		return &clean
 	}
-	return result
+	clean := &mcp.CallToolResult{
+		IsError: true,
+		Content: snapshot,
+		Meta:    call.Meta,
+	}
+	if rendered != nil {
+		clean.StructuredContent = json.RawMessage(rendered)
+	}
+	return clean
 }

@@ -145,17 +145,22 @@ func (g typedGate) mountableHandlerType(t types.Type) bool {
 // net/http.Handler in a package-level variable made the compiled-fixture test
 // pass alone and fail after the real gates, since types.Implements compared a
 // fixture's *http.Request against the previous load's. Per load, passed in.
-type typedGate struct{ handler *types.Interface }
+type typedGate struct {
+	handler *types.Interface
+	// pkgPath is the package under the gate, so the walk can tell a carrier
+	// THIS package declared from another package's own type.
+	pkgPath string
+}
 
 // gateFor resolves net/http.Handler out of one loaded package.
 func gateFor(pkg *packages.Package) typedGate {
 	if http := pkg.Imports["net/http"]; http != nil && http.Types != nil {
 		if handler := http.Types.Scope().Lookup("Handler"); handler != nil {
 			iface, _ := handler.Type().Underlying().(*types.Interface)
-			return typedGate{handler: iface}
+			return typedGate{handler: iface, pkgPath: pkg.PkgPath}
 		}
 	}
-	return typedGate{}
+	return typedGate{pkgPath: pkg.PkgPath}
 }
 
 // handedOutDirectly is what no exported path may RETURN. It is wider than
@@ -225,32 +230,153 @@ func deref(t types.Type) types.Type {
 	}
 }
 
-// exposesMountableHandler reports whether a caller holding this type can reach
-// a mountable handler through it — a field, an embedded field, a method, or any
-// of those inside a container or an unnamed struct.
+// typeWalk is THE traversal, and every rule in this file asks its question
+// through it.
 //
-// Recursive and cycle-guarded. This is what replaces localHandlerTypes and
-// carriesAMountableHandler: it needs no declaration to visit, so an anonymous
-// struct is no different from a named one, and it reads method sets, which the
-// field walk could not.
-func (g typedGate) exposesMountableHandler(t types.Type, seen map[types.Type]bool, depth int) bool {
-	if t == nil || depth > 8 {
-		return false
-	}
-	if seen == nil {
-		seen = map[types.Type]bool{}
-	}
-	if seen[t] {
-		return false
-	}
-	seen[t] = true
+// Four rounds of gate findings were all the same defect: a walk that
+// enumerated the carriers it knew. A struct, then a map, then a signature
+// result, then an interface-typed field, then a generic's type argument, then
+// a concrete wrapper around a capability. Each fix was correct and the next
+// carrier arrived, because the author picks the carrier.
+//
+// So this reaches a FIXED POINT over resolved types instead: given a type, it
+// expands every way a value of that type can hold or hand back another value —
+// pointer, slice, array, map key and element, channel, struct field,
+// signature result, interface method result, exported method result, a named
+// type's underlying type, a generic's type arguments, a type parameter's
+// constraint terms — and asks the predicate at every node. There is no list of
+// shapes to extend because there is no list.
+//
+// It FAILS CLOSED in both directions that a traversal can go wrong:
+//
+//   - A cycle is guarded by identity, not by a depth cap. The previous walks
+//     returned false beyond depth 8 and depth 6, so nine nested arrays around
+//     an http.Handler escaped both — a traversal that gives up quietly is a
+//     gate that can be exhausted by nesting.
+//   - What it cannot resolve is REPORTED rather than skipped. An invalid type
+//     or a budget exhausted by a pathological graph comes back as `unresolved`,
+//     and every caller turns that into a finding. A gate that cannot see is not
+//     a gate that passes.
+type typeWalk struct {
+	gate   typedGate
+	match  func(types.Type) bool
+	fields fieldPolicy
+	// local is this package's path. When foreignOpaque is set, a named type
+	// from ANOTHER package is not expanded into its fields.
+	//
+	// That distinction is the rule, not a concession: what this boundary
+	// forbids is THIS package building a carrier for one of core's wire
+	// messages. The SDK's own `Credential` transitively contains them — that
+	// is its API, and this runtime holds one by design — so expanding every
+	// foreign struct flagged `openCredential`, `mcpViewer` and `Credential`
+	// itself. A core wire type is still matched directly wherever it appears,
+	// however deep, because the match runs before any expansion.
+	local         string
+	foreignOpaque bool
+	// storage restricts expansion to what a value's own memory contains;
+	// indirect adds what a decoder allocates through.
+	storage  bool
+	indirect bool
+	// seen keys on the type's own identity, which is what makes a recursive
+	// named type terminate.
+	seen  map[types.Type]bool
+	depth int
+	// budget bounds a graph this walk cannot otherwise finish. Exhausting it is
+	// an ANSWER — "this could not be decided" — not a false.
+	budget     int
+	unresolved string
+}
 
-	if g.mountableHandlerType(t) {
+// fieldPolicy says which struct fields a value's holder can reach, and — with
+// the walk's graph mode — what "carries" means for the question being asked.
+type fieldPolicy int
+
+const (
+	// reachableFields: exported, or embedded (reachable by its own type name).
+	// What a CONSUMER of a handed-out value can read. Used with the EXPOSURE
+	// graph, which follows every way a value hands back another value:
+	// methods, callable results, interface results, elements, fields.
+	reachableFields fieldPolicy = iota
+	// everyField: visibility is irrelevant, because allocating a struct
+	// allocates its unexported fields too. Used with the STORAGE graph.
+	everyField
+)
+
+// storageGraph restricts the walk to what a value's own MEMORY contains.
+//
+// This distinction is the one the first run of the fixed-point walk got wrong,
+// and the finding was real: expanding every carrier reported
+// `&authorityHeldSource{…}` as constructing a capability, because its
+// `CredentialSource` field is an interface whose method returns the SDK's
+// credential — which is an alias for one of core's wire messages.
+//
+// But a method RESULT is not an allocation, and neither is what a pointer, a
+// slice, a map or a channel refers to: those are nil in a freshly allocated
+// value. Allocating a struct allocates its FIELDS, and allocating an array
+// allocates its ELEMENTS, inline. That is the whole of what construction
+// means, so that is the whole of what this walk follows — which is both
+// narrower and exactly right: `struct{ Seal wc.SealedValues }` allocates a
+// seal, and holding a `CredentialSource` does not.
+func storageGraph(w *typeWalk) { w.storage = true }
+
+// throughIndirection adds what a DECODER reaches: it allocates through the
+// pointers and slices in its destination, which a constructor does not.
+func throughIndirection(w *typeWalk) { w.storage, w.indirect = true, true }
+
+func (g typedGate) walk(t types.Type, match func(types.Type) bool, fields fieldPolicy, opts ...func(*typeWalk)) (bool, string) {
+	w := &typeWalk{gate: g, match: match, fields: fields, seen: map[types.Type]bool{}, budget: 50000}
+	for _, opt := range opts {
+		opt(w)
+	}
+	found := w.reach(t)
+	return found, w.unresolved
+}
+
+// withinThisPackage stops the walk expanding another package's named types
+// into their fields.
+func withinThisPackage(path string) func(*typeWalk) {
+	return func(w *typeWalk) { w.local, w.foreignOpaque = path, true }
+}
+
+func (w *typeWalk) reach(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if w.budget <= 0 {
+		if w.unresolved == "" {
+			w.unresolved = "the traversal ran out of budget before it finished, so this type's carriers were never all examined"
+		}
+		return false
+	}
+	w.budget--
+	if !resolved(t) {
+		if w.depth > 0 {
+			// Invalid INSIDE a graph: a carrier the gate cannot see into.
+			w.unresolved = "go/types could not resolve a type inside this one, so nothing can be decided about what it carries"
+		}
+		// At the root, an invalid type is an expression that is not a value at
+		// all — a package name, a callee identifier. There is nothing to
+		// decide, and reporting it would fire on every file.
+		return false
+	}
+	if w.seen[t] {
+		return false
+	}
+	w.seen[t] = true
+	w.depth++
+	defer func() { w.depth-- }()
+
+	if w.match(t) {
 		return true
 	}
-	// An exported method handing one back is the same exposure with a call in
-	// the way.
+
+	// An EXPORTED METHOD handing one back is the same exposure with a call in
+	// the way, on the value and on a pointer to it. A method result is not
+	// STORAGE, so this is the exposure graph only.
 	for _, receiver := range []types.Type{t, types.NewPointer(t)} {
+		if w.storage {
+			break
+		}
 		set := types.NewMethodSet(receiver)
 		for i := range set.Len() {
 			method := set.At(i).Obj()
@@ -262,45 +388,191 @@ func (g typedGate) exposesMountableHandler(t types.Type, seen map[types.Type]boo
 				continue
 			}
 			for r := range signature.Results().Len() {
-				if g.mountableHandlerType(signature.Results().At(r).Type()) {
+				if w.reach(signature.Results().At(r).Type()) {
 					return true
 				}
 			}
 		}
 	}
-	switch under := types.Unalias(t).Underlying().(type) {
-	case *types.Signature:
-		// A CALLABLE that hands one back. `func() http.Handler` in a field or
-		// a result is a handler one call away, and the walk had no signature
-		// case at all.
-		for i := range under.Results().Len() {
-			if g.exposesMountableHandler(under.Results().At(i).Type(), seen, depth+1) {
+
+	// A NAMED type carries its underlying type and its type ARGUMENTS: an
+	// instantiated generic holds whatever it was instantiated with.
+	if named, ok := types.Unalias(t).(*types.Named); ok {
+		if args := named.TypeArgs(); args != nil {
+			for i := range args.Len() {
+				if w.reach(args.At(i)) {
+					return true
+				}
+			}
+		}
+		if w.foreignOpaque {
+			if pkg := named.Obj().Pkg(); pkg != nil && pkg.Path() != w.local {
+				// Another package's type, and not a match itself. Its insides
+				// are its own API.
+				return false
+			}
+		}
+	}
+
+	under := types.Unalias(t).Underlying()
+	if w.storage {
+		// Only what the value itself holds.
+		switch held := under.(type) {
+		case *types.Struct:
+			for i := range held.NumFields() {
+				field := held.Field(i)
+				if w.fields == reachableFields && !field.Exported() && !field.Embedded() {
+					continue
+				}
+				if w.reach(field.Type()) {
+					return true
+				}
+			}
+		case *types.Array:
+			if w.reach(held.Elem()) {
+				return true
+			}
+		case *types.Pointer:
+			if w.indirect && w.reach(held.Elem()) {
+				return true
+			}
+		case *types.Slice:
+			if w.indirect && w.reach(held.Elem()) {
+				return true
+			}
+		case *types.Map:
+			if w.indirect && (w.reach(held.Key()) || w.reach(held.Elem())) {
+				return true
+			}
+		case *types.TypeParam:
+			if constraint := held.Constraint(); constraint != nil && w.reach(constraint) {
 				return true
 			}
 		}
+		return false
+	}
+	switch under := under.(type) {
+	case *types.Signature:
+		// A CALLABLE hands back whatever it returns. `func() any` is a handler
+		// one call away when the body builds one.
+		for i := range under.Results().Len() {
+			if w.reach(under.Results().At(i).Type()) {
+				return true
+			}
+		}
+	case *types.Interface:
+		// An interface hands back its methods' results.
+		for i := range under.NumMethods() {
+			signature, ok := under.Method(i).Type().(*types.Signature)
+			if !ok {
+				continue
+			}
+			for r := range signature.Results().Len() {
+				if w.reach(signature.Results().At(r).Type()) {
+					return true
+				}
+			}
+		}
 	case *types.Pointer:
-		return g.exposesMountableHandler(under.Elem(), seen, depth+1)
+		if w.reach(under.Elem()) {
+			return true
+		}
 	case *types.Slice:
-		return g.exposesMountableHandler(under.Elem(), seen, depth+1)
+		if w.reach(under.Elem()) {
+			return true
+		}
 	case *types.Array:
-		return g.exposesMountableHandler(under.Elem(), seen, depth+1)
+		if w.reach(under.Elem()) {
+			return true
+		}
 	case *types.Map:
-		return g.exposesMountableHandler(under.Elem(), seen, depth+1)
+		// Both halves: a map keyed by a carrier carries it too.
+		if w.reach(under.Key()) || w.reach(under.Elem()) {
+			return true
+		}
 	case *types.Chan:
-		return g.exposesMountableHandler(under.Elem(), seen, depth+1)
+		if w.reach(under.Elem()) {
+			return true
+		}
 	case *types.Struct:
 		for i := range under.NumFields() {
 			field := under.Field(i)
-			// Reachable: exported, or embedded (reachable by its own name).
-			if !field.Exported() && !field.Embedded() {
+			if w.fields == reachableFields && !field.Exported() && !field.Embedded() {
 				continue
 			}
-			if g.exposesMountableHandler(field.Type(), seen, depth+1) {
+			if w.reach(field.Type()) {
+				return true
+			}
+		}
+	case *types.TypeParam:
+		// A type parameter carries whatever its constraint admits.
+		if terms := under.Constraint(); terms != nil {
+			if w.reach(terms) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// exposesMountableHandler: does a value of this type IS or CARRY something
+// mountable, anywhere in its type graph?
+func (g typedGate) exposesMountableHandler(t types.Type) (bool, string) {
+	return g.walk(t, g.mountableHandlerType, reachableFields)
+}
+
+// opaqueForHandler: does this type carry an interface A HANDLER COULD BE
+// STORED IN — the point at which static types stop answering?
+//
+// It runs through the same walk, so `func() any`, `[]any`, `struct{ H any }`
+// and a method returning one are all one case. Reaching callable results is
+// what closed the escape: the old predicate had no signature traversal, so a
+// `func() any` result skipped the body check entirely.
+func (g typedGate) opaqueForHandler(t types.Type) (bool, string) {
+	return g.walk(t, func(candidate types.Type) bool {
+		iface, ok := types.Unalias(candidate).Underlying().(*types.Interface)
+		if !ok || g.handler == nil {
+			return false
+		}
+		// `any` can hold a handler; `error` cannot, and every function returns
+		// one. Asking whether http.Handler implements the interface is the
+		// type-driven form of "could a handler hide here".
+		return types.Implements(g.handler, iface)
+	}, reachableFields)
+}
+
+// carriesCoreWire: does this type IS or CARRY one of core's wire messages?
+//
+// Every field counts, exported or not: allocating a struct allocates its
+// unexported fields, so `struct{ seal wc.SealedValues }` constructs a seal as
+// much as an exported one does. This is what closed the concrete wrapper —
+// `new(reviewBox)` where reviewBox holds a SealedValues allocates a capability,
+// and pointer-stripping plus a top-level package check could not see it.
+// decodesIntoCoreWire is carriesCoreWire for a DESTINATION, which a decoder
+// allocates through: a `*struct{ Seal *SealedValues }` destination has a seal
+// written into it even though constructing that struct allocates none.
+func (g typedGate) decodesIntoCoreWire(t types.Type) (string, string) {
+	var carried string
+	_, unresolved := g.walk(t, func(candidate types.Type) bool {
+		if path := coreWireType(candidate); path != "" {
+			carried = path
+			return true
+		}
+		return false
+	}, everyField, withinThisPackage(g.pkgPath), throughIndirection)
+	return carried, unresolved
+}
+
+func (g typedGate) carriesCoreWire(t types.Type) (string, string) {
+	var carried string
+	_, unresolved := g.walk(t, func(candidate types.Type) bool {
+		if path := coreWireType(candidate); path != "" {
+			carried = path
+			return true
+		}
+		return false
+	}, everyField, withinThisPackage(g.pkgPath), storageGraph)
+	return carried, unresolved
 }
 
 // TestNoExportedPathHandsOutAServableHandlerByType is the handler-export gate,
@@ -342,9 +614,20 @@ func reportHandlerShapes(_ *testing.T, pkg *packages.Package) []string {
 			case isEmptyInterface(result):
 				report("%s exports %s returning the empty interface: nothing can tell from the signature whether what comes back is servable. Declare the concrete type.",
 					where, name)
-			case g.exposesMountableHandler(result, nil, 0):
-				report("%s exports %s returning %s, which exposes a servable handler through a reachable field or method: a caller reaches it and has a handler built without the boot.",
-					where, name, types.TypeString(result, nil))
+			default:
+				exposes, unresolved := g.exposesMountableHandler(result)
+				if unresolved != "" {
+					// FAIL CLOSED. A traversal that could not finish is not a
+					// traversal that found nothing — the previous walks
+					// returned false past a depth cap, so nesting escaped
+					// them.
+					report("%s exports %s returning %s and the gate COULD NOT DECIDE what it carries: %s. Declare a concrete type the gate can resolve.",
+						where, name, types.TypeString(result, nil), unresolved)
+				}
+				if exposes {
+					report("%s exports %s returning %s, which exposes a servable handler through a reachable field, element, callable result or method: a caller reaches it and has a handler built without the boot.",
+						where, name, types.TypeString(result, nil))
+				}
 			}
 		}
 	}
@@ -370,10 +653,22 @@ func reportHandlerShapes(_ *testing.T, pkg *packages.Package) []string {
 			if !ok || fn.Body == nil || !fn.Name.IsExported() || fn.Type.Results == nil {
 				continue
 			}
-			if !resultsHoldAnInterface(gateFor(pkg), pkg.TypesInfo, fn.Type.Results) {
+			g := gateFor(pkg)
+			opaque, unresolved := false, ""
+			for _, result := range fn.Type.Results.List {
+				carries, why := g.opaqueForHandler(pkg.TypesInfo.TypeOf(result.Type))
+				opaque = opaque || carries
+				if why != "" && unresolved == "" {
+					unresolved = why
+				}
+			}
+			if unresolved != "" {
+				report("%s exports %s and the gate COULD NOT DECIDE whether its results carry an interface a handler could hide in: %s.",
+					pkg.PkgPath, fn.Name.Name, unresolved)
+			}
+			if !opaque {
 				continue
 			}
-			g := gateFor(pkg)
 			ast.Inspect(fn.Body, func(node ast.Node) bool {
 				expr, ok := node.(ast.Expr)
 				if !ok {
@@ -399,7 +694,11 @@ func reportHandlerShapes(_ *testing.T, pkg *packages.Package) []string {
 		case *types.Func:
 			servable(pkg.PkgPath, name, typed.Type())
 		case *types.Var, *types.Const:
-			if g.exposesMountableHandler(object.Type(), nil, 0) {
+			exposes, unresolved := g.exposesMountableHandler(object.Type())
+			if unresolved != "" {
+				report("%s exports %s and the gate COULD NOT DECIDE what its type carries: %s.", pkg.PkgPath, name, unresolved)
+			}
+			if exposes {
 				report("%s exports %s, whose type exposes a servable handler: a caller holding it serves the viewer's bearer and this workload's credential over whatever it is mounted on.",
 					pkg.PkgPath, name)
 			}
@@ -416,54 +715,6 @@ func reportHandlerShapes(_ *testing.T, pkg *packages.Package) []string {
 		}
 	}
 	return findings
-}
-
-// resultsHoldAnInterface reports whether a result list contains an interface
-// anywhere inside it — directly, or in a field of a struct it returns.
-//
-// This is the point where the type system stops being able to say what a value
-// carries, which is why it is the point where the rule stops trusting types
-// and starts looking at what the function actually built.
-func resultsHoldAnInterface(g typedGate, info *types.Info, results *ast.FieldList) bool {
-	var opaque func(types.Type, int) bool
-	opaque = func(t types.Type, depth int) bool {
-		if !resolved(t) || depth > 6 {
-			return false
-		}
-		switch under := types.Unalias(t).Underlying().(type) {
-		case *types.Interface:
-			// Only an interface a HANDLER COULD BE STORED IN. `any` can hold
-			// one; `error` cannot, and treating every interface as opaque made
-			// every function returning an error qualify — which is all of
-			// them. Asking whether http.Handler implements the interface is
-			// the type-driven form of "could a handler hide here".
-			return g.handler != nil && types.Implements(g.handler, under)
-		case *types.Pointer:
-			return opaque(under.Elem(), depth+1)
-		case *types.Slice:
-			return opaque(under.Elem(), depth+1)
-		case *types.Array:
-			return opaque(under.Elem(), depth+1)
-		case *types.Map:
-			return opaque(under.Elem(), depth+1)
-		case *types.Chan:
-			return opaque(under.Elem(), depth+1)
-		case *types.Struct:
-			for i := range under.NumFields() {
-				field := under.Field(i)
-				if (field.Exported() || field.Embedded()) && opaque(field.Type(), depth+1) {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	for _, result := range results.List {
-		if opaque(info.TypeOf(result.Type), 0) {
-			return true
-		}
-	}
-	return false
 }
 
 func isEmptyInterface(t types.Type) bool {
@@ -494,18 +745,24 @@ func reportCapabilityShapes(_ *testing.T, pkg *packages.Package) []string {
 		findings = append(findings, fmt.Sprintf(format, args...))
 	}
 	info := pkg.TypesInfo
-	// A GENERIC INSTANTIATED WITH ONE OF CORE'S WIRE MESSAGES.
-	//
-	// `alloc[wc.SealedValues]()` where `func alloc[T any]() *T { return new(T)
-	// }` allocates a capability, and at the `new(T)` the scanner sees a type
-	// PARAMETER: there is no concrete type at the allocation site to ask
-	// about. The instantiation is where the concrete type appears, and
-	// info.Instances records it — so the question is asked where the answer
-	// exists rather than where the allocation is written.
+	g := gateFor(pkg)
+	// Every instantiation in the package, walked for what its type arguments
+	// CARRY — not merely what they are. A generic's `new(T)` sees a type
+	// parameter, so the instantiation is where the concrete type exists; and
+	// `alloc[box, *box]()` carries the capability one field inside box, which
+	// is where two type parameters and an alias hid it.
 	for ident, instance := range info.Instances {
+		if instance.TypeArgs == nil {
+			continue
+		}
 		for i := range instance.TypeArgs.Len() {
-			if path := coreWireType(deref(instance.TypeArgs.At(i))); path != "" {
-				report("%s instantiates %s with %s: a generic over one of core's wire messages allocates and decodes one wherever it is used, and the allocation site sees only a type parameter. Read the seal through Credential.Seal().",
+			path, unresolved := g.carriesCoreWire(instance.TypeArgs.At(i))
+			if unresolved != "" {
+				report("%s instantiates %s and the gate COULD NOT DECIDE what the type argument carries: %s.", pkg.PkgPath, ident.Name, unresolved)
+				continue
+			}
+			if path != "" {
+				report("%s instantiates %s with a type carrying %s: a generic over one of core's wire messages allocates and decodes one wherever it is used, and the allocation site sees only a type parameter. Read the seal through Credential.Seal().",
 					pkg.PkgPath, ident.Name, path)
 			}
 		}
@@ -521,81 +778,123 @@ func reportCapabilityShapes(_ *testing.T, pkg *packages.Package) []string {
 			if fn, ok := decl.(*ast.FuncDecl); ok {
 				where += "." + fn.Name.Name
 			}
-			inspectForCapabilities(decl, where, info, report)
+			inspectForCapabilities(g, decl, where, info, report)
 		}
 	}
 	return findings
 }
 
 // inspectForCapabilities is the capability rule over one declaration.
-func inspectForCapabilities(decl ast.Node, where string, info *types.Info, report func(string, ...any)) {
+// reportCarrier asks one of the carrier walks and turns its answer — including
+// "could not decide" — into a finding. Fail-closed is the default: a gate that
+// cannot see is not a gate that passes.
+func reportCarrier(ask func(types.Type) (string, string), t types.Type, said, where string, report func(string, ...any), args ...any) {
+	path, unresolved := ask(t)
+	if unresolved != "" {
+		report("%s: the gate COULD NOT DECIDE whether %s carries one of core's wire messages: %s. Use a concrete type the gate can resolve.",
+			where, types.TypeString(t, nil), unresolved)
+		return
+	}
+	if path == "" {
+		return
+	}
+	report(said, append(args, path)...)
+}
+
+func inspectForCapabilities(g typedGate, decl ast.Node, where string, info *types.Info, report func(string, ...any)) {
+	// EVERY question here goes through the same fixed-point walk, so a
+	// CONCRETE WRAPPER is one case with everything else. `type box struct{
+	// Seal wc.SealedValues }` allocated with `new(box)` constructs a
+	// capability, and decoding into a `*box` decodes one — pointer-stripping
+	// plus a top-level package check saw neither, because the wire type was
+	// one field in.
+	carries := func(t types.Type, said string, args ...any) {
+		reportCarrier(g.carriesCoreWire, t, said, where, report, args...)
+	}
+	// A DESTINATION is reached through indirection: a decoder allocates
+	// through the pointers and slices in it.
+	destination := func(t types.Type, said string, args ...any) {
+		reportCarrier(g.decodesIntoCoreWire, t, said, where, report, args...)
+	}
 	ast.Inspect(decl, func(node ast.Node) bool {
 		switch typed := node.(type) {
 		case *ast.CompositeLit:
-			if path := coreWireType(info.TypeOf(typed)); path != "" {
-				report("%s constructs %s: allocating one of core's wire messages is what decoding into it requires, and a second reader of that encoding is this boundary's whole subject. Read the seal through Credential.Seal().",
-					where, path)
-			}
+			carries(info.TypeOf(typed),
+				"%s constructs a value carrying %s: allocating one of core's wire messages is what decoding into it requires, and a second reader of that encoding is this boundary's whole subject. Read the seal through Credential.Seal().",
+				where)
 		case *ast.ValueSpec:
 			if typed.Type == nil {
 				return true
 			}
-			if path := coreWireType(info.TypeOf(typed.Type)); path != "" {
-				report("%s declares a %s, whose zero value is an allocation of core's wire message: see Credential.Seal().",
-					where, path)
-			}
+			carries(info.TypeOf(typed.Type),
+				"%s declares a value carrying %s, whose zero value allocates core's wire message: see Credential.Seal().",
+				where)
 		case *ast.CallExpr:
 			if called, ok := typed.Fun.(*ast.Ident); ok && called.Name == "new" && len(typed.Args) == 1 {
-				if path := coreWireType(info.TypeOf(typed.Args[0])); path != "" {
-					report("%s allocates a %s with new(): see Credential.Seal().", where, path)
-				}
+				carries(info.TypeOf(typed.Args[0]),
+					"%s allocates a value carrying %s with new(): see Credential.Seal().", where)
 				return true
+			}
+			// A GENERIC is asked at its INSTANTIATION, because `new(T)` sees
+			// only a type parameter. The type ARGUMENT is then walked, so
+			// `alloc[box, *box]()` is caught through box's own field — two
+			// type parameters and an alias deep.
+			if ident, ok := typed.Fun.(*ast.Ident); ok {
+				if instance, instantiated := info.Instances[ident]; instantiated && instance.TypeArgs != nil {
+					for i := range instance.TypeArgs.Len() {
+						carries(instance.TypeArgs.At(i),
+							"%s instantiates %s with a type carrying %s: a generic over one of core's wire messages allocates and decodes one wherever it is used, and the allocation site sees only a type parameter. Read the seal through Credential.Seal().",
+							where, ident.Name)
+					}
+				}
+			}
+			if selector, ok := typed.Fun.(*ast.SelectorExpr); ok {
+				if instance, instantiated := info.Instances[selector.Sel]; instantiated && instance.TypeArgs != nil {
+					for i := range instance.TypeArgs.Len() {
+						carries(instance.TypeArgs.At(i),
+							"%s instantiates %s with a type carrying %s: see Credential.Seal().",
+							where, selector.Sel.Name)
+					}
+				}
 			}
 			// HANDING A CAPABILITY TO SOMETHING THAT TAKES IT AS AN OPAQUE
 			// MESSAGE is handing it to a codec, and that is decided by the
-			// callee's SIGNATURE rather than its name.
-			//
-			// The name check below needs a selector, so a decoder reached
-			// through a function variable — `decode := proto.Unmarshal;
-			// decode(raw, dst)` — escaped it. This rule needs no spelling at
-			// all: it asks what the parameter's type is.
-			// `proto.Unmarshal(b []byte, m proto.Message)` takes the
-			// capability as an INTERFACE; `holdSealedIdentity(seal
-			// *workcontext.SealedValues)` takes it concretely and is the
-			// supported way to read one, so it is not flagged.
+			// callee's SIGNATURE rather than its name — so a decoder reached
+			// through a function variable is one case with a named one.
+			// `holdSealedIdentity(seal *workcontext.SealedValues)` takes it
+			// CONCRETELY and is the supported way to read one, so it is not
+			// flagged.
 			if signature, ok := types.Unalias(info.TypeOf(typed.Fun)).(*types.Signature); ok {
 				for i, arg := range typed.Args {
-					path := coreWireType(deref(info.TypeOf(arg)))
-					if path == "" {
-						continue
-					}
 					parameter := parameterAt(signature, i)
 					if parameter == nil {
 						continue
 					}
-					if _, opaque := types.Unalias(parameter).Underlying().(*types.Interface); opaque {
-						report("%s hands a %s to something that takes it as an opaque message (parameter %d is an interface): that is a codec, whatever the call is spelled like. Read the seal through Credential.Seal().",
-							where, path, i)
+					if _, opaque := types.Unalias(parameter).Underlying().(*types.Interface); !opaque {
+						continue
 					}
+					destination(deref(info.TypeOf(arg)),
+						"%s hands a value carrying %s to something that takes it as an opaque message (parameter %d is an interface): that is a codec, whatever the call is spelled like. Read the seal through Credential.Seal().",
+						where, i)
 				}
 			}
 			selector, ok := typed.Fun.(*ast.SelectorExpr)
 			if !ok {
 				return true
 			}
-			// Any decoder, by the shape of its name. The DESTINATION is
-			// what decides, and its type is resolved — so an assignment, a
-			// parameter, a field, a package-level alias and a
-			// function-local alias are all one case here, which is why
-			// this rule no longer grows a branch per spelling.
+			// Any decoder, by the shape of its name. The DESTINATION decides,
+			// and its type is resolved — an assignment, a parameter, a field,
+			// a package-level alias and a function-local alias are one case.
 			if !strings.Contains(selector.Sel.Name, "Unmarshal") && !strings.Contains(selector.Sel.Name, "Decode") {
 				return true
 			}
-			for _, arg := range typed.Args {
-				if path := coreWireType(deref(info.TypeOf(arg))); path != "" {
-					report("%s decodes into a %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through Credential.Seal().",
-						where, path)
-				}
+			// The RECEIVER is a destination too: `b.Decode(raw)` on a
+			// `*box` decodes into box, and only the arguments were examined.
+			destinations := append([]ast.Expr{selector.X}, typed.Args...)
+			for _, arg := range destinations {
+				destination(deref(info.TypeOf(arg)),
+					"%s decodes into a value carrying %s: that is a second reader of core's wire encoding, whoever allocated the destination. Read the seal through Credential.Seal().",
+					where)
 			}
 		}
 		return true
@@ -1067,5 +1366,186 @@ func FixtureReadsASeal(seal *wc.SealedValues) string { return seal.GetInstallati
 `, reportHandlerShapes)
 	if clean != "\n" && strings.TrimSpace(clean) != "" {
 		t.Errorf("the handler gate refused shapes that are the documented way to use this package:\n%s", clean)
+	}
+}
+
+// TestTheTypedGatesReachAFixedPoint pins the confirming round's two escapes,
+// in the reviewer's own shapes, plus the exhaustion both earlier walks failed
+// open on.
+//
+// These are not two more carriers added to a list. They are the two the fixed
+// point exists for: an interface-typed RESULT (the previous rule closed the
+// interface-typed FIELD and had no signature traversal at all) and a CONCRETE
+// WRAPPER around a capability, behind two type parameters and an alias method
+// (the previous rules stripped pointers and checked the top-level package, so
+// a wire type one field in was invisible).
+func TestTheTypedGatesReachAFixedPoint(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A callable returning an opaque handler, and nine nested arrays.
+	callable := filepath.Join(dir, "zz_typed_callable_fixture.go")
+	handlers := gateFindings(t, callable, `package solution
+
+import "net/http"
+
+func (s *Server) FixtureCallableOpaque() func() any {
+	return func() any {
+		return s.wrapRequest(func(*http.Request, *Gateway) (any, error) { return nil, nil })
+	}
+}
+
+// Depth the old walks failed OPEN on: both returned false past their caps, so
+// nesting escaped them. The fixed point has no cap.
+func (s *Server) FixtureDeeplyNested() [1][1][1][1][1][1][1][1][1]http.Handler {
+	return [1][1][1][1][1][1][1][1][1]http.Handler{}
+}
+`, reportHandlerShapes)
+	for _, want := range []string{"FixtureCallableOpaque", "FixtureDeeplyNested"} {
+		if !strings.Contains(handlers, want) {
+			t.Errorf("the handler gate did not flag %s:\n%s", want, handlers)
+		}
+	}
+
+	// A concrete wrapper around a capability, behind two type parameters and
+	// an alias method.
+	wrapper := filepath.Join(dir, "zz_typed_wrapper_fixture.go")
+	capabilities := gateFindings(t, wrapper, `package solution
+
+import (
+	"encoding/json"
+
+	wc "github.com/codefly-dev/sdk-go/workcontext"
+)
+
+type fixtureBox struct{ Seal wc.SealedValues }
+type fixtureBoxAlias = fixtureBox
+
+func fixtureTwoParams[T any, P ~*T]() P { return P(new(T)) }
+
+func (b *fixtureBoxAlias) DecodeFixture(raw []byte) error { return json.Unmarshal(raw, b) }
+
+func fixtureReadWrapped(raw []byte) (string, error) {
+	b := fixtureTwoParams[fixtureBoxAlias, *fixtureBoxAlias]()
+	err := b.DecodeFixture(raw)
+	return b.Seal.GetInstallationId(), err
+}
+
+// Even the plain allocation, which the reviewer noted escapes too.
+func fixturePlainAllocation() *fixtureBoxAlias { return new(fixtureBoxAlias) }
+
+// A decoder whose own body decodes NOTHING, so the only rule that can catch
+// the call below is "the receiver is a destination too". Without it the
+// receiver rule rode on the opaque-parameter rule firing inside
+// DecodeFixture's body, and neither was pinned alone.
+type fixtureReceiverOnly struct{ Seal wc.SealedValues }
+
+func (b *fixtureReceiverOnly) UnmarshalFixture(raw []byte) error {
+	b.Seal.InstallationId = string(raw)
+	return nil
+}
+
+func fixtureDecodeThroughReceiver(raw []byte, b *fixtureReceiverOnly) error {
+	return b.UnmarshalFixture(raw)
+}
+
+// An UNEXPORTED field is still allocated, so visibility cannot be the rule.
+type fixtureHiddenBox struct{ seal wc.SealedValues }
+
+func fixtureAllocateHidden() fixtureHiddenBox { return fixtureHiddenBox{} }
+`, reportCapabilityShapes)
+	for _, want := range []string{
+		"fixtureTwoParams",       // the instantiation, through two type parameters
+		"DecodeFixture",          // the receiver as a decode destination
+		"fixturePlainAllocation", // new() on a wrapper
+		"fixtureAllocateHidden",  // an unexported field
+		// The receiver as a destination, with nothing else able to catch it.
+		"fixtureDecodeThroughReceiver",
+	} {
+		if !strings.Contains(capabilities, want) {
+			t.Errorf("the capability gate did not flag %s, so a concrete wrapper still hides a capability:\n%s", want, capabilities)
+		}
+	}
+
+	// CONTROLS. Both walks are fail-closed, and a gate nobody can satisfy gets
+	// loosened by whoever hits it next. These are the shapes production
+	// actually has.
+	controls := filepath.Join(dir, "zz_typed_fixedpoint_control_fixture.go")
+	clean := gateFindings(t, controls, `package solution
+
+import (
+	"context"
+
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+
+// Holding a source whose method returns the SDK's credential — which is an
+// alias for one of core's wire messages — is not constructing one. The first
+// run of the fixed point reported authorityHeldSource for exactly this, and
+// the finding was mine, not the code's: a method RESULT is not an allocation.
+type fixtureHolder struct {
+	inner  CredentialSource
+	anchor *workcontext.Credential
+}
+
+func fixtureHold(s CredentialSource) *fixtureHolder { return &fixtureHolder{inner: s} }
+
+func fixtureReadThrough(ctx context.Context, s CredentialSource) (string, error) {
+	held, err := s.Credential(ctx)
+	if err != nil {
+		return "", err
+	}
+	return held.Token(), nil
+}
+
+// Reading a seal through the SDK's accessors, which is the supported way.
+func fixtureReadSealed(seal *workcontext.SealedValues) string { return seal.GetInstallationId() }
+`, reportCapabilityShapes)
+	if strings.TrimSpace(clean) != "" {
+		t.Errorf("the capability gate refused shapes production has: holding the SDK's credential is not constructing core's wire message:\n%s", clean)
+	}
+}
+
+// TestTheWalkRefusesWhatItCannotFinish pins the fail-closed half of the fixed
+// point, which no fixture can reach: the budget is 50,000 nodes and a type
+// graph that large cannot be written into a fixture, so the branch is asked
+// directly.
+//
+// It matters because the two walks this replaced failed OPEN past a depth cap
+// — they returned false, which reads as "carries nothing" — so a gate could be
+// exhausted by nesting. A traversal that gives up has not answered, and the
+// difference between those two is why this returns a reason alongside its
+// verdict.
+func TestTheWalkRefusesWhatItCannotFinish(t *testing.T) {
+	pkgs := gatePackages(t, nil)
+	if len(pkgs) == 0 {
+		t.Fatal("no package loaded")
+	}
+	g := gateFor(pkgs[0])
+	never := func(types.Type) bool { return false }
+
+	// A graph larger than the budget allows.
+	deep := types.Type(types.Typ[types.String])
+	for range 64 {
+		deep = types.NewPointer(deep)
+	}
+	w := &typeWalk{gate: g, match: never, fields: everyField,
+		seen: map[types.Type]bool{}, budget: 8, indirect: true, storage: true}
+	if w.reach(deep) {
+		t.Fatal("the walk matched nothing and said it found something")
+	}
+	if w.unresolved == "" {
+		t.Error(`the walk ran out of budget and reported nothing: a traversal that could not finish must not read as "carries nothing", which is how a depth cap let nesting escape the two walks this replaced`)
+	}
+
+	// An invalid type INSIDE a graph is the same answer. At the root it is not:
+	// an expression with no type is not a value to decide about.
+	w = &typeWalk{gate: g, match: never, fields: everyField,
+		seen: map[types.Type]bool{}, budget: 50000, indirect: true, storage: true}
+	w.reach(types.NewPointer(types.Typ[types.Invalid]))
+	if w.unresolved == "" {
+		t.Error("a type the checker could not resolve, inside a graph, was skipped rather than reported")
 	}
 }

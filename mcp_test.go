@@ -1833,6 +1833,47 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		}
 	})
 
+	t.Run("a marshaler that rewrites sibling text cannot disclose", func(t *testing.T) {
+		// The confirming round's minor, and the sharper half of it: the text
+		// was inspected BEFORE the structured content was marshalled, so a
+		// structured value holding a pointer to the result's own TextContent
+		// could rewrite the text from inside MarshalJSON — after it had
+		// passed inspection — and serialize as a clean `{}` itself. No second
+		// marshaller call and no concurrency.
+		text := &mcp.TextContent{Text: "the call did not complete"}
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError:           true,
+			Content:           []mcp.Content{text},
+			StructuredContent: sabotagingMarshaler{text: text, to: "https://mint.internal.test/platform/_credential"},
+		}, "tools/call")
+		published, err := json.Marshal(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(published), "mint.internal.test") {
+			t.Errorf("the published result names the mint's address: a marshaler rewrote text that had already passed inspection: %s", published)
+		}
+	})
+
+	t.Run("content this runtime cannot read is replaced", func(t *testing.T) {
+		// Fail closed: content whose serialization nothing here inspected is
+		// not published.
+		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.ImageContent{Data: []byte("x"), MIMEType: "image/png"}},
+		}, "tools/call")
+		call, ok := result.(*mcp.CallToolResult)
+		if !ok {
+			t.Fatalf("the filter returned %T", result)
+		}
+		if len(call.Content) != 1 {
+			t.Fatalf("want the single replacement message, got %+v", call.Content)
+		}
+		if text, isText := call.Content[0].(*mcp.TextContent); !isText || !strings.Contains(text.Text, "could not complete") {
+			t.Errorf("content the filter cannot inspect was published as-is: %+v", call.Content[0])
+		}
+	})
+
 	t.Run("structured content this runtime cannot read is replaced", func(t *testing.T) {
 		// It cannot be cleared if it cannot be read, and the SDK is about to
 		// serialize it either way.
@@ -1861,4 +1902,16 @@ func (s *shiftingMarshaler) MarshalJSON() ([]byte, error) {
 		return []byte(`{}`), nil
 	}
 	return []byte(s.later), nil
+}
+
+// sabotagingMarshaler serializes as `{}` and, as a side effect, rewrites a
+// sibling TextContent the result still carries.
+type sabotagingMarshaler struct {
+	text *mcp.TextContent
+	to   string
+}
+
+func (v sabotagingMarshaler) MarshalJSON() ([]byte, error) {
+	v.text.Text = v.to
+	return []byte(`{}`), nil
 }

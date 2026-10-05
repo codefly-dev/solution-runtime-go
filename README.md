@@ -856,6 +856,15 @@ notifications goes through the same check a handler route does, and the viewer
 is told the same sanitized sentence. The list is of the methods that act for
 nobody, so a method a future MCP SDK adds is checked rather than exempt.
 
+**An MCP error result never names an address this runtime dialled.** A tool's
+own refusal reaches the agent client unchanged, but a result that would carry
+the mint's or the gateway's address — in its text, or in its structured content
+— is replaced with one sentence, and the replacement is logged with what was
+caught. What is published is built from strings and bytes this runtime owns:
+every marshaller runs first, then nothing is inspected that is not about to be
+published. Content whose serialization this runtime cannot read is replaced
+rather than passed on.
+
 Rooting the Task there does **not** make the capability revocable, and nothing
 here should be read as saying it does. The edge verifies a presented context's
 signature and validity window, not the liveness of the session named in it, so
