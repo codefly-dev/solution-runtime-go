@@ -2035,6 +2035,59 @@ func decodeAlias(raw []byte) error {
 	return proto.Unmarshal(raw, &seal)
 }`,
 		},
+		{
+			// F1, and the reason it hid for three rounds: the gate knew
+			// "WorkContextV1" and the SDK does not export that name — it
+			// exports Claims. Both probes that claimed to cover the whole
+			// capability named a type that does not exist, and a probe only
+			// PARSES its source, so nothing ever failed.
+			"the SDK's REAL whole-capability alias",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func reviewDecode(raw []byte) error {
+	var dst workcontext.Claims
+	return proto.Unmarshal(raw, &dst)
+}`,
+		},
+		{
+			"a Decode rather than an Unmarshal",
+			`package solution
+import (
+	"encoding/json"
+	"io"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(r io.Reader, dst *workcontext.SealedValues) error {
+	return json.NewDecoder(r).Decode(dst)
+}`,
+		},
+		{
+			"a FUNCTION-LOCAL type alias, which no package-level scan sees",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeSeal(raw []byte) error {
+	type localSeal = workcontext.SealedValues
+	var dst localSeal
+	return proto.Unmarshal(raw, &dst)
+}`,
+		},
+		{
+			"the operation-binding alias, which the list also omitted",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func decodeBinding(raw []byte, dst *workcontext.SealedOperationBinding) error {
+	return proto.Unmarshal(raw, dst)
+}`,
+		},
 	}
 	for _, probe := range caught {
 		t.Run(probe.shape, func(t *testing.T) {
