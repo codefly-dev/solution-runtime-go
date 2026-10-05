@@ -1586,3 +1586,54 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 		})
 	}
 }
+
+// TestTheMintsAnchorIsPassedAsAReaderNotASnapshot is the narrow thing this
+// runtime owns about the mint's anchor.
+//
+// Re-reading it per handshake is the SDK's behaviour and cannot be mutated from
+// here. What IS this runtime's is passing the READER through rather than
+// resolving it once and handing over the answer — and a mutant that captures
+// the pool at construction is invisible to every test that only asks the
+// reader what it says now, including the configuration test above.
+//
+// So the reader's answer is changed between calls, which is what a rotation
+// looks like from the SDK's side.
+func TestTheMintsAnchorIsPassedAsAReaderNotASnapshot(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	bootEnvironment(t, mint)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := New(Manifest{ID: testSolutionID})
+	ln, err := takeListener(server).start(ctx)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	_ = ln.Close()
+
+	first, second := x509.NewCertPool(), x509.NewCertPool()
+	second.AddCert(mint.Certificate())
+	rotated := false
+	options := server.mintOptions("projection",
+		func() (*x509.CertPool, error) {
+			if rotated {
+				return second, nil
+			}
+			return first, nil
+		},
+		func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &tls.Certificate{}, nil })
+
+	if got, _ := options.TrustAnchor(); got != first {
+		t.Fatal("the mint's trust-anchor reader does not answer from the reader this runtime passed")
+	}
+	rotated = true
+	got, err := options.TrustAnchor()
+	if err != nil {
+		t.Fatalf("the mint's trust-anchor reader refused after the rotation: %v", err)
+	}
+	if got == first {
+		t.Error("the mint's trust-anchor reader still answers the pool it first returned: the anchor was resolved once and the ANSWER handed over, so the SDK re-reading per handshake re-reads a snapshot and a removed root never stops this process dialling the endpoint that receives the projected service-account token")
+	}
+	if got != second {
+		t.Errorf("the mint's trust-anchor reader answered %v, want the rotated pool", got)
+	}
+}
