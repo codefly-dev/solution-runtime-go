@@ -367,12 +367,6 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 		t.Setenv(key, value)
 	}
 
-	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
-	solution := boot(t, New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).
-		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
-			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
-		}}), mint)
-
 	// reached is what the observer has seen since the last reset, with the
 	// paths, so every assertion below can name what called a deleted endpoint
 	// rather than only that something did.
@@ -407,20 +401,53 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 		reset()
 	}
 
-	// The PERIODIC window, asserted on its own count.
+	// THE BOOT WINDOW, and it has to come first.
 	//
-	// It used to be slept through and then thrown away: the reachability probe
-	// called reset() before the only `!= 0` assertion, so that assertion
-	// measured a window of roughly zero length and a surviving beat showed up
-	// — if at all — as the probe's own `!= 1`, whose message blames the
-	// instrument. A registration heartbeat was 15s and the shortest interval
-	// the deleted configuration accepted was 1s, which is what is set above,
-	// so three seconds is three periods of the fastest beat that was ever
-	// configurable.
-	listening("before the periodic window")
+	// The observer is proved reachable BEFORE the boot and the count is
+	// asserted BEFORE anything resets it. Neither was true: the helpers were
+	// defined after boot() returned and the first listening() call reset the
+	// counters, so a one-time registration or token exchange during boot
+	// disappeared before any assertion looked. The mint.count() check at the
+	// end is about the separate mint server and says nothing about these
+	// endpoints.
+	//
+	// Boot is where the deleted code would have run: a registration was what a
+	// runtime did on the way up, and the beat only followed it.
+	listening("before the boot")
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
+	solution := boot(t, New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}), mint)
+	if got, paths := reached(); got != 0 {
+		t.Errorf("a deleted endpoint was called %d times at %v DURING THE BOOT: the self-registration, the consumed-module registrations and the single-use token exchange are deleted, so the way up may not touch one", got, paths)
+	}
+	listening("after the boot")
+
+	// THE PERIODIC WINDOW, in two parts, because one of them was the wrong
+	// length.
+	//
+	// The shortest interval the deleted configuration accepted was 1s, set
+	// above, so three seconds is three periods of the fastest beat that was
+	// ever configurable — and a reviewer pointed out that it says nothing
+	// about a survivor that IGNORES the removed setting and keeps the old
+	// 15-second default. That one fires in neither three seconds nor any
+	// window shorter than its period, so the window has to be longer than the
+	// default was.
+	//
+	// This is the one place in the suite that waits on real time, and it is
+	// deliberate: the two heartbeat tests that waited 10s and 5s went with the
+	// heartbeat, and this is the test that answers whether the heartbeat is
+	// actually gone. A shorter window here is the assertion that was already
+	// wrong once.
+	const deletedDefaultInterval = 15 * time.Second
 	time.Sleep(3 * time.Second)
 	if got, paths := reached(); got != 0 {
 		t.Errorf("a deleted endpoint was called %d times at %v during three periods of the fastest heartbeat interval this configuration ever accepted: the beat, both registrations and the token exchange are deleted, so nothing may reach one", got, paths)
+	}
+	time.Sleep(deletedDefaultInterval + time.Second - 3*time.Second)
+	if got, paths := reached(); got != 0 {
+		t.Errorf("a deleted endpoint was called %d times at %v within %s of the boot: that is longer than the registration heartbeat's own default period, so this catches a surviving beat that ignores the interval configuration as well as one that honours it", got, paths, deletedDefaultInterval+time.Second)
 	}
 	listening("after the periodic window")
 

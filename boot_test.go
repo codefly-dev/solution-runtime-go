@@ -560,6 +560,11 @@ type booted struct {
 	// does. It is idempotent, and the cleanup calls it too — a test that stops
 	// the runtime itself must not leave a second cancel racing the first.
 	stop func()
+	// ended waits for serve to return by itself, within a bound, and reports
+	// its error and whether it returned at all. Nothing here cancels, which is
+	// the difference between observing a process end and watching cleanup end
+	// it.
+	ended func(time.Duration) (error, bool)
 }
 
 // bootEnvironment provisions everything a deployed solution's boot reads — the
@@ -651,16 +656,32 @@ func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 	}
 	served := make(chan error, 1)
 	go func() { served <- server.serve(ctx, ln) }()
-	var ended sync.Once
+	var stopped sync.Once
 	stop := func() {
-		ended.Do(func() {
+		stopped.Do(func() {
 			cancel()
 			<-served
 		})
 	}
 	t.Cleanup(stop)
+	// ended waits for serve to return ON ITS OWN and reports what it returned.
+	//
+	// It must not cancel: a test asserting that this process ends has to
+	// observe it ending by itself, and cleanup cancelling afterwards is
+	// exactly how such a test passes against a runtime that never would. The
+	// error goes back on the buffered channel so stop() still completes.
+	ended := func(within time.Duration) (error, bool) {
+		select {
+		case err := <-served:
+			served <- err
+			return err, true
+		case <-time.After(within):
+			return nil, false
+		}
+	}
 	return &booted{
 		stop:   stop,
+		ended:  ended,
 		server: server,
 		base:   "https://127.0.0.1:" + os.Getenv("PORT"),
 		// The caller presents its own identity, because the listener requires
@@ -1505,7 +1526,21 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 
 			// Past the renewal lead, every ask renews — and the issuer has
 			// changed shape.
-			deadline := time.Now().Add(12 * time.Second)
+			//
+			// THE ROUTE REFUSING IS NOT THE ASSERTION. This test returned on
+			// the first 503 or the first transport error, and a reviewer was
+			// right that a runtime refusing the request and then serving 503
+			// forever satisfied it — as would an unrelated transient renewal
+			// failure, and a transport error was being read as proof the
+			// listener had disappeared when it proves only that one request
+			// did not complete. Worse, cleanup stops the server itself, so
+			// "the process ended" was never observed at all.
+			//
+			// So the refusal is a waypoint, and what is asserted is: the
+			// handler did not run on the refused call, serve returned BY
+			// ITSELF, and it returned the terminal reason.
+			refused := false
+			deadline := time.Now().Add(20 * time.Second)
 			for time.Now().Before(deadline) {
 				// Reset per call, not once: a call made while the FIRST
 				// credential is still valid runs the handler legitimately, so
@@ -1517,11 +1552,37 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 					if ran.Load() {
 						t.Error("the handler ran on the refused call: the refusal has to come before anything author-written")
 					}
-					return
+					refused = true
+					break
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
-			t.Fatalf("the route was still answering 200 twelve seconds after the issuer began sealing a different execution: a renewal that replaces this execution is terminal, so the process stops serving and ends for the orchestrator")
+			if !refused {
+				t.Fatalf("the route was still answering 200 twenty seconds after the issuer began sealing a different execution: a renewal that replaces this execution is terminal, so the process stops serving and ends for the orchestrator")
+			}
+
+			// And the process ends, by itself, with the reason.
+			//
+			// This is what an orchestrator depends on: a pod that refuses
+			// every request but stays up is reported healthy by its
+			// supervisor and keeps a routable endpoint, which is the exact
+			// failure the health/terminal coupling exists to prevent.
+			err, done := solution.ended(20 * time.Second)
+			if !done {
+				t.Fatal("serve was still running twenty seconds after the renewal was refused: the process refuses every request and never exits, so the orchestrator never restarts it and the host keeps routing to a binding this process has no authority for")
+			}
+			if err == nil {
+				t.Fatal("serve returned without reporting why: the orchestrator restarts against a judgement, so the reason is what it has to be given")
+			}
+			// The terminal reason, not any error: an unrelated transient
+			// failure ending the process would satisfy a nil check and is the
+			// crash loop ErrMintUnavailable must never cause.
+			if !errors.Is(err, workcontext.ErrMintRefused) {
+				t.Errorf("serve ended with %v, which does not wrap ErrMintRefused: a transient answer must not end this process, and only a terminal one may", err)
+			}
+			if !strings.Contains(err.Error(), "execution") {
+				t.Errorf("serve ended with %q, which does not say the execution was replaced", err)
+			}
 		})
 	}
 }

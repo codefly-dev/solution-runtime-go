@@ -448,12 +448,19 @@ func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.
 // Handler and RequestHandler and lets Serve mount them.
 func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 	fset := token.NewFileSet()
+	// Every source first, because a result's type may be declared in another
+	// file than the function returning it.
+	files := map[string]*ast.File{}
 	for _, name := range moduleSources(t) {
 		file, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		for _, finding := range servableExports(name, file) {
+		files[name] = file
+	}
+	local := localHandlerTypes(files)
+	for name, file := range files {
+		for _, finding := range servableExports(name, file, local) {
 			t.Error(finding)
 		}
 	}
@@ -467,7 +474,7 @@ func TestNoExportedPathHandsOutAServableHandler(t *testing.T) {
 // copies agree, and this gate has been falsified four times by a shape nobody
 // had written a probe for. TestTheHandlerGateCatchesEveryEscapeShape is that
 // probe.
-func servableExports(name string, file *ast.File) (findings []string) {
+func servableExports(name string, file *ast.File, local map[string]bool) (findings []string) {
 	report := func(format string, args ...any) {
 		findings = append(findings, fmt.Sprintf(format, args...))
 	}
@@ -475,6 +482,8 @@ func servableExports(name string, file *ast.File) (findings []string) {
 		aliases := importedAs(file)
 		rendered := func(expr ast.Expr) string { return renderedTypeIn(aliases, expr) }
 		serves := func(expr ast.Expr) bool { return servesHTTP(aliases, expr) }
+		// handedOut, plus the names this module declares for the same thing.
+		handedOut := func(named string) bool { return handedOut(named) || local[named] }
 		// An exported struct carrying a servable field is the same re-exposure
 		// with a type in the way: `type Mounted struct { Handler http.Handler }`
 		// returned from an exported method hands out exactly what a direct
@@ -591,6 +600,21 @@ func coreCapabilityConstructions(file *ast.File) []string {
 			if called, ok := typed.Fun.(*ast.Ident); ok && called.Name == "new" && len(typed.Args) == 1 {
 				allocated = typed.Args[0]
 			}
+		case *ast.ValueSpec:
+			// `var seal workcontext.SealedValues` — round thirteen's major 3.
+			//
+			// This rule inspected composite literals and new() only, and I
+			// asserted that decoding necessarily passes through one of them.
+			// It does not: the zero value is allocated by the declaration, and
+			// `proto.Unmarshal(raw, &seal)` then decodes into it with no
+			// literal, no new, no generated import, no signing primitive, no
+			// verifier and no prohibited declaration name anywhere. The
+			// assertion was simply false, and a reviewer produced the four
+			// lines that show it.
+			//
+			// ValueSpec covers both a package-level var and a local one, since
+			// a DeclStmt inside a function carries the same node.
+			allocated = typed.Type
 		}
 		if allocated == nil {
 			return true
@@ -619,6 +643,67 @@ func coreCapabilityType(rendered string) bool {
 		return true
 	}
 	return false
+}
+
+// localHandlerTypes is every type NAME declared in the module that resolves to
+// something servable, following chains and across files.
+//
+// This is round thirteen's G5u, and the coordinator had asked for it by name a
+// round earlier:
+//
+//	type hiddenHandler = http.Handler
+//	func (s *Server) Routes() hiddenHandler { ... }
+//
+// walked past the gate completely. The declaration is unexported, so the rule
+// that reports "exports the type X" skipped it; and the result rendered as the
+// bare spelling "hiddenHandler", which matched no entry in either set. Adding
+// probes for bare `Handler` and `map[string]Handler` did not touch it, because
+// those two are names the gate already knew — this one is a name the AUTHOR
+// chooses, and there are infinitely many of those. The only rule that holds is
+// resolution.
+//
+// Unexported declarations are READ here even though they are never reported:
+// what makes a bypass a bypass is the exported function's result, and the
+// unexported alias is just the spelling it reaches that result under.
+func localHandlerTypes(files map[string]*ast.File) map[string]bool {
+	under := map[string]string{}
+	servable := map[string]bool{}
+	for _, file := range files {
+		aliases := importedAs(file)
+		for _, decl := range file.Decls {
+			declared, ok := decl.(*ast.GenDecl)
+			if !ok || declared.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range declared.Specs {
+				typed, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				// A function type with ServeHTTP's signature is a handler
+				// under any name, so it is recorded directly rather than by
+				// its rendering (which is empty for a func type).
+				if servesHTTP(aliases, typed.Type) {
+					servable[typed.Name.Name] = true
+					continue
+				}
+				under[typed.Name.Name] = renderedTypeIn(aliases, typed.Type)
+			}
+		}
+	}
+	// To a fixpoint, because an alias may name an alias.
+	for changed := true; changed; {
+		changed = false
+		for name, target := range under {
+			if servable[name] {
+				continue
+			}
+			if handedOut(target) || servable[target] {
+				servable[name], changed = true, true
+			}
+		}
+	}
+	return servable
 }
 
 // mountableHandler is what a caller can serve the moment they hold it, keyed
@@ -1044,10 +1129,62 @@ type Mounted struct { Handler nh.Handler }`,
 import "net/http"
 type Routes map[string]http.Handler`,
 		},
+		{
+			// G5u, named by the coordinator a round before a reviewer
+			// reproduced it. The declaration is unexported, so the rule that
+			// reports an exported type skipped it, and the result rendered as
+			// a spelling no set could contain.
+			"an UNEXPORTED alias for http.Handler, returned by an exported method",
+			`package solution
+import "net/http"
+type hiddenHandler = http.Handler
+func (s *Server) Routes() hiddenHandler { return nil }`,
+		},
+		{
+			"an unexported DEFINITION rather than an alias",
+			`package solution
+import "net/http"
+type hiddenHandler http.Handler
+func (s *Server) Routes() hiddenHandler { return nil }`,
+		},
+		{
+			"an alias chain, through two unexported names",
+			`package solution
+import "net/http"
+type innerHandler = http.Handler
+type hiddenHandler = innerHandler
+func (s *Server) Routes() hiddenHandler { return nil }`,
+		},
+		{
+			"an unexported alias for this package's own Handler",
+			`package solution
+type hiddenHandler = Handler
+func (s *Server) Routes() hiddenHandler { return nil }`,
+		},
+		{
+			"an unexported func type with ServeHTTP's signature",
+			`package solution
+import "net/http"
+type hiddenHandler func(http.ResponseWriter, *http.Request)
+func (s *Server) Routes() hiddenHandler { return nil }`,
+		},
+		{
+			"a collection of an unexported alias",
+			`package solution
+import "net/http"
+type hiddenHandler = http.Handler
+func (s *Server) Routes() map[string]hiddenHandler { return nil }`,
+		},
+	}
+	exports := func(t *testing.T, source string) []string {
+		t.Helper()
+		file := parse(t, source)
+		files := map[string]*ast.File{"probe.go": file}
+		return servableExports("probe.go", file, localHandlerTypes(files))
 	}
 	for _, probe := range caught {
 		t.Run(probe.shape, func(t *testing.T) {
-			if findings := servableExports("probe.go", parse(t, probe.source)); len(findings) == 0 {
+			if findings := exports(t, probe.source); len(findings) == 0 {
 				t.Errorf("the gate did not catch %s, so an exported path can hand out a handler built without the boot in this shape:\n%s", probe.shape, probe.source)
 			}
 		})
@@ -1090,7 +1227,7 @@ func (s *Server) Source() IdentitySource { return nil }`,
 	}
 	for _, probe := range passes {
 		t.Run("passes: "+probe.shape, func(t *testing.T) {
-			if findings := servableExports("probe.go", parse(t, probe.source)); len(findings) != 0 {
+			if findings := exports(t, probe.source); len(findings) != 0 {
 				t.Errorf("the gate refused %s, which is the documented way to use this package:\n%s\nfindings: %v", probe.shape, probe.source, findings)
 			}
 		})
@@ -1216,6 +1353,29 @@ func build() *pb.WorkSealV1 { return &pb.WorkSealV1{} }`,
 			`package solution
 import "github.com/codefly-dev/sdk-go/workcontext"
 func build() any { return &workcontext.WorkContextV1{} }`,
+		},
+		{
+			// Round thirteen's major 3: no literal, no new(), and the decode
+			// lands in the zero value the declaration allocated.
+			"a decode into a zero-value variable",
+			`package solution
+import (
+	"google.golang.org/protobuf/proto"
+	"github.com/codefly-dev/sdk-go/workcontext"
+)
+func sealOf(raw []byte) (*workcontext.SealedValues, error) {
+	var seal workcontext.SealedValues
+	if err := proto.Unmarshal(raw, &seal); err != nil {
+		return nil, err
+	}
+	return &seal, nil
+}`,
+		},
+		{
+			"the same, declared at package level",
+			`package solution
+import "github.com/codefly-dev/sdk-go/workcontext"
+var scratchSeal workcontext.SealedValues`,
 		},
 	}
 	for _, probe := range caught {
