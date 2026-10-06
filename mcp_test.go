@@ -2043,6 +2043,16 @@ func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
 // maps before dialling. The name cases are what must NOT be mistaken for an
 // address, including a host whose labels merely look numeric.
 func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
+	// Built at run time rather than written as literals: Go's scanner refuses
+	// a byte order mark in source, and these read better named anyway.
+	var (
+		zeroWidthJoiner    = string(rune(0x200d))
+		zeroWidthNonJoiner = string(rune(0x200c))
+		hebrewAlef         = string(rune(0x05d0))
+		softHyphen         = string(rune(0x00ad))
+		zeroWidthSpace     = string(rune(0x200b))
+		byteOrderMark      = string(rune(0xfeff))
+	)
 	t.Run("addresses", func(t *testing.T) {
 		for _, tc := range []struct{ host, want string }{
 			// inet_aton spellings.
@@ -2113,6 +2123,17 @@ func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
 			{"my_host.example.com", "my_host.example.com"},
 			{"9to5.example.com", "9to5.example.com"},
 			{"1host.example.com", "1host.example.com"},
+			// A label that overflows AND holds a character that is no digit
+			// in its radix is an ordinary name. Reading the conversion's
+			// out-of-range error as proof the label was numeric refused these.
+			{"0x10000000000000000g", "0x10000000000000000g"},
+			{"example.0X10000000000000000Z", "example.0x10000000000000000z"},
+			{"18446744073709551616z", "18446744073709551616z"},
+			{"02000000000000000000000g", "02000000000000000000000g"},
+			// The rooted dot is the one trailing dot a name may carry.
+			{"example.test.", "example.test"},
+			// 63 bytes is the longest label and 253 the longest name.
+			{strings.Repeat("a", 63) + ".test", strings.Repeat("a", 63) + ".test"},
 		} {
 			kind, name, ip, err := hostOf(tc.host)
 			if kind != hostIsName {
@@ -2161,6 +2182,35 @@ func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
 			// Bracketed like IPv6 and not one, and malformed IPv6.
 			"[::1",
 			"::fffg:1",
+			// A final label of only decimal digits has to enter the address
+			// parser, even when it is not a valid number there. Without that,
+			// each of these reads as a name.
+			"08",
+			"09",
+			"0178",
+			// Mapping errors have to propagate rather than be ignored: an
+			// invalid joiner, and the bidi rule.
+			"a" + zeroWidthJoiner + "b.example",
+			"a" + zeroWidthNonJoiner + "b.example",
+			"a" + hebrewAlef + ".example",
+			hebrewAlef + "a.example",
+			// Mapping to nothing is not a host. These map cleanly, with no
+			// error, to the empty string.
+			softHyphen,
+			zeroWidthSpace,
+			byteOrderMark,
+			softHyphen + zeroWidthSpace,
+			// A name UTS-46 maps cleanly and no resolver accepts: an empty
+			// label, a second trailing dot, a label past 63 bytes, a name past
+			// 253. Mapping does not care how labels are divided or how long
+			// they are, so each of these used to be published.
+			".example.test",
+			"a..example.test",
+			"localhost..",
+			"127.1..",
+			".",
+			strings.Repeat("a", 64) + ".test",
+			strings.Repeat("ab.", 86) + "test",
 		} {
 			kind, name, ip, err := hostOf(host)
 			if kind != hostIsUnreadable {
@@ -2179,6 +2229,14 @@ func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
 		// unpinned.
 		if _, _, _, err := hostOf(""); err == nil || !strings.Contains(err.Error(), "port and no host") {
 			t.Errorf("hostOf(%q) reason = %v, want it to say the authority names a port and no host", "", err)
+		}
+		// A host of only ignorable code points has its own reason for the same
+		// reason: the name check would refuse the empty mapping too, so
+		// without this the branch is unpinned — and what an operator staring
+		// at an invisible host needs to be told is that it mapped to nothing,
+		// not that the result has no labels.
+		if _, _, _, err := hostOf(softHyphen); err == nil || !strings.Contains(err.Error(), "UTS-46") {
+			t.Errorf("hostOf(softHyphen) reason = %v, want it to say UTS-46 mapping cannot read the host", err)
 		}
 	})
 }
@@ -2228,6 +2286,11 @@ func TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling(t *testing.T) {
 	for _, host := range []string{
 		"mcp.example.com", "[fe80::1%25lo0]",
 		"93.184.216.34", "1572395042", "0x5db8d822", "0135.0270.0330.042",
+		// Valid names that the structural checks must not refuse: the rooted
+		// dot, the longest label, an underscore, and a numeric-looking label
+		// holding a non-digit.
+		"mcp.example.com.", strings.Repeat("a", 63) + ".example.com",
+		"my_host.example.com", "0x10000000000000000g.example.com",
 	} {
 		t.Run("reachable "+host, func(t *testing.T) {
 			if err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP(); err != nil {
@@ -2244,6 +2307,8 @@ func TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling(t *testing.T) {
 		"127.0.0.999", "127..1", "127.16777216", "256.0.0.1", "127.0.0.0.0",
 		"0x10000000000000000", "example.0xfffffffffffffffff",
 		"127%252e1", "host%25name.example", "",
+		".example.test", "a..example.test", "localhost..", "127.1..",
+		"08", "0178",
 	} {
 		t.Run("unreadable "+host, func(t *testing.T) {
 			err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP()
@@ -2322,6 +2387,8 @@ func TestDeployedMCPIssuerRefusesAnUnreachableAddress(t *testing.T) {
 	for _, issuer := range []string{
 		"https://127.0.0.999:3000", "https://0x10000000000000000:3000",
 		"https://127%252e1:3000", "https://:3000",
+		"https://.example.test:3000", "https://a..example.test:3000",
+		"https://" + strings.Repeat("a", 64) + ".test:3000",
 	} {
 		t.Run("unreadable "+issuer, func(t *testing.T) {
 			err := deployed(t, issuer).validateMCP()

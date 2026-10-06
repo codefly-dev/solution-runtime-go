@@ -1314,13 +1314,21 @@ dotted-quad `127.0.0.0/8` and `0.0.0.0`, IPv6 `[::1]` and `[::]` with or without
 a zone, the inet_aton forms (fewer than four parts, a bare integer, octal,
 hexadecimal, a bare `0x` component) and their Unicode spellings all classify
 alike. There are exactly three outcomes and the third is a refusal, not a fallback: a
-host either reads as an address, or as a name, or as **neither** — a host that
-ends in a number and is not a valid address (`127.0.0.999`), one whose numeric
-label is too large to be one (`0x10000000000000000`), one carrying a code point
-forbidden in a host (a decoded `%`), or an authority that names a port and no
-host at all (`https://:443/mcp`). Each of those is refused naming the
-configuration that supplied it, because treating an unreadable host as a name is
-how an address-shaped authority gets published.
+host reads as an **address**, as a **name**, or as **neither**. Neither covers a
+host that ends in a number and is not a valid address (`127.0.0.999`), one whose
+numeric label is too large to be one (`0x10000000000000000`), one carrying a
+code point forbidden in a host (a decoded `%`), an authority that names a port
+and no host at all (`https://:443/mcp`), and a name no resolver would accept —
+an empty label (`.example.test`, `a..example.test`, `localhost..`), a label past
+63 bytes, or a name past 253. Each is refused naming the configuration that
+supplied it, because treating an unreadable host as a name is how an
+address-shaped or unusable authority gets published.
+
+Mapping a host is not the same as the host being usable: UTS-46 maps the labels
+it is given without caring how they are divided or how long they are. What the
+name check does **not** do is tighten what the mapping deliberately allows — an
+underscore is a name here, a label may start with a digit, and a single rooted
+trailing dot is fine.
 
 Both published URLs — the identifier and `issuer-url` — go through the same
 decision, so neither can disagree with the other about what a host is.

@@ -585,7 +585,11 @@ against.
    not by matching notations. A host is one of exactly three things — an
    address, a name, or neither — and the third is a refusal naming the
    provisioning key, never a fallback to the second; both published URLs go
-   through the one function that decides it. A *name* that merely resolves to
+   through the one function that decides it. Mapping a host successfully is not
+   the same as the host being usable, which is how the name branch was the soft
+   one twice: it now checks label boundaries and DNS lengths as well, without
+   tightening what the mapping allows on purpose (an underscore, a leading
+   digit, one rooted dot). A *name* that merely resolves to
    loopback is not refused, because that needs a lookup this runtime does not
    do at boot. `PUBLIC_URL` itself went with the manifest
    registration it fed and came back for this one consumer: whether a runtime

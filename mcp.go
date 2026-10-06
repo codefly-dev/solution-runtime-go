@@ -1072,7 +1072,11 @@ func hostOf(hostname string) (hostKind, string, net.IP, error) {
 		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which contains %q — a code point a URL consumer forbids in a host", hostname, bad)
 	}
 	if !hostEndsInNumber(mapped) {
-		return hostIsName, strings.TrimSuffix(mapped, "."), nil, nil
+		name := strings.TrimSuffix(mapped, ".")
+		if why := unusableDomainName(name); why != nil {
+			return hostIsUnreadable, "", nil, why
+		}
+		return hostIsName, name, nil, nil
 	}
 	parsed, ok := ipv4FromHost(mapped)
 	if !ok {
@@ -1082,6 +1086,40 @@ func hostOf(hostname string) (hostKind, string, net.IP, error) {
 		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which ends in a number and so has to be an address, and is not a valid one", hostname)
 	}
 	return hostIsAddress, mapped, parsed, nil
+}
+
+// unusableDomainName is why name cannot be a domain, or nil. It takes the name
+// with its single rooted dot already removed.
+//
+// Mapping a host successfully is not the same as the host being usable, and
+// treating it as the same is what made the NAME branch the soft one: UTS-46
+// maps each label it is given without caring how the labels are divided or how
+// long they are, so an empty label, a leading dot or a label past the length a
+// resolver accepts all mapped cleanly and were published. A host that is
+// neither a valid address nor a valid name is the third outcome, not the
+// second.
+//
+// The limits are DNS's: 63 bytes a label, 253 bytes a name. What this must NOT
+// do is tighten what the mapping deliberately allows — an underscore is a name
+// here (STD3 rules are off, see urlHostProfile) and a label may start with a
+// digit, so this checks boundaries and lengths and nothing about the characters
+// inside a label.
+func unusableDomainName(name string) error {
+	if name == "" {
+		return errors.New("empty once its rooted dot is removed, so it names nothing")
+	}
+	if len(name) > 253 {
+		return fmt.Errorf("%d bytes long, past the 253 a name can be", len(name))
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" {
+			return fmt.Errorf("%q, which has an empty label — a leading dot, or two in a row, or a second trailing one", name)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("%q, whose label %q is %d bytes long, past the 63 a label can be", name, label, len(label))
+		}
+	}
+	return nil
 }
 
 // forbiddenDomainRune is the first code point WHATWG forbids in a domain, or
@@ -1191,14 +1229,43 @@ func ipv4Number(part string) (uint64, bool, bool) {
 	if digits == "" {
 		return 0, true, true
 	}
+	// Before converting, not after. Go reports an out-of-range error as soon
+	// as the accumulator overflows, which can happen before it reaches a
+	// character that is not a digit at all — so taking that error as proof the
+	// label is numeric read "0x10000000000000000g" as a malformed address when
+	// it is an ordinary name. Once the characters are known to be digits, an
+	// out-of-range error is the only one left and does mean numeric.
+	if !digitsInBase(digits, base) {
+		return 0, false, false
+	}
 	value, err := strconv.ParseUint(digits, base, 64)
-	switch {
-	case err == nil:
-		return value, true, true
-	case errors.Is(err, strconv.ErrRange):
+	if err != nil {
 		return 0, true, false
 	}
-	return 0, false, false
+	return value, true, true
+}
+
+// digitsInBase reports whether every byte of digits is a digit in base, which
+// is WHATWG's own check and the one that has to come first.
+func digitsInBase(digits string, base int) bool {
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		var value int
+		switch {
+		case c >= '0' && c <= '9':
+			value = int(c - '0')
+		case c >= 'a' && c <= 'z':
+			value = int(c-'a') + 10
+		case c >= 'A' && c <= 'Z':
+			value = int(c-'A') + 10
+		default:
+			return false
+		}
+		if value >= base {
+			return false
+		}
+	}
+	return true
 }
 
 // mcpPublicURLSource names where the public MCP URL came from, so a refusal
