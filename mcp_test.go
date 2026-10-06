@@ -2040,10 +2040,12 @@ func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
 // address classifier this package had — so nothing refused a loopback
 // identifier provisioned into a cell, and https does not launder one.
 //
-// Every spelling, because a spelling the predicate misses is an address that
-// passes. An IPv6 zone is the one that defeats net.ParseIP: url.Hostname keeps
-// the zone and ParseIP rejects any address carrying one, so the same loopback
-// written with a zone read as a name that is not an IP at all.
+// Every spelling, because the invariant is that an address classifies the same
+// however it is written: an IPv6 zone selects the interface an address is
+// reached on and not which address it is, and an IPv4 address is the same
+// address in every form a resolver accepts — dotted quad, fewer than four
+// parts, a bare integer, octal, hexadecimal. net.ParseIP reads only dotted-quad
+// decimal without a zone, so the predicate classifies the rest itself.
 func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
 	for _, declared := range []string{
 		"https://localhost:8443" + MCPPath,
@@ -2056,6 +2058,22 @@ func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
 		"https://[::1%25lo0]:8443" + MCPPath,
 		"https://[0:0:0:0:0:0:0:1%25lo0]:8443" + MCPPath,
 		"https://[::%25lo0]:8443" + MCPPath,
+		// The inet_aton spellings. getaddrinfo accepts all of them and they
+		// reach the loopback listener; net.ParseIP reads none of them, so each
+		// one used to classify as a host name and pass.
+		"https://127.1:8443" + MCPPath,
+		"https://127.0.1:8443" + MCPPath,
+		"https://127.000.000.001:8443" + MCPPath,
+		"https://2130706433:8443" + MCPPath,
+		"https://017700000001:8443" + MCPPath,
+		"https://0177.0.0.1:8443" + MCPPath,
+		"https://0x7f000001:8443" + MCPPath,
+		"https://0X7F000001:8443" + MCPPath,
+		"https://0x7f.0.0.1:8443" + MCPPath,
+		"https://0x7f.1:8443" + MCPPath,
+		// And the unspecified address in the same spellings.
+		"https://0:8443" + MCPPath,
+		"https://0x0:8443" + MCPPath,
 	} {
 		t.Run(declared, func(t *testing.T) {
 			cfg := deployedMCPConfig(t, declared)
@@ -2081,6 +2099,12 @@ func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
 	for _, declared := range []string{
 		"https://mcp.example.com/elsewhere" + MCPPath,
 		"https://[fe80::1%25lo0]:8443" + MCPPath,
+		// Numeric notation is not the refusal: these are the same spellings
+		// naming addresses that are neither loopback nor unspecified.
+		"https://93.184.216.34:8443" + MCPPath,
+		"https://1572395042:8443" + MCPPath,
+		"https://0x5db8d822:8443" + MCPPath,
+		"https://0135.0270.0330.042:8443" + MCPPath,
 	} {
 		t.Run("reachable "+declared, func(t *testing.T) {
 			if err := deployedMCPConfig(t, declared).validateMCP(); err != nil {
@@ -2102,4 +2126,51 @@ func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
 			t.Fatalf("a local loopback identifier was refused: %v", err)
 		}
 	})
+}
+
+// TestNumericIPv4ReadsEverySpellingAResolverAccepts pins the address
+// classification itself, apart from the refusal that consumes it: the inet_aton
+// forms getaddrinfo accepts and net.ParseIP does not, and the names that must
+// not be mistaken for them.
+func TestNumericIPv4ReadsEverySpellingAResolverAccepts(t *testing.T) {
+	for _, tc := range []struct{ host, want string }{
+		{"127.1", "127.0.0.1"},
+		{"127.0.1", "127.0.0.1"},
+		{"127.000.000.001", "127.0.0.1"},
+		{"2130706433", "127.0.0.1"},
+		{"017700000001", "127.0.0.1"},
+		{"0177.0.0.1", "127.0.0.1"},
+		{"0x7f000001", "127.0.0.1"},
+		{"0x7f.0.0.1", "127.0.0.1"},
+		{"0x7f.1", "127.0.0.1"},
+		{"0", "0.0.0.0"},
+		{"0x0", "0.0.0.0"},
+		{"1572395042", "93.184.216.34"},
+		{"0135.0270.0330.042", "93.184.216.34"},
+		// Not numeric addresses at all.
+		{"mcp.example.com", ""},
+		{"127.0.0.1.example.com", ""},
+		{"0x", ""},
+		{"", ""},
+		{"0178.0.0.1", ""},  // 8 is not an octal digit
+		{"256.0.0.1", ""},   // a leading part over one byte
+		{"127.0.0.0.1", ""}, // five parts
+		// Five parts whose last one fits the byte it would span: only the
+		// part-count guard rejects this, and without it the trailing zero is
+		// dropped and the address reads as the loopback net.
+		{"127.0.0.0.0", ""},
+		{"4294967296", ""},   // over 32 bits
+		{"127.16777216", ""}, // the final part over the bytes it spans
+	} {
+		got := numericIPv4(tc.host)
+		if tc.want == "" {
+			if got != nil {
+				t.Errorf("numericIPv4(%q) = %v, want nil", tc.host, got)
+			}
+			continue
+		}
+		if got == nil || got.String() != tc.want {
+			t.Errorf("numericIPv4(%q) = %v, want %s", tc.host, got, tc.want)
+		}
+	}
 }

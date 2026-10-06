@@ -572,8 +572,12 @@ against.
    `TestMCPIdentifierNamesTheHostsPublicProxyRoute` pins the constants against a
    literal, which keeps anyone from changing them here unnoticed and cannot do
    more: nothing in this suite can see the host, so a host that changes its route
-   leaves this repository green and breaks a client's discovery. What limits that
-   is the deployed refusal — a deployment declares the identifier. A declared one
+   leaves this repository green and breaks a client's discovery, with no
+   automated alarm for that case today: the test for it must compare the host's
+   own rendered route against the identifier this runtime advertises, so it
+   belongs where the host is visible, in module-saas-starter. What limits that
+   is the deployed refusal, not a test — a deployment declares the identifier,
+   so no cell depends on these constants. A declared one
    is published verbatim for the same code-point reason, so a trailing slash is a
    different identifier and is refused, not trimmed, and a loopback address is
    refused however it is spelled. `PUBLIC_URL` itself went with the manifest

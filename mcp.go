@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	codefly "github.com/codefly-dev/sdk-go"
@@ -766,6 +767,20 @@ const (
 // against a literal so nobody changes them here unnoticed — and that is all it
 // can do: this module has no dependency on the host, so if the HOST changes its
 // route, this repository stays green and a client's discovery breaks.
+//
+// NO automated alarm covers that case today. The test for it has to compare the
+// host's OWN rendered solution-proxy route against the identifier this runtime
+// advertises, and fail when either side moves — which it can only do where the
+// host is visible, so it belongs in module-saas-starter and not here. Until it
+// exists, a host route change is caught by whoever notices that discovery
+// stopped working.
+//
+// What bounds the exposure meanwhile is the refusal below, and it — not a test
+// — is the mitigation: a DEPLOYED surface DECLARES the identifier, so no cell
+// depends on these constants at all. What they govern is a local run, where the
+// person who made the guess can check it, and the value the boot log suggests.
+// Carried as an ACCEPTED limitation; the specification for closing it is in
+// README's resource-identifier section.
 const (
 	hostSolutionProxyRoute  = "/api/solutions/"
 	hostSolutionProxySuffix = "/proxy"
@@ -970,14 +985,20 @@ func (c config) validateMCP() error {
 // registration, and the gap they left is that a declared identifier naming this
 // machine reached a cell unrefused.
 //
-// An IPv6 zone is the spelling that defeats the obvious version: "[::1%25eth0]"
-// is the loopback reached on a named interface, url.Hostname keeps the zone
-// ("::1%eth0"), and net.ParseIP rejects every address carrying one — so the
-// same loopback written with a zone read as a name that is not an IP at all and
-// passed where the unzoned spelling was refused. The zone selects the interface
-// an address is reached on; it does not change which address it is, so it is
-// dropped before classifying. That cannot turn a real host name into an IP,
-// because a host name cannot contain "%".
+// Two invariants decide it, and strict IP parsing alone gives neither:
+//
+// An IPv6 zone does not change address classification. A zone selects the
+// interface an address is reached on, so "::1%eth0" and "::1" are one address;
+// url.Hostname keeps the zone and net.ParseIP accepts no address carrying one,
+// so the zone is dropped before classifying. Dropping it cannot turn a host
+// name into an IP, because a host name cannot contain "%".
+//
+// An IPv4 address classifies the same in every spelling a resolver accepts.
+// net.ParseIP takes only dotted-quad decimal, while getaddrinfo also accepts
+// the inet_aton forms — fewer than four parts, a bare integer, octal and
+// hexadecimal — so numericIPv4 classifies those too. Anything neither parser
+// reads is a name, which is what a name resolving to loopback is: the host's
+// business, not an address this runtime can classify.
 func loopbackURL(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -991,7 +1012,65 @@ func loopbackURL(raw string) bool {
 		host = host[:zone]
 	}
 	ip := net.ParseIP(host)
+	if ip == nil {
+		ip = numericIPv4(host)
+	}
 	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+// numericIPv4 reads the IPv4 spellings getaddrinfo accepts and net.ParseIP does
+// not, by inet_aton's rules: one to four parts, each decimal, octal with a
+// leading "0", or hexadecimal with a leading "0x"; every part before the last
+// names one byte, and the last spans the bytes that are left. So "127.1",
+// "2130706433", "0x7f000001", "0177.0.0.1" and "017700000001" are all
+// 127.0.0.1, and "0" is 0.0.0.0. nil for anything that is not one of them,
+// including a host name, whose parts do not parse as numbers.
+func numericIPv4(host string) net.IP {
+	parts := strings.Split(host, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return nil
+	}
+	values := make([]uint64, len(parts))
+	for i, part := range parts {
+		value, ok := inetAtonPart(part)
+		if !ok {
+			return nil
+		}
+		values[i] = value
+	}
+	// Each part before the last is one byte; the last covers the remaining
+	// bytes, so "127.1" is 127.0.0.1 and a lone integer is the whole address.
+	last := values[len(values)-1]
+	if last >= 1<<(8*uint(5-len(values))) {
+		return nil
+	}
+	// Named "packed" rather than "address" because the boundary gate in
+	// environment_boundary_test.go matches a configuration resolver by bare
+	// name, and this package has one called address.
+	packed := last
+	for i, value := range values[:len(values)-1] {
+		if value > 0xff {
+			return nil
+		}
+		packed |= value << (8 * uint(3-i))
+	}
+	return net.IPv4(byte(packed>>24), byte(packed>>16), byte(packed>>8), byte(packed))
+}
+
+// inetAtonPart reads one part of a numeric IPv4 address, in the base its prefix
+// names: "0x" hexadecimal, a leading "0" octal, otherwise decimal. Range is the
+// caller's to check, because what a part may hold depends on how many there
+// are.
+func inetAtonPart(part string) (uint64, bool) {
+	base, digits := 10, part
+	switch {
+	case len(part) > 2 && part[0] == '0' && (part[1] == 'x' || part[1] == 'X'):
+		base, digits = 16, part[2:]
+	case len(part) > 1 && part[0] == '0':
+		base, digits = 8, part[1:]
+	}
+	value, err := strconv.ParseUint(digits, base, 64)
+	return value, err == nil
 }
 
 // mcpPublicURLSource names where the public MCP URL came from, so a refusal

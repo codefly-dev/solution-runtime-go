@@ -1254,11 +1254,35 @@ this runtime to consume and refuse by its provisioning key. Until then
 literal so nobody changes them here unnoticed. That test does **not** detect the
 host changing its route: this module has no dependency on the host and nothing in
 its suite observes the host's routing, so that case leaves this repository green
-and breaks a client's discovery. The test that would catch it drives the host's
-own source and belongs where the host is visible. What limits the damage
-meanwhile is the refusal below — a deployed surface declares the identifier, so
-the derivation only stands where the guess is checkable (see [Where the host
-reaches the solution](#where-the-host-reaches-the-solution)).
+and breaks a client's discovery. **No automated alarm covers that case today.**
+The test for it has to compare the host's own rendered solution-proxy route
+against the identifier this runtime advertises and fail when either side moves,
+so it can only live where the host is visible — in `module-saas-starter`, not
+here. Until it exists, a host route change is caught by whoever notices that
+discovery stopped working.
+
+What limits the damage meanwhile is the refusal below, and it rather than any
+test is the mitigation: **a deployed surface declares the identifier**, so no
+cell depends on these constants at all. What they govern is a local run, where
+the guess is checkable by the person making it, and the value the boot log
+suggests (see [Where the host reaches the
+solution](#where-the-host-reaches-the-solution)).
+
+The gap is carried as an accepted limitation. Closing it needs the host to
+project the **complete per-solution MCP URL** it computes from its own routing —
+one absolute `https` URL ending in `/mcp`, with the solution id already
+substituted and escaped by the platform — as a workspace-configuration value its
+render sets for every solution it composes, under the existing `mcp/public-url`
+key. This runtime then publishes it verbatim and composes nothing, which is what
+keeps the identifier byte-exact; a missing value refuses at boot exactly as it
+does today. A route *template* or a bare *base* is deliberately not the contract:
+either one leaves this runtime appending the id or the `/mcp` suffix, and that
+composition is the defect being removed. The alternative shape, an endpoint, is
+not available — `core` and `sdk-go` would first have to carry a public base URL
+*with a path*, since `resources.NetworkInstance` has no path component,
+`basev0.Endpoint` no route template, and `resources.EnvironmentIngressRoute` is
+CLI-side and reaches no running service. PR #54's body carries the full
+specification.
 
 **That derivation is for a local run only, and this said otherwise.** It read
 as "a deployment that already sets `PUBLIC_URL` … has addressed the MCP surface
@@ -1279,10 +1303,15 @@ whitespace is dropped; nothing inside the string is normalized, because RFC 9728
 point for code point, so `…/mcp/` and `…/mcp` are two different identifiers and
 a trailing slash is refused at boot naming the declaration rather than quietly
 turned into the other one. In a deployed runtime context it is also refused when
-it names a loopback or unspecified address — `localhost`, `127.0.0.1`, `[::1]`,
-`0.0.0.0`, and the same addresses carrying an IPv6 zone — because a client
-dialling it reaches its own machine; `https` does not make such an address
-reachable. With neither — no `PUBLIC_URL`, no declared override — the
+it names a loopback or unspecified address, in any spelling the resolver
+accepts: `localhost` and names under it, dotted-quad `127.0.0.0/8` and
+`0.0.0.0`, IPv6 `[::1]` and `[::]` with or without a zone, and the inet_aton
+forms `getaddrinfo` also takes — fewer than four parts (`127.1`), a bare integer
+(`2130706433`), octal (`0177.0.0.1`) and hexadecimal (`0x7f000001`). One address
+classifies the same however it is written, because a client dialling any of them
+reaches its own machine; `https` does not make such an address reachable, and
+numeric notation is not itself the refusal — the same spellings naming a
+reachable address are accepted. With neither — no `PUBLIC_URL`, no declared override — the
 identifier is reconstructed per request from `x-forwarded-proto`,
 `x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
 is doing so: a proxy that forwards no prefix yields an identifier missing the
