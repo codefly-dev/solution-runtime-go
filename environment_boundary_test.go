@@ -92,9 +92,11 @@ func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
 }
 
 // And the gate has to be able to see a read at all, or its silence means
-// nothing. Three shapes, each the one a previous version of this gate lost:
-// an exported function reading directly, a handler reached only as a value
-// mounted on a mux, and a method value stored in a package-level struct.
+// nothing. Every serving shape a previous version of this gate lost, in ONE
+// compiled fixture: each load shells out to the go command and builds SSA for
+// the whole program, so one overlay answers for all of them. Each shape has
+// its own reader, and each is asserted by name, so a gate that followed one
+// edge kind and missed the others fails.
 func TestThePostBootGateSeesEveryServingShape(t *testing.T) {
 	dir, err := filepath.Abs(".")
 	if err != nil {
@@ -104,7 +106,11 @@ func TestThePostBootGateSeesEveryServingShape(t *testing.T) {
 
 	source := `package solution
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+	"os"
+)
 
 // A parenthesised callee on an exported path.
 func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
@@ -119,17 +125,17 @@ func fixtureHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("x-fixture", fixtureMountedRead())
 }
 
-func fixtureMountedRead() string { return env("ANYTHING", "") }
+func fixtureMountedRead() string { return os.Getenv("ANYTHING") }
 
 // A method value stored in a package-level struct and mounted from there, so
-// the only edge to it is through the stored field.
+// the only edge to it is the stored field.
 type fixtureReceiver struct{}
 
 func (fixtureReceiver) fixtureServe(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("x-stored", fixtureStoredRead())
 }
 
-func fixtureStoredRead() string { return env("ANYTHING", "") }
+func fixtureStoredRead() string { return os.LookupEnvValue("ANYTHING") }
 
 var fixtureHandlers = struct {
 	h func(http.ResponseWriter, *http.Request)
@@ -141,85 +147,46 @@ func MountStoredFixture(mux *http.ServeMux) {
 
 // An exported variable holding a closure that reads.
 var ExportedClosure = func() string { return (env)("ANYTHING", "") }
-`
 
-	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
-	if len(readers) == 0 {
-		t.Fatal("the gate reported no post-boot reader for a fixture that reads on four serving paths")
-	}
-	// env is the reader every one of these reaches, so its path has to come
-	// back; the path itself is what says WHICH shape was followed.
-	if _, ok := readers["env"]; !ok {
-		t.Errorf("the gate did not report env: readers=%v", readers)
-	}
-}
-
-// And an aliased reader on a serving path, with a perfectly constant key.
-//
-// This is the shape that survived both gates at once: the key resolves, so the
-// key gate has nothing to say about it, and the call is indirect, so the CHA
-// edge into os.Getenv is an over-approximation the post-boot gate discards.
-// Neither gate was wrong on its own — they were asking different questions
-// about what a read is. One model answers both: the identity model resolves
-// the alias exactly, and the serving graph says whether that call site runs
-// after boot.
-func TestThePostBootGateSeesAnAliasedReaderWithAConstantKey(t *testing.T) {
-	dir, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := filepath.Join(dir, "zz_aliased_serving_fixture.go")
-
-	source := `package solution
-
-import (
-	"net/http"
-	"os"
-)
-
+// An ALIASED reader with a perfectly constant key, on a served path. This is
+// the shape that passed both gates at once: the key resolves, so the key gate
+// has nothing to say, and the call is indirect, so a CHA edge into os.Getenv
+// is an over-approximation the serving graph discards.
 type servingEnvReader = func(string) string
 
 var servingRead servingEnvReader = os.Getenv
 
 func servingAliasRead() string { return servingRead("ANYTHING") }
 
-// On a served path, so it runs per request rather than at boot.
 func (s *Server) MountAliasFixture(mux *http.ServeMux) {
 	mux.HandleFunc("/alias", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("x-alias", servingAliasRead())
 	})
 }
-`
-	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
-	if len(readers) == 0 {
-		t.Fatal("an aliased reader with a constant key, called on a served path, was not reported")
-	}
-}
 
-// And os.Environ is a reader too, which is the omission that let an exported
-// wrapper of a function using it read changing configuration after boot. It
-// has no key to resolve — it reads all of them — so the read itself is the
-// finding.
-func TestTheWholeEnvironmentCountsAsARead(t *testing.T) {
-	dir, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := filepath.Join(dir, "zz_environ_fixture.go")
-
-	source := `package solution
-
-import "context"
-
+// And the whole environment at once, through a function boot also uses:
 // discoverHostModule scans os.Environ, so an exported wrapper of it reads
-// changing configuration after boot.
+// changing configuration after boot. os.Environ was missing from the reader
+// set entirely.
 func ExportedLateHost() string {
 	return discoverHostModule(context.Background(), "auth-gateway", "rest", "rest")
 }
 `
+	// os.LookupEnvValue does not exist; the fixture must compile, so use the
+	// real reader.
+	source = strings.ReplaceAll(source, "os.LookupEnvValue(", "os.Getenv(")
+
 	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
 	if len(readers) == 0 {
-		t.Fatal("an exported wrapper of a function scanning the whole environment was not reported")
+		t.Fatal("the gate reported no post-boot reader for a fixture that reads on seven serving paths")
+	}
+	// Both readers these shapes reach, so a gate that saw one kind of read and
+	// not the other cannot pass: env for the in-package helper, os.Getenv for
+	// the direct and aliased ones, os.Environ for the whole-environment scan.
+	for _, want := range []string{"env", "os.Getenv", "os.Environ"} {
+		if _, ok := readers[want]; !ok {
+			t.Errorf("the gate did not report %s: readers=%v", want, readers)
+		}
 	}
 }
 
@@ -292,7 +259,14 @@ var keylessReaders = map[string]bool{"Environ": true, "ExpandEnv": true}
 func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
 	t.Helper()
 
-	prog, _ := ssautil.AllPackages(pkgs, 0)
+	// SSA for THIS package only, not the whole dependency closure. Building
+	// everything cost 40s of the suite under -race and bought nothing: the
+	// graph is used for in-package reachability, and re-entry into this
+	// package from a dependency always happens through a function whose
+	// address was taken — net/http invoking a mounted handler is exactly that
+	// — which is already a root. Reader identification does not come from
+	// this graph at all.
+	prog, _ := ssautil.Packages(pkgs, 0)
 	prog.Build()
 	graph := cha.CallGraph(prog)
 	graph.DeleteSyntheticNodes()
@@ -359,14 +333,12 @@ func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
 			// reader on the path named four that are all somebody else's: the
 			// SDK rechecking a rotated value, grpc's resolver, viper's init,
 			// none of which this package could resolve in loadConfig.
-			if _, isReader := environmentReader(next.Func); isReader {
-				// Reader edges are not taken from this graph. CHA resolves an
-				// indirect call to every type-compatible function, so a
-				// callback of shape func(string) (string, bool) resolves to
-				// os.LookupEnv whether or not anything puts it there — which
-				// is what it did, through namedInJSON's `named` parameter.
-				// Which calls are reads is the identity model's answer, below,
-				// and it is the same model the key gate uses.
+			// Which calls are reads is the identity model's answer, below,
+			// and it is the same model the key gate uses: CHA resolves an
+			// indirect call to every type-compatible function, so a callback
+			// of shape func(string) (string, bool) resolves to os.LookupEnv
+			// whether or not anything puts it there.
+			if !inPackage(next.Func, target) {
 				continue
 			}
 			seen[next] = true

@@ -198,6 +198,8 @@ func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
 
 	source := `package solution
 
+import "os"
+
 // A constant conversion splicing the carrier's name.
 func FacadeCredentialViaConversion() string {
 	const key = "CODEFLY__MODULE_" + string(rune(82)) + "EGISTRATION_SECRETS"
@@ -255,6 +257,38 @@ func FacadeCredentialViaRuntimeKey(parts []string) string {
 	return env(joinedKey(parts), "")
 }
 
+// The reader's identity hidden behind a local function type: the callee is
+// ` + "`read`" + `, so no rule about callee names sees a read at all, and the key is
+// never examined.
+type aliasedReader = func(string) string
+
+func AliasedCredential(parts []string) string {
+	read := aliasedReader(osGetenv)
+	return read(joinedKey(parts))
+}
+
+// Through a struct field, through a parameter, and parenthesised.
+type readerBox struct{ read func(string) string }
+
+func AliasedThroughAField(parts []string) string {
+	box := readerBox{read: osGetenv}
+	return box.read(joinedKey(parts))
+}
+
+func aliasedThroughAParameter(read func(string) string, parts []string) string {
+	return read(joinedKey(parts))
+}
+
+func AliasedCaller(parts []string) string {
+	return aliasedThroughAParameter(osGetenv, parts)
+}
+
+func AliasedThroughParentheses(parts []string) string {
+	return (env)(joinedKey(parts), "")
+}
+
+var osGetenv = os.Getenv
+
 func joinedKey(parts []string) string {
 	out := ""
 	for _, part := range parts {
@@ -264,7 +298,16 @@ func joinedKey(parts []string) string {
 }
 `
 
-	shapes := gateFindings(t, fixture, source, claimShapeFindings)
+	// One load for both rules: each shells out to the go command, and the
+	// fixture is the same package either way.
+	shapes, keys := "", ""
+	for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(source)}) {
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+			continue
+		}
+		shapes = strings.Join(claimShapeFindings(t, pkg), "\n")
+		keys = strings.Join(unresolvedKeyFindings(t, pkg), "\n")
+	}
 	for _, want := range []string{
 		"CODEFLY__MODULE_REGISTRATION_SECRETS",
 		"/modules/_register",
@@ -280,72 +323,11 @@ func joinedKey(parts []string) string {
 		t.Errorf("the claim path was caught in only one spelling.\nfindings:\n%s", shapes)
 	}
 
-	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
-	if !strings.Contains(keys, "does not resolve to constants") {
-		t.Errorf("the key gate did not catch a runtime-computed key.\nfindings:\n%s", keys)
-	}
-}
-
-// TestTheKeyGateCatchesAnAliasedReader drives the key gate against the reader
-// whose identity is hidden behind a local function type.
-//
-// This is the shape that defeated recognising readers by callee name: the
-// callee is `read`, so no rule about names sees a read, and the key — the
-// forbidden carrier assembled at run time — is never examined. No constant
-// expression in the fixture contains the complete key either, so the
-// claim-shape gate cannot be what catches it. Only the reader's identity can.
-func TestTheKeyGateCatchesAnAliasedReader(t *testing.T) {
-	dir, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := filepath.Join(dir, "zz_aliased_reader_fixture.go")
-
-	source := `package solution
-
-import (
-	"os"
-	"strings"
-)
-
-type aliasedReader = func(string) string
-
-func AliasedCredential() string {
-	read := aliasedReader(os.Getenv)
-	return read(strings.Join(
-		[]string{"CODEFLY", "", "MODULE", "REGISTRATION", "SECRETS"},
-		"_",
-	))
-}
-
-// And through a struct field, and through a parameter, which are the other
-// two ways the identity travels.
-type readerBox struct{ read func(string) string }
-
-func AliasedThroughAField(parts []string) string {
-	box := readerBox{read: os.Getenv}
-	return box.read(strings.Join(parts, "_"))
-}
-
-func aliasedThroughAParameter(read func(string) string, parts []string) string {
-	return read(strings.Join(parts, "_"))
-}
-
-// And parenthesised, which returned false from a rule reading the immediate
-// spelling and so skipped the key check entirely.
-func AliasedThroughParentheses(parts []string) string {
-	return (env)(strings.Join(parts, "_"), "")
-}
-
-func AliasedCaller(parts []string) string {
-	return aliasedThroughAParameter(os.Getenv, parts)
-}
-`
-
-	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
-	// One finding per invocation: the alias, the field and the parameter.
-	if got := strings.Count(keys, "does not resolve to constants"); got < 4 {
-		t.Errorf("the key gate caught %d of the four aliased reader invocations.\nfindings:\n%s", got, keys)
+	// Four aliased reader invocations: through a conversion, a struct field,
+	// a parameter, and parenthesised — plus the runtime-joined key. Each is a
+	// spelling that defeated recognising readers by callee name.
+	if got := strings.Count(keys, "does not resolve to constants"); got < 5 {
+		t.Errorf("the key gate caught %d of the five untraceable-key invocations.\nfindings:\n%s", got, keys)
 	}
 }
 
