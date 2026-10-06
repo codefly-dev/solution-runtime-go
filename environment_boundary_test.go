@@ -4,12 +4,14 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // AGENTS.md tells an agent that configuration is resolved in one place and
@@ -50,105 +52,289 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 // call tree. A helper can sit there and be called from serving code as well,
 // and then it passes: `env` is reachable from loadConfig, so a serve-time call
 // to `env` reads the environment after validate() has had its say while every
-// boot-reachability check stays green. Reachability says where a function may
-// be called from, never where it is not.
+// boot-reachability check stays green.
 //
-// ROOTED AT EVERY EXPORTED DECLARATION, not at two names. The first version of
-// this gate rooted at `serve` and `passthroughSeam`, which is a list, and a
-// list is a thing an author adds to without noticing: an exported function
-// reading `env` is callable by any consumer and was walked by nothing. Every
-// exported function and method is an entry point a consumer may call after
-// boot, so every one of them is a root, to a fixed point. loadConfig is
-// excluded as a node rather than as a root, so a helper boot shares with
-// serving code is judged by the serving path.
+// ON THE TYPE CHECKER, and over function VALUES, because the two things this
+// gate must follow are exactly the two a name-matching graph loses:
+//
+//   - `(env)(...)` is a call to env that no callee-NAME walker sees, because
+//     the callee is a parenthesised expression rather than an identifier;
+//   - a handler mounted on the mux is never "called" anywhere. `handleHealth`
+//     is passed to HandleFunc as a value and invoked by net/http per request,
+//     so a graph built from call expressions contains no edge to it at all —
+//     and a read inside it happens on every request, which is as far from boot
+//     as a read gets.
+//
+// So calls are resolved through types.Info, and a function mentioned as a
+// VALUE is an edge too: if serving code can hand it to something, something
+// can call it. Roots are `serve` plus every exported declaration, to a fixed
+// point — a library's exported surface is callable by a consumer at any time,
+// and a list of two names was a list an author adds to without noticing.
 func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
-	pkg := parsePackage(t)
-
-	roots := pkg.postBootRoots()
-	if len(roots) == 0 {
-		t.Fatal("no post-boot entry points found: this gate is inert")
-	}
-	served := pkg.reachableFromExcluding(roots, "loadConfig")
-
-	var afterBoot []string
-	for _, fn := range pkg.environmentReaders() {
-		if served[fn] {
-			afterBoot = append(afterBoot, fn)
+	for _, pkg := range gatePackages(t, nil) {
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+			continue
 		}
-	}
-	sort.Strings(afterBoot)
-	if len(afterBoot) > 0 {
-		t.Errorf("these environment readers are reachable from the post-boot surface without passing through loadConfig: %s\n"+
-			"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
-			"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
-			strings.Join(afterBoot, ", "))
-	}
+		graph := newCallGraph(pkg)
+		reached, unresolved := graph.servingSurface()
 
-	// The gate has to be able to see such a read at all, or its silence means
-	// nothing: `env` is the helper a serve-time read would go through, and it
-	// must be a reader this analysis knows about.
-	if !pkg.reads["env"] {
-		t.Fatal("env is not recorded as an environment reader: this gate is inert")
-	}
-	if len(pkg.environmentReaders()) == 0 {
-		t.Fatal("no environment readers found at all: this gate is inert")
-	}
-	// And Serve must be among the roots, or "every exported declaration" is
-	// not what is being walked.
-	if !slices.Contains(roots, "Serve") {
-		t.Fatalf("Serve is not a post-boot root, so the roots are not every exported declaration: %v", roots)
+		// Fail closed: a serving edge this gate could not resolve is a part of
+		// the surface it did not walk, and silence about it would be the same
+		// silent pass the name-matching graph gave.
+		for _, edge := range unresolved {
+			t.Errorf("%s: a call on the serving surface goes through a value this gate cannot resolve, so what it reaches was never walked. Call the function directly, or give it a type this gate can follow.", edge)
+		}
+
+		var afterBoot []string
+		for name := range reached {
+			if graph.readsEnvironment[name] {
+				afterBoot = append(afterBoot, name)
+			}
+		}
+		sort.Strings(afterBoot)
+		if len(afterBoot) > 0 {
+			t.Errorf("these environment readers are reachable from the post-boot surface without passing through loadConfig: %s\n"+
+				"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
+				"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
+				strings.Join(afterBoot, ", "))
+		}
+
+		// Inertness checks: the gate must know about env, must have found the
+		// serving root, and must have walked a served handler — the edge kind
+		// the previous version did not have at all.
+		if !graph.readsEnvironment["env"] {
+			t.Fatal("env is not recorded as an environment reader: this gate is inert")
+		}
+		if !graph.declared["serve"] {
+			t.Fatal("serve is not in the call graph: this gate is inert")
+		}
+		if !reached["handleHealth"] {
+			t.Fatal("handleHealth is not reachable from the serving surface, so mounted handlers are not being followed: this gate is inert")
+		}
 	}
 }
 
-// postBootRoots is every exported function and method in the package, plus
-// `serve` — the unexported body Serve calls once configuration is resolved,
-// which is where the post-boot surface actually begins.
-//
-// Exported-ness is the right test for an entry point here: this package is a
-// library, so anything exported is callable by a consumer at any time, and a
-// read behind one of them is a read validate() never saw.
-func (p pkgFuncs) postBootRoots() []string {
-	roots := []string{"serve"}
-	for name := range p.calls {
-		if name != "" && ast.IsExported(name) {
-			roots = append(roots, name)
+// callGraph is this package's functions, the edges between them resolved by
+// the type checker, and which of them read the environment.
+type callGraph struct {
+	pkg *packages.Package
+	// edges maps a function's name to everything it calls or hands out.
+	edges map[string]map[string]bool
+	// readsEnvironment marks the functions whose own body reads the environment.
+	readsEnvironment map[string]bool
+	// declared is every function this package defines.
+	declared map[string]bool
+	// unresolvedIn records, per function, a call whose callee the type
+	// checker could not type at all — the only edge this gate refuses.
+	unresolvedIn map[string][]string
+	// valueTaken is every package function whose value is taken somewhere, and
+	// signatureOf its signature. An indirect call is resolved against these:
+	// a call through a func-typed value can only land on a function of that
+	// exact signature whose value somebody took.
+	valueTaken  map[string]bool
+	signatureOf map[string]string
+}
+
+// newCallGraph builds the graph from resolved types rather than from names.
+func newCallGraph(pkg *packages.Package) *callGraph {
+	g := &callGraph{
+		pkg:              pkg,
+		edges:            map[string]map[string]bool{},
+		readsEnvironment: map[string]bool{},
+		declared:         map[string]bool{},
+		unresolvedIn:     map[string][]string{},
+		valueTaken:       map[string]bool{},
+		signatureOf:      map[string]string{},
+	}
+	for _, file := range pkg.Syntax {
+		if strings.HasSuffix(filepath.Base(pkg.Fset.Position(file.Pos()).Filename), "_test.go") {
+			continue
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Name == nil || fn.Body == nil {
+				continue
+			}
+			name := fn.Name.Name
+			g.declared[name] = true
+			if obj, ok := pkg.TypesInfo.Defs[fn.Name].(*types.Func); ok {
+				g.signatureOf[name] = obj.Type().String()
+			}
+			g.scan(name, fn.Body)
 		}
 	}
-	for name := range p.reads {
-		if name != "" && ast.IsExported(name) && !slices.Contains(roots, name) {
+	return g
+}
+
+// scan records every edge out of one function body: what it calls, and what it
+// hands out as a value. A function literal's body belongs to the function that
+// writes it, since that is who can invoke it.
+func (g *callGraph) scan(from string, body ast.Node) {
+	if g.edges[from] == nil {
+		g.edges[from] = map[string]bool{}
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			g.scanCall(from, node)
+		case *ast.Ident:
+			// A function named as a VALUE: handed to HandleFunc, stored, or
+			// wrapped. Whoever receives it can call it.
+			if obj, ok := g.pkg.TypesInfo.Uses[node].(*types.Func); ok {
+				g.edges[from][obj.Name()] = true
+				g.valueTaken[obj.Name()] = true
+			}
+		case *ast.SelectorExpr:
+			if obj, ok := g.pkg.TypesInfo.Uses[node.Sel].(*types.Func); ok {
+				g.edges[from][obj.Name()] = true
+				g.valueTaken[obj.Name()] = true
+			}
+		}
+		return true
+	})
+}
+
+// scanCall resolves one call. os.Getenv and os.LookupEnv mark the caller as an
+// environment reader; a call this gate cannot resolve at all is recorded so the
+// walk can fail closed on it.
+func (g *callGraph) scanCall(from string, call *ast.CallExpr) {
+	fun := unparen(call.Fun)
+	switch callee := fun.(type) {
+	case *ast.Ident:
+		if obj := g.pkg.TypesInfo.Uses[callee]; obj != nil {
+			if _, isFunc := obj.(*types.Func); isFunc {
+				g.edges[from][obj.Name()] = true
+				return
+			}
+			// A func-typed variable, field or parameter: resolve it by type
+			// rather than stopping here.
+			if isFuncTyped(obj.Type()) {
+				g.resolveIndirect(from, call, obj.Type())
+			}
+			return
+		}
+		// A builtin or an unresolved name: builtins cannot read the
+		// environment, so nothing to record.
+	case *ast.SelectorExpr:
+		obj := g.pkg.TypesInfo.Uses[callee.Sel]
+		fn, isFunc := obj.(*types.Func)
+		if !isFunc {
+			if obj != nil && isFuncTyped(obj.Type()) {
+				g.resolveIndirect(from, call, obj.Type())
+			} else if obj == nil {
+				g.refuse(from, call, callee.Sel.Name)
+			}
+			return
+		}
+		if pkgOf(fn) == "os" && (fn.Name() == "Getenv" || fn.Name() == "LookupEnv") {
+			g.readsEnvironment[from] = true
+			return
+		}
+		g.edges[from][fn.Name()] = true
+	case *ast.FuncLit:
+		// An immediately invoked literal belongs to its writer, which scan
+		// already walked.
+	}
+}
+
+// resolveIndirect follows a call through a func-typed value by TYPE: it can
+// only land on a function of that exact signature whose value somebody took,
+// so every such function becomes an edge. Resolving rather than exempting is
+// the whole point — a callback field is not a place the walk stops, it is a
+// place the walk widens to everything that could be in it.
+//
+// An empty candidate set is a RESOLVED answer, not an unknown one: no function
+// of this package with that signature has its value taken anywhere, so the
+// call provably cannot land on one, whatever the value came from. That is what
+// `cancel` from context.WithCancel is — resolvable to nothing here.
+func (g *callGraph) resolveIndirect(from string, call *ast.CallExpr, t types.Type) {
+	want := types.Unalias(t).Underlying().String()
+	for name, signature := range g.signatureOf {
+		if signature == want && g.valueTaken[name] {
+			g.edges[from][name] = true
+		}
+	}
+	// A signature the checker could not resolve is the one unknown left.
+	if tv, ok := g.pkg.TypesInfo.Types[call.Fun]; !ok || tv.Type == nil || !resolved(tv.Type) {
+		g.refuse(from, call, "an unresolved callee type")
+	}
+}
+
+// refuse records an edge the type checker could not resolve at all. This is
+// the fail-closed case and the only one: a call this gate cannot type is a
+// part of the serving surface it did not walk, and saying nothing about it
+// would be the silent pass the name-matching graph gave.
+func (g *callGraph) refuse(from string, call *ast.CallExpr, what string) {
+	g.unresolvedIn[from] = append(g.unresolvedIn[from],
+		g.pkg.Fset.Position(call.Pos()).String()+" in "+from+" ("+what+")")
+}
+
+// servingSurface is everything reachable from the post-boot roots without
+// passing through loadConfig, and the unresolved calls found along the way.
+func (g *callGraph) servingSurface() (map[string]bool, []string) {
+	const bootResolution = "loadConfig"
+
+	roots := []string{"serve"}
+	for name := range g.declared {
+		if ast.IsExported(name) {
 			roots = append(roots, name)
 		}
 	}
 	sort.Strings(roots)
-	return roots
-}
 
-// reachableFromExcluding is reachability over several roots, never traversing
-// `excluded`. Excluding a node rather than declining to root at it is what
-// separates "boot reads this" from "serving reads this": a helper both use is
-// reached by the serving path on its own.
-func (p pkgFuncs) reachableFromExcluding(roots []string, excluded string) map[string]bool {
-	seen := map[string]bool{}
+	reached := map[string]bool{}
 	var queue []string
 	for _, root := range roots {
-		if root == excluded || seen[root] {
+		if root == bootResolution || reached[root] {
 			continue
 		}
-		seen[root] = true
+		reached[root] = true
 		queue = append(queue, root)
 	}
+	var unresolved []string
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
-		for _, callee := range p.calls[current] {
-			if callee == excluded || seen[callee] {
+		unresolved = append(unresolved, g.unresolvedIn[current]...)
+		for callee := range g.edges[current] {
+			if callee == bootResolution || reached[callee] {
 				continue
 			}
-			seen[callee] = true
+			reached[callee] = true
 			queue = append(queue, callee)
 		}
 	}
-	return seen
+	sort.Strings(unresolved)
+	return reached, unresolved
+}
+
+// unparen removes every layer of parentheses, so `(env)(...)` is a call to env
+// rather than a call to something this gate has never heard of.
+func unparen(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
+}
+
+// isFuncTyped reports whether a type is a function type.
+func isFuncTyped(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := types.Unalias(t).Underlying().(*types.Signature)
+	return ok
+}
+
+// pkgOf is the import path of the package a function belongs to.
+func pkgOf(fn *types.Func) string {
+	if fn.Pkg() == nil {
+		return ""
+	}
+	return fn.Pkg().Path()
 }
 
 // And the read has to happen at boot, not merely be written there.
