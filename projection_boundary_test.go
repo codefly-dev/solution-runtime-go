@@ -150,10 +150,31 @@ func TestADeclaredPassthroughIsCheckedAgainstTheProjection(t *testing.T) {
 // TestTheSeamJudgesItsOwnProjection: the test seam supplies the projection
 // instead of resolving it, so it decodes there what loadConfig decodes at a
 // boot — otherwise a consumer's test would accept what a boot refuses.
+//
+// The refusal must be the DECODE refusal. Asserting only that an error came
+// back proved nothing: with the seam's decode removed, the projection is
+// simply empty, the declared module is then absent from it, and the agreement
+// check refuses — a different refusal, for a different reason, that this test
+// happily counted as success. A mutation that deleted the decode left it
+// green, which is the defect it now fails on.
 func TestTheSeamJudgesItsOwnProjection(t *testing.T) {
 	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
 	s.consumed = []ConsumedModule{passthroughModule()}
-	if _, err := passthroughSeam(s, "https://gateway.cell.test", `{"not":"a list"}`); err == nil {
+	_, err := passthroughSeam(s, "https://gateway.cell.test", `{"not":"a list"}`)
+	if err == nil {
 		t.Fatal("the seam accepted a projection a boot would refuse")
+	}
+	if !strings.Contains(err.Error(), "cannot be checked against api.consumes") {
+		t.Errorf("the seam refused for some other reason than the projection failing to decode: %v", err)
+	}
+}
+
+// And the seam accepts the projection it should: the same declaration, listed.
+// Without this, the test above is satisfied by a seam that refuses everything.
+func TestTheSeamAcceptsAProjectionThatListsTheDeclaration(t *testing.T) {
+	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	s.consumed = []ConsumedModule{passthroughModule()}
+	if _, err := passthroughSeam(s, "https://gateway.cell.test", projectionOf(passthroughModule().As)); err != nil {
+		t.Fatalf("the seam refused a projection that lists the declared module: %v", err)
 	}
 }

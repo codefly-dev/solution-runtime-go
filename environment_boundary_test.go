@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -52,18 +53,22 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 // boot-reachability check stays green. Reachability says where a function may
 // be called from, never where it is not.
 //
-// So this gate asks the other question — what is reachable from the serving
-// surface, not passing through loadConfig — and refuses an environment reader
-// there whatever boot also does with it.
+// ROOTED AT EVERY EXPORTED DECLARATION, not at two names. The first version of
+// this gate rooted at `serve` and `passthroughSeam`, which is a list, and a
+// list is a thing an author adds to without noticing: an exported function
+// reading `env` is callable by any consumer and was walked by nothing. Every
+// exported function and method is an entry point a consumer may call after
+// boot, so every one of them is a root, to a fixed point. loadConfig is
+// excluded as a node rather than as a root, so a helper boot shares with
+// serving code is judged by the serving path.
 func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
 	pkg := parsePackage(t)
 
-	// serve is the whole post-boot surface: Serve resolves the configuration
-	// and then calls it, so rooting here is rooting after validate(). The
-	// seam is a second entry point, used by a consumer's test in place of a
-	// boot. loadConfig is excluded as a node rather than as a root, so a
-	// helper it shares with serving code is judged by the serving path.
-	served := pkg.reachableFromExcluding([]string{"serve", "passthroughSeam"}, "loadConfig")
+	roots := pkg.postBootRoots()
+	if len(roots) == 0 {
+		t.Fatal("no post-boot entry points found: this gate is inert")
+	}
+	served := pkg.reachableFromExcluding(roots, "loadConfig")
 
 	var afterBoot []string
 	for _, fn := range pkg.environmentReaders() {
@@ -73,25 +78,52 @@ func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
 	}
 	sort.Strings(afterBoot)
 	if len(afterBoot) > 0 {
-		t.Errorf("these environment readers are reachable from the serving surface without passing through loadConfig: %s\n"+
+		t.Errorf("these environment readers are reachable from the post-boot surface without passing through loadConfig: %s\n"+
 			"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
 			"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
 			strings.Join(afterBoot, ", "))
 	}
 
 	// The gate has to be able to see such a read at all, or its silence means
-	// nothing: `env` is the helper the mutation above would go through, and it
+	// nothing: `env` is the helper a serve-time read would go through, and it
 	// must be a reader this analysis knows about.
-	if !pkg.reachableFrom("env")["env"] {
-		t.Fatal("the call graph has no env helper: this gate is inert")
+	if !pkg.reads["env"] {
+		t.Fatal("env is not recorded as an environment reader: this gate is inert")
 	}
-	readers := pkg.environmentReaders()
-	if len(readers) == 0 {
+	if len(pkg.environmentReaders()) == 0 {
 		t.Fatal("no environment readers found at all: this gate is inert")
+	}
+	// And Serve must be among the roots, or "every exported declaration" is
+	// not what is being walked.
+	if !slices.Contains(roots, "Serve") {
+		t.Fatalf("Serve is not a post-boot root, so the roots are not every exported declaration: %v", roots)
 	}
 }
 
-// reachableFromExcluding is reachableFrom over several roots, never traversing
+// postBootRoots is every exported function and method in the package, plus
+// `serve` — the unexported body Serve calls once configuration is resolved,
+// which is where the post-boot surface actually begins.
+//
+// Exported-ness is the right test for an entry point here: this package is a
+// library, so anything exported is callable by a consumer at any time, and a
+// read behind one of them is a read validate() never saw.
+func (p pkgFuncs) postBootRoots() []string {
+	roots := []string{"serve"}
+	for name := range p.calls {
+		if name != "" && ast.IsExported(name) {
+			roots = append(roots, name)
+		}
+	}
+	for name := range p.reads {
+		if name != "" && ast.IsExported(name) && !slices.Contains(roots, name) {
+			roots = append(roots, name)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+// reachableFromExcluding is reachability over several roots, never traversing
 // `excluded`. Excluding a node rather than declining to root at it is what
 // separates "boot reads this" from "serving reads this": a helper both use is
 // reached by the serving path on its own.
@@ -99,7 +131,7 @@ func (p pkgFuncs) reachableFromExcluding(roots []string, excluded string) map[st
 	seen := map[string]bool{}
 	var queue []string
 	for _, root := range roots {
-		if root == excluded {
+		if root == excluded || seen[root] {
 			continue
 		}
 		seen[root] = true
