@@ -3,6 +3,7 @@ package solution
 import (
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 	"path/filepath"
 	"sort"
@@ -330,6 +331,12 @@ func aliasedThroughAParameter(read func(string) string, parts []string) string {
 	return read(strings.Join(parts, "_"))
 }
 
+// And parenthesised, which returned false from a rule reading the immediate
+// spelling and so skipped the key check entirely.
+func AliasedThroughParentheses(parts []string) string {
+	return (env)(strings.Join(parts, "_"), "")
+}
+
 func AliasedCaller(parts []string) string {
 	return aliasedThroughAParameter(os.Getenv, parts)
 }
@@ -337,8 +344,8 @@ func AliasedCaller(parts []string) string {
 
 	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
 	// One finding per invocation: the alias, the field and the parameter.
-	if got := strings.Count(keys, "does not resolve to constants"); got < 3 {
-		t.Errorf("the key gate caught %d of the three aliased reader invocations.\nfindings:\n%s", got, keys)
+	if got := strings.Count(keys, "does not resolve to constants"); got < 4 {
+		t.Errorf("the key gate caught %d of the four aliased reader invocations.\nfindings:\n%s", got, keys)
 	}
 }
 
@@ -376,6 +383,17 @@ type readerIdentity struct {
 	// unresolvedKeys is the findings: a resolved reader invocation whose key
 	// is not traceable to constants.
 	unresolvedKeys []string
+	// invocations is every resolved reader invocation, wherever it is. The
+	// post-boot gate uses these rather than its own notion of a reader call:
+	// one model, so an alias the key gate resolves is an alias that gate sees
+	// too.
+	invocations []readerSite
+}
+
+// readerSite is one resolved reader invocation.
+type readerSite struct {
+	pos  token.Pos
+	name string
 }
 
 func newReaderIdentity(pkg *packages.Package) *readerIdentity {
@@ -525,6 +543,7 @@ func (r *readerIdentity) checkInvocations() {
 			if callee == nil || !r.readerAliases[callee] {
 				return true
 			}
+			r.invocations = append(r.invocations, readerSite{pos: call.Pos(), name: readerDisplayName(callee)})
 			if fn, ok := callee.(*types.Func); ok && keylessReaders[fn.Name()] {
 				return true
 			}
@@ -539,6 +558,20 @@ func (r *readerIdentity) checkInvocations() {
 		})
 	}
 	sort.Strings(r.unresolvedKeys)
+}
+
+// readerDisplayName names a reader for a finding.
+func readerDisplayName(obj types.Object) string {
+	if fn, ok := obj.(*types.Func); ok && fn.Pkg() != nil {
+		if fn.Pkg().Path() == "github.com/codefly-dev/solution-runtime-go" {
+			return fn.Name()
+		}
+		return fn.Pkg().Name() + "." + fn.Name()
+	}
+	if obj != nil {
+		return obj.Name()
+	}
+	return "an environment reader"
 }
 
 // object resolves an expression to the object it names.

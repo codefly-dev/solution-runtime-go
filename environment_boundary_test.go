@@ -154,6 +154,48 @@ var ExportedClosure = func() string { return (env)("ANYTHING", "") }
 	}
 }
 
+// And an aliased reader on a serving path, with a perfectly constant key.
+//
+// This is the shape that survived both gates at once: the key resolves, so the
+// key gate has nothing to say about it, and the call is indirect, so the CHA
+// edge into os.Getenv is an over-approximation the post-boot gate discards.
+// Neither gate was wrong on its own — they were asking different questions
+// about what a read is. One model answers both: the identity model resolves
+// the alias exactly, and the serving graph says whether that call site runs
+// after boot.
+func TestThePostBootGateSeesAnAliasedReaderWithAConstantKey(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_aliased_serving_fixture.go")
+
+	source := `package solution
+
+import (
+	"net/http"
+	"os"
+)
+
+type servingEnvReader = func(string) string
+
+var servingRead servingEnvReader = os.Getenv
+
+func servingAliasRead() string { return servingRead("ANYTHING") }
+
+// On a served path, so it runs per request rather than at boot.
+func (s *Server) MountAliasFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/alias", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-alias", servingAliasRead())
+	})
+}
+`
+	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
+	if len(readers) == 0 {
+		t.Fatal("an aliased reader with a constant key, called on a served path, was not reported")
+	}
+}
+
 // And os.Environ is a reader too, which is the omission that let an exported
 // wrapper of a function using it read changing configuration after boot. It
 // has no key to resolve — it reads all of them — so the read itself is the
@@ -317,22 +359,14 @@ func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
 			// reader on the path named four that are all somebody else's: the
 			// SDK rechecking a rotated value, grpc's resolver, viper's init,
 			// none of which this package could resolve in loadConfig.
-			if name, ok := environmentReader(next.Func); ok {
-				// Only a call that actually names the reader. CHA resolves an
-				// indirect call to every type-compatible function in the
-				// program, so a callback of shape func(string) (string, bool)
-				// resolves to os.LookupEnv whether or not anything ever puts
-				// it there — which is exactly what it did here, through
-				// namedInJSON's `named` parameter.
-				//
-				// A reader genuinely held in a value and called through it is
-				// not lost by this: that is the identity the key gate follows,
-				// precisely, and refuses when its key cannot be resolved. An
-				// over-approximated edge proves nothing and the precise gate
-				// is the one that owns that shape.
-				if inPackage(current.Func, target) && staticCall(edge, next.Func) {
-					readers[name] = path[current] + " → " + name
-				}
+			if _, isReader := environmentReader(next.Func); isReader {
+				// Reader edges are not taken from this graph. CHA resolves an
+				// indirect call to every type-compatible function, so a
+				// callback of shape func(string) (string, bool) resolves to
+				// os.LookupEnv whether or not anything puts it there — which
+				// is what it did, through namedInJSON's `named` parameter.
+				// Which calls are reads is the identity model's answer, below,
+				// and it is the same model the key gate uses.
 				continue
 			}
 			seen[next] = true
@@ -340,7 +374,48 @@ func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
 			queue = append(queue, next)
 		}
 	}
+
+	// Which calls are reads comes from the reader identity model, not from
+	// this graph: an aliased reader — `var read reviewEnvReader = os.Getenv`,
+	// called through `read` — is an indirect call CHA can only guess at, while
+	// the identity model resolves it exactly. Each invocation is attributed to
+	// the innermost function containing it, and reported when that function is
+	// reachable after boot.
+	for _, pkg := range pkgs {
+		if pkg.PkgPath != target {
+			continue
+		}
+		identity := newReaderIdentity(pkg)
+		for _, site := range identity.invocations {
+			holder := innermostContaining(seen, site.pos)
+			if holder == nil {
+				continue
+			}
+			readers[site.name] = path[holder] + " → " + site.name
+		}
+	}
 	return readers
+}
+
+// innermostContaining is the reachable function whose source extent contains a
+// position most tightly, so a read inside a closure is attributed to the
+// closure rather than to whatever encloses it.
+func innermostContaining(reached map[*callgraph.Node]bool, pos token.Pos) *callgraph.Node {
+	var best *callgraph.Node
+	var bestSize token.Pos
+	for node := range reached {
+		syntax := node.Func.Syntax()
+		if syntax == nil {
+			continue
+		}
+		if pos < syntax.Pos() || pos >= syntax.End() {
+			continue
+		}
+		if size := syntax.End() - syntax.Pos(); best == nil || size < bestSize {
+			best, bestSize = node, size
+		}
+	}
+	return best
 }
 
 // isPostBootRoot reports whether a function can run after boot.
