@@ -472,6 +472,11 @@ type config struct {
 	// a solution declaring no passthrough, so one undecodable value had two
 	// answers — refused for a solution with a declaration, accepted and served
 	// for one without. validate() now judges it either way.
+	//
+	// Set these with parseAPIConsumes whenever apiConsumes above is set, never
+	// one without the other: the two production writers are loadConfig and the
+	// test seam, and a config built by hand with only the raw string decodes
+	// to no entries, which reads as "the projection lists nothing".
 	consumedAPIs   []manifest.ConsumedAPI
 	apiConsumesErr error
 	// mcp says the solution declared an MCP surface (ServeMCP), which is what
