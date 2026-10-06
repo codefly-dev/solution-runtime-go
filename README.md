@@ -752,6 +752,19 @@ than a log line. It used to be read at serve time: a malformed projection
 disabled the whole federation with one log line while the solution served on,
 so every consumed facade 404'd at the gateway and the solution looked healthy.
 
+The refusal fires **whether or not the solution declares a passthrough**. Being
+resolved at boot is not the same as being judged there, and for a release it
+was only the first: the projection was decoded by the code that consumes it,
+which returns early when there is no `Consumes` declaration, so the same
+undecodable value was refused for one solution and served for another. It is
+decoded once at boot now and refused either way, naming `CODEFLY__API_CONSUMES`
+— the projection is the composition's output, so no override an operator can
+set repairs it, and `codefly run solution` is where it is fixed.
+
+Unset is not malformed. A solution that consumes nothing leaves the variable
+empty, and whitespace alone counts as empty, so a render emitting a bare
+newline for it does not fail a boot.
+
 
 ### Reading a Work-Context-authenticated module
 

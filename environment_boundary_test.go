@@ -43,6 +43,82 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 	}
 }
 
+// And a helper that boot resolution uses must not also be used after it.
+//
+// The gate above asks only whether an environment reader sits in loadConfig's
+// call tree. A helper can sit there and be called from serving code as well,
+// and then it passes: `env` is reachable from loadConfig, so a serve-time call
+// to `env` reads the environment after validate() has had its say while every
+// boot-reachability check stays green. Reachability says where a function may
+// be called from, never where it is not.
+//
+// So this gate asks the other question — what is reachable from the serving
+// surface, not passing through loadConfig — and refuses an environment reader
+// there whatever boot also does with it.
+func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
+	pkg := parsePackage(t)
+
+	// serve is the whole post-boot surface: Serve resolves the configuration
+	// and then calls it, so rooting here is rooting after validate(). The
+	// seam is a second entry point, used by a consumer's test in place of a
+	// boot. loadConfig is excluded as a node rather than as a root, so a
+	// helper it shares with serving code is judged by the serving path.
+	served := pkg.reachableFromExcluding([]string{"serve", "passthroughSeam"}, "loadConfig")
+
+	var afterBoot []string
+	for _, fn := range pkg.environmentReaders() {
+		if served[fn] {
+			afterBoot = append(afterBoot, fn)
+		}
+	}
+	sort.Strings(afterBoot)
+	if len(afterBoot) > 0 {
+		t.Errorf("these environment readers are reachable from the serving surface without passing through loadConfig: %s\n"+
+			"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
+			"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
+			strings.Join(afterBoot, ", "))
+	}
+
+	// The gate has to be able to see such a read at all, or its silence means
+	// nothing: `env` is the helper the mutation above would go through, and it
+	// must be a reader this analysis knows about.
+	if !pkg.reachableFrom("env")["env"] {
+		t.Fatal("the call graph has no env helper: this gate is inert")
+	}
+	readers := pkg.environmentReaders()
+	if len(readers) == 0 {
+		t.Fatal("no environment readers found at all: this gate is inert")
+	}
+}
+
+// reachableFromExcluding is reachableFrom over several roots, never traversing
+// `excluded`. Excluding a node rather than declining to root at it is what
+// separates "boot reads this" from "serving reads this": a helper both use is
+// reached by the serving path on its own.
+func (p pkgFuncs) reachableFromExcluding(roots []string, excluded string) map[string]bool {
+	seen := map[string]bool{}
+	var queue []string
+	for _, root := range roots {
+		if root == excluded {
+			continue
+		}
+		seen[root] = true
+		queue = append(queue, root)
+	}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, callee := range p.calls[current] {
+			if callee == excluded || seen[callee] {
+				continue
+			}
+			seen[callee] = true
+			queue = append(queue, callee)
+		}
+	}
+	return seen
+}
+
 // And the read has to happen at boot, not merely be written there.
 //
 // Static reachability is not the claim AGENTS.md makes, and the difference was
