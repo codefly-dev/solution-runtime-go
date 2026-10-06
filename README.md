@@ -114,7 +114,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 | Host issuer (MCP) | `codefly.For(ctx).WorkspaceConfiguration("mcp", "issuer-url")` — the declared value the composition supplies; without one, the resolved host frontend origin (see [Exposing an MCP server](#exposing-an-mcp-server)). Checked at boot only when `ServeMCP` is declared | — (declared configuration, no env override) |
-| Public MCP URL | **declared** (`mcp/public-url`) in a deployed runtime context, where a derived value is refused: the derivation encodes the route the *host* serves this solution on. Locally, derived from `<PUBLIC_URL>/solutions/<id>/mcp`. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")` (must end in `/mcp`). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
+| Public MCP URL | **declared** (`mcp/public-url`) in a deployed runtime context, where a derived value is refused: the derivation encodes the route the *host* serves this solution on. Locally, derived from `<PUBLIC_URL>/api/solutions/<id>/proxy/mcp` — the host's **public** proxy route. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")`, published exactly as declared (must end in `/mcp`, no trailing slash; refused in a deployment when it names a loopback address). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
 
 Every `workload-identity` value is a **path, never material**, the three
 admission sets included — and that is what makes them live. They are admission
@@ -158,8 +158,11 @@ registration, where building an absolute URL from it was wrong — the route a
 browser reaches this solution through is the host's to resolve — and the
 manifest is a path now. The MCP resource identifier an agent client binds its
 token to does need a public origin, and derives from it when no `mcp/public-url`
-is declared. Whether a runtime should derive the host's `/solutions/<id>` route
-even for that is an open follow-up.
+is declared. That derivation names the host's **public** proxy route,
+`/api/solutions/<id>/proxy/mcp`; it used to name the gateway's in-cluster
+`/solutions/<id>`, which is not reachable from outside a cell. Whether a runtime
+should derive the host's route even for a local run is an open follow-up — what
+it must not do is derive an unreachable one.
 
 **Removed in this cutover, with the registrations they fed**: `SELF_UPSTREAM`, `HOST_REGISTER_URL`, `GATEWAY_REGISTER_URL`,
 `GATEWAY_MODULE_REGISTER_URL`, `GATEWAY_MODULE_REGISTRATION_TOKEN_URL`,
@@ -1130,9 +1133,9 @@ person, through the host's gateway, with the same authority. The solution owns
 its tool surface; this runtime owns serving it. These are the three lines:
 
 ```go
-solution.New(solution.Manifest{ID: "wiki", Title: "Wiki"}).
-    ServeMCP("wiki", "v1.0.0", func(srv *mcp.Server) {
-        mcp.AddTool(srv, &mcp.Tool{Name: "ask_wiki", Description: "ask the wiki a question"}, askWiki)
+solution.New(solution.Manifest{ID: "example", Title: "Example"}).
+    ServeMCP("example", "v1.0.0", func(srv *mcp.Server) {
+        mcp.AddTool(srv, &mcp.Tool{Name: "ask", Description: "answer a question about this solution's content"}, ask)
     }).
     Serve()
 ```
@@ -1163,7 +1166,7 @@ module through `ForModule` under the viewer's own Work Context — the identical
 call the page makes, with the identical typed refusals:
 
 ```go
-func askWiki(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
+func ask(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
     gw, err := solution.ViewerFromContext(ctx)
     if err != nil {
         return nil, askOut{}, err
@@ -1186,7 +1189,7 @@ harness of its own, or an `*mcp.Server` mounted without `ServeMCP`.
 
 | Path | What |
 | --- | --- |
-| `/mcp` (`solution.MCPPath`) | Stateless Streamable HTTP. `/solutions/<id>/mcp` through the gateway, a route it already fronts. `POST` only: `GET` and `DELETE` are `405` and no `Mcp-Session-Id` is ever issued, because the gateway is a reverse proxy with no sticky routing — a session held in one replica's memory is unreachable from the next request. The SDK's DNS-rebinding protection is left on, so a request reaching a loopback listener with a non-loopback `Host` header is refused `403`: on a developer's machine that protection is the one that still applies, since a rebound page is same-origin and can forge identity headers that a cross-origin page cannot. |
+| `/mcp` (`solution.MCPPath`) | Stateless Streamable HTTP. `/solutions/<id>/mcp` through the gateway in-cluster; `/api/solutions/<id>/proxy/mcp` is the public URL a client dials, and the one the resource identifier names. `POST` only: `GET` and `DELETE` are `405` and no `Mcp-Session-Id` is ever issued, because the gateway is a reverse proxy with no sticky routing — a session held in one replica's memory is unreachable from the next request. The SDK's DNS-rebinding protection is left on, so a request reaching a loopback listener with a non-loopback `Host` header is refused `403`: on a developer's machine that protection is the one that still applies, since a rebound page is same-origin and can forge identity headers that a cross-origin page cannot. |
 | `/.well-known/oauth-protected-resource` (`solution.ProtectedResourceMetadataPath`) | The OAuth 2.0 Protected Resource Metadata document (RFC 9728): the `resource` a client binds its token to, the host issuer in `authorization_servers`, and `bearer_methods_supported: ["header"]`. Served unauthenticated, with `Access-Control-Allow-Origin: *`, because discovery is public (RFC 9728 §3.1). |
 
 The MCP endpoint itself carries **no** CORS. The runtime's policy for a
@@ -1228,9 +1231,34 @@ it on the solution's behalf.
 
 So it is **derived by construction** from the two things the runtime already
 has: the origin this product is reachable at and this solution's id —
-`<PUBLIC_URL>/solutions/<id>/mcp`. This is the one place the runtime encodes the
-gateway's solution route (see [Where the host reaches the
-solution](#where-the-host-reaches-the-solution)).
+`<PUBLIC_URL>/api/solutions/<id>/proxy/mcp`. This is the one place the runtime
+encodes a route of the host's, and it encodes the **public** one. The gateway's
+own `/solutions/<id>` is in-cluster: on the host's public origin that prefix is a
+page of the host's frontend, so an identifier naming it is one no client can
+dial — and RFC 9728 §3.3 has the client compare the identifier in this document
+with the URL it dialled, so it rejects the mismatch and discovery stops there.
+The runtime derived and published that in-cluster prefix, and also **suggested**
+it in the boot log as the value to provision, which is the worse half: a default
+an operator never reads is a default, but a suggestion is read as the answer and
+provisions the same unreachable identifier by hand.
+
+The prefix and suffix are compiled constants, so the identifier tracks
+`PUBLIC_URL` but not a change to the host's route shape. Nothing projects that
+route to a composed solution's backend: the SDK resolves endpoints as an address
+with no path, an endpoint carries no public URL or route template, and core's
+only public-route concept binds hosts to a service endpoint CLI-side and reaches
+no running service. Closing it belongs to the host that serves
+`/api/solutions/<id>/proxy` — projecting that route as resolved configuration for
+this runtime to consume and refuse by its provisioning key. Until then
+`TestMCPIdentifierNamesTheHostsPublicProxyRoute` pins the constants against a
+literal so nobody changes them here unnoticed. That test does **not** detect the
+host changing its route: this module has no dependency on the host and nothing in
+its suite observes the host's routing, so that case leaves this repository green
+and breaks a client's discovery. The test that would catch it drives the host's
+own source and belongs where the host is visible. What limits the damage
+meanwhile is the refusal below — a deployed surface declares the identifier, so
+the derivation only stands where the guess is checkable (see [Where the host
+reaches the solution](#where-the-host-reaches-the-solution)).
 
 **That derivation is for a local run only, and this said otherwise.** It read
 as "a deployment that already sets `PUBLIC_URL` … has addressed the MCP surface
@@ -1244,8 +1272,17 @@ in a deployment failed the boot. In a deployed context the identifier is
 A host whose gateway fronts solutions under some other route declares
 `public-url` in the `mcp` group instead. It must end in `/mcp` — the metadata
 document's own URL is derived from it by swapping that suffix, the same pairing
-the registration token URLs use, refused at boot for the same reason when it
-cannot be made. With neither — no `PUBLIC_URL`, no declared override — the
+the registration token URLs used, refused at boot for the same reason when it
+cannot be made — and it is published **exactly as declared**. Only surrounding
+whitespace is dropped; nothing inside the string is normalized, because RFC 9728
+§3.3 has the client compare this identifier against the URL it dialled code
+point for code point, so `…/mcp/` and `…/mcp` are two different identifiers and
+a trailing slash is refused at boot naming the declaration rather than quietly
+turned into the other one. In a deployed runtime context it is also refused when
+it names a loopback or unspecified address — `localhost`, `127.0.0.1`, `[::1]`,
+`0.0.0.0`, and the same addresses carrying an IPv6 zone — because a client
+dialling it reaches its own machine; `https` does not make such an address
+reachable. With neither — no `PUBLIC_URL`, no declared override — the
 identifier is reconstructed per request from `x-forwarded-proto`,
 `x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
 is doing so: a proxy that forwards no prefix yields an identifier missing the
@@ -1278,12 +1315,12 @@ Three things about discovery belong to the host, not to this runtime, all of the
 tracked by
 [module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003).
 The gateway emits the 401 challenge, as above. It must admit an unauthenticated
-`GET` on `/solutions/<id>/.well-known/oauth-protected-resource`, or no client can
-read the document that challenge points at. And that is where the document is —
-on the solution's own path — whereas RFC 9728 §3.1 also defines a location
-derived from the resource's path,
-`/.well-known/oauth-protected-resource/solutions/<id>/mcp`, at the **host's**
-root. A client that follows `resource_metadata` reaches the document either way;
+`GET` on the solution's `/.well-known/oauth-protected-resource`, reached through
+its public proxy route, or no client can read the document that challenge points
+at. And that is where the document is — on the solution's own path — whereas RFC
+9728 §3.1 also defines a location derived from the resource's path,
+`/.well-known/oauth-protected-resource/api/solutions/<id>/proxy/mcp`, at the
+**host's** root. A client that follows `resource_metadata` reaches the document either way;
 one that only guesses the derived location needs the host to serve it there.
 
 #### Connecting
@@ -1292,7 +1329,7 @@ Until the host is an MCP-conformant OAuth 2.1 authorization server, a client
 presents a token it already has, which the gateway already accepts:
 
 ```sh
-claude mcp add --transport http wiki https://<host>/solutions/<id>/mcp \
+claude mcp add --transport http <name> https://<host>/api/solutions/<id>/proxy/mcp \
     --header "Authorization: Bearer <access token>"
 ```
 

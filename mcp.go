@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -172,7 +173,7 @@ func (s *Server) mountMCP(mux *http.ServeMux) error {
 		// stripped — which a conforming client rejects and a tolerant one
 		// silently binds to the wrong resource.
 		log.Printf("solution %q: MCP resource identifier derived per request from forwarded headers (no PUBLIC_URL and no %s): set PUBLIC_URL to the origin clients reach this product at, so the identifier is %q",
-			s.manifest.ID, mcpConfigurationValue(MCPPublicURLKey), "https://<host>"+gatewaySolutionsRoute+s.manifest.ID+MCPPath)
+			s.manifest.ID, mcpConfigurationValue(MCPPublicURLKey), hostSolutionPublicMCPURL("https://<host>", s.manifest.ID))
 	}
 	return nil
 }
@@ -330,8 +331,8 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 		}
 		// The one thing a tool call leaves nowhere else. Minting is audited on
 		// accounts and names the viewer and the module, but not which tool
-		// asked — so an operator reading that audit cannot tell an "ask the
-		// wiki" from a bulk export. The name only: arguments are the viewer's
+		// asked — so an operator reading that audit cannot tell a single
+		// lookup from a bulk export. The name only: arguments are the viewer's
 		// content and the headers carry their credentials.
 		if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
 			log.Printf("solution %q: mcp tool %q", s.manifest.ID, call.Params.Name)
@@ -703,9 +704,16 @@ func firstForwarded(r *http.Request, name string) string {
 //
 // MCPPublicURLKey is the public MCP URL. A deployed MCP surface must declare
 // it: the runtime can derive one from PUBLIC_URL, but the derivation builds
-// <PUBLIC_URL>/solutions/<id>/mcp, which encodes the route the HOST serves this
-// solution on — a layout this runtime does not know. The derivation stands for
-// a local run, where whoever made the guess can check it.
+// <PUBLIC_URL>/api/solutions/<id>/proxy/mcp, which encodes the route the HOST
+// serves this solution on — a layout this runtime does not know. The derivation
+// stands for a local run, where whoever made the guess can check it.
+//
+// A declared value is published verbatim. It is the resource identifier, which
+// RFC 9728 §3.3 has a client compare code point for code point against the URL
+// it dialled, so "…/mcp/" and "…/mcp" are two different identifiers and only
+// one of them can be the one a client reached. Trimming the trailing slash
+// turned the first into the second and published an identifier nobody declared
+// and no client dialled, which is a 401 on a document that validates.
 //
 // It must end in MCPPath, because the metadata document's own URL is derived
 // from it by swapping that suffix, and a value that cannot be paired is
@@ -718,19 +726,57 @@ const (
 	MCPPublicURLKey       = "public-url"
 )
 
-// gatewaySolutionsRoute is the route prefix the host gateway fronts a solution
-// under, "/solutions/<id>" — the one piece of the host's route layout this
-// runtime does encode, and only for the resource identifier.
+// hostSolutionProxyRoute and hostSolutionProxySuffix bracket the host's PUBLIC
+// route to a solution's backend, "/api/solutions/<id>/proxy" — the one piece of
+// the host's route layout this runtime does encode, and only for the resource
+// identifier.
 //
-// Everywhere else it deliberately does not: the manifest URL is registered
-// root-relative and the host resolves it against the route it reached the
-// solution by (see frontendManifestURL). An MCP client cannot do that. The
-// resource identifier is what its token is audience-bound to (RFC 8707), so it
-// has to be byte-exact with the URL the client dialled, and a client that is
-// handed any other identifier rejects it. Deriving it is what makes a
-// composition supply nothing; MCPPublicURLKey is the way out for a host that
-// routes differently.
-const gatewaySolutionsRoute = "/solutions/"
+// It is the PUBLIC route, not the gateway's internal one. The host's gateway
+// fronts a solution under "/solutions/<id>" in-cluster, but that prefix is not
+// reachable from outside: on the host's public origin it is a page of the
+// host's frontend, so a client dialling it does not arrive here. This runtime
+// derived that in-cluster prefix and published it, and the published identifier
+// is the one thing a client cannot work around — RFC 9728 §3.3 has it compare
+// the identifier in this document against the URL it dialled, so discovery
+// stopped there. Both the derivation and the value this package SUGGESTS to an
+// operator were the unreachable route; the suggestion is worse, because it
+// reads as the answer and provisions the same failure by hand.
+//
+// Everywhere else it deliberately encodes nothing: the manifest URL is
+// registered root-relative and the host resolves it against the route it
+// reached the solution by (see frontendManifestURL). An MCP client cannot do
+// that — it has only this document. The resource identifier is what its token
+// is audience-bound to (RFC 8707), so it has to be byte-exact with the URL the
+// client dialled, and a client handed any other identifier rejects it.
+//
+// These are compiled constants, so the identifier tracks PUBLIC_URL but not a
+// change to the host's route shape. That gap is why a DEPLOYED surface must
+// declare MCPPublicURLKey rather than derive anything (see validateMCP): the
+// route is the host's to resolve and this runtime does not know it. What
+// remains derived is the local run, where whoever made the guess can check it,
+// and the suggestion in that boot log. Nothing projects the route to a composed
+// solution's backend today — the SDK resolves endpoints as
+// resources.NetworkInstance (host, hostname, port, address; no path), a
+// basev0.Endpoint carries no public URL or route template, and core's one
+// public-route concept, resources.EnvironmentIngressRoute, binds hosts to a
+// service endpoint, is CLI-side and is not serialized to proto. Closing it
+// belongs to the host that serves "/api/solutions/<id>/proxy", projecting that
+// route as resolved configuration for this runtime to consume and refuse by its
+// provisioning key. TestMCPIdentifierNamesTheHostsPublicProxyRoute pins these
+// against a literal so nobody changes them here unnoticed — and that is all it
+// can do: this module has no dependency on the host, so if the HOST changes its
+// route, this repository stays green and a client's discovery breaks.
+const (
+	hostSolutionProxyRoute  = "/api/solutions/"
+	hostSolutionProxySuffix = "/proxy"
+)
+
+// hostSolutionPublicMCPURL is the identifier a client dials for the solution
+// id, on the given origin: the host's public proxy route plus MCPPath.
+func hostSolutionPublicMCPURL(origin, id string) string {
+	return strings.TrimRight(origin, "/") + hostSolutionProxyRoute + id +
+		hostSolutionProxySuffix + MCPPath
+}
 
 // mcpConfigurationValue names one value in the group above, as a refusal and
 // the README both name it: group/key, never an environment variable.
@@ -742,7 +788,7 @@ func mcpConfigurationValue(key string) string {
 // dials, which is the resource identifier its token is bound to.
 //
 // It is derived by construction from the origin this product is reachable at
-// and this solution's id — PUBLIC_URL + gatewaySolutionsRoute + id + MCPPath —
+// and this solution's id — PUBLIC_URL + the host's public proxy route + MCPPath —
 // so a composition that renders a solution serving MCP declares nothing for
 // it. Empty when PUBLIC_URL resolved nothing and no override was declared,
 // which validate() refuses in a deployed runtime context: the identifier would
@@ -750,17 +796,21 @@ func mcpConfigurationValue(key string) string {
 //
 // The declared override wins, for a host whose gateway routes solutions
 // elsewhere. It is read through the SDK rather than from the environment for
-// the reason the group's doc comment gives.
+// the reason the group's doc comment gives, and it is returned exactly as
+// declared: only surrounding whitespace is dropped, which a URL cannot contain
+// and a carrier can pick up. Nothing inside the string is normalised, for the
+// reason MCPPublicURLKey's comment gives — validateMCP refuses what cannot be
+// paired instead, naming the declaration.
 func resolveMCPPublicURL(ctx context.Context, publicURL, id string) (string, bool) {
 	if declared, err := codefly.For(ctx).WorkspaceConfiguration(MCPConfigurationGroup, MCPPublicURLKey); err == nil {
-		if declared = strings.TrimRight(strings.TrimSpace(declared), "/"); declared != "" {
+		if declared = strings.TrimSpace(declared); declared != "" {
 			return declared, true
 		}
 	}
 	if publicURL == "" || id == "" {
 		return "", false
 	}
-	return strings.TrimRight(publicURL, "/") + gatewaySolutionsRoute + id + MCPPath, false
+	return hostSolutionPublicMCPURL(publicURL, id), false
 }
 
 // resolveMCPIssuer is the host's OAuth issuer, published as this resource's
@@ -832,6 +882,18 @@ func (c config) validateMCP() error {
 			return fmt.Errorf("no %s provisioned in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Provision that workspace configuration with the origin clients authenticate against and declare the %s group as a workspace-configuration dependency of this backend",
 				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, redactedURL(c.mcpIssuerURL), MCPConfigurationGroup)
 		}
+		// A declared identifier passes every check above and can still name
+		// this machine. The registration that used to refuse a loopback
+		// PUBLIC_URL and self upstream is gone, and with it the only place
+		// that classified an address — so nothing refused "https://localhost/mcp"
+		// provisioned into a cell. It is the same silent damage: the document
+		// is well-formed, served with a 200, and names an address only this
+		// process can reach, with a client's token bound to it.
+		if loopbackURL(c.mcpPublicURL) {
+			return fmt.Errorf("%s (%q) is a loopback address in the deployed runtime context %q: it is the resource identifier an MCP client binds its token to, so a client dialling it reaches its own machine, not this solution. Provision %s with the URL clients actually dial",
+				c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), c.runtimeContext,
+				mcpConfigurationValue(MCPPublicURLKey))
+		}
 		// Declared, not derived. The derived identifier satisfied a check for
 		// "a public URL is set", so this refusal never fired in the one case
 		// it matters: a deployment with PUBLIC_URL resolved, where
@@ -843,8 +905,8 @@ func (c config) validateMCP() error {
 		// derivation stands, because there the guess is checkable by the
 		// person making it.
 		if c.mcpPublicURL != "" && !c.mcpPublicExplicit {
-			return fmt.Errorf("the public MCP URL in the deployed runtime context %q is derived (%q), not declared: it is built as <PUBLIC_URL>%s<id>%s, which encodes the route the HOST serves this solution on — a layout this runtime does not know and must not assume. Provision the workspace configuration %s with the URL clients actually dial, ending in %s",
-				c.runtimeContext, redactedURL(c.mcpPublicURL), gatewaySolutionsRoute, MCPPath,
+			return fmt.Errorf("the public MCP URL in the deployed runtime context %q is derived (%q), not declared: it is built as <PUBLIC_URL>%s<id>%s%s, which encodes the route the HOST serves this solution on — a layout this runtime does not know and must not assume. Provision the workspace configuration %s with the URL clients actually dial, ending in %s",
+				c.runtimeContext, redactedURL(c.mcpPublicURL), hostSolutionProxyRoute, hostSolutionProxySuffix, MCPPath,
 				mcpConfigurationValue(MCPPublicURLKey), MCPPath)
 		}
 	}
@@ -881,11 +943,55 @@ func (c config) validateMCP() error {
 		mcpConfigurationValue(MCPPublicURLKey), deployed); err != nil {
 		return err
 	}
+	// A trailing slash is a different identifier, not a cosmetic variant: RFC
+	// 9728 §3.3 has the client compare the `resource` in this document against
+	// the URL it dialled, code point for code point. Refused on its own rather
+	// than falling through to the pairing refusal below, which would tell an
+	// operator that a value ending in "/mcp/" has to end in "/mcp".
+	if strings.HasSuffix(c.mcpPublicURL, "/") {
+		return fmt.Errorf("unusable %s (%q): the trailing slash makes it a different identifier from %q, and only one of the two can be the URL a client dialled — it compares the one published here against that URL code point for code point. Declare it ending in %s, with no trailing slash",
+			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL),
+			redactedURL(strings.TrimRight(c.mcpPublicURL, "/")), MCPPath)
+	}
 	if siblingURL(c.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath) == "" {
 		return fmt.Errorf("unpairable %s (%q): it must end in %s, because the metadata document a 401 points a client to is derived from it by swapping that suffix",
 			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), MCPPath)
 	}
 	return nil
+}
+
+// loopbackURL reports whether raw names this machine: localhost (or a name
+// under .localhost), a loopback IP, or the unspecified address. Such a URL is
+// reachable only from the process's own host.
+//
+// It is here rather than in solution.go because the MCP resource identifier is
+// the last address this runtime publishes. The predicate used to serve the
+// registration's self-upstream and PUBLIC_URL refusals; those went with the
+// registration, and the gap they left is that a declared identifier naming this
+// machine reached a cell unrefused.
+//
+// An IPv6 zone is the spelling that defeats the obvious version: "[::1%25eth0]"
+// is the loopback reached on a named interface, url.Hostname keeps the zone
+// ("::1%eth0"), and net.ParseIP rejects every address carrying one — so the
+// same loopback written with a zone read as a name that is not an IP at all and
+// passed where the unzoned spelling was refused. The zone selects the interface
+// an address is reached on; it does not change which address it is, so it is
+// dropped before classifying. That cannot turn a real host name into an IP,
+// because a host name cannot contain "%".
+func loopbackURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if zone := strings.IndexByte(host, '%'); zone >= 0 {
+		host = host[:zone]
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
 // mcpPublicURLSource names where the public MCP URL came from, so a refusal
