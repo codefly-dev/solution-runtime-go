@@ -71,6 +71,15 @@ func TestProjectionIsRefusedBeforeServingWhateverIsDeclared(t *testing.T) {
 			if err == nil {
 				t.Fatalf("validate() accepted the projection %q: a value nothing decodes is a value nothing refuses", tc.raw)
 			}
+			// And through the real entry point, not only the validator. The
+			// refusal is only a boot refusal if the boot path runs it: with
+			// `start` no longer calling validate() at all, every assertion
+			// above still passed, because they call it themselves.
+			if err := startRefusal(t, tc.raw); err == nil {
+				t.Errorf("start() accepted the projection %q: validate() refusing it is not a boot refusal unless the boot path asks", tc.raw)
+			} else if !strings.Contains(err.Error(), manifest.APIConsumesEnvironmentVariable) {
+				t.Errorf("start() refused for some other reason than the projection: %v", err)
+			}
 			// The refusal has to name what to go and fix. The projection is
 			// the composition's output, not an operator's setting, so the
 			// variable carrying it is the only handle there is.
@@ -99,8 +108,8 @@ func TestAUsableOrAbsentProjectionIsNotRefused(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := bootConfig(t, tc.raw)
-			if cfg.apiConsumesErr != nil {
-				t.Fatalf("projection %q did not decode: %v", tc.raw, cfg.apiConsumesErr)
+			if cfg.consumes.err != nil {
+				t.Fatalf("projection %q did not decode: %v", tc.raw, cfg.consumes.err)
 			}
 			if err := cfg.validate(); err != nil {
 				t.Fatalf("validate() refused the usable projection %q: %v", tc.raw, err)
@@ -176,5 +185,103 @@ func TestTheSeamAcceptsAProjectionThatListsTheDeclaration(t *testing.T) {
 	s.consumed = []ConsumedModule{passthroughModule()}
 	if _, err := passthroughSeam(s, "https://gateway.cell.test", projectionOf(passthroughModule().As)); err != nil {
 		t.Fatalf("the seam refused a projection that lists the declared module: %v", err)
+	}
+}
+
+// startRefusal runs the real boot entry point far enough to be refused, and
+// returns what refused it.
+//
+// `start` is what Serve calls: it resolves the configuration, validates it,
+// and only then opens a listener. A projection refusal must come from there,
+// not from a test calling the validator on its own — a mutant that deleted
+// `start`'s validate() call left every refusal assertion green, because each
+// one validated the config itself.
+func startRefusal(t *testing.T, projection string) error {
+	t.Helper()
+	bootableEnvironment(t)
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, projection)
+
+	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	ln, err := s.start(context.Background())
+	if ln != nil {
+		_ = ln.Close()
+	}
+	return err
+}
+
+// TestEveryProjectedTargetIsDecodedNotJustTheFirst: a projection naming two
+// modules decodes to both.
+//
+// The "several targets" case only checked that such a projection was accepted,
+// which is satisfied by decoding one of them and dropping the rest: a mutant
+// keeping only the first target passed it, and passed every other test, because
+// nothing consumed a later one. A declaration against the SECOND target is what
+// makes the difference visible.
+func TestEveryProjectedTargetIsDecodedNotJustTheFirst(t *testing.T) {
+	first, second := "firstthing", passthroughModule().As
+	both := `[{"id":"a.` + first + `","module":"a","service":"` + first +
+		`","endpoint":"rest","protocol":"rest","as":"` + first + `"},` +
+		`{"id":"b.` + second + `","module":"b","service":"` + second +
+		`","endpoint":"rest","protocol":"rest","as":"` + second + `"}]`
+
+	cfg := bootConfig(t, both)
+	if got := len(cfg.consumes.targets); got != 2 {
+		t.Fatalf("decoded %d targets, want 2: a projection that names two modules federates two", got)
+	}
+	if cfg.consumes.targets[1].As != second {
+		t.Errorf("the second target decoded as %q, want %q", cfg.consumes.targets[1].As, second)
+	}
+
+	// And the later target is usable, which is what a dropped one costs: the
+	// declaration names only the second module, so it agrees with the
+	// projection exactly when that entry survived decoding.
+	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	s.consumed = []ConsumedModule{passthroughModule()}
+	s.cfg = cfg
+	if _, err := s.validatePassthrough(); err != nil {
+		t.Fatalf("a module the projection lists second was refused, so only the first entry survived decoding: %v", err)
+	}
+}
+
+// TestTheProjectionCannotBeHalfConstructed: there is one representation, so a
+// config cannot hold a decoded projection that disagrees with its source.
+//
+// There used to be two fields — the raw string and the decoded pair — with a
+// comment asking writers to set both. A config built with only the raw string
+// passed validate(), because the decoded half was empty and an empty
+// projection is legitimate, and the passthrough then refused every declared
+// module as if nothing were projected. A comment is not a constraint; the
+// second field is gone, so the state cannot be written.
+func TestTheProjectionCannotBeHalfConstructed(t *testing.T) {
+	// Every construction goes through newProjection, so a malformed source is
+	// carried as an error rather than silently becoming "nothing projected".
+	malformed := newProjection("nope")
+	if malformed.err == nil {
+		t.Fatal("a malformed projection constructed without an error: nothing downstream can then tell it from an empty one")
+	}
+	if len(malformed.targets) != 0 {
+		t.Error("a malformed projection carried targets")
+	}
+
+	// And the two states a reader distinguishes are distinguishable: empty
+	// means "consumes nothing", error means "cannot be read".
+	empty := newProjection("")
+	if empty.err != nil || len(empty.targets) != 0 {
+		t.Errorf("an unset projection is not empty-and-clean: targets=%d err=%v", len(empty.targets), empty.err)
+	}
+
+	// A config carrying the malformed one is refused; a config carrying the
+	// empty one is not. That pair is what the raw string used to be able to
+	// contradict.
+	bootableEnvironment(t)
+	refused := loadConfig(context.Background(), "solution-under-test", nil)
+	refused.consumes = malformed
+	if err := refused.validate(); err == nil {
+		t.Error("a config holding a malformed projection passed validate()")
+	}
+	accepted := loadConfig(context.Background(), "solution-under-test", nil)
+	accepted.consumes = empty
+	if err := accepted.validate(); err != nil {
+		t.Errorf("a config holding an empty projection was refused: %v", err)
 	}
 }

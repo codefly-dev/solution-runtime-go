@@ -1953,7 +1953,7 @@ func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		}})
-	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, apiConsumes: consumesThings}
+	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
 	server.principal = testPrincipal
 	contract, err := server.resolveContract()
 	if err != nil {
