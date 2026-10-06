@@ -114,7 +114,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 | Host issuer (MCP) | `codefly.For(ctx).WorkspaceConfiguration("mcp", "issuer-url")` — the declared value the composition supplies; without one, the resolved host frontend origin (see [Exposing an MCP server](#exposing-an-mcp-server)). Checked at boot only when `ServeMCP` is declared | — (declared configuration, no env override) |
-| Public MCP URL | **declared** (`mcp/public-url`) in a deployed runtime context, where a derived value is refused: the derivation encodes the route the *host* serves this solution on. Locally, derived from `<PUBLIC_URL>/api/solutions/<id>/proxy/mcp` — the host's **public** proxy route. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")`, published exactly as declared (must end in `/mcp`, no trailing slash; refused in a deployment when it names a loopback address). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
+| Public MCP URL | **declared** (`mcp/public-url`) in a deployed runtime context, where a derived value is refused: the derivation encodes the route the *host* serves this solution on. Locally, derived from `<PUBLIC_URL>/api/solutions/<id>/proxy/mcp` — the host's **public** proxy route. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")`, published exactly as declared (must end in `/mcp`, no trailing slash; refused in a deployment when its host reads as a loopback or unspecified address, or is unreadable as either a name or an address). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
 
 Every `workload-identity` value is a **path, never material**, the three
 admission sets included — and that is what makes them live. They are admission
@@ -1303,15 +1303,22 @@ whitespace is dropped; nothing inside the string is normalized, because RFC 9728
 point for code point, so `…/mcp/` and `…/mcp` are two different identifiers and
 a trailing slash is refused at boot naming the declaration rather than quietly
 turned into the other one. In a deployed runtime context it is also refused when
-it names a loopback or unspecified address, in any spelling the resolver
-accepts: `localhost` and names under it, dotted-quad `127.0.0.0/8` and
-`0.0.0.0`, IPv6 `[::1]` and `[::]` with or without a zone, and the inet_aton
-forms `getaddrinfo` also takes — fewer than four parts (`127.1`), a bare integer
-(`2130706433`), octal (`0177.0.0.1`) and hexadecimal (`0x7f000001`). One address
-classifies the same however it is written, because a client dialling any of them
-reaches its own machine; `https` does not make such an address reachable, and
-numeric notation is not itself the refusal — the same spellings naming a
-reachable address are accepted. With neither — no `PUBLIC_URL`, no declared override — the
+its host is one a URL consumer reads as a **loopback or unspecified address**,
+or is `localhost` or a name under it. The host is mapped with UTS-46 and then
+read by WHATWG's host rules — the same path a client takes before dialling —
+and the **result** is classified, so the refusal does not depend on notation:
+dotted-quad `127.0.0.0/8` and `0.0.0.0`, IPv6 `[::1]` and `[::]` with or without
+a zone, the inet_aton forms (fewer than four parts, a bare integer, octal,
+hexadecimal, a bare `0x` component) and their Unicode spellings all classify
+alike. A host that ends in a number and is *not* a valid address — `127.0.0.999`
+— is refused too, because WHATWG makes that an invalid URL rather than a name.
+
+Two limits are worth stating exactly, because "every spelling" would be a
+stronger claim than the code makes. `https` does not launder such an address.
+And a **name** that merely resolves to loopback — a DNS record pointing at
+`127.0.0.1` — is not refused: answering that needs a lookup, which this runtime
+does not do at boot. Numeric notation is not itself the refusal either: the same
+spellings naming a reachable address are accepted. With neither — no `PUBLIC_URL`, no declared override — the
 identifier is reconstructed per request from `x-forwarded-proto`,
 `x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
 is doing so: a proxy that forwards no prefix yields an identifier missing the

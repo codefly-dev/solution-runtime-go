@@ -1915,13 +1915,12 @@ func clearSelfEnvironment(t *testing.T) {
 	}
 	// Every self-endpoint carrier, by prefix rather than by name.
 	//
-	// The restored version named one deployment's:
-	// CODEFLY__SELF_ENDPOINT__LASTLOGIN_GO__BACKEND__HTTP__HTTP. A carrier's
-	// name is built from the module and service it belongs to, so naming one
-	// puts a particular deployment in a runtime that is generic by rule — and
-	// it clears exactly that deployment's variable and no other, which is the
-	// weaker half of the problem: an operator running the suite with any other
-	// service's carrier exported still has it answering these assertions.
+	// A carrier's name is built from the module and service it belongs to, so
+	// naming one would put a particular deployment in a runtime that is
+	// generic by rule — and would clear that one variable and no other, which
+	// is the weaker half of the problem: an operator running the suite with
+	// any other service's carrier exported still has it answering these
+	// assertions.
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
 		if strings.HasPrefix(key, resources.SelfEndpointPrefix) {

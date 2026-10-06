@@ -2034,51 +2034,152 @@ func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
 	}
 }
 
-// TestDeployedMCPPublicURLRefusesALoopbackAddress: a declared identifier passes
-// every other check and can still name this machine. The registration that
-// refused a loopback PUBLIC_URL and self upstream is gone, and with it the only
-// address classifier this package had — so nothing refused a loopback
-// identifier provisioned into a cell, and https does not launder one.
+// TestURLHostReadsWhatAURLConsumerReads pins the host reading itself, apart
+// from the refusals that consume it: the three outcomes are a name, an address,
+// and a host that is neither, which is refused rather than admitted as a name.
 //
-// Every spelling, because the invariant is that an address classifies the same
-// however it is written: an IPv6 zone selects the interface an address is
-// reached on and not which address it is, and an IPv4 address is the same
-// address in every form a resolver accepts — dotted quad, fewer than four
-// parts, a bare integer, octal, hexadecimal. net.ParseIP reads only dotted-quad
-// decimal without a zone, so the predicate classifies the rest itself.
-func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
-	for _, declared := range []string{
-		"https://localhost:8443" + MCPPath,
-		"https://app.localhost:8443" + MCPPath,
-		"https://127.0.0.1:8443" + MCPPath,
-		"https://127.9.9.9:8443" + MCPPath,
-		"https://[::1]:8443" + MCPPath,
-		"https://0.0.0.0:8443" + MCPPath,
-		"https://[::1%25eth0]:8443" + MCPPath,
-		"https://[::1%25lo0]:8443" + MCPPath,
-		"https://[0:0:0:0:0:0:0:1%25lo0]:8443" + MCPPath,
-		"https://[::%25lo0]:8443" + MCPPath,
-		// The inet_aton spellings. getaddrinfo accepts all of them and they
-		// reach the loopback listener; net.ParseIP reads none of them, so each
-		// one used to classify as a host name and pass.
-		"https://127.1:8443" + MCPPath,
-		"https://127.0.1:8443" + MCPPath,
-		"https://127.000.000.001:8443" + MCPPath,
-		"https://2130706433:8443" + MCPPath,
-		"https://017700000001:8443" + MCPPath,
-		"https://0177.0.0.1:8443" + MCPPath,
-		"https://0x7f000001:8443" + MCPPath,
-		"https://0X7F000001:8443" + MCPPath,
-		"https://0x7f.0.0.1:8443" + MCPPath,
-		"https://0x7f.1:8443" + MCPPath,
-		// And the unspecified address in the same spellings.
-		"https://0:8443" + MCPPath,
-		"https://0x0:8443" + MCPPath,
+// The address cases are every spelling the conformance review drove to a
+// loopback listener with DNS disabled, plus the Unicode forms a URL consumer
+// maps before dialling. The name cases are what must NOT be mistaken for an
+// address, including a host whose labels merely look numeric.
+func TestURLHostReadsWhatAURLConsumerReads(t *testing.T) {
+	t.Run("addresses", func(t *testing.T) {
+		for _, tc := range []struct{ host, want string }{
+			// inet_aton spellings.
+			{"127.1", "127.0.0.1"},
+			{"127.0.1", "127.0.0.1"},
+			{"127.000.000.001", "127.0.0.1"},
+			{"2130706433", "127.0.0.1"},
+			{"017700000001", "127.0.0.1"},
+			{"0177.0.0.1", "127.0.0.1"},
+			{"0x7f000001", "127.0.0.1"},
+			{"0X7F000001", "127.0.0.1"},
+			{"0x7f.0.0.1", "127.0.0.1"},
+			{"0x7f.1", "127.0.0.1"},
+			// A prefix with no digits after it is zero, not a failure.
+			{"127.0x.1", "127.0.0.1"},
+			{"0x7f.0x.0x.1", "127.0.0.1"},
+			{"0X7F.0X.0X.1", "127.0.0.1"},
+			{"0x7f.0x", "127.0.0.0"},
+			{"0x.0x.0x.0x", "0.0.0.0"},
+			{"0", "0.0.0.0"},
+			{"0x0", "0.0.0.0"},
+			// Unicode a URL consumer maps before dialling: fullwidth digits,
+			// three spellings of a full stop, mathematical digits, a trailing
+			// ideographic stop.
+			{"\uff11\uff12\uff17.\uff10.\uff10.\uff11", "127.0.0.1"},
+			{"127\u30021", "127.0.0.1"},
+			{"127\uff0e1", "127.0.0.1"},
+			{"127\uff611", "127.0.0.1"},
+			{"\uff10\uff38\uff17\uff26\uff10\uff10\uff10\uff10\uff10\uff11", "127.0.0.1"},
+			{"\U0001d7cf\U0001d7d0\U0001d7d5.\U0001d7cf", "127.0.0.1"},
+			{"127.1\u3002", "127.0.0.1"},
+			// Reachable addresses, in the same spellings: notation is not the
+			// refusal.
+			{"93.184.216.34", "93.184.216.34"},
+			{"1572395042", "93.184.216.34"},
+			{"0x5db8d822", "93.184.216.34"},
+			{"0135.0270.0330.042", "93.184.216.34"},
+			// IPv6, bracketless as url.Hostname returns it, zone included.
+			{"::1", "::1"},
+			{"::1%eth0", "::1"},
+			{"::", "::"},
+			{"::ffff:127.0.0.1", "127.0.0.1"},
+		} {
+			name, ip, err := urlHost(tc.host)
+			if err != nil {
+				t.Errorf("urlHost(%q) = error %v, want the address %s", tc.host, err, tc.want)
+				continue
+			}
+			if ip == nil {
+				t.Errorf("urlHost(%q) read the name %q, want the address %s", tc.host, name, tc.want)
+				continue
+			}
+			if ip.String() != tc.want {
+				t.Errorf("urlHost(%q) = %s, want %s", tc.host, ip, tc.want)
+			}
+		}
+	})
+
+	t.Run("names", func(t *testing.T) {
+		for _, tc := range []struct{ host, want string }{
+			{"mcp.example.com", "mcp.example.com"},
+			{"MCP.EXAMPLE.COM", "mcp.example.com"},
+			{"127.0.0.1.example.com", "127.0.0.1.example.com"},
+			{"0x7f.example.com", "0x7f.example.com"},
+			{"localhost", "localhost"},
+			{"localhost\u3002", "localhost."},
+			{"\u24db\u24de\u24d2\u24d0\u24db\u24d7\u24de\u24e2\u24e3", "localhost"},
+			{"xn--e1afmkfd.xn--p1ai", "xn--e1afmkfd.xn--p1ai"},
+			// Hosts a stricter profile would wrongly refuse: STD3 rules are
+			// off, so an underscore is a name, and a label may start with a
+			// digit as long as the LAST one is not a number.
+			{"my_host.example.com", "my_host.example.com"},
+			{"9to5.example.com", "9to5.example.com"},
+			{"1host.example.com", "1host.example.com"},
+		} {
+			name, ip, err := urlHost(tc.host)
+			if err != nil {
+				t.Errorf("urlHost(%q) = error %v, want the name %q", tc.host, err, tc.want)
+				continue
+			}
+			if ip != nil {
+				t.Errorf("urlHost(%q) read the address %s, want the name %q", tc.host, ip, tc.want)
+				continue
+			}
+			if name != tc.want {
+				t.Errorf("urlHost(%q) = %q, want %q", tc.host, name, tc.want)
+			}
+		}
+	})
+
+	// Neither a name nor an address. WHATWG makes a host whose last label is a
+	// number an invalid URL when it does not parse as IPv4, so admitting these
+	// as names is what let an address-shaped host through.
+	t.Run("neither", func(t *testing.T) {
+		for _, host := range []string{
+			"127.0.0.999",  // a part over one byte
+			"127.0.0.0.1",  // five parts
+			"127..1",       // an empty part
+			"4294967296",   // over 32 bits
+			"127.16777216", // a final part over the bytes it spans
+			"0178.0.0.1",   // 8 is not an octal digit
+			"[::1",         // bracketed like IPv6 and not one
+			"::fffg:1",     // malformed IPv6
+		} {
+			if name, ip, err := urlHost(host); err == nil {
+				t.Errorf("urlHost(%q) = (%q, %v, nil), want a refusal: it is neither a name nor an address", host, name, ip)
+			}
+		}
+	})
+}
+
+// TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling is the property, not a
+// list: for every host a URL consumer reads as a loopback or unspecified
+// address, a deployed surface refuses the declaration. The spellings come from
+// the conformance review, which drove each one to a loopback-only listener with
+// DNS disabled and got a 204 back, so these are addresses that really do reach
+// this machine rather than strings that look like it.
+func TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling(t *testing.T) {
+	for _, host := range []string{
+		"localhost", "app.localhost", "LOCALHOST.",
+		"127.0.0.1", "127.9.9.9", "0.0.0.0",
+		"127.1", "127.0.1", "127.000.000.001", "2130706433", "017700000001",
+		"0177.0.0.1", "0x7f000001", "0X7F000001", "0x7f.0.0.1", "0x7f.1",
+		"127.0x.1", "0x7f.0x.0x.1", "0X7F.0X.0X.1", "0x7f.0x", "0x.0x.0x.0x",
+		"0", "0x0",
+		"１２７.０.０.１", "127。1", "127．1", "127｡1",
+		"０Ｘ７Ｆ０００００１",
+		"𝟏𝟐𝟕.𝟏", "127.1。",
+		"localhost。", "ⓛⓞⓒⓐⓛⓗⓞⓢⓣ",
+		"[::1]", "[::]", "[::1%25eth0]", "[::1%25lo0]",
+		"[0:0:0:0:0:0:0:1%25lo0]", "[::%25lo0]", "[::ffff:127.0.0.1]",
 	} {
-		t.Run(declared, func(t *testing.T) {
+		declared := "https://" + host + ":8443" + MCPPath
+		t.Run(host, func(t *testing.T) {
 			cfg := deployedMCPConfig(t, declared)
 			if cfg.mcpPublicURL != declared {
-				t.Fatalf("mcpPublicURL = %q, want the declared %q", cfg.mcpPublicURL, declared)
+				t.Fatalf("mcpPublicURL = %q, want the declared %q preserved byte for byte", cfg.mcpPublicURL, declared)
 			}
 			err := cfg.validateMCP()
 			if err == nil {
@@ -2092,29 +2193,36 @@ func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
 			}
 		})
 	}
-	// A reachable declaration is accepted in the same context, and a zone on an
-	// address that is neither loopback nor unspecified is not itself the
-	// refusal: dropping the zone must classify the address, not condemn the
-	// spelling.
-	for _, declared := range []string{
-		"https://mcp.example.com/elsewhere" + MCPPath,
-		"https://[fe80::1%25lo0]:8443" + MCPPath,
-		// Numeric notation is not the refusal: these are the same spellings
-		// naming addresses that are neither loopback nor unspecified.
-		"https://93.184.216.34:8443" + MCPPath,
-		"https://1572395042:8443" + MCPPath,
-		"https://0x5db8d822:8443" + MCPPath,
-		"https://0135.0270.0330.042:8443" + MCPPath,
+
+	// Reachable declarations in the same context and the same notations: the
+	// refusal is the address, not the spelling.
+	for _, host := range []string{
+		"mcp.example.com", "[fe80::1%25lo0]",
+		"93.184.216.34", "1572395042", "0x5db8d822", "0135.0270.0330.042",
 	} {
-		t.Run("reachable "+declared, func(t *testing.T) {
-			if err := deployedMCPConfig(t, declared).validateMCP(); err != nil {
+		t.Run("reachable "+host, func(t *testing.T) {
+			if err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP(); err != nil {
 				t.Fatalf("a reachable declared identifier was refused in a deployment: %v", err)
 			}
 		})
 	}
-	// Locally it stands: a developer's machine is where a loopback identifier
-	// is the right one, and refusing it there would refuse the local run this
-	// runtime also serves.
+
+	// A host that is neither a name nor an address is refused too, naming the
+	// declaration — not admitted because it failed to look like an address.
+	for _, host := range []string{"127.0.0.999", "127..1", "127.16777216"} {
+		t.Run("unreadable "+host, func(t *testing.T) {
+			err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP()
+			if err == nil {
+				t.Fatal("a declared identifier whose host is neither a name nor an address was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+				t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPPublicURLKey))
+			}
+		})
+	}
+
+	// Locally a loopback identifier is the right one, and refusing it there
+	// would refuse the local run this runtime also serves.
 	t.Run("local", func(t *testing.T) {
 		clearSelfEnvironment(t)
 		t.Setenv("PORT", "8080")
@@ -2128,49 +2236,80 @@ func TestDeployedMCPPublicURLRefusesALoopbackAddress(t *testing.T) {
 	})
 }
 
-// TestNumericIPv4ReadsEverySpellingAResolverAccepts pins the address
-// classification itself, apart from the refusal that consumes it: the inet_aton
-// forms getaddrinfo accepts and net.ParseIP does not, and the names that must
-// not be mistaken for them.
-func TestNumericIPv4ReadsEverySpellingAResolverAccepts(t *testing.T) {
-	for _, tc := range []struct{ host, want string }{
-		{"127.1", "127.0.0.1"},
-		{"127.0.1", "127.0.0.1"},
-		{"127.000.000.001", "127.0.0.1"},
-		{"2130706433", "127.0.0.1"},
-		{"017700000001", "127.0.0.1"},
-		{"0177.0.0.1", "127.0.0.1"},
-		{"0x7f000001", "127.0.0.1"},
-		{"0x7f.0.0.1", "127.0.0.1"},
-		{"0x7f.1", "127.0.0.1"},
-		{"0", "0.0.0.0"},
-		{"0x0", "0.0.0.0"},
-		{"1572395042", "93.184.216.34"},
-		{"0135.0270.0330.042", "93.184.216.34"},
-		// Not numeric addresses at all.
-		{"mcp.example.com", ""},
-		{"127.0.0.1.example.com", ""},
-		{"0x", ""},
-		{"", ""},
-		{"0178.0.0.1", ""},  // 8 is not an octal digit
-		{"256.0.0.1", ""},   // a leading part over one byte
-		{"127.0.0.0.1", ""}, // five parts
-		// Five parts whose last one fits the byte it would span: only the
-		// part-count guard rejects this, and without it the trailing zero is
-		// dropped and the address reads as the loopback net.
-		{"127.0.0.0.0", ""},
-		{"4294967296", ""},   // over 32 bits
-		{"127.16777216", ""}, // the final part over the bytes it spans
-	} {
-		got := numericIPv4(tc.host)
-		if tc.want == "" {
-			if got != nil {
-				t.Errorf("numericIPv4(%q) = %v, want nil", tc.host, got)
-			}
-			continue
-		}
-		if got == nil || got.String() != tc.want {
-			t.Errorf("numericIPv4(%q) = %v, want %s", tc.host, got, tc.want)
-		}
+// TestDeployedMCPIssuerRefusesAnUnreachableAddress: the issuer is published as
+// this resource's authorization server, so it gets the address refusal the
+// resource identifier gets. A client handed a loopback issuer is sent to
+// authenticate against its own machine, on a document that is well-formed and
+// served with a 200 — the silent damage validateMCP exists for, one field over
+// from where it was first caught.
+//
+// The spellings are the identifier's, because the classification is shared: a
+// notation that hides an address in one value hides it in the other.
+func TestDeployedMCPIssuerRefusesAnUnreachableAddress(t *testing.T) {
+	deployed := func(t *testing.T, issuer string) config {
+		t.Helper()
+		clearSelfEnvironment(t)
+		t.Setenv("PORT", "8080")
+		t.Setenv("CODEFLY__RUNTIME_CONTEXT", "kubernetes")
+		declareMCPConfiguration(t, MCPIssuerURLKey, issuer)
+		declareMCPConfiguration(t, MCPPublicURLKey, "https://mcp.example.com/elsewhere"+MCPPath)
+		cfg := loadConfig(context.Background(), "example", nil)
+		cfg.mcp = true
+		return cfg
 	}
+
+	for _, host := range []string{
+		"localhost", "127.0.0.1", "0.0.0.0", "127.1", "0x7f000001", "127.0x.1",
+		"１２７.０.０.１", "127。1", "[::1]", "[::1%25eth0]",
+	} {
+		issuer := "https://" + host + ":3000"
+		t.Run(host, func(t *testing.T) {
+			cfg := deployed(t, issuer)
+			if cfg.mcpIssuerURL != issuer {
+				t.Fatalf("mcpIssuerURL = %q, want the declared %q", cfg.mcpIssuerURL, issuer)
+			}
+			err := cfg.validateMCP()
+			if err == nil {
+				t.Fatal("a deployed MCP surface publishing a loopback authorization server was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+				t.Errorf("refusal %q does not name %s, the declaration that supplied the address", err, mcpConfigurationValue(MCPIssuerURLKey))
+			}
+			if !strings.Contains(err.Error(), "loopback") {
+				t.Errorf("refusal %q does not say the address is a loopback one", err)
+			}
+		})
+	}
+
+	// Neither a name nor an address: refused naming the issuer declaration,
+	// rather than published as an authorization server nobody can read.
+	t.Run("unreadable", func(t *testing.T) {
+		err := deployed(t, "https://127.0.0.999:3000").validateMCP()
+		if err == nil {
+			t.Fatal("a declared issuer whose host is neither a name nor an address was accepted")
+		}
+		if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+			t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPIssuerURLKey))
+		}
+	})
+
+	t.Run("reachable", func(t *testing.T) {
+		if err := deployed(t, "https://login.example.com").validateMCP(); err != nil {
+			t.Fatalf("a reachable declared issuer was refused in a deployment: %v", err)
+		}
+	})
+
+	// Locally the issuer IS loopback — that is where a developer's host runs —
+	// so the refusal must not reach a local run.
+	t.Run("local", func(t *testing.T) {
+		clearSelfEnvironment(t)
+		t.Setenv("PORT", "8080")
+		declareMCPConfiguration(t, MCPIssuerURLKey, "http://localhost:3000")
+		declareMCPConfiguration(t, MCPPublicURLKey, "http://localhost:8080"+MCPPath)
+		cfg := loadConfig(context.Background(), "example", nil)
+		cfg.mcp = true
+		if err := cfg.validateMCP(); err != nil {
+			t.Fatalf("a local loopback issuer was refused: %v", err)
+		}
+	})
 }
