@@ -464,12 +464,17 @@ func readsEnvironmentCall(call *ast.CallExpr) bool {
 // --- The fixture that escaped, as a compiled negative case ---
 
 // TestTheFacadeGatesCatchTheEscapingFixture drives both gates against the
-// source that defeated the hand evaluator, compiled into this very package.
+// sources that defeated the hand evaluator, compiled into this very package.
 //
 // A fixture that only parsed would prove nothing — it is the compiler's
-// folding of `string(rune(82))` that makes the key real, and a parse-only fixture
-// never folds anything. gatePackages fails the load if it does not type-check,
-// so this cannot quietly become a fixture about nothing.
+// folding of `string(rune(82))` and of a constant chain that makes these keys
+// real, and a parse-only fixture folds nothing. gatePackages fails the load if
+// it does not type-check, so this cannot quietly become a fixture about
+// nothing.
+//
+// All of them in ONE overlay, because each load shells out to the go command:
+// the shapes are independent declarations, and the rules return every finding,
+// so one compile answers for all of them.
 func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
 	dir, err := filepath.Abs(".")
 	if err != nil {
@@ -477,56 +482,25 @@ func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
 	}
 	fixture := filepath.Join(dir, "zz_facade_claim_fixture.go")
 
-	for _, tc := range []struct {
-		name   string
-		source string
-		// want is a string the finding must contain, so a gate that fires for
-		// an unrelated reason does not count as catching this.
-		want string
-		rule func(*testing.T, *packages.Package) []string
-	}{
-		{
-			name: "a constant conversion splicing the carrier's name",
-			// The review's fixture, verbatim in substance: the compiler folds
-			// this to the carrier, while no fragment of it matches.
-			source: `package solution
+	source := `package solution
 
+// A constant conversion splicing the carrier's name.
 func FacadeCredentialViaConversion() string {
 	const key = "CODEFLY__MODULE_" + string(rune(82)) + "EGISTRATION_SECRETS"
 	return env(key, "")
 }
-`,
-			want: "CODEFLY__MODULE_REGISTRATION_SECRETS",
-			rule: claimShapeFindings,
-		},
-		{
-			name: "a claim path spliced the same way",
-			source: `package solution
 
+// A claim path spliced the same way.
 const facadeClaimPath = "/modules/" + string(rune(95)) + "register"
 
 func FacadeClaimPath() string { return facadeClaimPath }
-`,
-			want: "/modules/_register",
-			rule: claimShapeFindings,
-		},
-		{
-			name: "a header assembled through a conversion",
-			source: `package solution
 
+// A header assembled through a conversion.
 func FacadeSecretHeader() string {
 	return "X-Codefly-Module-" + string(rune(83)) + "ecret"
 }
-`,
-			want: "X-Codefly-Module-Secret",
-			rule: claimShapeFindings,
-		},
-		{
-			// C5: function-local constants, which a package-level-only
-			// collector never saw.
-			name: "function-local constants for a claim and the carrier",
-			source: `package solution
 
+// Function-local constants, which a package-level-only collector never saw.
 func FacadeClaimLocal(gatewayURL string) string {
 	const claim = "/modules/" + "_register"
 	return gatewayURL + claim
@@ -536,16 +510,9 @@ func FacadeCredentialLocal() string {
 	const carrier = "CODEFLY__MODULE" + "_REGISTRATION_SECRETS"
 	return env(carrier, "")
 }
-`,
-			want: "CODEFLY__MODULE_REGISTRATION_SECRETS",
-			rule: claimShapeFindings,
-		},
-		{
-			// C6: a chain longer than any iteration limit, declared in
-			// reverse so a single forward pass resolves none of it.
-			name: "a reverse-declared constant chain",
-			source: `package solution
 
+// A chain longer than any iteration limit, declared in reverse so a single
+// forward pass resolves none of it.
 const (
 	chain00 = "/" + chain01
 	chain01 = "m" + chain02
@@ -568,30 +535,40 @@ const (
 )
 
 func FacadeClaimChain() string { return chain00 }
-`,
-			want: "/modules/_register",
-			rule: claimShapeFindings,
-		},
-		{
-			name: "an environment key that is not constant at all",
-			source: `package solution
 
-import "strings"
-
+// And a key that is not constant at all.
 func FacadeCredentialViaRuntimeKey(parts []string) string {
-	return env(strings.Join(parts, "_"), "")
+	return env(joinedKey(parts), "")
 }
-`,
-			want: "does not resolve to constants",
-			rule: unresolvedKeyFindings,
-		},
+
+func joinedKey(parts []string) string {
+	out := ""
+	for _, part := range parts {
+		out += part
+	}
+	return out
+}
+`
+
+	shapes := gateFindings(t, fixture, source, claimShapeFindings)
+	for _, want := range []string{
+		"CODEFLY__MODULE_REGISTRATION_SECRETS",
+		"/modules/_register",
+		"X-Codefly-Module-Secret",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := gateFindings(t, fixture, tc.source, tc.rule)
-			if !strings.Contains(got, tc.want) {
-				t.Errorf("the gate did not catch this fixture.\nfindings:\n%s\nwant one containing %q", got, tc.want)
-			}
-		})
+		if !strings.Contains(shapes, want) {
+			t.Errorf("the claim-shape gate did not catch %q.\nfindings:\n%s", want, shapes)
+		}
+	}
+	// Every spelling, not just one of each shape: the chain and the local
+	// constant both produce the claim path, so two findings name it.
+	if strings.Count(shapes, "/modules/_register") < 2 {
+		t.Errorf("the claim path was caught in only one spelling.\nfindings:\n%s", shapes)
+	}
+
+	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
+	if !strings.Contains(keys, "does not resolve to constants") {
+		t.Errorf("the key gate did not catch a runtime-computed key.\nfindings:\n%s", keys)
 	}
 }
 

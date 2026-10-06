@@ -6,6 +6,7 @@ import (
 	"go/types"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -46,9 +47,40 @@ import (
 // `workcontext.WorkContextV1` — a type the SDK does not export — and supplied
 // three rounds of false evidence that the whole-capability rule worked.
 
-// gatePackages loads this module's packages with full type information.
+// loadedGates caches the unchanged-source load. packages.Load shells out to
+// the go command, which costs seconds, and the gates that read the package as
+// it is all want the same answer — the sources cannot change inside one run.
+// Loading per gate put the suite over CI's five-minute budget.
+var (
+	loadedGatesOnce sync.Once
+	loadedGates     []*packages.Package
+	loadedGatesErr  error
+)
+
+// gatePackages loads this module's packages with full type information. A nil
+// overlay is the package as it is, and is loaded once; an overlay is a
+// different package and is loaded on its own.
 func gatePackages(t *testing.T, overlay map[string][]byte) []*packages.Package {
 	t.Helper()
+	if overlay == nil {
+		loadedGatesOnce.Do(func() {
+			loadedGates, loadedGatesErr = loadGatePackages(nil)
+		})
+		if loadedGatesErr != nil {
+			t.Fatalf("load this module for type-resolved gating: %v", loadedGatesErr)
+		}
+		return loadedGates
+	}
+	loaded, err := loadGatePackages(overlay)
+	if err != nil {
+		t.Fatalf("load this module for type-resolved gating: %v", err)
+	}
+	return loaded
+}
+
+// loadGatePackages is the load itself, returning its complaint rather than
+// failing a test, so the cache above can hold the outcome.
+func loadGatePackages(overlay map[string][]byte) ([]*packages.Package, error) {
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedImports,
@@ -56,22 +88,22 @@ func gatePackages(t *testing.T, overlay map[string][]byte) []*packages.Package {
 	}
 	loaded, err := packages.Load(cfg, ".", "./passthroughtest")
 	if err != nil {
-		t.Fatalf("load this module for type-resolved gating: %v", err)
+		return nil, err
 	}
 	if len(loaded) < 2 {
-		t.Fatalf("loaded %d packages, want at least the root and passthroughtest: a gate that reads nothing passes", len(loaded))
+		return nil, fmt.Errorf("loaded %d packages, want at least the root and passthroughtest: a gate that reads nothing passes", len(loaded))
 	}
 	for _, pkg := range loaded {
 		// A fixture that does not COMPILE cannot supply evidence. This is the
 		// check the parse-only probes did not have.
 		for _, err := range pkg.Errors {
-			t.Fatalf("%s does not type-check, so nothing below means anything: %v", pkg.PkgPath, err)
+			return nil, fmt.Errorf("%s does not type-check, so nothing below means anything: %v", pkg.PkgPath, err)
 		}
 		if pkg.TypesInfo == nil {
-			t.Fatalf("%s loaded without type information", pkg.PkgPath)
+			return nil, fmt.Errorf("%s loaded without type information", pkg.PkgPath)
 		}
 	}
-	return loaded
+	return loaded, nil
 }
 
 // resolved reports whether a type is a real one. go/types gives the INVALID

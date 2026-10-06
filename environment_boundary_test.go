@@ -345,7 +345,8 @@ func pkgOf(fn *types.Func) string {
 // rooted at two functions reported nothing about: one because the callee is
 // parenthesised, one because the function is never called anywhere — it is
 // mounted on the mux and invoked per request — and one because it is reached
-// only through a func-typed field.
+// only through a func-typed field. One overlay for all three, because each
+// load shells out to the go command.
 func TestThePostBootGateCatchesTheServedAndParenthesisedReaders(t *testing.T) {
 	dir, err := filepath.Abs(".")
 	if err != nil {
@@ -353,38 +354,25 @@ func TestThePostBootGateCatchesTheServedAndParenthesisedReaders(t *testing.T) {
 	}
 	fixture := filepath.Join(dir, "zz_post_boot_fixture.go")
 
-	for _, tc := range []struct {
-		name   string
-		source string
-	}{
-		{
-			name: "a parenthesised callee on an exported path",
-			source: `package solution
-
-func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
-`,
-		},
-		{
-			name: "a reader reached only as a mounted handler value",
-			source: `package solution
+	source := `package solution
 
 import "net/http"
 
+// A parenthesised callee on an exported path.
+func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
+
+// A reader reached only as a handler value mounted on a mux.
 func (s *Server) MountFixture(mux *http.ServeMux) {
 	mux.HandleFunc("/fixture", fixtureHandler)
 }
 
 func fixtureHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("x-fixture", fixtureRead())
+	w.Header().Set("x-fixture", fixtureMountedRead())
 }
 
-func fixtureRead() string { return env("ANYTHING", "") }
-`,
-		},
-		{
-			name: "a reader reached only through a func-typed field",
-			source: `package solution
+func fixtureMountedRead() string { return env("ANYTHING", "") }
 
+// A reader reached only through a func-typed field.
 type fixtureHooks struct{ read func(string, string) string }
 
 func ServedThroughAField() string {
@@ -393,27 +381,36 @@ func ServedThroughAField() string {
 }
 
 func fixtureFieldRead(k, d string) string { return env(k, d) }
-`,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var reported []string
-			for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(tc.source)}) {
-				if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
-					continue
-				}
-				graph := newCallGraph(pkg)
-				reached, _ := graph.servingSurface()
-				for name := range reached {
-					if graph.readsEnvironment[name] {
-						reported = append(reported, name)
-					}
-				}
+`
+
+	walked := map[string]bool{}
+	readers := map[string]bool{}
+	for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(source)}) {
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+			continue
+		}
+		graph := newCallGraph(pkg)
+		reached, _ := graph.servingSurface()
+		for name := range reached {
+			walked[name] = true
+			if graph.readsEnvironment[name] {
+				readers[name] = true
 			}
-			if len(reported) == 0 {
-				t.Error("the gate reported no post-boot environment reader for this fixture")
-			}
-		})
+		}
+	}
+	// Each shape has its own function, so a gate that followed one edge kind
+	// and missed the others cannot pass this. These are the functions that
+	// must be WALKED; the reader they reach is env, which is what the gate
+	// then reports.
+	for _, want := range []string{"ServedParenthesisedRead", "fixtureMountedRead", "fixtureFieldRead"} {
+		if !walked[want] {
+			t.Errorf("the post-boot gate did not reach %s, so that shape is still unwalked", want)
+		}
+	}
+	// And the walk has to end in a reported read, or reaching the function
+	// proves nothing about what the gate would say.
+	if !readers["env"] {
+		t.Errorf("the gate reached the fixtures but reported no environment reader: readers=%v", readers)
 	}
 }
 
