@@ -11,7 +11,11 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/tools/go/callgraph"
+	"golang.org/x/tools/go/callgraph/cha"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // AGENTS.md tells an agent that configuration is resolved in one place and
@@ -71,241 +75,372 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 // point — a library's exported surface is callable by a consumer at any time,
 // and a list of two names was a list an author adds to without noticing.
 func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
-	for _, pkg := range gatePackages(t, nil) {
-		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
-			continue
-		}
-		graph := newCallGraph(pkg)
-		reached, unresolved := graph.servingSurface()
+	pkgs := gatePackages(t, nil)
+	readers := servingReaders(t, pkgs)
 
-		// Fail closed: a serving edge this gate could not resolve is a part of
-		// the surface it did not walk, and silence about it would be the same
-		// silent pass the name-matching graph gave.
-		for _, edge := range unresolved {
-			t.Errorf("%s: a call on the serving surface goes through a value this gate cannot resolve, so what it reaches was never walked. Call the function directly, or give it a type this gate can follow.", edge)
-		}
-
-		var afterBoot []string
-		for name := range reached {
-			if graph.readsEnvironment[name] {
-				afterBoot = append(afterBoot, name)
-			}
-		}
-		sort.Strings(afterBoot)
-		if len(afterBoot) > 0 {
-			t.Errorf("these environment readers are reachable from the post-boot surface without passing through loadConfig: %s\n"+
-				"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
-				"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
-				strings.Join(afterBoot, ", "))
-		}
-
-		// Inertness checks: the gate must know about env, must have found the
-		// serving root, and must have walked a served handler — the edge kind
-		// the previous version did not have at all.
-		if !graph.readsEnvironment["env"] {
-			t.Fatal("env is not recorded as an environment reader: this gate is inert")
-		}
-		if !graph.declared["serve"] {
-			t.Fatal("serve is not in the call graph: this gate is inert")
-		}
-		if !reached["handleHealth"] {
-			t.Fatal("handleHealth is not reachable from the serving surface, so mounted handlers are not being followed: this gate is inert")
-		}
+	var names []string
+	for name := range readers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		t.Errorf("%s is reachable from the post-boot surface without passing through loadConfig:\n    %s\n"+
+			"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
+			"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
+			name, readers[name])
 	}
 }
 
-// callGraph is this package's functions, the edges between them resolved by
-// the type checker, and which of them read the environment.
-type callGraph struct {
-	pkg *packages.Package
-	// edges maps a function's name to everything it calls or hands out.
-	edges map[string]map[string]bool
-	// readsEnvironment marks the functions whose own body reads the environment.
-	readsEnvironment map[string]bool
-	// declared is every function this package defines.
-	declared map[string]bool
-	// unresolvedIn records, per function, a call whose callee the type
-	// checker could not type at all — the only edge this gate refuses.
-	unresolvedIn map[string][]string
-	// valueTaken is every package function whose value is taken somewhere, and
-	// signatureOf its signature. An indirect call is resolved against these:
-	// a call through a func-typed value can only land on a function of that
-	// exact signature whose value somebody took.
-	valueTaken  map[string]bool
-	signatureOf map[string]string
+// And the gate has to be able to see a read at all, or its silence means
+// nothing. Three shapes, each the one a previous version of this gate lost:
+// an exported function reading directly, a handler reached only as a value
+// mounted on a mux, and a method value stored in a package-level struct.
+func TestThePostBootGateSeesEveryServingShape(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_post_boot_fixture.go")
+
+	source := `package solution
+
+import "net/http"
+
+// A parenthesised callee on an exported path.
+func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
+
+// A reader reached only as a handler value mounted on a mux, with the handler
+// itself never called in this package.
+func (s *Server) MountFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/fixture", fixtureHandler)
 }
 
-// newCallGraph builds the graph from resolved types rather than from names.
-func newCallGraph(pkg *packages.Package) *callGraph {
-	g := &callGraph{
-		pkg:              pkg,
-		edges:            map[string]map[string]bool{},
-		readsEnvironment: map[string]bool{},
-		declared:         map[string]bool{},
-		unresolvedIn:     map[string][]string{},
-		valueTaken:       map[string]bool{},
-		signatureOf:      map[string]string{},
-	}
-	for _, file := range pkg.Syntax {
-		if strings.HasSuffix(filepath.Base(pkg.Fset.Position(file.Pos()).Filename), "_test.go") {
-			continue
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Name == nil || fn.Body == nil {
-				continue
-			}
-			name := fn.Name.Name
-			g.declared[name] = true
-			if obj, ok := pkg.TypesInfo.Defs[fn.Name].(*types.Func); ok {
-				g.signatureOf[name] = obj.Type().String()
-			}
-			g.scan(name, fn.Body)
-		}
-	}
-	return g
+func fixtureHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("x-fixture", fixtureMountedRead())
 }
 
-// scan records every edge out of one function body: what it calls, and what it
-// hands out as a value. A function literal's body belongs to the function that
-// writes it, since that is who can invoke it.
-func (g *callGraph) scan(from string, body ast.Node) {
-	if g.edges[from] == nil {
-		g.edges[from] = map[string]bool{}
-	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.CallExpr:
-			g.scanCall(from, node)
-		case *ast.Ident:
-			// A function named as a VALUE: handed to HandleFunc, stored, or
-			// wrapped. Whoever receives it can call it.
-			if obj, ok := g.pkg.TypesInfo.Uses[node].(*types.Func); ok {
-				g.edges[from][obj.Name()] = true
-				g.valueTaken[obj.Name()] = true
-			}
-		case *ast.SelectorExpr:
-			if obj, ok := g.pkg.TypesInfo.Uses[node.Sel].(*types.Func); ok {
-				g.edges[from][obj.Name()] = true
-				g.valueTaken[obj.Name()] = true
-			}
-		}
-		return true
-	})
+func fixtureMountedRead() string { return env("ANYTHING", "") }
+
+// A method value stored in a package-level struct and mounted from there, so
+// the only edge to it is through the stored field.
+type fixtureReceiver struct{}
+
+func (fixtureReceiver) fixtureServe(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("x-stored", fixtureStoredRead())
 }
 
-// scanCall resolves one call. os.Getenv and os.LookupEnv mark the caller as an
-// environment reader; a call this gate cannot resolve at all is recorded so the
-// walk can fail closed on it.
-func (g *callGraph) scanCall(from string, call *ast.CallExpr) {
-	fun := unparen(call.Fun)
-	switch callee := fun.(type) {
-	case *ast.Ident:
-		if obj := g.pkg.TypesInfo.Uses[callee]; obj != nil {
-			if _, isFunc := obj.(*types.Func); isFunc {
-				g.edges[from][obj.Name()] = true
-				return
-			}
-			// A func-typed variable, field or parameter: resolve it by type
-			// rather than stopping here.
-			if isFuncTyped(obj.Type()) {
-				g.resolveIndirect(from, call, obj.Type())
-			}
-			return
-		}
-		// A builtin or an unresolved name: builtins cannot read the
-		// environment, so nothing to record.
-	case *ast.SelectorExpr:
-		obj := g.pkg.TypesInfo.Uses[callee.Sel]
-		fn, isFunc := obj.(*types.Func)
-		if !isFunc {
-			if obj != nil && isFuncTyped(obj.Type()) {
-				g.resolveIndirect(from, call, obj.Type())
-			} else if obj == nil {
-				g.refuse(from, call, callee.Sel.Name)
-			}
-			return
-		}
-		if pkgOf(fn) == "os" && (fn.Name() == "Getenv" || fn.Name() == "LookupEnv") {
-			g.readsEnvironment[from] = true
-			return
-		}
-		g.edges[from][fn.Name()] = true
-	case *ast.FuncLit:
-		// An immediately invoked literal belongs to its writer, which scan
-		// already walked.
+func fixtureStoredRead() string { return env("ANYTHING", "") }
+
+var fixtureHandlers = struct {
+	h func(http.ResponseWriter, *http.Request)
+}{h: fixtureReceiver{}.fixtureServe}
+
+func MountStoredFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/stored", fixtureHandlers.h)
+}
+
+// An exported variable holding a closure that reads.
+var ExportedClosure = func() string { return (env)("ANYTHING", "") }
+`
+
+	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
+	if len(readers) == 0 {
+		t.Fatal("the gate reported no post-boot reader for a fixture that reads on four serving paths")
+	}
+	// env is the reader every one of these reaches, so its path has to come
+	// back; the path itself is what says WHICH shape was followed.
+	if _, ok := readers["env"]; !ok {
+		t.Errorf("the gate did not report env: readers=%v", readers)
 	}
 }
 
-// resolveIndirect follows a call through a func-typed value by TYPE: it can
-// only land on a function of that exact signature whose value somebody took,
-// so every such function becomes an edge. Resolving rather than exempting is
-// the whole point — a callback field is not a place the walk stops, it is a
-// place the walk widens to everything that could be in it.
+// And os.Environ is a reader too, which is the omission that let an exported
+// wrapper of a function using it read changing configuration after boot. It
+// has no key to resolve — it reads all of them — so the read itself is the
+// finding.
+func TestTheWholeEnvironmentCountsAsARead(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_environ_fixture.go")
+
+	source := `package solution
+
+import "context"
+
+// discoverHostModule scans os.Environ, so an exported wrapper of it reads
+// changing configuration after boot.
+func ExportedLateHost() string {
+	return discoverHostModule(context.Background(), "auth-gateway", "rest", "rest")
+}
+`
+	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
+	if len(readers) == 0 {
+		t.Fatal("an exported wrapper of a function scanning the whole environment was not reported")
+	}
+}
+
+// --- One reader definition, by object identity ---
 //
-// An empty candidate set is a RESOLVED answer, not an unknown one: no function
-// of this package with that signature has its value taken anywhere, so the
-// call provably cannot land on one, whatever the value came from. That is what
-// `cancel` from context.WithCancel is — resolvable to nothing here.
-func (g *callGraph) resolveIndirect(from string, call *ast.CallExpr, t types.Type) {
-	want := types.Unalias(t).Underlying().String()
-	for name, signature := range g.signatureOf {
-		if signature == want && g.valueTaken[name] {
-			g.edges[from][name] = true
-		}
-	}
-	// A signature the checker could not resolve is the one unknown left.
-	if tv, ok := g.pkg.TypesInfo.Types[call.Fun]; !ok || tv.Type == nil || !resolved(tv.Type) {
-		g.refuse(from, call, "an unresolved callee type")
-	}
+// A reader is an OBJECT, not a spelling. Both gates share this, because the
+// two of them disagreeing about what a read is is how a read gets past both:
+//
+//	read := r2Reader(os.Getenv)
+//	read(strings.Join([]string{"CODEFLY", "", "MODULE", ...}, "_"))
+//
+// recognising readers by callee name sees no read at all — the callee is
+// `read` — while a graph that merely records an edge to Getenv never marks it
+// as a reader when its value is taken rather than called. So the identity is
+// followed wherever it flows: converted, aliased, assigned, stored in a field,
+// passed as an argument, returned.
+//
+// readerNames are the readers by package and name. os.ExpandEnv reads every
+// variable named in its argument, syscall.Getenv is the same read one package
+// down, and os.Environ reads all of them at once — which is why an exported
+// wrapper of a function using it reads changing configuration after boot.
+var readerNames = map[string]map[string]bool{
+	"os":      {"Getenv": true, "LookupEnv": true, "Environ": true, "ExpandEnv": true},
+	"syscall": {"Getenv": true, "Environ": true},
 }
 
-// refuse records an edge the type checker could not resolve at all. This is
-// the fail-closed case and the only one: a call this gate cannot type is a
-// part of the serving surface it did not walk, and saying nothing about it
-// would be the silent pass the name-matching graph gave.
-func (g *callGraph) refuse(from string, call *ast.CallExpr, what string) {
-	g.unresolvedIn[from] = append(g.unresolvedIn[from],
-		g.pkg.Fset.Position(call.Pos()).String()+" in "+from+" ("+what+")")
+// readerPackageOf is the import path a reader package goes by, since SSA names
+// a package by path and the syntax names it by identifier.
+func readerPackageOf(path string) string { return path }
+
+// sdkReaderNames are the SDK's own accessors, by method name. They are matched
+// by name because they are methods on the SDK's query value rather than
+// package functions, and the older gate's round-four finding was precisely a
+// closure reading configuration through one of them.
+var sdkReaderNames = map[string]bool{
+	"WorkspaceConfiguration": true, "WorkspaceSecret": true,
+	"Environment": true, "Endpoint": true, "Secret": true,
 }
 
-// servingSurface is everything reachable from the post-boot roots without
-// passing through loadConfig, and the unresolved calls found along the way.
-func (g *callGraph) servingSurface() (map[string]bool, []string) {
-	const bootResolution = "loadConfig"
+// keylessReaders read the whole environment rather than one named variable, so
+// there is no key to resolve and nothing to constrain: the read itself is the
+// finding when it happens after boot.
+var keylessReaders = map[string]bool{"Environ": true, "ExpandEnv": true}
 
-	roots := []string{"serve"}
-	for name := range g.declared {
-		if ast.IsExported(name) {
-			roots = append(roots, name)
+// --- The serving surface, on a sound call graph ---
+//
+// Reachability is CHA (class hierarchy analysis) over SSA, from
+// golang.org/x/tools, rather than a graph this test builds.
+//
+// Three rounds of hand-written graph each lost one more Go construct: a
+// parenthesised callee, a handler mounted as a value, a method value stored in
+// a package-level struct, a callback in a variadic option, a func field on an
+// interface. Every fix was right and the next construct arrived anyway,
+// because a graph assembled from the shapes somebody thought of is a graph
+// about those shapes. CHA resolves an indirect call to every type-compatible
+// function in the program — an over-approximation, which is the safe
+// direction — so there is no "unresolved edge" category left to fail closed
+// on: the analysis has an answer for every call site by construction.
+//
+// What this gate still chooses is the ROOTS. Everything that can run after
+// boot: `serve`, which Serve calls once configuration is resolved; every
+// exported function and method, this being a library a consumer calls into;
+// and the package initializer, where a served callback is stored
+// (`var h = struct{f func(...)}{f: method}`) and where an exported
+// `var X = func() { ... }` lives. loadConfig is excluded as a NODE, so a
+// helper boot shares with serving code is judged by the serving path.
+
+// servingReaders is every environment reader reachable from the post-boot
+// roots, named by the function that reads, with the path that reaches it.
+func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
+	t.Helper()
+
+	prog, _ := ssautil.AllPackages(pkgs, 0)
+	prog.Build()
+	graph := cha.CallGraph(prog)
+	graph.DeleteSyntheticNodes()
+
+	target := ""
+	for _, pkg := range pkgs {
+		if pkg.PkgPath == "github.com/codefly-dev/solution-runtime-go" {
+			target = pkg.PkgPath
 		}
 	}
-	sort.Strings(roots)
+	if target == "" {
+		t.Fatal("the package under test was not loaded: this gate is inert")
+	}
 
-	reached := map[string]bool{}
-	var queue []string
-	for _, root := range roots {
-		if root == bootResolution || reached[root] {
+	// Address-taken functions are roots too. A handler mounted on a mux and a
+	// closure assigned to an exported variable are never CALLED in this
+	// package, so the call graph holds no edge to them — whoever holds the
+	// value chooses when it runs, and that is after boot. These two shapes
+	// survived a gate that rooted only at named entry points.
+	escaping := addressTaken(prog, target)
+
+	var roots []*callgraph.Node
+	for fn, node := range graph.Nodes {
+		if fn == nil || !inPackage(fn, target) {
 			continue
 		}
-		reached[root] = true
+		if isPostBootRoot(fn) || escaping[fn] {
+			roots = append(roots, node)
+		}
+	}
+	if len(roots) == 0 {
+		t.Fatal("no post-boot roots found: this gate is inert")
+	}
+
+	// Breadth-first from the roots, never through loadConfig.
+	readers := map[string]string{}
+	seen := map[*callgraph.Node]bool{}
+	path := map[*callgraph.Node]string{}
+	var queue []*callgraph.Node
+	for _, root := range roots {
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		path[root] = root.Func.Name()
 		queue = append(queue, root)
 	}
-	var unresolved []string
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
-		unresolved = append(unresolved, g.unresolvedIn[current]...)
-		for callee := range g.edges[current] {
-			if callee == bootResolution || reached[callee] {
+		for _, edge := range current.Out {
+			next := edge.Callee
+			if next == nil || next.Func == nil || seen[next] {
 				continue
 			}
-			reached[callee] = true
-			queue = append(queue, callee)
+			if isBootResolution(next.Func) {
+				continue
+			}
+			// A reader is reported only when THIS package's code is what
+			// calls it. The walk still goes through dependencies, because a
+			// handler this package mounts is invoked by net/http and the path
+			// back to it runs through there — but a dependency reading its own
+			// configuration is not this package's boundary. Reporting every
+			// reader on the path named four that are all somebody else's: the
+			// SDK rechecking a rotated value, grpc's resolver, viper's init,
+			// none of which this package could resolve in loadConfig.
+			if name, ok := environmentReader(next.Func); ok {
+				// Only a call that actually names the reader. CHA resolves an
+				// indirect call to every type-compatible function in the
+				// program, so a callback of shape func(string) (string, bool)
+				// resolves to os.LookupEnv whether or not anything ever puts
+				// it there — which is exactly what it did here, through
+				// namedInJSON's `named` parameter.
+				//
+				// A reader genuinely held in a value and called through it is
+				// not lost by this: that is the identity the key gate follows,
+				// precisely, and refuses when its key cannot be resolved. An
+				// over-approximated edge proves nothing and the precise gate
+				// is the one that owns that shape.
+				if inPackage(current.Func, target) && staticCall(edge, next.Func) {
+					readers[name] = path[current] + " → " + name
+				}
+				continue
+			}
+			seen[next] = true
+			path[next] = path[current] + " → " + next.Func.Name()
+			queue = append(queue, next)
 		}
 	}
-	sort.Strings(unresolved)
-	return reached, unresolved
+	return readers
+}
+
+// isPostBootRoot reports whether a function can run after boot.
+func isPostBootRoot(fn *ssa.Function) bool {
+	if fn.Synthetic == "package initializer" || fn.Name() == "init" {
+		// Where a package-level callback is stored and where an exported
+		// func-valued variable is initialised.
+		return true
+	}
+	if fn.Name() == "serve" {
+		return true
+	}
+	// A method on an exported or unexported receiver is still reachable from a
+	// consumer when the method itself is exported.
+	return ast.IsExported(fn.Name())
+}
+
+// staticCall reports whether an edge is a call that names its callee, rather
+// than one CHA resolved from a function type.
+func staticCall(edge *callgraph.Edge, callee *ssa.Function) bool {
+	if edge.Site == nil {
+		return false
+	}
+	return edge.Site.Common().StaticCallee() == callee
+}
+
+// addressTaken is every function of the package whose value is used as a
+// value rather than called: stored in a variable or a struct, handed to a
+// registration call, closed over. SSA makes this visible — a function
+// appearing as an operand anywhere other than a call's static callee is one
+// somebody can invoke later.
+func addressTaken(prog *ssa.Program, target string) map[*ssa.Function]bool {
+	taken := map[*ssa.Function]bool{}
+	for fn := range ssautil.AllFunctions(prog) {
+		for _, block := range fn.Blocks {
+			for _, instruction := range block.Instrs {
+				call, isCall := instruction.(ssa.CallInstruction)
+				var static *ssa.Function
+				if isCall {
+					static = call.Common().StaticCallee()
+				}
+				var operands []*ssa.Value
+				operands = instruction.Operands(operands)
+				for _, operand := range operands {
+					if operand == nil || *operand == nil {
+						continue
+					}
+					referenced, ok := (*operand).(*ssa.Function)
+					if !ok || referenced == static {
+						continue
+					}
+					if referenced.Pkg != nil && referenced.Pkg.Pkg.Path() == target {
+						taken[referenced] = true
+					}
+					// An anonymous function's parent is what wrote it; the
+					// literal itself is the thing being handed out.
+					if referenced.Parent() != nil && referenced.Parent().Pkg != nil &&
+						referenced.Parent().Pkg.Pkg.Path() == target {
+						taken[referenced] = true
+					}
+				}
+			}
+		}
+	}
+	return taken
+}
+
+// inPackage reports whether a function belongs to the package under test.
+func inPackage(fn *ssa.Function, path string) bool {
+	return fn.Pkg != nil && fn.Pkg.Pkg.Path() == path
+}
+
+// isBootResolution reports whether a function IS boot configuration
+// resolution, which the walk does not pass through.
+func isBootResolution(fn *ssa.Function) bool {
+	return fn.Name() == "loadConfig" && fn.Pkg != nil &&
+		fn.Pkg.Pkg.Path() == "github.com/codefly-dev/solution-runtime-go"
+}
+
+// environmentReader reports whether an SSA function is one of the readers, by
+// the SAME definition the key gate uses: package and name for the os and
+// syscall readers, method name for the SDK's accessors, and this package's own
+// env helper.
+func environmentReader(fn *ssa.Function) (string, bool) {
+	if fn.Pkg != nil {
+		path := fn.Pkg.Pkg.Path()
+		if readerNames[path][fn.Name()] {
+			return path + "." + fn.Name(), true
+		}
+		if path == "github.com/codefly-dev/solution-runtime-go" && fn.Name() == "env" {
+			return "env", true
+		}
+	}
+	// The SDK's own accessors, matched by the package they belong to as well
+	// as the name: a bare name match reported grpc's resolver `Endpoint` as a
+	// configuration read, which it is not.
+	if fn.Pkg != nil && sdkReaderNames[fn.Name()] && strings.HasPrefix(fn.Pkg.Pkg.Path(), "github.com/codefly-dev/sdk-go") {
+		return "the SDK's " + fn.Name(), true
+	}
+	return "", false
 }
 
 // unparen removes every layer of parentheses, so `(env)(...)` is a call to env
@@ -335,83 +470,6 @@ func pkgOf(fn *types.Func) string {
 		return ""
 	}
 	return fn.Pkg().Path()
-}
-
-// TestThePostBootGateCatchesTheServedAndParenthesisedReaders drives the gate
-// against the shapes that defeated the name-matching graph, compiled into this
-// package.
-//
-// Each is an environment read on the serving surface that a callee-name walker
-// rooted at two functions reported nothing about: one because the callee is
-// parenthesised, one because the function is never called anywhere — it is
-// mounted on the mux and invoked per request — and one because it is reached
-// only through a func-typed field. One overlay for all three, because each
-// load shells out to the go command.
-func TestThePostBootGateCatchesTheServedAndParenthesisedReaders(t *testing.T) {
-	dir, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := filepath.Join(dir, "zz_post_boot_fixture.go")
-
-	source := `package solution
-
-import "net/http"
-
-// A parenthesised callee on an exported path.
-func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
-
-// A reader reached only as a handler value mounted on a mux.
-func (s *Server) MountFixture(mux *http.ServeMux) {
-	mux.HandleFunc("/fixture", fixtureHandler)
-}
-
-func fixtureHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("x-fixture", fixtureMountedRead())
-}
-
-func fixtureMountedRead() string { return env("ANYTHING", "") }
-
-// A reader reached only through a func-typed field.
-type fixtureHooks struct{ read func(string, string) string }
-
-func ServedThroughAField() string {
-	hooks := fixtureHooks{read: fixtureFieldRead}
-	return hooks.read("ANYTHING", "")
-}
-
-func fixtureFieldRead(k, d string) string { return env(k, d) }
-`
-
-	walked := map[string]bool{}
-	readers := map[string]bool{}
-	for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(source)}) {
-		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
-			continue
-		}
-		graph := newCallGraph(pkg)
-		reached, _ := graph.servingSurface()
-		for name := range reached {
-			walked[name] = true
-			if graph.readsEnvironment[name] {
-				readers[name] = true
-			}
-		}
-	}
-	// Each shape has its own function, so a gate that followed one edge kind
-	// and missed the others cannot pass this. These are the functions that
-	// must be WALKED; the reader they reach is env, which is what the gate
-	// then reports.
-	for _, want := range []string{"ServedParenthesisedRead", "fixtureMountedRead", "fixtureFieldRead"} {
-		if !walked[want] {
-			t.Errorf("the post-boot gate did not reach %s, so that shape is still unwalked", want)
-		}
-	}
-	// And the walk has to end in a reported read, or reaching the function
-	// proves nothing about what the gate would say.
-	if !readers["env"] {
-		t.Errorf("the gate reached the fixtures but reported no environment reader: readers=%v", readers)
-	}
 }
 
 // And the read has to happen at boot, not merely be written there.

@@ -130,74 +130,459 @@ func foldShape(s string) string {
 
 // --- An environment read is refused unless its key is a resolved constant ---
 
-// environmentReadFunctions are the ways this package reads the process
-// environment. `env` is the package's own helper, which is what a reader
-// reaches for: the gate below is about the KEY each one is given.
-var environmentReadFunctions = map[string]bool{"Getenv": true, "LookupEnv": true, "env": true}
-
-// TestEveryEnvironmentKeyIsAResolvedConstant refuses an environment read whose
-// key cannot be traced to constants.
+// TestEveryEnvironmentKeyIsAResolvedConstant refuses an environment read
+// whose key cannot be traced to constants.
+//
+// BY READER IDENTITY, shared with the post-boot gate, because recognising a
+// reader by the callee's name is how this escaped:
+//
+//	read := r2Reader(os.Getenv)
+//	read(strings.Join([]string{"CODEFLY", "", "MODULE", ...}, "_"))
+//
+// The callee is `read`, so a name rule sees no read at all, and the key — the
+// forbidden carrier, assembled at run time — is never examined. The reader is
+// an object now, followed wherever its identity flows: converted, aliased,
+// assigned, stored in a field, passed as an argument.
 //
 // An unresolved key is a REFUSAL rather than a skip, which is the difference
-// between a gate and a suggestion. The gate above judges constants; a key
-// computed at run time — joined from a slice, formatted, concatenated with a
-// variable — is a key no static rule can judge at all, and letting it through
-// is how the one shape that matters arrives.
-//
-// Traced, not demanded in place. This package names its keys as exported
-// constants and passes them to `env` through a parameter or a struct field,
-// which is good code and must stay possible: `workloadPath(ctx, override, key)`
-// takes the variable name as an argument, and the admission table ranges over a
-// literal of them. So a key that does not fold is followed to its sources — the
-// arguments at every call site of the enclosing function, the field values of
-// the literal being ranged over — and each source must itself resolve. Anything
-// that bottoms out in something other than a constant is refused.
-//
-// The point of tracing rather than relaxing: every constant reached this way is
-// also inspected by the gate above, so there is no path to a forbidden key that
-// is neither a constant this package declares nor a refusal here.
+// between a gate and a suggestion. Traced, not demanded in place: this package
+// names its keys as exported constants and passes them through a parameter or
+// a struct field, which is good code and stays possible, so a key that does
+// not fold is followed to its sources and anything bottoming out in a computed
+// value is refused.
 func TestEveryEnvironmentKeyIsAResolvedConstant(t *testing.T) {
 	for _, pkg := range gatePackages(t, nil) {
-		if findings := unresolvedKeyFindings(t, pkg); len(findings) > 0 {
-			for _, finding := range findings {
-				t.Errorf("%s\nan environment key that cannot be traced to constants cannot be judged by any static gate, so it is refused here rather than skipped: name the key as a constant, or pass one in",
-					finding)
-			}
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+			continue
+		}
+		for _, finding := range unresolvedKeyFindings(t, pkg) {
+			t.Errorf("%s\nan environment key that cannot be traced to constants cannot be judged by any static gate, so it is refused here rather than skipped: name the key as a constant, or pass one in",
+				finding)
 		}
 	}
 }
 
+// unresolvedKeyFindings is every reader invocation in pkg whose key does not
+// resolve. The reader set comes from the call graph, which seeds it with the
+// reader objects and grows it through every flow that can carry one.
 func unresolvedKeyFindings(t *testing.T, pkg *packages.Package) []string {
 	t.Helper()
+	identity := newReaderIdentity(pkg)
+	if len(identity.readerAliases) == 0 {
+		t.Fatal("no readers identified at all: this gate is inert")
+	}
+	return identity.unresolvedKeys
+}
 
-	tracer := newKeyTracer(pkg)
-	var findings []string
-	for _, file := range pkg.Syntax {
-		name := filepath.Base(pkg.Fset.Position(file.Pos()).Filename)
-		if strings.HasSuffix(name, "_test.go") {
+// --- The fixture that escaped, as a compiled negative case ---
+
+// TestTheFacadeGatesCatchTheEscapingFixture drives both gates against the
+// sources that defeated the hand evaluator, compiled into this very package.
+//
+// A fixture that only parsed would prove nothing — it is the compiler's
+// folding of `string(rune(82))` and of a constant chain that makes these keys
+// real, and a parse-only fixture folds nothing. gatePackages fails the load if
+// it does not type-check, so this cannot quietly become a fixture about
+// nothing.
+//
+// All of them in ONE overlay, because each load shells out to the go command:
+// the shapes are independent declarations, and the rules return every finding,
+// so one compile answers for all of them.
+func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_facade_claim_fixture.go")
+
+	source := `package solution
+
+// A constant conversion splicing the carrier's name.
+func FacadeCredentialViaConversion() string {
+	const key = "CODEFLY__MODULE_" + string(rune(82)) + "EGISTRATION_SECRETS"
+	return env(key, "")
+}
+
+// A claim path spliced the same way.
+const facadeClaimPath = "/modules/" + string(rune(95)) + "register"
+
+func FacadeClaimPath() string { return facadeClaimPath }
+
+// A header assembled through a conversion.
+func FacadeSecretHeader() string {
+	return "X-Codefly-Module-" + string(rune(83)) + "ecret"
+}
+
+// Function-local constants, which a package-level-only collector never saw.
+func FacadeClaimLocal(gatewayURL string) string {
+	const claim = "/modules/" + "_register"
+	return gatewayURL + claim
+}
+
+func FacadeCredentialLocal() string {
+	const carrier = "CODEFLY__MODULE" + "_REGISTRATION_SECRETS"
+	return env(carrier, "")
+}
+
+// A chain longer than any iteration limit, declared in reverse so a single
+// forward pass resolves none of it.
+const (
+	chain00 = "/" + chain01
+	chain01 = "m" + chain02
+	chain02 = "o" + chain03
+	chain03 = "d" + chain04
+	chain04 = "u" + chain05
+	chain05 = "l" + chain06
+	chain06 = "e" + chain07
+	chain07 = "s" + chain08
+	chain08 = "/" + chain09
+	chain09 = "_" + chain10
+	chain10 = "r" + chain11
+	chain11 = "e" + chain12
+	chain12 = "g" + chain13
+	chain13 = "i" + chain14
+	chain14 = "s" + chain15
+	chain15 = "t" + chain16
+	chain16 = "e" + chain17
+	chain17 = "r"
+)
+
+func FacadeClaimChain() string { return chain00 }
+
+// And a key that is not constant at all.
+func FacadeCredentialViaRuntimeKey(parts []string) string {
+	return env(joinedKey(parts), "")
+}
+
+func joinedKey(parts []string) string {
+	out := ""
+	for _, part := range parts {
+		out += part
+	}
+	return out
+}
+`
+
+	shapes := gateFindings(t, fixture, source, claimShapeFindings)
+	for _, want := range []string{
+		"CODEFLY__MODULE_REGISTRATION_SECRETS",
+		"/modules/_register",
+		"X-Codefly-Module-Secret",
+	} {
+		if !strings.Contains(shapes, want) {
+			t.Errorf("the claim-shape gate did not catch %q.\nfindings:\n%s", want, shapes)
+		}
+	}
+	// Every spelling, not just one of each shape: the chain and the local
+	// constant both produce the claim path, so two findings name it.
+	if strings.Count(shapes, "/modules/_register") < 2 {
+		t.Errorf("the claim path was caught in only one spelling.\nfindings:\n%s", shapes)
+	}
+
+	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
+	if !strings.Contains(keys, "does not resolve to constants") {
+		t.Errorf("the key gate did not catch a runtime-computed key.\nfindings:\n%s", keys)
+	}
+}
+
+// TestTheKeyGateCatchesAnAliasedReader drives the key gate against the reader
+// whose identity is hidden behind a local function type.
+//
+// This is the shape that defeated recognising readers by callee name: the
+// callee is `read`, so no rule about names sees a read, and the key — the
+// forbidden carrier assembled at run time — is never examined. No constant
+// expression in the fixture contains the complete key either, so the
+// claim-shape gate cannot be what catches it. Only the reader's identity can.
+func TestTheKeyGateCatchesAnAliasedReader(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_aliased_reader_fixture.go")
+
+	source := `package solution
+
+import (
+	"os"
+	"strings"
+)
+
+type aliasedReader = func(string) string
+
+func AliasedCredential() string {
+	read := aliasedReader(os.Getenv)
+	return read(strings.Join(
+		[]string{"CODEFLY", "", "MODULE", "REGISTRATION", "SECRETS"},
+		"_",
+	))
+}
+
+// And through a struct field, and through a parameter, which are the other
+// two ways the identity travels.
+type readerBox struct{ read func(string) string }
+
+func AliasedThroughAField(parts []string) string {
+	box := readerBox{read: os.Getenv}
+	return box.read(strings.Join(parts, "_"))
+}
+
+func aliasedThroughAParameter(read func(string) string, parts []string) string {
+	return read(strings.Join(parts, "_"))
+}
+
+func AliasedCaller(parts []string) string {
+	return aliasedThroughAParameter(os.Getenv, parts)
+}
+`
+
+	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
+	// One finding per invocation: the alias, the field and the parameter.
+	if got := strings.Count(keys, "does not resolve to constants"); got < 3 {
+		t.Errorf("the key gate caught %d of the three aliased reader invocations.\nfindings:\n%s", got, keys)
+	}
+}
+
+// And the gates must not fire on the package as it is, or the fixtures above
+// prove nothing: a gate that fires on everything catches every fixture.
+func TestTheFacadeGatesAreSilentOnThisPackage(t *testing.T) {
+	for _, pkg := range gatePackages(t, nil) {
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
 			continue
 		}
+		if findings := claimShapeFindings(t, pkg); len(findings) > 0 {
+			t.Errorf("the claim-shape gate fires on the package as it is: %s", strings.Join(findings, "; "))
+		}
+		if findings := unresolvedKeyFindings(t, pkg); len(findings) > 0 {
+			t.Errorf("the key gate fires on the package as it is: %s", strings.Join(findings, "; "))
+		}
+	}
+}
+
+// --- Reader identity, shared with the post-boot gate ---
+
+// readerIdentity is the set of objects that may hold an environment reader,
+// and the reader invocations whose key does not resolve to constants.
+//
+// A reader is an OBJECT, not a spelling. The gates agreeing about what a read
+// is matters because two definitions disagreeing is how a read gets past both:
+// a reader converted to a local function type and called through that name is
+// invisible to a rule that matches callee names, and its key is then never
+// examined at all.
+type readerIdentity struct {
+	pkg *packages.Package
+	// readerAliases is seeded with the reader objects and grown through every
+	// flow that can carry one, to a fixpoint.
+	readerAliases map[types.Object]bool
+	// unresolvedKeys is the findings: a resolved reader invocation whose key
+	// is not traceable to constants.
+	unresolvedKeys []string
+}
+
+func newReaderIdentity(pkg *packages.Package) *readerIdentity {
+	r := &readerIdentity{pkg: pkg, readerAliases: map[types.Object]bool{}}
+	r.seed()
+	for round := 0; round < 16; round++ {
+		if !r.grow() {
+			break
+		}
+	}
+	r.checkInvocations()
+	return r
+}
+
+// files is this package's non-test sources.
+func (r *readerIdentity) files() []*ast.File {
+	var out []*ast.File
+	for _, file := range r.pkg.Syntax {
+		if strings.HasSuffix(filepath.Base(r.pkg.Fset.Position(file.Pos()).Filename), "_test.go") {
+			continue
+		}
+		out = append(out, file)
+	}
+	return out
+}
+
+// seed puts the reader objects themselves into the set, by the same definition
+// the post-boot gate uses: the os and syscall readers, and this package's env.
+func (r *readerIdentity) seed() {
+	for _, file := range r.files() {
 		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok || len(call.Args) == 0 || !readsEnvironmentCall(call) {
+			ident, ok := n.(*ast.Ident)
+			if !ok {
 				return true
 			}
-			// env's own body reads os.Getenv(key) on its parameter. It is the
-			// helper every traced key arrives through, so judging it here
-			// would be judging the mechanism rather than any key; its callers
-			// are what this gate follows.
-			if tracer.insideEnvHelper(call) {
+			fn, isFunc := r.pkg.TypesInfo.Uses[ident].(*types.Func)
+			if !isFunc || fn.Pkg() == nil {
 				return true
 			}
-			if why, ok := tracer.resolves(call.Args[0], 0); !ok {
-				findings = append(findings, pkg.Fset.Position(call.Pos()).String()+
-					": the key of this environment read does not resolve to constants ("+why+")")
+			if readerNames[fn.Pkg().Path()][fn.Name()] {
+				r.readerAliases[fn] = true
+			}
+			if fn.Pkg() == r.pkg.Types && fn.Name() == "env" {
+				r.readerAliases[fn] = true
 			}
 			return true
 		})
 	}
-	sort.Strings(findings)
-	return findings
+}
+
+// grow adds one round of objects that may hold a reader.
+func (r *readerIdentity) grow() bool {
+	learned := false
+	add := func(obj types.Object) {
+		if obj != nil && !r.readerAliases[obj] {
+			r.readerAliases[obj] = true
+			learned = true
+		}
+	}
+	for _, file := range r.files() {
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.AssignStmt:
+				for i, rhs := range node.Rhs {
+					if i < len(node.Lhs) && r.holds(rhs) {
+						add(r.object(node.Lhs[i]))
+					}
+				}
+			case *ast.ValueSpec:
+				for i, value := range node.Values {
+					if i < len(node.Names) && r.holds(value) {
+						add(r.pkg.TypesInfo.Defs[node.Names[i]])
+					}
+				}
+			case *ast.CompositeLit:
+				for _, element := range node.Elts {
+					kv, ok := element.(*ast.KeyValueExpr)
+					if !ok || !r.holds(kv.Value) {
+						continue
+					}
+					if key, ok := kv.Key.(*ast.Ident); ok {
+						add(r.field(node, key.Name))
+					}
+				}
+			case *ast.CallExpr:
+				r.intoParameters(node, add)
+			}
+			return true
+		})
+	}
+	return learned
+}
+
+// intoParameters adds a callee's parameters that receive a reader.
+func (r *readerIdentity) intoParameters(call *ast.CallExpr, add func(types.Object)) {
+	fn, ok := r.object(call.Fun).(*types.Func)
+	if !ok || fn.Pkg() != r.pkg.Types {
+		return
+	}
+	decl := r.decl(fn)
+	if decl == nil || decl.Type.Params == nil {
+		return
+	}
+	index := 0
+	for _, field := range decl.Type.Params.List {
+		for _, name := range field.Names {
+			if index < len(call.Args) && r.holds(call.Args[index]) {
+				add(r.pkg.TypesInfo.Defs[name])
+			}
+			index++
+		}
+	}
+}
+
+// holds reports whether an expression evaluates to a reader: the object, a
+// parenthesisation, a CONVERSION of one — which is the same function wearing a
+// different type name — or an object already known to hold one.
+func (r *readerIdentity) holds(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.ParenExpr:
+		return r.holds(e.X)
+	case *ast.Ident, *ast.SelectorExpr:
+		return r.readerAliases[r.object(expr)]
+	case *ast.CallExpr:
+		if tv, ok := r.pkg.TypesInfo.Types[e.Fun]; ok && tv.IsType() && len(e.Args) == 1 {
+			return r.holds(e.Args[0])
+		}
+	}
+	return false
+}
+
+// checkInvocations requires every resolved reader invocation's key to be
+// traceable to constants. A keyless reader reads the whole environment, so
+// there is no key: that read is the post-boot gate's finding, not this one's.
+func (r *readerIdentity) checkInvocations() {
+	tracer := newKeyTracer(r.pkg)
+	for _, file := range r.files() {
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if tv, ok := r.pkg.TypesInfo.Types[call.Fun]; ok && tv.IsType() {
+				return true // a conversion, not a call
+			}
+			callee := r.object(call.Fun)
+			if callee == nil || !r.readerAliases[callee] {
+				return true
+			}
+			if fn, ok := callee.(*types.Func); ok && keylessReaders[fn.Name()] {
+				return true
+			}
+			if len(call.Args) == 0 || tracer.insideEnvHelper(call) {
+				return true
+			}
+			if why, ok := tracer.resolves(call.Args[0], 0); !ok {
+				r.unresolvedKeys = append(r.unresolvedKeys,
+					r.pkg.Fset.Position(call.Pos()).String()+": the key of this environment read does not resolve to constants ("+why+")")
+			}
+			return true
+		})
+	}
+	sort.Strings(r.unresolvedKeys)
+}
+
+// object resolves an expression to the object it names.
+func (r *readerIdentity) object(expr ast.Expr) types.Object {
+	switch e := unparen(expr).(type) {
+	case *ast.Ident:
+		if obj := r.pkg.TypesInfo.Uses[e]; obj != nil {
+			return obj
+		}
+		return r.pkg.TypesInfo.Defs[e]
+	case *ast.SelectorExpr:
+		if selection, ok := r.pkg.TypesInfo.Selections[e]; ok {
+			return selection.Obj()
+		}
+		return r.pkg.TypesInfo.Uses[e.Sel]
+	}
+	return nil
+}
+
+// field is the struct field a composite literal key names.
+func (r *readerIdentity) field(lit *ast.CompositeLit, name string) types.Object {
+	structType, ok := structTypeOf(r.pkg.TypesInfo.TypeOf(lit))
+	if !ok {
+		return nil
+	}
+	for i := 0; i < structType.NumFields(); i++ {
+		if structType.Field(i).Name() == name {
+			return structType.Field(i)
+		}
+	}
+	return nil
+}
+
+// decl is the declaration of one of this package's functions.
+func (r *readerIdentity) decl(fn *types.Func) *ast.FuncDecl {
+	for _, file := range r.files() {
+		for _, d := range file.Decls {
+			if decl, ok := d.(*ast.FuncDecl); ok && decl.Name != nil &&
+				r.pkg.TypesInfo.Defs[decl.Name] == fn {
+				return decl
+			}
+		}
+	}
+	return nil
 }
 
 // keyTracer follows an environment key back to the constants that reach it.
@@ -447,140 +832,4 @@ func structTypeOf(t types.Type) (*types.Struct, bool) {
 	}
 	structType, ok := t.Underlying().(*types.Struct)
 	return structType, ok
-}
-
-// readsEnvironmentCall reports whether a call reads the process environment,
-// by the callee's name — os.Getenv, os.LookupEnv, or this package's own env.
-func readsEnvironmentCall(call *ast.CallExpr) bool {
-	switch fn := call.Fun.(type) {
-	case *ast.Ident:
-		return environmentReadFunctions[fn.Name]
-	case *ast.SelectorExpr:
-		return environmentReadFunctions[fn.Sel.Name]
-	}
-	return false
-}
-
-// --- The fixture that escaped, as a compiled negative case ---
-
-// TestTheFacadeGatesCatchTheEscapingFixture drives both gates against the
-// sources that defeated the hand evaluator, compiled into this very package.
-//
-// A fixture that only parsed would prove nothing — it is the compiler's
-// folding of `string(rune(82))` and of a constant chain that makes these keys
-// real, and a parse-only fixture folds nothing. gatePackages fails the load if
-// it does not type-check, so this cannot quietly become a fixture about
-// nothing.
-//
-// All of them in ONE overlay, because each load shells out to the go command:
-// the shapes are independent declarations, and the rules return every finding,
-// so one compile answers for all of them.
-func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
-	dir, err := filepath.Abs(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := filepath.Join(dir, "zz_facade_claim_fixture.go")
-
-	source := `package solution
-
-// A constant conversion splicing the carrier's name.
-func FacadeCredentialViaConversion() string {
-	const key = "CODEFLY__MODULE_" + string(rune(82)) + "EGISTRATION_SECRETS"
-	return env(key, "")
-}
-
-// A claim path spliced the same way.
-const facadeClaimPath = "/modules/" + string(rune(95)) + "register"
-
-func FacadeClaimPath() string { return facadeClaimPath }
-
-// A header assembled through a conversion.
-func FacadeSecretHeader() string {
-	return "X-Codefly-Module-" + string(rune(83)) + "ecret"
-}
-
-// Function-local constants, which a package-level-only collector never saw.
-func FacadeClaimLocal(gatewayURL string) string {
-	const claim = "/modules/" + "_register"
-	return gatewayURL + claim
-}
-
-func FacadeCredentialLocal() string {
-	const carrier = "CODEFLY__MODULE" + "_REGISTRATION_SECRETS"
-	return env(carrier, "")
-}
-
-// A chain longer than any iteration limit, declared in reverse so a single
-// forward pass resolves none of it.
-const (
-	chain00 = "/" + chain01
-	chain01 = "m" + chain02
-	chain02 = "o" + chain03
-	chain03 = "d" + chain04
-	chain04 = "u" + chain05
-	chain05 = "l" + chain06
-	chain06 = "e" + chain07
-	chain07 = "s" + chain08
-	chain08 = "/" + chain09
-	chain09 = "_" + chain10
-	chain10 = "r" + chain11
-	chain11 = "e" + chain12
-	chain12 = "g" + chain13
-	chain13 = "i" + chain14
-	chain14 = "s" + chain15
-	chain15 = "t" + chain16
-	chain16 = "e" + chain17
-	chain17 = "r"
-)
-
-func FacadeClaimChain() string { return chain00 }
-
-// And a key that is not constant at all.
-func FacadeCredentialViaRuntimeKey(parts []string) string {
-	return env(joinedKey(parts), "")
-}
-
-func joinedKey(parts []string) string {
-	out := ""
-	for _, part := range parts {
-		out += part
-	}
-	return out
-}
-`
-
-	shapes := gateFindings(t, fixture, source, claimShapeFindings)
-	for _, want := range []string{
-		"CODEFLY__MODULE_REGISTRATION_SECRETS",
-		"/modules/_register",
-		"X-Codefly-Module-Secret",
-	} {
-		if !strings.Contains(shapes, want) {
-			t.Errorf("the claim-shape gate did not catch %q.\nfindings:\n%s", want, shapes)
-		}
-	}
-	// Every spelling, not just one of each shape: the chain and the local
-	// constant both produce the claim path, so two findings name it.
-	if strings.Count(shapes, "/modules/_register") < 2 {
-		t.Errorf("the claim path was caught in only one spelling.\nfindings:\n%s", shapes)
-	}
-
-	keys := gateFindings(t, fixture, source, unresolvedKeyFindings)
-	if !strings.Contains(keys, "does not resolve to constants") {
-		t.Errorf("the key gate did not catch a runtime-computed key.\nfindings:\n%s", keys)
-	}
-}
-
-// And the gates must not fire on the package as it is, or the fixtures above
-// prove nothing: a gate that fires on everything catches every fixture.
-func TestTheFacadeGatesAreSilentOnThisPackage(t *testing.T) {
-	for _, pkg := range gatePackages(t, nil) {
-		if findings := claimShapeFindings(t, pkg); len(findings) > 0 {
-			t.Errorf("%s: the claim-shape gate fires on the package as it is: %s", pkg.PkgPath, strings.Join(findings, "; "))
-		}
-		if findings := unresolvedKeyFindings(t, pkg); len(findings) > 0 {
-			t.Errorf("%s: the key gate fires on the package as it is: %s", pkg.PkgPath, strings.Join(findings, "; "))
-		}
-	}
 }

@@ -171,6 +171,20 @@ embedding it.
   suite until this file describes the exception — and so does a read reachable
   from the serving surface, because a helper boot shares with serving code sits
   in that tree while running long after `validate()`.
+- Those gates ask the compiler, not the source text, and that is not a style
+  choice: four review rounds each found one more spelling a syntactic rule
+  lost. Constants come from `types.Info` (a conversion, a chain, a local
+  constant all fold); reachability is CHA over SSA from `golang.org/x/tools`,
+  rooted at `serve`, every exported declaration, the package initializer and
+  every address-taken function — a handler mounted on a mux is never *called*
+  here, so a graph of call expressions has no edge to it. A reader is an
+  OBJECT (`os.Getenv`/`LookupEnv`/`Environ`/`ExpandEnv`, `syscall`'s, the
+  SDK's accessors, this package's `env`) followed wherever its identity flows,
+  with one definition shared by both gates, and an environment key that cannot
+  be traced to constants is refused rather than skipped. If you add a gate
+  here, resolve rather than match: `facade_claim_test.go` and
+  `environment_boundary_test.go` carry the compiled fixtures for every spelling
+  that beat an earlier version.
 - Resolving a value in `loadConfig` is half the rule; the other half is a
   refusal in `validate()` that fires **whether or not the feature using it is
   switched on**. The `api.consumes` projection was resolved at boot and decoded
