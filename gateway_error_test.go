@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -34,7 +36,7 @@ func TestUnaryErrorStatusAcrossHTTPBoundary(t *testing.T) {
 			upstream := httptest.NewServer(connect.NewUnaryHandler("/example.Service/Read",
 				func(_ context.Context, req *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
 					calls.Add(1)
-					if req.Header().Get("Authorization") != "Bearer viewer-token" {
+					if req.Header().Get("Authorization") != viewerBearer() {
 						t.Error("viewer credential lost")
 					}
 					return nil, connect.NewError(tc.code, errors.New("private upstream diagnostic"))
@@ -76,5 +78,67 @@ func TestGatewayErrorStatusValidation(t *testing.T) {
 				t.Fatalf("got %d %q, want %d", got, message, want)
 			}
 		})
+	}
+}
+
+// TestAHandlerPathCredentialFailureDisclosesNothing is the disclosure a second
+// reviewer found behind the "a page sees unavailable" answer, which was only
+// ever true of the passthrough.
+//
+// A Handle or HandleRequest handler returns whatever ForModule gave it. Those
+// errors are produced inside this package and deliberately name the mint URL,
+// the gateway URL and the issuer's own text, because that is what a boot
+// refusal has to say. handlerErrorResponse ended in `err.Error()`, so the
+// browser got a 502 carrying all of it — and 502 is the wrong answer anyway:
+// the condition is this process's and one renewal fixes it, which is what the
+// passthrough path has always reported.
+func TestAHandlerPathCredentialFailureDisclosesNothing(t *testing.T) {
+	const secretish = "https://mint.internal.example/platform/_credential"
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"a workload this solution cannot attest for", fmt.Errorf("obtain this execution's credential from %s: 403 forbidden: build 11 is not approved: %w", secretish, ErrNotAttested), http.StatusServiceUnavailable},
+		{"a superseded authority", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrRevoked), http.StatusConflict},
+		{"a capability this solution cannot carry", fmt.Errorf("mint at %s: %w", secretish, workcontext.ErrInvalid), http.StatusBadGateway},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, message := handlerErrorResponse(tc.err)
+			if status != tc.status {
+				t.Errorf("status = %d, want %d: the handler path must answer what the passthrough path answers for the same condition", status, tc.status)
+			}
+			if strings.Contains(message, secretish) {
+				t.Errorf("the message handed to the browser names an internal destination:\n%s", message)
+			}
+			if strings.Contains(message, "403") || strings.Contains(message, "not approved") {
+				t.Errorf("the message handed to the browser carries the issuer's own text:\n%s", message)
+			}
+			if message == "" {
+				t.Error("the message says nothing at all: a page still needs to know whose problem it is")
+			}
+		})
+	}
+}
+
+// TestATransportFailureDoesNotNameTheDestination is the disclosure that got
+// past the sentinel mapping by a different route.
+//
+// *url.Error carries the URL it was dialling in Error(), so a mint or gateway
+// call that could not connect reached the browser as a 502 naming an internal
+// address — the same leak the credential sentinels were mapped to stop, arriving
+// through the untyped fallthrough and not matched by any of them.
+func TestATransportFailureDoesNotNameTheDestination(t *testing.T) {
+	const internal = "https://gateway.internal.svc.cluster.local:42152"
+	err := &url.Error{Op: "Post", URL: internal + "/platform/_credential", Err: errors.New("dial tcp 10.0.0.5:42152: connect: connection refused")}
+	status, message := handlerErrorResponse(fmt.Errorf("mint: %w", err))
+	if status != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", status)
+	}
+	if strings.Contains(message, "internal") || strings.Contains(message, "10.0.0.5") {
+		t.Errorf("the message handed to the browser names an internal destination:\n%s", message)
+	}
+	if message == "" {
+		t.Error("the message says nothing at all")
 	}
 }

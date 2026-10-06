@@ -2,9 +2,14 @@
 // test, against a fake host, so a consuming solution can exercise the calls its
 // page makes — unary and server-streaming — without a composition.
 //
-// It serves the real passthrough: Server.PassthroughHandler, the handler Serve
-// mounts, checked by the same boot check, over an httptest server. Only the
-// host is fake. Host stands in for the gateway the passthrough calls through:
+// It serves the real passthrough — the handler Serve mounts, checked by the
+// same boot check — over an httptest server, reached through internal/seam.
+// Only the host is fake. The seam is not public API: Server.PassthroughHandler
+// was exported once, and a deployment calling it completed a viewer mint and a
+// module call over plaintext with no validate(), no mTLS boot, no caller
+// allow-list, no ceiling and no authenticated outbound. This package is the one
+// caller Go's internal rule lets reach it, and because any module can import
+// *this* package, its constructors refuse a non-test binary. Host stands in for the gateway the passthrough calls through:
 // it mints the viewer's Work Context (the accounts StartTask procedure the
 // gateway routes) and forwards each /v1/<as>/* call to the module address the
 // test gave it, typically an httptest server of the test's own that answers
@@ -20,20 +25,27 @@
 package passthroughtest
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	corework "github.com/codefly-dev/core/workcontext"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/codefly-dev/core/solution/manifest"
-	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	solution "github.com/codefly-dev/solution-runtime-go"
+	"github.com/codefly-dev/solution-runtime-go/internal/seam"
 )
 
 // startTaskProcedure is the accounts procedure the gateway routes a Work
@@ -41,19 +53,44 @@ import (
 const startTaskProcedure = "/saas.accounts.v1.WorkContextService/StartTask"
 
 // Viewer is the identity the page calls as: the bearer the browser sends, and
-// the organization and session the gateway stamps from it (x-org-id,
-// x-session-id) before the call reaches the solution.
+// the organization, session and installation the gateway stamps from it
+// (x-org-id, x-session-id, x-codefly-installation-id) before the call reaches
+// the solution.
 type Viewer struct {
 	Bearer    string
 	OrgID     string
 	SessionID string
+	// InstallationID is the installation the gateway stamps, which every mint
+	// the runtime runs names. Empty is refused.
+	InstallationID string
 }
 
 // DefaultViewer is the viewer Solution.Client calls as.
-var DefaultViewer = Viewer{
-	Bearer:    "Bearer passthroughtest-viewer",
-	OrgID:     "passthroughtest-org",
-	SessionID: "passthroughtest-session",
+//
+// The bearer is a real sealed capability from core's authority, not a
+// placeholder string. Every mint the runtime runs names the installation it
+// acts under, and the viewer's comes from the seal of the capability they
+// arrived with — so a placeholder bearer is a request no installation can be
+// read from, and this seam would hand every consumer the refusal path instead
+// of the behaviour they are testing.
+//
+// A consumer supplying their own Viewer needs a sealed bearer too. SealedViewer
+// builds one, and the refusal names what is missing if they pass something
+// else.
+var DefaultViewer = SealedViewer("passthroughtest-viewer")
+
+// SealedViewer is a viewer whose bearer is a capability sealed to core's
+// fixture installation, which is what the runtime reads the mint's installation
+// from. seed names the capability so two viewers can differ.
+func SealedViewer(seed string) Viewer {
+	return Viewer{
+		Bearer:    "Bearer " + capability(seed),
+		OrgID:     "passthroughtest-org",
+		SessionID: "passthroughtest-session",
+		// The installation the gateway stamps beside the org and the session.
+		// Every mint the runtime runs names one and refuses without it.
+		InstallationID: corework.FixtureInstallation,
+	}
 }
 
 // Mint is one Work Context the host was asked to mint: the passthrough's
@@ -100,19 +137,66 @@ type Refusal struct {
 type Host struct {
 	server *httptest.Server
 
+	// dir holds the projected files this fake host stands in for.
+	dir     string
 	mu      sync.Mutex
 	modules map[string]*httputil.ReverseProxy
 	refuse  func(Mint) *Refusal
 	mints   []Mint
 	calls   []Call
+	// workloadMints counts the solution's own execution credentials.
+	workloadMints int
+	// mintServer serves the workload mint over TLS, separately from the
+	// gateway's own plaintext server.
+	//
+	// The SDK's mint client refuses plain HTTP outright — the projected
+	// service-account token travels on that request — and it requires the
+	// roots that may sign the endpoint, with no system-pool fallback. Both are
+	// right, and neither can be satisfied by the plaintext server the rest of
+	// this host uses.
+	//
+	// Only the mint moves. Making the whole host TLS would need a SPIFFE leaf
+	// from a test CA for the gateway's own identity, because the runtime's
+	// outbound client admits a platform destination by its certificate — and
+	// the seam deliberately runs without that boot. That remains the
+	// fidelity gap seam.go already names; this closes the half the SDK now
+	// requires rather than pretending to close both.
+	mintServer *httptest.Server
+	// cell is the fake host's own CA, because the mint endpoint is now held to
+	// WHICH party it is and not merely to a certificate from an accepted root.
+	cell *mintCell
 }
 
 // NewHost starts a fake host, closed when the test ends.
 func NewHost(t testing.TB) *Host {
+	mustBeATest()
 	t.Helper()
-	h := &Host{modules: map[string]*httputil.ReverseProxy{}}
+	h := &Host{modules: map[string]*httputil.ReverseProxy{}, dir: t.TempDir()}
 	h.server = httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	t.Cleanup(h.server.Close)
+	cell, err := newMintCell()
+	if err != nil {
+		t.Fatalf("start the fake host: %v", err)
+	}
+	h.cell = cell
+	// mTLS, with the client certificate REQUIRED and verified.
+	//
+	// The real endpoint receives the projected service-account token, and
+	// sdk-go#51 makes the client present this workload's X.509-SVID on that
+	// request. A fake host that merely tolerated a client certificate would
+	// let a consumer's green run mean less than it looks like: the seam is
+	// where a consumer finds out their passthrough works against the posture
+	// a deployment has.
+	mint := httptest.NewUnstartedServer(http.HandlerFunc(h.serveHTTP))
+	mint.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cell.mint},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    cell.roots,
+	}
+	mint.StartTLS()
+	h.mintServer = mint
+	t.Cleanup(h.mintServer.Close)
 	return h
 }
 
@@ -168,6 +252,59 @@ func (h *Host) Calls() []Call {
 	return append([]Call(nil), h.calls...)
 }
 
+// workloadMintPath is where this fake host mints the solution's own execution
+// credential — the same path the runtime derives from its resolved gateway.
+//
+// It exists because minting for a viewer is fail-closed: a solution that cannot
+// attest which module is asking does not ask. A seam that handed the
+// passthrough no credential would therefore be a seam in which every call is
+// refused, so the fake host mints one, exactly as the real host does.
+const workloadMintPath = "/platform/_credential"
+
+// mintWorkload answers the solution's own mint: one credential per execution,
+// sealed to this fake host's installation.
+func (h *Host) mintWorkload(w http.ResponseWriter, r *http.Request) {
+	// The sequence is copied under the lock and the copy is what names the
+	// task: reading h.workloadMints again after unlocking is a read of shared
+	// state that concurrent mints race on, which the race detector reports with
+	// thirty-two of them in flight.
+	h.mu.Lock()
+	h.workloadMints++
+	execution := h.workloadMints
+	h.mu.Unlock()
+	token, _, err := standInAuthority().Start(r.Context(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
+		TaskID:             fmt.Sprintf("passthroughtest-execution-%d", execution),
+		Audience:           WorkloadAudience,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     corework.FixtureInstallation,
+		TTL:                10 * time.Minute,
+		Execution: corework.Execution{
+			ImageDigest:      corework.FixtureImageDigest,
+			BuildIncarnation: corework.FixtureBuildIncarnation,
+		},
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": 13, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"work_context": token})
+}
+
+// WorkloadAudience is the audience this fake host mints the solution's own
+// execution credential for.
+const WorkloadAudience = "passthroughtest-workload"
+
+// WorkloadMints is how many execution credentials this host was asked for. A
+// correct run asks once, however many calls the page makes.
+func (h *Host) WorkloadMints() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.workloadMints
+}
+
 // consumes is the api.consumes projection of the routed modules.
 func (h *Host) consumes() []manifest.ConsumedAPI {
 	h.mu.Lock()
@@ -180,6 +317,10 @@ func (h *Host) consumes() []manifest.ConsumedAPI {
 }
 
 func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == workloadMintPath {
+		h.mintWorkload(w, r)
+		return
+	}
 	if r.URL.Path == startTaskProcedure {
 		h.mint(w, r)
 		return
@@ -193,7 +334,7 @@ func (h *Host) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	call := Call{Module: as, Method: r.Method, Path: r.URL.Path, Bearer: r.Header.Get("authorization")}
-	if presented := r.Header.Get(codefly.WorkContextHeaderName); presented != "" {
+	if presented := r.Header.Get(workcontext.HeaderName); presented != "" {
 		for i := range h.mints {
 			if h.mints[i].Token == presented {
 				mint := h.mints[i]
@@ -257,7 +398,7 @@ func (h *Host) record(mint *Mint, granted bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if granted {
-		mint.Token = fmt.Sprintf("passthroughtest-%d.%s", len(h.mints)+1, mint.Audience)
+		mint.Token = capability(fmt.Sprintf("passthroughtest-%d-%s", len(h.mints)+1, mint.Audience))
 	}
 	h.mints = append(h.mints, *mint)
 }
@@ -280,13 +421,85 @@ type Solution struct {
 // modules host routes as the solution's api.consumes: the real handler, and
 // the error Serve would refuse the declaration with at boot.
 func Handler(host *Host, consumes ...solution.ConsumedModule) (http.Handler, error) {
-	server := solution.New(solution.Manifest{ID: "passthroughtest"}).Consumes(consumes...)
-	return server.PassthroughHandler(solution.PassthroughEnvironment{GatewayURL: host.URL(), Consumes: host.consumes()})
+	mustBeATest()
+	source, err := host.credentialSource()
+	if err != nil {
+		return nil, err
+	}
+	server := solution.New(solution.Manifest{ID: "passthroughtest"}).
+		Consumes(consumes...).
+		Credential(source)
+	projection, err := json.Marshal(host.consumes())
+	if err != nil {
+		return nil, err
+	}
+	// Through internal/seam, because building a credential-bearing handler
+	// without the boot is no longer something the runtime's public API can do:
+	// exported, that constructor was a production bypass, and this package is
+	// the one caller Go's internal-package rule still lets reach it.
+	return seam.Passthrough(server, host.URL(), string(projection))
+}
+
+// credentialSource is the solution's own execution credential, obtained from
+// this fake host through the SDK's mint client — the same client a booted
+// runtime uses, so the seam exercises the attestation rather than skipping it.
+func (h *Host) credentialSource() (solution.CredentialSource, error) {
+	tokenFile := filepath.Join(h.dir, "projected-token")
+	if err := os.WriteFile(tokenFile, []byte("passthroughtest-projected-token"), 0o600); err != nil {
+		return nil, err
+	}
+	return workcontext.NewMintClient(workcontext.MintOptions{
+		URL: h.mintServer.URL + workloadMintPath,
+		// The audience is named as a pinned value now, not passed as a string
+		// beside the pin, so the seam supplies a pin that answers it.
+		Audience:           workcontext.AuthorityValue{Name: authorityGroup, Key: audienceKey},
+		Authority:          fixedAuthority{audience: WorkloadAudience},
+		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
+		ProjectionAudience: "accounts",
+		// The three readers sdk-go#51 takes in place of a pool by value. They
+		// are readers here for the same reason they are readers in a booted
+		// runtime: each is consulted during the handshake, so what this seam
+		// exercises is the check and not a snapshot of it.
+		TrustAnchor:       func() (*x509.CertPool, error) { return h.cell.roots, nil },
+		ClientCertificate: func() (*tls.Certificate, error) { return &h.cell.workload, nil },
+		AdmittedPeers:     func() ([]string, error) { return []string{mintPeerIdentity}, nil },
+	})
+}
+
+// mustBeATest refuses to build any of this outside a test binary.
+//
+// This package is the one caller Go's internal-package rule lets reach the
+// passthrough seam, and that made it the bypass it was built to close: the root
+// package's exported constructor is gone, but Handler is exported from a package
+// any module can import, so a deployment importing it got the same
+// credential-bearing handler with no validate(), no mTLS boot, no caller
+// allow-list, no ceiling and no authenticated outbound. Taking a testing.TB is
+// not the gate it resembles — testing.TB's unexported method only stops a
+// type *declaring* the interface, and a struct that EMBEDS testing.TB satisfies
+// it in any program, so the signature proves nothing about where the call came
+// from.
+//
+// testing.Testing() does prove it: it is true exactly when the binary was built
+// by `go test`. It was the wrong tool for the root package, where the
+// legitimate caller is production code and only the bypass is a test; it is the
+// right one here, where every legitimate caller is a test and only the bypass
+// is production.
+func mustBeATest() { refuseOutsideTest(testing.Testing()) }
+
+// refuseOutsideTest takes the answer rather than asking for it, so the refusal
+// itself is reachable from a test. Written as one function reading
+// testing.Testing() directly, the only branch that matters is the one no test
+// can enter — a mutation that neutered it left every gate here passing.
+func refuseOutsideTest(isTest bool) {
+	if !isTest {
+		panic("passthroughtest is a test seam and this is not a test binary: it builds a handler that holds a real execution credential without validate(), the mTLS boot, the caller allow-list, the published ceiling or authenticated outbound, so a deployment reaching it would serve the viewer's bearer and this workload's credential over whatever it was mounted on. Boot the runtime with solution.Serve instead")
+	}
 }
 
 // Start serves the passthrough for the declaration against host, until the
 // test ends. A declaration Serve would refuse fails the test.
 func Start(t testing.TB, host *Host, consumes ...solution.ConsumedModule) *Solution {
+	mustBeATest()
 	t.Helper()
 	handler, err := Handler(host, consumes...)
 	if err != nil {
@@ -325,6 +538,9 @@ func (t viewerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		"authorization": t.viewer.Bearer,
 		"x-org-id":      t.viewer.OrgID,
 		"x-session-id":  t.viewer.SessionID,
+		// Stamped beside them, because every mint the runtime runs names the
+		// installation it acts under.
+		"x-codefly-installation-id": t.viewer.InstallationID,
 	} {
 		r.Header.Del(header)
 		if value != "" {
@@ -332,4 +548,89 @@ func (t viewerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	return t.base.RoundTrip(r)
+}
+
+// capability is a stand-in issuer's capability, minted per seed.
+//
+// It is minted by **core's** authority, from core's own conformance fixture
+// identities and key — the one implementation of a Work Context, which this
+// runtime neither signs nor parses. The private key is public by design (core
+// derives it from a seed in its own source), so this is a real sealed
+// capability that a conforming verifier accepts, without a signer or a payload
+// struct living here. That matters beyond convenience: a fixture issuer with
+// its own encoding is how two implementations of a capability format start.
+//
+// Memoised by seed so a test can recompute the capability it expects to have
+// been presented: every mint carries a fresh nonce, so minting the same seed
+// twice would otherwise produce two different strings.
+func capability(seed string) string {
+	capabilityMu.Lock()
+	defer capabilityMu.Unlock()
+	if issued, ok := issuedCapabilities[seed]; ok {
+		return issued
+	}
+	token, _, err := standInAuthority().Start(context.Background(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
+		TaskID:             seed,
+		Audience:           corework.FixtureAudience,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     corework.FixtureInstallation,
+		TTL:                10 * time.Minute,
+		Execution: corework.Execution{
+			ImageDigest:      corework.FixtureImageDigest,
+			BuildIncarnation: corework.FixtureBuildIncarnation,
+		},
+	})
+	if err != nil {
+		panic("stand-in capability: " + err.Error())
+	}
+	issuedCapabilities[seed] = token
+	return token
+}
+
+var (
+	capabilityMu       sync.Mutex
+	issuedCapabilities = map[string]string{}
+)
+
+// standInAuthority is core's minter, configured from core's fixture identities.
+//
+// Built once through sync.OnceValue rather than on a nil check: the check was a
+// data race, reached from the fake host's mint handler and from capability() at
+// the same time, so a consumer running this seam under -race could fail in a
+// file they do not own, for a reason that has nothing to do with their test.
+var standInAuthority = sync.OnceValue(func() *corework.Authority {
+	_, key := corework.FixtureKeyPair()
+	return &corework.Authority{
+		Issuer:    corework.FixtureIssuer,
+		KeyID:     corework.FixtureKeyID,
+		Key:       key,
+		Revisions: corework.FixtureRevisions(),
+		Seals:     corework.FixtureSeals(),
+	}
+})
+
+// authorityGroup and audienceKey name the pinned value this seam's mint reads
+// its audience from. They mirror the root package's own constants; the seam
+// cannot import them without importing the package it is a seam for.
+const (
+	authorityGroup = "module-authority"
+	audienceKey    = "AUDIENCE"
+)
+
+// fixedAuthority is an AuthorityPin whose values never drift, which is what a
+// fake host should be: the drift refusal is the runtime's behaviour to exercise
+// elsewhere, and a seam that drifted at random would fail a consumer's suite
+// for a reason they did not write.
+type fixedAuthority struct{ audience string }
+
+func (fixedAuthority) Recheck(context.Context) error { return nil }
+
+func (a fixedAuthority) Value(name, key string) (string, error) {
+	if name == authorityGroup && key == audienceKey {
+		return a.audience, nil
+	}
+	return "", fmt.Errorf("passthroughtest: no pinned authority value %s/%s", name, key)
 }

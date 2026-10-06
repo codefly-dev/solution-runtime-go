@@ -27,7 +27,7 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		if r.Method != "POST" || string(body) != `{"question":"why?"}` || r.URL.Query().Get("mode") != "wiki" {
+		if r.Method != "POST" || string(body) != `{"question":"why?"}` || r.URL.Query().Get("mode") != "notes" {
 			t.Error("request input lost")
 		}
 		if r.Context().Value(requestTestKey{}) != "request-context" {
@@ -38,11 +38,11 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return map[string]string{"answer": "ok"}, nil
 	})
 	for _, bearer := range []string{"", "Bearer viewer"} {
-		req := httptest.NewRequest("POST", "/ask?mode=wiki", strings.NewReader(`{"question":"why?"}`))
+		req := httptest.NewRequest("POST", "/ask?mode=notes", strings.NewReader(`{"question":"why?"}`))
 		req = req.WithContext(context.WithValue(req.Context(), requestTestKey{}, "request-context"))
 		req.Header.Set("Authorization", bearer)
 		rec := httptest.NewRecorder()

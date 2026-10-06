@@ -4,24 +4,86 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	corework "github.com/codefly-dev/core/workcontext"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 )
+
+// capability is a stand-in issuer's capability, minted per seed.
+//
+// It is minted by **core's** authority, from core's own conformance fixture
+// identities and key — the one implementation of a Work Context, which this
+// runtime neither signs nor parses. The private key is public by design (core
+// derives it from a seed in its own source), so this is a real sealed
+// capability that a conforming verifier accepts, without a signer or a payload
+// struct living here. That matters beyond convenience: a fixture issuer with
+// its own encoding is how two implementations of a capability format start.
+//
+// Memoised by seed so a test can recompute the capability it expects to have
+// been presented: every mint carries a fresh nonce, so minting the same seed
+// twice would otherwise produce two different strings.
+func capability(seed string) string {
+	capabilityMu.Lock()
+	defer capabilityMu.Unlock()
+	if issued, ok := issuedCapabilities[seed]; ok {
+		return issued
+	}
+	token, _, err := standInAuthority().Start(context.Background(), corework.StartInput{
+		TenantID:           corework.FixtureTenant,
+		OwnerPrincipalID:   corework.FixturePrincipal,
+		OwnerPrincipalKind: "human",
+		TaskID:             seed,
+		Audience:           corework.FixtureAudience,
+		OrganizationID:     corework.FixtureOrganization,
+		InstallationID:     corework.FixtureInstallation,
+		TTL:                10 * time.Minute,
+		Execution: corework.Execution{
+			ImageDigest:      corework.FixtureImageDigest,
+			BuildIncarnation: corework.FixtureBuildIncarnation,
+		},
+	})
+	if err != nil {
+		panic("stand-in capability: " + err.Error())
+	}
+	issuedCapabilities[seed] = token
+	return token
+}
+
+var (
+	capabilityMu       sync.Mutex
+	issuedCapabilities = map[string]string{}
+	standInAuthorityV  *corework.Authority
+)
+
+// standInAuthority is core's minter, configured from core's fixture identities.
+func standInAuthority() *corework.Authority {
+	if standInAuthorityV == nil {
+		_, key := corework.FixtureKeyPair()
+		standInAuthorityV = &corework.Authority{
+			Issuer:    corework.FixtureIssuer,
+			KeyID:     corework.FixtureKeyID,
+			Key:       key,
+			Revisions: corework.FixtureRevisions(),
+			Seals:     corework.FixtureSeals(),
+		}
+	}
+	return standInAuthorityV
+}
 
 type syncBuffer struct {
 	mu  sync.Mutex
@@ -38,134 +100,6 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
-}
-
-func TestHeartbeatSendsInternalToken(t *testing.T) {
-	tests := []struct {
-		name      string
-		token     string
-		wantToken string
-	}{
-		{name: "with token", token: "local-dev-only-replace-me", wantToken: "local-dev-only-replace-me"},
-		{name: "without token", token: "", wantToken: ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := make(chan string, 1)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				got <- r.Header.Get("x-codefly-internal-token")
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer srv.Close()
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			s := &Server{cfg: config{internalToken: tt.token}}
-			done := make(chan struct{})
-			go func() {
-				s.heartbeat(ctx, srv.URL, []byte("{}"), "host", internalTokenAuth(tt.token))
-				close(done)
-			}()
-
-			select {
-			case header := <-got:
-				if header != tt.wantToken {
-					t.Errorf("x-codefly-internal-token = %q, want %q", header, tt.wantToken)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("heartbeat did not POST within timeout")
-			}
-			cancel()
-			<-done
-		})
-	}
-}
-
-// TestServeRegistersOnListenPort is the solution↔host regression guard: it boots
-// a real solution on an OS-assigned port against fake host and gateway registries
-// and asserts the invariants that a wrong port / wrong host URL broke — the
-// runtime binds and advertises the same port, registers with both host and
-// gateway, and routes an unauthenticated call to a 401 rather than a 502.
-func TestServeRegistersOnListenPort(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	hostSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer hostSrv.Close()
-	gatewaySrv := httptest.NewServer(http.HandlerFunc(answeringTheExchange))
-	defer gatewaySrv.Close()
-
-	assets := t.TempDir()
-	if err := os.WriteFile(filepath.Join(assets, "mf-manifest.json"), []byte(`{"name":"test"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
-
-	t.Setenv("PORT", port)
-	t.Setenv("HOST_REGISTER_URL", hostSrv.URL)
-	t.Setenv("GATEWAY_REGISTER_URL", gatewaySrv.URL+solutionRegisterPath)
-	t.Setenv("GATEWAY_URL", gatewaySrv.URL)
-	t.Setenv("ASSETS_DIR", assets)
-	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
-
-	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"}).
-		Handle("/audit", func(context.Context, *Gateway) (any, error) {
-			return map[string]string{"ok": "yes"}, nil
-		})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	s.cfg = loadConfig(ctx, s.manifest.ID)
-	if s.cfg.port != port {
-		t.Fatalf("loadConfig port = %q, want assigned listen port %q", s.cfg.port, port)
-	}
-	done := make(chan struct{})
-	go func() { _ = s.serve(ctx, ln); close(done) }()
-
-	base := "http://127.0.0.1:" + port
-	waitFor(t, "health", func() bool { return getStatus(t, base+"/health") == http.StatusOK })
-
-	// With no PUBLIC_URL the manifest is registered as a path on this backend —
-	// never on its own loopback listen address, which no browser but the
-	// developer's can reach — and that path is one this backend serves.
-	manifestURL := frontendManifestURL(t, base)
-	u, err := url.Parse(manifestURL)
-	if err != nil {
-		t.Fatalf("parse manifestUrl %q: %v", manifestURL, err)
-	}
-	if u.IsAbs() || u.Host != "" || manifestURL != federationManifestPath {
-		t.Errorf("manifestUrl = %q, want the root-relative path %q", manifestURL, federationManifestPath)
-	}
-	if code := getStatus(t, base+u.Path); code != http.StatusOK {
-		t.Errorf("GET manifestUrl = %d, want 200", code)
-	}
-
-	// A solution route without a bearer is rejected as 401 (auth). A 502 would
-	// mean the request never reached a live upstream — the failure mode this
-	// registration path exists to avoid.
-	if code := getStatus(t, base+"/audit"); code != http.StatusUnauthorized {
-		t.Errorf("GET /audit without bearer = %d, want 401", code)
-	}
-
-	waitFor(t, "host registration", func() bool { return strings.Contains(buf.String(), `registered with host`) })
-	waitFor(t, "gateway registration", func() bool { return strings.Contains(buf.String(), `registered with gateway`) })
-
-	// Exactly one process owns the backend port: a second bind must fail.
-	if extra, err := net.Listen("tcp", "127.0.0.1:"+port); err == nil {
-		extra.Close()
-		t.Errorf("port %s bound a second time; runtime is not its sole owner", port)
-	}
-
-	cancel()
-	<-done
 }
 
 // sampleDataGraph is a minimal but structurally complete DataGraph
@@ -202,7 +136,7 @@ func sampleDataGraph() map[string]any {
 // through JSON, so the host receives exactly what the solution declared.
 func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
 	graph := sampleDataGraph()
-	s := &Server{manifest: Manifest{ID: "lastlogin-go", Dashboard: graph}}
+	s := &Server{manifest: Manifest{ID: testSolutionID, Dashboard: graph}}
 
 	var got map[string]any
 	body, err := json.Marshal(s.manifestMap())
@@ -221,20 +155,20 @@ func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
 // not even a null one, which would break a host that feeds a present slot into
 // its data-graph validator and would perturb the existing wire contract.
 func TestManifestOmitsAbsentDashboard(t *testing.T) {
-	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	s := &Server{manifest: Manifest{ID: testSolutionID}}
 	if _, ok := s.manifestMap()["dashboard"]; ok {
 		t.Errorf("emitted a dashboard key with no dashboard declared")
 	}
 }
 
-// wordFootnote is the surface shape the wiki declares for a Word document: the
+// wordFootnote is the surface shape the notes solution declares for a Word document: the
 // whole set of slots a client reads, so a test can assert on all of them.
 func wordFootnote() Surface {
 	return Surface{
 		ID:          "footnote",
 		Client:      "word",
 		Title:       "Footnote",
-		Description: "Cite a claim from the wiki.",
+		Description: "Cite a claim from the notes solution.",
 		Module:      "/surfaces/word/footnote.js",
 		Contract:    1,
 		Applies:     "always",
@@ -246,7 +180,7 @@ func wordFootnote() Surface {
 // so every declared slot must survive the trip through JSON — including the
 // applies selector, which the runtime carries without interpreting.
 func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
-	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote()}}}
+	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{wordFootnote()}}}
 
 	var got map[string]any
 	body, err := json.Marshal(s.manifestMap())
@@ -260,7 +194,7 @@ func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
 		"id":          "footnote",
 		"client":      "word",
 		"title":       "Footnote",
-		"description": "Cite a claim from the wiki.",
+		"description": "Cite a claim from the notes solution.",
 		"module":      "/surfaces/word/footnote.js",
 		"contract":    float64(1),
 		"applies":     "always",
@@ -277,7 +211,7 @@ func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
 	applies := map[string]any{"tagged": []any{"legal", "finance"}}
 	surface := wordFootnote()
 	surface.Applies = applies
-	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{surface}}}
 
 	var got map[string]any
 	body, _ := json.Marshal(s.manifestMap())
@@ -292,7 +226,7 @@ func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
 
 // A solution that offers nothing inside a client must not gain the key at all.
 func TestManifestOmitsAbsentSurfaces(t *testing.T) {
-	bare := &Server{manifest: Manifest{ID: "lastlogin-go"}}
+	bare := &Server{manifest: Manifest{ID: testSolutionID}}
 	if _, ok := bare.manifestMap()["surfaces"]; ok {
 		t.Errorf("emitted a surfaces key with no surface declared")
 	}
@@ -308,7 +242,7 @@ func TestManifestDefaultsAppliesAndOmitsEmptySurfaceSlots(t *testing.T) {
 	surface.Applies = nil
 	surface.Events = nil
 	surface.Description = ""
-	s := &Server{manifest: Manifest{ID: "wiki", Surfaces: []Surface{surface}}}
+	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{surface}}}
 
 	entry := s.manifestMap()["surfaces"].([]any)[0].(map[string]any)
 	if got := entry["applies"]; got != "always" {
@@ -380,7 +314,7 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := Manifest{ID: "wiki", Surfaces: tc.surfaces}.validateSurfaces()
+			err := Manifest{ID: "notes", Surfaces: tc.surfaces}.validateSurfaces()
 			if err == nil {
 				t.Fatalf("validateSurfaces accepted %s", tc.name)
 			}
@@ -391,21 +325,21 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 	}
 }
 
-// The same offering in two clients carries the same id — the wiki's footnote is
+// The same offering in two clients carries the same id — the notes solution's footnote is
 // "footnote" in Word and in PowerPoint — and neither client can see the other's,
 // so that is not a collision. Only two surfaces of one client are ambiguous.
 func TestSurfaceIDsAreUniquePerClientNotPerSolution(t *testing.T) {
 	powerpoint := wordFootnote()
 	powerpoint.Client = "powerpoint"
 	powerpoint.Module = "/surfaces/powerpoint/footnote.js"
-	if err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), powerpoint}}).validateSurfaces(); err != nil {
+	if err := (Manifest{ID: "notes", Surfaces: []Surface{wordFootnote(), powerpoint}}).validateSurfaces(); err != nil {
 		t.Errorf("validateSurfaces refused one id shared across two clients: %v", err)
 	}
 
 	second := wordFootnote()
 	second.Title = "Footnote, again"
 	second.Module = "/surfaces/word/footnote-2.js"
-	err := (Manifest{ID: "wiki", Surfaces: []Surface{wordFootnote(), second}}).validateSurfaces()
+	err := (Manifest{ID: "notes", Surfaces: []Surface{wordFootnote(), second}}).validateSurfaces()
 	if err == nil {
 		t.Fatal("validateSurfaces accepted two surfaces sharing an id within one client")
 	}
@@ -421,251 +355,13 @@ func TestServeRejectsUnusableSurface(t *testing.T) {
 	surface := wordFootnote()
 	surface.Module = `/\evil.example/footnote.js`
 
-	s := New(Manifest{ID: "wiki", Title: "Wiki", Surfaces: []Surface{surface}})
+	s := New(Manifest{ID: "notes", Title: "Notes", Surfaces: []Surface{surface}})
 	err := s.Serve()
 	if err == nil {
 		t.Fatal("Serve returned nil for an off-origin surface module; expected a boot error and no bind")
 	}
 	if !strings.Contains(err.Error(), "footnote") {
 		t.Errorf("boot error should name the surface, got: %v", err)
-	}
-}
-
-// The host registration payload (the heartbeat body) must carry the declared
-// data-graph verbatim, not just the GET manifest — that is the surface the host
-// self-registration path reads.
-func TestRegistrationPayloadCarriesDashboardVerbatim(t *testing.T) {
-	graph := sampleDataGraph()
-
-	body := make(chan []byte, 1)
-	hostSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		select {
-		case body <- b:
-		default:
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer hostSrv.Close()
-	gatewaySrv := httptest.NewServer(http.HandlerFunc(answeringTheExchange))
-	defer gatewaySrv.Close()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login", Dashboard: graph})
-	s.cfg = config{
-		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
-		publicURL:          "http://127.0.0.1",
-		hostRegisterURL:    hostSrv.URL,
-		gatewayRegisterURL: gatewaySrv.URL + solutionRegisterPath,
-		solutionTokenURL:   gatewaySrv.URL + solutionRegistrationTokenPath,
-		solutionSecret:     "s3cret",
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() { _ = s.serve(ctx, ln); close(done) }()
-
-	var raw []byte
-	select {
-	case raw = <-body:
-	case <-time.After(5 * time.Second):
-		t.Fatal("host did not receive a registration within timeout")
-	}
-	cancel()
-	<-done
-
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		t.Fatalf("unmarshal registration body: %v", err)
-	}
-	if !reflect.DeepEqual(payload["dashboard"], graph) {
-		t.Errorf("registration dashboard = %#v, want %#v", payload["dashboard"], graph)
-	}
-}
-
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func getStatus(t *testing.T, target string) int {
-	t.Helper()
-	resp, err := http.Get(target)
-	if err != nil {
-		return 0
-	}
-	resp.Body.Close()
-	return resp.StatusCode
-}
-
-func frontendManifestURL(t *testing.T, base string) string {
-	t.Helper()
-	resp, err := http.Get(base + "/.well-known/solution.json")
-	if err != nil {
-		t.Fatalf("GET solution.json: %v", err)
-	}
-	defer resp.Body.Close()
-	var manifest struct {
-		Frontend struct {
-			ManifestURL string `json:"manifestUrl"`
-		} `json:"frontend"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-		t.Fatalf("decode solution.json: %v", err)
-	}
-	if manifest.Frontend.ManifestURL == "" {
-		t.Fatal("solution.json has no frontend.manifestUrl")
-	}
-	return manifest.Frontend.ManifestURL
-}
-
-// TestConfigValidate guards the boot-time floor: an unresolved value (empty port,
-// or a scheme-less register URL as loadConfig produces when the SDK resolves
-// nothing and no override is set) must be rejected, not silently accepted into a
-// ":"+"" bind and heartbeats to relative URLs.
-func TestConfigValidate(t *testing.T) {
-	valid := config{
-		port:               "8090",
-		gatewayURL:         "http://gateway:42152",
-		hostRegisterURL:    "http://frontend:21931/api/solutions/register",
-		gatewayRegisterURL: "http://gateway:42152/solutions/_register",
-		moduleRegisterURL:  "http://gateway:42152/modules/_register",
-		moduleTokenURL:     "http://gateway:42152/modules/_registration-token",
-		solutionTokenURL:   "http://gateway:42152/solutions/_registration-token",
-		solutionSecret:     "s3cret",
-		selfUpstream:       "http://backend:8080",
-	}
-	if err := valid.validate(); err != nil {
-		t.Fatalf("valid config rejected: %v", err)
-	}
-
-	cases := []struct {
-		name   string
-		mutate func(*config)
-	}{
-		{"empty port", func(c *config) { c.port = "" }},
-		{"non-numeric port", func(c *config) { c.port = "http" }},
-		{"port out of range", func(c *config) { c.port = "70000" }},
-		{"empty gateway URL", func(c *config) { c.gatewayURL = "" }},
-		{"relative host register URL", func(c *config) { c.hostRegisterURL = "/api/solutions/register" }},
-		{"relative gateway register URL", func(c *config) { c.gatewayRegisterURL = "/solutions/_register" }},
-		{"relative module register URL", func(c *config) { c.moduleRegisterURL = "/modules/_register" }},
-		{"relative module token URL", func(c *config) { c.moduleTokenURL = "/modules/_registration-token" }},
-		{"relative solution token URL", func(c *config) { c.solutionTokenURL = "/solutions/_registration-token" }},
-		{"no solution registration secret", func(c *config) { c.solutionSecret = "" }},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := valid
-			tc.mutate(&c)
-			if err := c.validate(); err == nil {
-				t.Errorf("validate accepted an unresolved config (%s)", tc.name)
-			}
-		})
-	}
-}
-
-// TestServeRejectsUnresolvedConfig proves Serve refuses to boot on an unresolved
-// config instead of binding a random port and registering into the void. A
-// relative HOST_REGISTER_URL stands in for the empty frontendURL loadConfig
-// yields when the SDK cannot resolve the host frontend endpoint.
-func TestServeRejectsUnresolvedConfig(t *testing.T) {
-	t.Setenv("PORT", "8090")
-	t.Setenv("GATEWAY_URL", "http://127.0.0.1:1")
-	t.Setenv("GATEWAY_REGISTER_URL", "http://127.0.0.1:1/solutions/_register")
-	t.Setenv("HOST_REGISTER_URL", "/api/solutions/register")
-
-	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
-	err := s.Serve()
-	if err == nil {
-		t.Fatal("Serve returned nil for an unresolved config; expected a boot error and no bind")
-	}
-	if !strings.Contains(err.Error(), "host register URL") {
-		t.Errorf("boot error should name the unresolved field, got: %v", err)
-	}
-}
-
-// TestHeartbeatLogsTransportError guards finding #4: a round trip that never
-// yields an HTTP status (scheme-less URL, connection refused) must be logged, not
-// swallowed — a permanently-failing registration was previously indistinguishable
-// from a working one.
-func TestHeartbeatLogsTransportError(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{cfg: config{internalToken: "t"}}
-	done := make(chan struct{})
-	go func() {
-		s.heartbeat(ctx, "/solutions/_register", []byte("{}"), "gateway", internalTokenAuth("t"))
-		close(done)
-	}()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(buf.String(), "failed") {
-		if time.Now().After(deadline) {
-			cancel()
-			<-done
-			t.Fatalf("no transport failure logged within timeout, got: %q", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cancel()
-	<-done
-
-	if strings.Contains(buf.String(), "registered with") {
-		t.Errorf("logged success on a transport failure: %q", buf.String())
-	}
-}
-
-func TestHeartbeatLogsRejection(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{cfg: config{internalToken: "wrong-token"}}
-	done := make(chan struct{})
-	go func() {
-		s.heartbeat(ctx, srv.URL, []byte("{}"), "host", internalTokenAuth("wrong-token"))
-		close(done)
-	}()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(buf.String(), "rejected") {
-		if time.Now().After(deadline) {
-			cancel()
-			<-done
-			t.Fatalf("no rejection logged within timeout, got: %q", buf.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cancel()
-	<-done
-
-	out := buf.String()
-	if strings.Contains(out, "registered with") {
-		t.Errorf("logged success on 401 response: %q", out)
-	}
-	if !strings.Contains(out, "401") {
-		t.Errorf("expected rejection log naming the status, got: %q", out)
 	}
 }
 
@@ -685,72 +381,80 @@ func setEndpoint(t *testing.T, key, addr string) {
 	})
 }
 
-// TestLoadConfigResolvesRenamedGateway proves the gateway default follows the
-// saas-starter auth-sidecar → auth-gateway rename (v0.0.49): loadConfig resolves
-// the gateway URL from the SDK against either service name, with no explicit
-// CODEFLY_HOST_GATEWAY or GATEWAY_URL override — so a solution boots against both
-// the renamed host and older ones.
-func TestLoadConfigResolvesRenamedGateway(t *testing.T) {
-	const addr = "http://gateway:42152"
-	cases := []struct {
-		name    string
-		service string
-	}{
-		{"auth-gateway (v0.0.49+)", "auth-gateway"},
-		{"auth-sidecar (pre-v0.0.49 fallback)", "auth-sidecar"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			key := "CODEFLY__ENDPOINT__SAAS__" +
-				strings.ToUpper(strings.ReplaceAll(tc.service, "-", "_")) + "__REST__REST"
-			setEndpoint(t, key, addr)
+// TestOnlyTheCurrentGatewayRoleResolves reverses an acceptance test this PR
+// deleted the behaviour of.
+//
+// Gateway resolution used to fall back to the pre-v0.0.49 `auth-sidecar` role
+// when the current one did not resolve, and a test asserted a solution booted
+// against either host version. That is a compatibility path: in this cutover an
+// unresolved current gateway silently selecting a legacy service is worse than a
+// boot that fails naming the role, because the legacy service is the one that
+// served the registration endpoints being deleted.
+func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
+	const addr = "https://gateway:42152"
+	t.Run("the current role resolves", func(t *testing.T) {
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", addr)
+		cfg := loadConfig(context.Background(), testSolutionID, nil)
+		if cfg.gatewayURL != addr {
+			t.Fatalf("gatewayURL = %q, want %q resolved from the current role without an override", cfg.gatewayURL, addr)
+		}
+		// And the mint URL is NOT derived from it. A resolved gateway says
+		// where the gateway is, not where the host mints a credential: that
+		// endpoint is unsettled and undeployed, and the address this runtime
+		// POSTs its projected service-account token to is not one to assume.
+		if cfg.mintURL != "" {
+			t.Errorf("mintURL = %q, want empty: a resolved gateway must not produce a mint address, because the attestation this runtime sends there would be going somewhere nobody published", cfg.mintURL)
+		}
+	})
 
-			cfg := loadConfig(context.Background(), "lastlogin-go")
-			if cfg.gatewayURL != addr {
-				t.Fatalf("gatewayURL = %q, want %q resolved from %s without an override", cfg.gatewayURL, addr, tc.service)
-			}
-			// The gateway module-register URL defaults to the resolved gateway plus
-			// the /modules/_register path, with no explicit override.
-			if want := addr + "/modules/_register"; cfg.moduleRegisterURL != want {
-				t.Errorf("moduleRegisterURL = %q, want %q derived from the resolved gateway", cfg.moduleRegisterURL, want)
-			}
-		})
-	}
+	t.Run("the legacy role resolves to nothing", func(t *testing.T) {
+		// Hermetic: no workspace on disk, so only the injected carriers drive
+		// resolution and the only role present is the legacy one.
+		t.Chdir(t.TempDir())
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_SIDECAR__REST__REST", addr)
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
+			t.Fatalf("resolveGateway = %q, want %q: a host exposing only the pre-rename role is one to re-render, and the boot must fail naming the role rather than selecting a legacy service", got, "")
+		}
+	})
 }
 
-// TestLoadConfigResolvesHostByRole proves the host gateway/frontend resolve by
-// service role alone, independent of the host module's workspace name: loadConfig
-// resolves both URLs with no CODEFLY_HOST_MODULE override whether the host module
-// is the current saas (auth-gateway service), the pre-rename saas-starter
+// TestLoadConfigResolvesHostByRole proves the host gateway resolves by service
+// role alone, independent of the host module's workspace name: loadConfig
+// resolves it with no CODEFLY_HOST_MODULE override whether the host module is
+// the current host module (auth-gateway service), a pre-rename one
 // (auth-sidecar), or any other name a solution composes it under (codefly-dev/core#382).
 func TestLoadConfigResolvesHostByRole(t *testing.T) {
-	const (
-		gatewayAddr  = "http://gateway:42152"
-		frontendAddr = "http://frontend:42153"
-	)
+	const gatewayAddr = "https://gateway:42152"
 	cases := []struct {
 		name    string
 		module  string
 		gateway string
 	}{
-		{"saas host (post-rename)", "SAAS", "AUTH_GATEWAY"},
-		{"saas-starter host (pre-rename)", "SAAS_STARTER", "AUTH_SIDECAR"},
-		{"arbitrary host module name", "SOME_OTHER_HOST", "AUTH_GATEWAY"},
+		{"a host module named saas", "SAAS", "AUTH_GATEWAY"},
+		{"a host module under a pre-rename name", "SAAS_STARTER", "AUTH_GATEWAY"},
+		{"any other name a solution composes it under", "SOME_OTHER_HOST", "AUTH_GATEWAY"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__REST__REST", gatewayAddr)
-			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__FRONTEND__HTTP__HTTP", frontendAddr)
 
-			cfg := loadConfig(context.Background(), "lastlogin-go")
+			cfg := loadConfig(context.Background(), testSolutionID, nil)
 			if cfg.gatewayURL != gatewayAddr {
 				t.Errorf("gatewayURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.gatewayURL, gatewayAddr)
 			}
-			if want := frontendAddr + "/api/solutions/register"; cfg.hostRegisterURL != want {
-				t.Errorf("hostRegisterURL = %q, want %q resolved without a CODEFLY_HOST_MODULE override", cfg.hostRegisterURL, want)
-			}
 		})
 	}
+}
+
+// identitiesFile writes an admission set to a file and returns its path, which
+// is the form both admission sets are provisioned in: they are read per
+// handshake and per dial, so they have to be something this process can re-read
+// rather than a value fixed when it started.
+func identitiesFile(t *testing.T, identities ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "identities")
+	writeFile(t, path, strings.Join(identities, "\n")+"\n")
+	return path
 }
 
 // writeFile writes content to path, creating parent directories, for building
@@ -776,15 +480,15 @@ func TestResolveGatewayAmbiguousModuleFailsLoud(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	t.Run("single owning module resolves", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "http://gateway:42152")
-		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "http://gateway:42152" {
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "https://gateway:42152")
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "https://gateway:42152" {
 			t.Fatalf("resolveGateway = %q, want the single module's address", got)
 		}
 	})
 
 	t.Run("two modules owning the same role are ambiguous", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "http://gateway-a:42152")
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__REST__REST", "http://gateway-b:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "https://gateway-a:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__REST__REST", "https://gateway-b:42152")
 		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
 			t.Fatalf("resolveGateway = %q, want %q so validate() fails loud on the ambiguous host", got, "")
 		}
@@ -810,7 +514,6 @@ modules:
 name: platform
 services:
   - name: auth-gateway
-  - name: frontend
 `)
 	writeFile(t, filepath.Join(root, "modules", "platform", "services", "auth-gateway", "service.codefly.yaml"), `kind: service
 name: auth-gateway
@@ -823,18 +526,6 @@ agent:
 endpoints:
   - name: rest
 `)
-	writeFile(t, filepath.Join(root, "modules", "platform", "services", "frontend", "service.codefly.yaml"), `kind: service
-name: frontend
-version: 0.0.0
-agent:
-  kind: codefly:service
-  name: go
-  version: 0.0.1
-  publisher: codefly.dev
-endpoints:
-  - name: http
-`)
-
 	// Force the SDK's local-native resolution (no injected carriers), and restore
 	// the shared env snapshot afterwards so later tests see a clean state.
 	t.Setenv("CODEFLY__ENVIRONMENT", "")
@@ -855,908 +546,14 @@ endpoints:
 		t.Errorf("resolveGateway(module=\"\") = %q, want %q discovered from the workspace", gotGW, wantGW)
 	}
 
-	gotFE := resolveFrontend(ctx, "", "frontend")
-	wantFE := resolveFrontend(ctx, "platform", "frontend")
-	if wantFE == "" {
-		t.Fatal("resolveFrontend with explicit module resolved empty; the workspace fixture did not expose the frontend endpoint")
-	}
-	if gotFE != wantFE {
-		t.Errorf("resolveFrontend(module=\"\") = %q, want %q discovered from the workspace", gotFE, wantFE)
-	}
 }
 
-// moduleRegistration is the wire payload the gateway's /modules/_register
-// accepts: a bare single-segment prefix (the gateway builds /v1/<prefix>/* from
-// it) and the resolved upstream. Registration and Internal are not part of the
-// body — they are the captured credential headers, so a test can assert the
-// registration presents the signed, prefix-bound token and not the shared
-// cluster-internal one.
-type moduleRegistration struct {
-	Prefix       string `json:"prefix"`
-	Upstream     string `json:"upstream"`
-	Registration string `json:"-"`
-	Internal     string `json:"-"`
-}
-
-// moduleExchange is what the credential exchange (/modules/_registration-token)
-// received: the prefix a module asks for, plus the two credentials the gateway
-// requires — its own perimeter token and the module's registration secret.
-type moduleExchange struct {
-	Prefix   string `json:"prefix"`
-	Secret   string `json:"-"`
-	Internal string `json:"-"`
-}
-
-// fakeGateway stands in for the host gateway on the two endpoints module
-// federation uses. It mirrors the real refusal semantics: the exchange mints a
-// token only for a prefix whose declared secret the caller presents, and answers
-// 401 otherwise (accounts' refusal, relayed).
-type fakeGateway struct {
-	*httptest.Server
-	registrations chan moduleRegistration
-	exchanges     chan moduleExchange
-
-	// declared maps a prefix to the secret the composition provisioned for it —
-	// the plaintext twin of the digest accounts holds.
-	declared map[string]string
-	// tokenTTL is how long a minted token is claimed to be valid.
-	tokenTTL time.Duration
-	// registerStatus, when non-zero, is what /modules/_register answers instead
-	// of 200.
-	registerStatus int
-
-	mu sync.Mutex
-	// registerRefusals, while positive, makes /modules/_register answer 401 and
-	// counts down — a gateway that has stopped honouring the token it was handed
-	// and accepts the next one.
-	registerRefusals int
-	minted           int
-}
-
-func newFakeGateway(t *testing.T, gw *fakeGateway) *fakeGateway {
-	t.Helper()
-	gw.registrations = make(chan moduleRegistration, 8)
-	gw.exchanges = make(chan moduleExchange, 8)
-	if gw.tokenTTL == 0 {
-		gw.tokenTTL = time.Hour
-	}
-	gw.Server = httptest.NewServer(http.HandlerFunc(gw.serve))
-	t.Cleanup(gw.Close)
-	return gw
-}
-
-func (g *fakeGateway) serve(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case moduleRegistrationTokenPath:
-		var exchange moduleExchange
-		_ = json.NewDecoder(r.Body).Decode(&exchange)
-		exchange.Secret = r.Header.Get(moduleSecretHeader)
-		exchange.Internal = r.Header.Get(internalTokenHeader)
-		send(g.exchanges, exchange)
-		if g.declared[exchange.Prefix] == "" || g.declared[exchange.Prefix] != exchange.Secret {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		g.mu.Lock()
-		g.minted++
-		token := fmt.Sprintf("minted-%s-%d", exchange.Prefix, g.minted)
-		g.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]string{
-			"token":     token,
-			"expiresAt": time.Now().Add(g.tokenTTL).UTC().Format(time.RFC3339),
-		})
-	case moduleRegisterPath:
-		var registration moduleRegistration
-		_ = json.NewDecoder(r.Body).Decode(&registration)
-		registration.Registration = r.Header.Get(moduleRegistrationHeader)
-		registration.Internal = r.Header.Get(internalTokenHeader)
-		send(g.registrations, registration)
-		g.mu.Lock()
-		refusing := g.registerRefusals > 0
-		if refusing {
-			g.registerRefusals--
-		}
-		g.mu.Unlock()
-		if refusing {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		if g.registerStatus != 0 {
-			w.WriteHeader(g.registerStatus)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	default:
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-func (g *fakeGateway) mintCount() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.minted
-}
-
-// send records an observation without ever blocking the fake gateway's handler:
-// a heartbeat re-POSTs forever, so a full channel must not wedge the server.
+// send records an observation without ever blocking a fake host's handler: a
+// full channel must not wedge the server a test is driving.
 func send[T any](ch chan T, value T) {
 	select {
 	case ch <- value:
 	default:
-	}
-}
-
-// bootWithModuleRegistry boots a real solution on ln against gw. The host and
-// gateway self-registrations point at the same fake so their heartbeats don't
-// spew transport errors into the test log.
-func bootWithModuleRegistry(t *testing.T, ln net.Listener, gw *fakeGateway) func() {
-	t.Helper()
-	s := New(Manifest{ID: "lastlogin-go", Title: "Last Login"})
-	s.cfg = config{
-		port:               strconv.Itoa(ln.Addr().(*net.TCPAddr).Port),
-		publicURL:          "http://127.0.0.1",
-		hostRegisterURL:    gw.URL + "/host",
-		gatewayRegisterURL: gw.URL + "/gateway",
-		moduleRegisterURL:  gw.URL + moduleRegisterPath,
-		moduleTokenURL:     gw.URL + moduleRegistrationTokenPath,
-		internalToken:      internalTokenTest,
-		moduleSecrets:      parseModuleRegistrationSecrets(os.Getenv(ModuleRegistrationSecretsEnvironmentVariable)),
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { _ = s.serve(ctx, ln); close(done) }()
-	return func() {
-		cancel()
-		<-done
-	}
-}
-
-// internalTokenTest is the cluster-internal token the fake gateway's perimeter
-// check expects on the credential exchange.
-const internalTokenTest = "internal-token-xyz"
-
-// consumesDocuments is the api.consumes projection core surfaces to a running
-// backend for the wiki→documents federation. The literal key is
-// manifest.APIConsumesEnvironmentVariable (a wire contract).
-const consumesDocuments = `[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`
-
-// TestServeRegistersConsumedAPIUpstreams proves the api.consumes federation end
-// to end on the runtime's side: for each consumed target core surfaces in
-// CODEFLY__API_CONSUMES, the runtime exchanges the registration secret its
-// composition provisioned for a signed, prefix-bound token, then registers
-// /v1/<as> → the SDK-resolved upstream with that token. The shared
-// cluster-internal token authenticates only the exchange — the gateway rejects
-// it on /modules/_register, so it must not be what the registration presents.
-func TestServeRegistersConsumedAPIUpstreams(t *testing.T) {
-	const upstream = "http://docstore-upstream:9100"
-	// The consumed endpoint's address is injected because the backend depends on
-	// the consumed service; resolve it via the SDK snapshot.
-	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", upstream)
-	t.Setenv("CODEFLY__API_CONSUMES", consumesDocuments)
-	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret")
-
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bootWithModuleRegistry(t, ln, gw)()
-
-	select {
-	case exchange := <-gw.exchanges:
-		if exchange.Prefix != "documents" {
-			t.Errorf("exchanged for prefix %q, want %q", exchange.Prefix, "documents")
-		}
-		if exchange.Secret != "s3cret" {
-			t.Errorf("exchange presented secret %q, want the provisioned %q", exchange.Secret, "s3cret")
-		}
-		if exchange.Internal != internalTokenTest {
-			t.Errorf("exchange presented internal token %q, want %q — the gateway's perimeter check requires it", exchange.Internal, internalTokenTest)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("gateway did not receive a registration-token exchange within timeout")
-	}
-
-	select {
-	case reg := <-gw.registrations:
-		if reg.Prefix != "documents" {
-			t.Errorf("registered prefix = %q, want %q (the facade as core projected)", reg.Prefix, "documents")
-		}
-		if reg.Upstream != upstream {
-			t.Errorf("registered upstream = %q, want %q resolved via the SDK", reg.Upstream, upstream)
-		}
-		if reg.Registration != "minted-documents-1" {
-			t.Errorf("registered with %s = %q, want the minted token", moduleRegistrationHeader, reg.Registration)
-		}
-		if reg.Internal != "" {
-			t.Errorf("registration carried the shared internal token %q; the gateway refuses it and it must not leak to this path", reg.Internal)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("gateway did not receive a module registration within timeout")
-	}
-}
-
-// TestServeSkipsConsumedAPIWithoutSecret proves the provisioning gap fails loud
-// rather than hammering the gateway: with no secret for the prefix there is no
-// credential to exchange, so every registration would be a guaranteed 401. The
-// runtime neither exchanges nor registers, and says which variable is missing.
-func TestServeSkipsConsumedAPIWithoutSecret(t *testing.T) {
-	buf := &syncBuffer{}
-	log.SetOutput(buf)
-	defer log.SetOutput(os.Stderr)
-
-	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
-	t.Setenv("CODEFLY__API_CONSUMES", consumesDocuments)
-	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "")
-
-	gw := newFakeGateway(t, &fakeGateway{})
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bootWithModuleRegistry(t, ln, gw)()
-
-	select {
-	case exchange := <-gw.exchanges:
-		t.Fatalf("exchanged a registration token for %q with no provisioned secret", exchange.Prefix)
-	case reg := <-gw.registrations:
-		t.Fatalf("registered module %q → %q with no provisioned secret", reg.Prefix, reg.Upstream)
-	case <-time.After(500 * time.Millisecond):
-	}
-
-	if out := buf.String(); !strings.Contains(out, ModuleRegistrationSecretsEnvironmentVariable) {
-		t.Errorf("missing secret was not reported against %s, got: %q", ModuleRegistrationSecretsEnvironmentVariable, out)
-	}
-}
-
-// TestServeIsolatesFailedModuleRegistration proves a per-module failure stays
-// per-module: the composition provisions a secret for one consumed module and a
-// stale one for another, so the first federates while the second's exchange is
-// refused. The refused module must not take down the backend or the sibling
-// registration — it just retries on its own heartbeat.
-func TestServeIsolatesFailedModuleRegistration(t *testing.T) {
-	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
-	setEndpoint(t, "CODEFLY__ENDPOINT__BILLING__INVOICES__REST__REST", "http://billing-upstream:9200")
-	t.Setenv("CODEFLY__API_CONSUMES", `[`+
-		`{"id":"billing.invoices","module":"billing","service":"invoices","endpoint":"rest","protocol":"rest","as":"billing"},`+
-		`{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest","as":"documents"}]`)
-	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret,billing:stale")
-
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{
-		"documents": "s3cret",
-		"billing":   "rotated",
-	}})
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bootWithModuleRegistry(t, ln, gw)()
-
-	select {
-	case reg := <-gw.registrations:
-		if reg.Prefix != "documents" {
-			t.Errorf("registered prefix = %q, want only %q to reach registration", reg.Prefix, "documents")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the module with a valid secret did not register within timeout")
-	}
-
-	// The backend is still serving: the refused module's failure did not take it
-	// down with it.
-	resp, err := http.Get("http://127.0.0.1:" + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port) + "/health")
-	if err != nil {
-		t.Fatalf("backend stopped serving after a module registration failure: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("health = %d, want 200", resp.StatusCode)
-	}
-}
-
-// TestServeSkipsConsumedAPIWithoutFacade proves the runtime never guesses a
-// facade prefix. Core derives an omitted `as` from the producing endpoint's
-// proto package — a value the runtime cannot reconstruct from the projected
-// identity — so an entry that arrives with no `as` is skipped rather than
-// registered under a fabricated prefix (e.g. the module name), which would proxy
-// a route the generated client never calls and could steal another facade's
-// prefix. The consumed endpoint resolves fine; only the missing `as` suppresses
-// registration.
-func TestServeSkipsConsumedAPIWithoutFacade(t *testing.T) {
-	setEndpoint(t, "CODEFLY__ENDPOINT__DOCSTORE__DOCUMENTS__REST__REST", "http://docstore-upstream:9100")
-	t.Setenv("CODEFLY__API_CONSUMES",
-		`[{"id":"docstore.documents","module":"docstore","service":"documents","endpoint":"rest","protocol":"rest"}]`)
-	t.Setenv(ModuleRegistrationSecretsEnvironmentVariable, "documents:s3cret")
-
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bootWithModuleRegistry(t, ln, gw)()
-
-	select {
-	case reg := <-gw.registrations:
-		t.Fatalf("registered module %q → %q for a consumed api with no facade entry-point (as); the runtime must not invent a prefix", reg.Prefix, reg.Upstream)
-	case <-time.After(500 * time.Millisecond):
-		// No registration, as expected.
-	}
-}
-
-// TestServeRegistersNoModulesWithoutConsumes proves the no-op: a solution that
-// declares no api.consumes (empty CODEFLY__API_CONSUMES) registers no module
-// upstream at all, so nothing changes for the solutions that consume nothing.
-func TestServeRegistersNoModulesWithoutConsumes(t *testing.T) {
-	t.Setenv("CODEFLY__API_CONSUMES", "")
-
-	gw := newFakeGateway(t, &fakeGateway{})
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer bootWithModuleRegistry(t, ln, gw)()
-
-	select {
-	case reg := <-gw.registrations:
-		t.Fatalf("registered module %q → %q for a solution that declares no api.consumes", reg.Prefix, reg.Upstream)
-	case <-time.After(500 * time.Millisecond):
-		// No registration, as expected.
-	}
-}
-
-// TestModuleCredentialReusesTokenUntilRenewal proves the beat does not re-mint
-// every 15 seconds: a registration token lives 5 minutes, and each mint is an
-// audited security event on accounts, so a token still comfortably inside its
-// lifetime is reused.
-func TestModuleCredentialReusesTokenUntilRenewal(t *testing.T) {
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
-	credential := &moduleCredential{
-		tokenURL:      gw.URL + moduleRegistrationTokenPath,
-		internalToken: internalTokenTest,
-		prefix:        "documents",
-		secret:        "s3cret",
-	}
-
-	for beat := range 3 {
-		req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := credential.authorize(context.Background(), req); err != nil {
-			t.Fatalf("beat %d: authorize: %v", beat, err)
-		}
-		if got := req.Header.Get(moduleRegistrationHeader); got != "minted-documents-1" {
-			t.Errorf("beat %d presented %q, want the first minted token reused", beat, got)
-		}
-	}
-	if got := gw.mintCount(); got != 1 {
-		t.Errorf("minted %d tokens across 3 beats, want 1 — a live token must be reused", got)
-	}
-}
-
-// TestModuleCredentialReExchangesAfterRejection proves recovery from a refused
-// registration: the gateway answering 401 means the token it was handed may no
-// longer be honoured (a restarted gateway, a rotated key), so replaying it for
-// the rest of its lifetime would strand the module. A refusal of a token held
-// from an earlier beat forces a fresh exchange on the next one.
-func TestModuleCredentialReExchangesAfterRejection(t *testing.T) {
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
-	credential := &moduleCredential{
-		tokenURL:      gw.URL + moduleRegistrationTokenPath,
-		internalToken: internalTokenTest,
-		prefix:        "documents",
-		secret:        "s3cret",
-	}
-
-	req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := credential.authorize(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	// A later beat presents the held token; that beat's refusal is the one that
-	// can be blamed on staleness, so it drops the credential.
-	if _, err := credential.authorize(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	credential.invalidate()
-	if _, err := credential.authorize(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := req.Header.Get(moduleRegistrationHeader); got != "minted-documents-2" {
-		t.Errorf("presented %q after invalidation, want a freshly minted token", got)
-	}
-	if got := gw.mintCount(); got != 2 {
-		t.Errorf("minted %d tokens, want 2 — a refused credential must be re-exchanged", got)
-	}
-}
-
-// TestModuleCredentialKeepsATokenMintedForThisBeat proves the one refusal a
-// fresh mint cannot fix is not answered with another mint. A gateway that
-// refuses a token minted moments ago is refusing it for a reason that has
-// nothing to do with staleness — it does not trust the issuer, the prefix is not
-// this module's to claim, its own clock is skewed, or a perimeter check rejected
-// the request before the token was ever read. Dropping the credential there put
-// a mint on every single beat: an audited security event on the issuer four
-// times a minute per module, indefinitely, and silent after the first log line
-// because the status never changes.
-func TestModuleCredentialKeepsATokenMintedForThisBeat(t *testing.T) {
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(os.Stderr)
-
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
-	credential := &moduleCredential{
-		tokenURL:      gw.URL + moduleRegistrationTokenPath,
-		internalToken: internalTokenTest,
-		prefix:        "documents",
-		secret:        "s3cret",
-	}
-	req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := credential.authorize(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	credential.invalidate() // refused the token this beat just minted
-	if credential.token == "" {
-		t.Fatal("dropped a token minted for this very beat; re-minting cannot fix a refusal that was never about staleness")
-	}
-	if _, err := credential.authorize(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	if got := gw.mintCount(); got != 1 {
-		t.Errorf("minted %d tokens, want 1 — a refusal of a just-minted token must not buy another mint", got)
-	}
-}
-
-// TestHeartbeatReExchangesOnRejectedRegistration proves the invalidation is
-// actually wired to the beat loop, not just available on the credential: a
-// gateway that answers 401 once — having stopped honouring the token it was
-// handed — makes the next beat present a freshly exchanged one.
-func TestHeartbeatReExchangesOnRejectedRegistration(t *testing.T) {
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(os.Stderr)
-
-	// Refuse the first two registrations. The first presents a token minted for
-	// that same beat, which re-minting cannot fix; the second presents that
-	// token held over from the earlier beat, and that is the refusal staleness
-	// explains — so it must be answered with a fresh exchange.
-	gw := newFakeGateway(t, &fakeGateway{
-		declared:         map[string]string{"documents": "s3cret"},
-		registerRefusals: 2,
-	})
-	credential := &moduleCredential{
-		tokenURL:      gw.URL + moduleRegistrationTokenPath,
-		internalToken: internalTokenTest,
-		prefix:        "documents",
-		secret:        "s3cret",
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{manifest: Manifest{ID: "lastlogin-go"}, registrationInterval: time.Millisecond}
-	done := make(chan struct{})
-	go func() {
-		s.heartbeat(ctx, gw.URL+moduleRegisterPath, []byte(`{"prefix":"documents"}`), "gateway module documents", credential)
-		close(done)
-	}()
-	defer func() { cancel(); <-done }()
-
-	first, deadline := "", time.After(10*time.Second)
-	for {
-		select {
-		case reg := <-gw.registrations:
-			switch {
-			case reg.Registration == "":
-				t.Fatal("registered with no token")
-			case first == "":
-				first = reg.Registration
-			case reg.Registration != first:
-				return // recovered: a fresh credential replaced the stale one
-			}
-		case <-deadline:
-			t.Fatalf("kept replaying %q: a token refused after being held across beats must be re-exchanged", first)
-		}
-	}
-}
-
-// TestHeartbeatDoesNotMintPerBeatOnAPersistentRefusal is the regression guard
-// for the mint storm. A gateway that refuses every registration does so for a
-// reason no new token can repair, and the old loop answered each refusal with a
-// fresh exchange: at the production 15s beat that is four mints a minute per
-// module, forever, each one an audited security event on the issuer — and
-// silent after the first log line, because the status never changes.
-//
-// The refusal is now worth exactly one re-mint, and failing beats back off, so
-// the mint count stays flat however long the gateway stays broken.
-func TestHeartbeatDoesNotMintPerBeatOnAPersistentRefusal(t *testing.T) {
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(os.Stderr)
-
-	gw := newFakeGateway(t, &fakeGateway{
-		declared:       map[string]string{"documents": "s3cret"},
-		registerStatus: http.StatusUnauthorized,
-	})
-	credential := &moduleCredential{
-		tokenURL:      gw.URL + moduleRegistrationTokenPath,
-		internalToken: internalTokenTest,
-		prefix:        "documents",
-		secret:        "s3cret",
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{manifest: Manifest{ID: "lastlogin-go"}, registrationInterval: time.Millisecond}
-	done := make(chan struct{})
-	go func() {
-		s.heartbeat(ctx, gw.URL+moduleRegisterPath, []byte(`{"prefix":"documents"}`), "gateway module documents", credential)
-		close(done)
-	}()
-	defer func() { cancel(); <-done }()
-
-	const beats = 5
-	for range beats {
-		select {
-		case <-gw.registrations:
-		case <-time.After(10 * time.Second):
-			t.Fatalf("gateway saw fewer than %d registration attempts", beats)
-		}
-	}
-	// One mint to obtain the credential, at most one more to answer the refusal.
-	if got := gw.mintCount(); got > 2 {
-		t.Errorf("minted %d tokens across %d refused beats, want at most 2 — a refusal that a new token cannot fix must not re-mint on every beat", got, beats)
-	}
-}
-
-// TestModuleCredentialRetriesAgainAfterRecovering proves a spent retry budget is
-// restored by a successful registration, so a second, independent refusal — a
-// gateway rotating its key twice inside one credential lifetime — is answered
-// with a fresh token instead of inheriting the first refusal's spent attempt and
-// stranding the module until the token renews on its own.
-func TestModuleCredentialRetriesAgainAfterRecovering(t *testing.T) {
-	gw := newFakeGateway(t, &fakeGateway{declared: map[string]string{"documents": "s3cret"}})
-	credential := &moduleCredential{
-		tokenURL:      gw.URL + moduleRegistrationTokenPath,
-		internalToken: internalTokenTest,
-		prefix:        "documents",
-		secret:        "s3cret",
-	}
-	req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	authorize := func() {
-		t.Helper()
-		if _, err := credential.authorize(context.Background(), req); err != nil {
-			t.Fatal(err)
-		}
-	}
-	authorize()             // beat 1: mint
-	authorize()             // beat 2: replay the held token
-	credential.invalidate() // refused: spends the retry, drops
-	authorize()             // beat 3: mint the replacement
-	credential.succeeded()  // ... which the gateway accepts
-
-	authorize()             // beat 4: replay
-	credential.invalidate() // a second, independent refusal
-	if credential.token != "" {
-		t.Fatal("kept a token refused after an intervening success: a new fault must earn its own re-mint")
-	}
-	authorize()
-	if got := gw.mintCount(); got != 3 {
-		t.Errorf("minted %d tokens, want 3 — one per refusal episode plus the original", got)
-	}
-}
-
-// TestHeartbeatDropsACredentialRefusedWith403 proves 403 recovers like 401. A
-// gateway answering "forbidden" to a lapsed token would otherwise have that
-// token replayed until it renewed naturally, stranding the module for most of
-// the credential's lifetime.
-func TestHeartbeatDropsACredentialRefusedWith403(t *testing.T) {
-	credential := &moduleCredential{prefix: "documents", token: "held", renewAt: time.Now().Add(time.Hour)}
-	// A token held from an earlier beat: this beat did not mint it.
-	credential.invalidate()
-	if credential.token != "" {
-		t.Fatal("a refused credential held from an earlier beat must be dropped")
-	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	defer srv.Close()
-	if status := statusOfOneBeat(t, srv.URL); status != http.StatusForbidden {
-		t.Fatalf("beat status = %d, want 403", status)
-	}
-}
-
-// statusOfOneBeat runs a single beat against target and returns its status.
-func statusOfOneBeat(t *testing.T, target string) int {
-	t.Helper()
-	s := &Server{manifest: Manifest{ID: "lastlogin-go"}}
-	status, _, err := s.beat(context.Background(), target, []byte(`{}`), internalTokenAuth("tok"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return status
-}
-
-// TestExchangeRejectsAnUnusableExpiry proves the credential refuses an expiry
-// it cannot act on instead of caching it as "already expired". Treated as
-// expired it would re-run the exchange on every beat while every registration
-// still returned 200 — an unlogged mint, and an audited security event on the
-// issuer, four times a minute for as long as the solution runs.
-func TestExchangeRejectsAnUnusableExpiry(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		body map[string]string
-	}{
-		// A response whose expiry field never arrives (an unset timestamp on the
-		// issuer, or a rename to the protobuf JSON spelling) decodes to the zero
-		// time.
-		{name: "absent", body: map[string]string{"token": "t"}},
-		{name: "epoch zero", body: map[string]string{"token": "t", "expiresAt": "1970-01-01T00:00:00Z"}},
-		// Stands in for a host clock skewed past the credential's own lifetime.
-		{name: "already past", body: map[string]string{
-			"token": "t", "expiresAt": time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)}},
-		// Below the minimum usable lifetime: it would lapse in flight.
-		{name: "lapses in flight", body: map[string]string{
-			"token": "t", "expiresAt": time.Now().Add(2 * time.Second).UTC().Format(time.RFC3339)}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			exchanges := 0
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				exchanges++
-				writeJSON(w, http.StatusOK, tc.body)
-			}))
-			defer srv.Close()
-
-			credential := &moduleCredential{
-				tokenURL: srv.URL, internalToken: internalTokenTest,
-				prefix: "documents", secret: "s3cret",
-			}
-			req, err := http.NewRequest(http.MethodPost, srv.URL, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := credential.authorize(context.Background(), req); err == nil {
-				t.Fatal("accepted a token the runtime cannot hold; a beat loop would re-mint forever")
-			}
-			// A second beat must not have cached anything either.
-			_, _ = credential.authorize(context.Background(), req)
-			if exchanges != 2 {
-				t.Errorf("exchanged %d times across 2 beats, want 2 attempts and 0 cached", exchanges)
-			}
-			if credential.token != "" {
-				t.Errorf("cached a token with an unusable expiry: %q", credential.token)
-			}
-		})
-	}
-}
-
-// TestRegistrationRequestsAreBounded is the regression guard for a wedged
-// heartbeat. The beat's context carries no deadline, so without a client timeout
-// a gateway that accepts a registration and never answers blocked the beat in
-// Do forever: no further beats, no log, and no recovery short of a restart —
-// for that module, or for this whole solution when it happened on one of the two
-// self-registrations. Asserted on the client rather than by holding a real
-// request open, so the guard costs no wall clock.
-func TestRegistrationRequestsAreBounded(t *testing.T) {
-	if registrationClient.Timeout != registrationTimeout {
-		t.Errorf("registrationClient.Timeout = %s, want %s: a gateway that never answers must surface as a failed beat, not wedge the loop",
-			registrationClient.Timeout, registrationTimeout)
-	}
-	if registrationTimeout <= 0 {
-		t.Error("registrationTimeout must be positive")
-	}
-}
-
-// TestExchangeOmitsAnUnconfiguredInternalToken proves the exchange sends no
-// header at all rather than an empty one, matching internalTokenAuth. A caller
-// claiming a credential it does not hold is the harder shape to diagnose at the
-// gateway.
-func TestExchangeOmitsAnUnconfiguredInternalToken(t *testing.T) {
-	seen := make(chan http.Header, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen <- r.Header.Clone()
-		writeJSON(w, http.StatusOK, map[string]string{
-			"token": "t", "expiresAt": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
-	}))
-	defer srv.Close()
-
-	credential := &moduleCredential{tokenURL: srv.URL, prefix: "documents", secret: "s3cret"}
-	req, err := http.NewRequest(http.MethodPost, srv.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := credential.authorize(context.Background(), req); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := (<-seen)[http.CanonicalHeaderKey(internalTokenHeader)]; ok {
-		t.Errorf("sent %s with no token configured, want the header absent", internalTokenHeader)
-	}
-}
-
-// TestExchangeAcceptsAShortButUsableExpiry proves the renewal lead is a ceiling
-// on how early the credential renews, not a floor on what the issuer may issue.
-// Conflating the two refused every token whose whole life was shorter than the
-// 30s lead — a 30s credential was rejected outright, and the error blamed this
-// host's clock for an issuer setting that was deliberate and fine. A short token
-// is now held and renewed at half its life.
-func TestExchangeAcceptsAShortButUsableExpiry(t *testing.T) {
-	log.SetOutput(io.Discard)
-	defer log.SetOutput(os.Stderr)
-
-	for _, ttl := range []time.Duration{10 * time.Second, 30 * time.Second, 5 * time.Minute} {
-		t.Run(ttl.String(), func(t *testing.T) {
-			gw := newFakeGateway(t, &fakeGateway{
-				declared: map[string]string{"documents": "s3cret"},
-				tokenTTL: ttl,
-			})
-			credential := &moduleCredential{
-				tokenURL:      gw.URL + moduleRegistrationTokenPath,
-				internalToken: internalTokenTest,
-				prefix:        "documents",
-				secret:        "s3cret",
-			}
-			req, err := http.NewRequest(http.MethodPost, gw.URL+moduleRegisterPath, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := credential.authorize(context.Background(), req); err != nil {
-				t.Fatalf("refused a usable %s credential: %v", ttl, err)
-			}
-			if req.Header.Get(moduleRegistrationHeader) == "" {
-				t.Error("presented no token")
-			}
-			// Renewal is at half-life for a short token, and a full lead ahead
-			// of expiry for a long one — never after expiry, and never so early
-			// that the token is discarded unused.
-			wantLead := min(moduleTokenRenewal, ttl/2)
-			held := time.Until(credential.renewAt)
-			if held <= 0 || held > ttl-wantLead+time.Second {
-				t.Errorf("renewAt is %s away for a %s credential, want about %s", held, ttl, ttl-wantLead)
-			}
-		})
-	}
-}
-
-// TestSiblingURLFollowsAnOverriddenGateway proves the two federation endpoints
-// stay on one gateway. The credential a registration presents is minted by the
-// exchange, so an explicitly overridden registration URL must carry the
-// exchange with it — minting against one host and registering with another
-// yields a token the second never trusts.
-func TestSiblingURLFollowsAnOverriddenGateway(t *testing.T) {
-	t.Setenv("PORT", "8090")
-	t.Setenv("GATEWAY_URL", "http://gateway:42152")
-	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
-	t.Setenv("GATEWAY_MODULE_REGISTER_URL", "https://other-gateway:9999/modules/_register")
-
-	cfg := loadConfig(context.Background(), "lastlogin-go")
-	want := "https://other-gateway:9999" + moduleRegistrationTokenPath
-	if cfg.moduleTokenURL != want {
-		t.Errorf("module token URL = %q, want %q — it must follow the overridden register URL", cfg.moduleTokenURL, want)
-	}
-}
-
-// An unparseable override must surface as itself, so validate() names the one
-// URL the operator actually set instead of a second one derived from it.
-func TestSiblingURLPassesThroughAnUnusableBase(t *testing.T) {
-	if got := siblingURL("/modules/_register", moduleRegisterPath, moduleRegistrationTokenPath); got != "/modules/_register" {
-		t.Errorf("siblingURL(relative) = %q, want the base handed back unchanged", got)
-	}
-}
-
-// TestSiblingURLKeepsTheGatewayBasePath proves the derived endpoint stays on the
-// gateway's mount, not just its host. Rebuilding the URL from scheme+host
-// dropped any path between them, so a gateway served under a prefix registered
-// at /gw/modules/_register while exchanging at /modules/_registration-token —
-// still absolute, so validate() passed it, and a 404 on every beat after that.
-func TestSiblingURLKeepsTheGatewayBasePath(t *testing.T) {
-	t.Setenv("PORT", "8090")
-	t.Setenv("GATEWAY_URL", "http://gateway:42152/gw")
-	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
-	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
-
-	cfg := loadConfig(context.Background(), "lastlogin-go")
-	if want := "http://gateway:42152/gw" + moduleRegisterPath; cfg.moduleRegisterURL != want {
-		t.Errorf("module register URL = %q, want %q", cfg.moduleRegisterURL, want)
-	}
-	if want := "http://gateway:42152/gw" + moduleRegistrationTokenPath; cfg.moduleTokenURL != want {
-		t.Errorf("module token URL = %q, want %q — the derived endpoint must keep the gateway's base path", cfg.moduleTokenURL, want)
-	}
-	if err := cfg.validate(); err != nil {
-		t.Errorf("validate() = %v, want nil", err)
-	}
-}
-
-// TestSiblingURLRefusesAnUnpairableOverride proves an override whose sibling
-// cannot be derived fails loud at boot rather than resolving to a plausible
-// guess that 404s on every beat. The operator must then name the token URL.
-func TestSiblingURLRefusesAnUnpairableOverride(t *testing.T) {
-	t.Setenv("PORT", "8090")
-	t.Setenv("GATEWAY_URL", "http://gateway:42152")
-	t.Setenv("HOST_REGISTER_URL", "http://frontend:21931/api/solutions/register")
-	t.Setenv("GATEWAY_MODULE_REGISTER_URL", "https://other-gateway:9999/custom/registration-endpoint")
-	t.Setenv(SolutionRegistrationSecretEnvironmentVariable, "s3cret")
-
-	cfg := loadConfig(context.Background(), "lastlogin-go")
-	if cfg.moduleTokenURL != "" {
-		t.Errorf("module token URL = %q, want empty so validate() names it", cfg.moduleTokenURL)
-	}
-	err := cfg.validate()
-	if err == nil || !strings.Contains(err.Error(), "module token URL") {
-		t.Errorf("validate() = %v, want an error naming the module token URL", err)
-	}
-
-	// Naming it explicitly is the documented way out.
-	t.Setenv("GATEWAY_MODULE_REGISTRATION_TOKEN_URL", "https://other-gateway:9999/custom/token-endpoint")
-	if err := loadConfig(context.Background(), "lastlogin-go").validate(); err != nil {
-		t.Errorf("validate() with an explicit token URL = %v, want nil", err)
-	}
-}
-
-// TestBackoffGrowsWhileBrokenAndResetsWhenHealthy pins the retry schedule that
-// bounds every failure path on the credential exchange.
-func TestBackoffGrowsWhileBrokenAndResetsWhenHealthy(t *testing.T) {
-	const interval = 15 * time.Second
-	for _, tc := range []struct {
-		failures int
-		want     time.Duration
-	}{
-		{0, interval},
-		{1, 30 * time.Second},
-		{2, time.Minute},
-		{3, registrationBackoffCap},
-		{50, registrationBackoffCap},
-	} {
-		if got := backoff(interval, tc.failures, registrationBackoffCap); got != tc.want {
-			t.Errorf("backoff(%s, %d) = %s, want %s", interval, tc.failures, got, tc.want)
-		}
-	}
-	// An interval longer than the cap is the caller's choice, not something to
-	// shorten — at any number of failures, not only at zero. Shortening it would
-	// have a failing beat retry sooner than a healthy one.
-	for _, failures := range []int{0, 1, 50} {
-		if got := backoff(time.Hour, failures, registrationBackoffCap); got != time.Hour {
-			t.Errorf("backoff(1h, %d, cap) = %s, want 1h", failures, got)
-		}
-	}
-}
-
-func TestParseModuleRegistrationSecrets(t *testing.T) {
-	tests := []struct {
-		name string
-		raw  string
-		want map[string]string
-	}{
-		{name: "empty", raw: "", want: map[string]string{}},
-		{name: "one", raw: "documents:s3cret", want: map[string]string{"documents": "s3cret"}},
-		{
-			name: "several, spaced",
-			raw:  "documents:s3cret, billing:other",
-			want: map[string]string{"documents": "s3cret", "billing": "other"},
-		},
-		// A secret is opaque and base64 may contain "=" and "+"; only the first
-		// ":" separates it from the prefix.
-		{name: "secret keeps inner colons", raw: "documents:a:b", want: map[string]string{"documents": "a:b"}},
-		// The registrar trims both halves of its digest twin; parsing the two
-		// asymmetrically turns a pair it accepts into a lookup miss here.
-		{name: "spaces around both halves", raw: "documents : s3cret", want: map[string]string{"documents": "s3cret"}},
-		{name: "unpaired entry dropped", raw: "documents", want: map[string]string{}},
-		{name: "empty secret dropped", raw: "documents:", want: map[string]string{}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := parseModuleRegistrationSecrets(tt.raw); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseModuleRegistrationSecrets(%q) = %v, want %v", tt.raw, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -1767,6 +564,7 @@ func TestParseModuleRegistrationSecrets(t *testing.T) {
 // is minted, and any capability that rode along, which none should.
 type mintRequest struct {
 	OrgID           string             `json:"orgId"`
+	InstallationID  string             `json:"installationId"`
 	TaskID          string             `json:"taskId"`
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`
@@ -1803,6 +601,15 @@ type workContextGateway struct {
 	// mintDelay holds each mint open, so concurrent asks genuinely overlap
 	// rather than serialising by luck.
 	mintDelay time.Duration
+	// supersedeFirstCall answers the first module call the way a far end
+	// answers a capability sealed to state it has moved past: 409, with the
+	// installation headers the carrier put beside it.
+	supersedeFirstCall bool
+	// conflictFirstCall answers the first module call with an ORDINARY 409 —
+	// a duplicate, a lost update — carrying an installation header that names
+	// somebody else's installation. It is the shape the supersession check
+	// used to accept, and it must retire nothing.
+	conflictFirstCall bool
 
 	mu     sync.Mutex
 	minted int
@@ -1828,7 +635,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		var mint mintRequest
 		_ = json.NewDecoder(r.Body).Decode(&mint)
 		mint.Bearer = r.Header.Get("authorization")
-		mint.WorkContext = r.Header.Get(codefly.WorkContextHeaderName)
+		mint.WorkContext = r.Header.Get(workcontext.HeaderName)
 		send(g.mints, mint)
 		if g.mintStatus != 0 {
 			writeJSON(w, g.mintStatus, map[string]string{
@@ -1840,7 +647,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		g.minted++
 		// Two segments: the wire shape sdk-go accepts for a signed capability.
-		token := fmt.Sprintf("context-%s.%d", mint.Audience, g.minted)
+		token := capability(fmt.Sprintf("context-%s.%d", mint.Audience, g.minted))
 		g.mu.Unlock()
 		if g.mintDelay > 0 {
 			time.Sleep(g.mintDelay)
@@ -1853,11 +660,34 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 	case modulePath:
 		call := moduleCall{
 			Bearer:      r.Header.Get("authorization"),
-			WorkContext: r.Header.Get(codefly.WorkContextHeaderName),
+			WorkContext: r.Header.Get(workcontext.HeaderName),
 		}
 		send(g.calls, call)
 		if call.WorkContext == "" {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+			return
+		}
+		g.mu.Lock()
+		supersede := g.supersedeFirstCall
+		g.supersedeFirstCall = false
+		conflict := g.conflictFirstCall
+		g.conflictFirstCall = false
+		g.mu.Unlock()
+		if conflict {
+			// An ordinary business conflict, carrying the SAME installation
+			// the capability is sealed to — which is what a real module
+			// answers with, because a module handling this viewer's call IS in
+			// their installation. A foreign id here is what hid the finding:
+			// it made comparing the installation look sufficient.
+			w.Header().Set(workcontext.InstallationIDHeaderName, corework.FixtureInstallation)
+			w.Header().Set(workcontext.InstallationRevisionHeaderName, "9")
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "that page already exists"})
+			return
+		}
+		if supersede {
+			w.Header().Set(workcontext.InstallationIDHeaderName, corework.FixtureInstallation)
+			w.Header().Set(workcontext.InstallationRevisionHeaderName, "4")
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "installation revision superseded"})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"collection": "handbook"})
@@ -1911,14 +741,48 @@ func lapseCachedCapabilities(gw *Gateway) {
 // serveHandler runs one solution handler behind the runtime's own wrapper, so a
 // test exercises the same Gateway a real request produces — including the
 // viewer identity the gateway injects, which wrap is the only place to read.
+// serveHandler serves one handler against a fake gateway, with the execution
+// credential a booted runtime holds: minting for a viewer is fail-closed, so a
+// handler whose solution cannot attest which module is asking never reaches the
+// gateway at all.
 func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Server {
 	t.Helper()
-	s := New(Manifest{ID: "wiki", Title: "Wiki"})
+	return serveHandlerWith(t, gatewayURL, attestingSource(t), handler)
+}
+
+// serveHandlerWith is serveHandler against a credential source the test holds,
+// for an assertion about the credential itself.
+func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, handler Handler) *httptest.Server {
+	t.Helper()
+	s := New(Manifest{ID: "notes", Title: "Notes"}).Credential(source)
 	s.cfg = config{gatewayURL: gatewayURL}
-	server := httptest.NewServer(s.wrap(handler))
+	server := httptest.NewServer(s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
+		return handler(r.Context(), gw)
+	}))
 	t.Cleanup(server.Close)
 	return server
 }
+
+// viewerBearer is the bearer a real gateway forwards: the viewer's own sealed
+// capability, minted by core's authority from core's fixture identities.
+//
+// It was a placeholder string, which was enough while nothing here read the
+// bearer. A real gateway forwards the viewer's own capability, so the fixture
+// does too — one that cannot answer a question the code might ask is a fixture
+// that tests the refusal path forever.
+//
+// The installation does NOT come from it. That was the design for one round
+// and the comment here said so; the installation is read from the stamped
+// x-codefly-installation-id header, because inbound a carried capability is
+// caller-controlled. See viewerInstallation. The sealed bearer stays because
+// it is what a gateway actually forwards, not because anything reads a seal
+// out of it.
+func viewerBearer() string { return sealedBearer("viewer") }
+
+// sealedBearer is a bearer for a named viewer, sealed the same way: a test that
+// needs two distinct callers gets two capabilities rather than one placeholder
+// string each.
+func sealedBearer(seed string) string { return "Bearer " + capability(seed) }
 
 const viewerOrg = "6f1d0a2e-6a21-4d0e-9a0e-2b8f6d2f0b11"
 
@@ -1934,9 +798,10 @@ func viewerRequest(t *testing.T, target string) *http.Response {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("authorization", "Bearer viewer-token")
+	req.Header.Set("authorization", viewerBearer())
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)
@@ -1967,7 +832,7 @@ func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
 	}
 
 	mint := <-gw.mints
-	if mint.Bearer != "Bearer viewer-token" {
+	if mint.Bearer != viewerBearer() {
 		t.Errorf("mint presented bearer %q, want the viewer's — accounts must resolve the viewer as owner", mint.Bearer)
 	}
 	if mint.OrgID != viewerOrg {
@@ -1990,10 +855,10 @@ func TestForModuleMintsAndPresentsTheViewersWorkContext(t *testing.T) {
 	}
 
 	call := <-gw.calls
-	if call.WorkContext != "context-documents.1" {
+	if call.WorkContext != capability("context-documents.1") {
 		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
 	}
-	if call.Bearer != "Bearer viewer-token" {
+	if call.Bearer != viewerBearer() {
 		t.Errorf("module read carried bearer %q, want the viewer's — the context is presented alongside it, not instead", call.Bearer)
 	}
 }
@@ -2141,13 +1006,9 @@ func TestForModuleRefusesAnExpiryThisHostCannotUse(t *testing.T) {
 func TestWorkContextCacheReMintsALapsedCapability(t *testing.T) {
 	cache := newWorkContextCache()
 	mints := 0
-	lapsed := func(context.Context) (codefly.WorkContextToken, time.Time, error) {
+	lapsed := func(context.Context) (string, time.Time, error) {
 		mints++
-		token, err := codefly.ParseWorkContextToken(fmt.Sprintf("payload.%d", mints))
-		if err != nil {
-			t.Fatalf("parse token: %v", err)
-		}
-		return token, time.Now().Add(-time.Second), nil
+		return capability(fmt.Sprintf("lapsed-%d", mints)), time.Now().Add(-time.Second), nil
 	}
 	for range 2 {
 		if _, err := cache.resolve(context.Background(), "ask", lapsed); err != nil {
@@ -2188,10 +1049,10 @@ func TestDerivedGatewayResolvesTheCapabilityPerRequest(t *testing.T) {
 		t.Fatalf("solution answered %d, want 200", resp.StatusCode)
 	}
 	first, second := <-gw.calls, <-gw.calls
-	if first.WorkContext != "context-documents.1" {
+	if first.WorkContext != capability("context-documents.1") {
 		t.Errorf("first read carried %q, want the first capability", first.WorkContext)
 	}
-	if second.WorkContext != "context-documents.2" {
+	if second.WorkContext != capability("context-documents.2") {
 		t.Errorf("read after the capability lapsed carried %q, want a freshly minted one — the derived gateway is holding a snapshot", second.WorkContext)
 	}
 	if got := gw.mintCount(); got != 2 {
@@ -2199,13 +1060,21 @@ func TestDerivedGatewayResolvesTheCapabilityPerRequest(t *testing.T) {
 	}
 }
 
-// TestMintCarriesNoOtherModulesCapability keeps the mint on a bearer-only
-// client. Riding a capability minted for one module along on the request that
-// mints another's is harmless only until the first lapses: the edge verifies
-// every presented context, so it would then 401 the call meant to replace it.
-func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
+// TestMintCarriesThisWorkloadsCredentialAndNoOthers pins what rides on a mint.
+//
+// One capability belongs there — this execution's own, which says which module
+// is asking and is the same on every mint of the process. A capability minted
+// for a *module* must not: riding one along on the request that mints another's
+// is harmless only until the first lapses, since the edge verifies every
+// presented context and would then refuse the call meant to replace it.
+func TestMintCarriesThisWorkloadsCredentialAndNoOthers(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+	source := attestingSource(t)
+	workload, err := source.Credential(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	solution := serveHandlerWith(t, gw.URL, source, func(ctx context.Context, g *Gateway) (any, error) {
 		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 		if err != nil {
 			return nil, err
@@ -2225,22 +1094,166 @@ func TestMintCarriesNoOtherModulesCapability(t *testing.T) {
 	}
 	for range 2 {
 		mint := <-gw.mints
-		if mint.WorkContext != "" {
-			t.Errorf("mint for %q carried work context %q, want none", mint.Audience, mint.WorkContext)
+		if mint.WorkContext != workload.Token() {
+			t.Errorf("mint for %q carried work context %q, want this execution's own credential: the issuer has to know which module is asking", mint.Audience, mint.WorkContext)
 		}
-		if mint.Bearer != "Bearer viewer-token" {
+		if mint.Bearer != viewerBearer() {
 			t.Errorf("mint for %q carried bearer %q, want the viewer's", mint.Audience, mint.Bearer)
 		}
 	}
 }
 
-// TestGatewayTrafficIsNeverProxied keeps the viewer's credentials off an
-// arbitrary egress host. Every gateway target is composition-local, and these
-// requests carry the bearer and the capability minted for it in headers — the
-// same reasoning that already forbids proxying registration traffic.
-func TestGatewayTrafficIsNeverProxied(t *testing.T) {
-	if gatewayTransport.Proxy != nil {
-		t.Error("gatewayTransport carries a proxy: with HTTP(S)_PROXY set and a NO_PROXY that misses the in-cluster gateway, the viewer's bearer and Work Context would be dialled to an arbitrary egress host")
+// TestA409IsNotReadAsSupersessionAtAll replaces
+// TestASupersededCapabilityIsDroppedNotReused, and the replacement is the
+// finding rather than a weakening of it.
+//
+// That test asserted the capability is DROPPED when a module answers 409 with
+// an installation header, and the behaviour it pinned was wrong in three
+// successive ways: any 409 with any installation header; then any 409 whose
+// header named the installation the capability is sealed to — and a module
+// answering an ordinary business conflict IS in that installation, so a
+// duplicate or a lost update evicted a valid capability and the next call
+// minted again.
+//
+// The two cases cannot be told apart on the wire: 409 means "the state you
+// were sealed to has moved" and it means "that page already exists". So this
+// runtime infers nothing from one. A genuinely superseded capability is
+// refused call by call by the far end, which is correct if noisy, and the
+// renewal replaces it on the credential's own schedule. What would make an
+// inference sound is a host-side discriminator — follow-up 11.
+func TestA409IsNotReadAsSupersessionAtAll(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{supersedeFirstCall: true})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		// Two reads through one derived gateway. The first is refused as
+		// superseded; the second must present a freshly minted capability
+		// rather than the dropped one.
+		if _, err := getThrough(ctx, docs); err != nil {
+			return nil, err
+		}
+		return getThrough(ctx, docs)
+	})
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+
+	first, second := <-gw.calls, <-gw.calls
+	if first.WorkContext == "" || second.WorkContext == "" {
+		t.Fatal("a module call arrived with no capability at all")
+	}
+	if first.WorkContext != second.WorkContext {
+		t.Error("the 409 retired the cached capability: a module's conflict is not a statement this runtime can read as supersession, and acting on it costs an audited mint per business conflict")
+	}
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("minted %d capabilities, want 1: one ask mints once, and a 409 from a callee does not change that", got)
+	}
+}
+
+// TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload keeps the viewer's
+// credentials and this workload's own off an arbitrary egress host, and makes
+// the outbound hop authenticated rather than merely https.
+//
+// Every platform target is composition-local, and these requests carry the
+// viewer's bearer, the capability minted for them, and — on a mint — the
+// projected token that attests which workload this process is. An https URL
+// alone says only that the scheme is https: without a trust anchor the far end
+// is verified against whatever the image's system roots happen to hold, and
+// without a client certificate it cannot tell this workload from anything else
+// that reached it.
+func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
+	if unauthenticatedTransport.Proxy != nil {
+		t.Error("the platform transport carries a proxy: with HTTP(S)_PROXY set and a NO_PROXY that misses the in-cluster gateway, the viewer's bearer and capability would be dialled to an arbitrary egress host")
+	}
+
+	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
+		// This test inspects the transport rather than dialling, so any
+		// resolved destination will do.
+		mintURL: "https://mint.cell:443" + credentialMintPath}
+	server.principal = testPrincipal
+	client, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
+	}
+	switch {
+	case transport.Proxy != nil:
+		t.Error("the outbound client carries a proxy")
+	case transport.DialTLSContext == nil:
+		t.Fatal("the outbound client has no per-connection dialler, so its trust is whatever was snapshotted at boot")
+	case transport.TLSClientConfig != nil:
+		t.Error("the outbound transport carries a snapshotted TLS configuration: peer trust must be built per connection, or a removed root keeps authenticating the platform")
+	case transport.IdleConnTimeout == 0 || transport.IdleConnTimeout > outboundTrustReloadBound:
+		t.Errorf("idle connections live for %s, so per-dial reloading bounds nothing: want at most %s", transport.IdleConnTimeout, outboundTrustReloadBound)
+	}
+	if client.CheckRedirect == nil {
+		t.Error("the outbound client follows redirects: net/http copies every header but three across hosts, so a Location would be handed this workload's credentials")
+	}
+	// A pair that rotated to another workload's identity must not be presented
+	// to the platform, which the default path never checked: the listener's
+	// leaf was held to the principal and this second reloader over the same
+	// files was not.
+	rival, rivalKey, _, _, _ := workloadIdentity(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
+	writeFile(t, certFile, readFile(t, rival))
+	writeFile(t, keyFile, readFile(t, rivalKey))
+	if _, err := server.outboundClient(nil); err == nil {
+		t.Error("an outbound client was built presenting a leaf issued for another workload")
+	}
+	// A boot with no trust anchor cannot build one at all, which is the same
+	// refusal the listener makes.
+	server.cfg.trustBundleFile = ""
+	if _, err := server.outboundClient(nil); err == nil {
+		t.Error("an outbound client was built with no projected anchor to verify the platform against")
+	}
+}
+
+// TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport is the leg the
+// test above was missing, and a reviewer showed it: everything there inspects
+// the client outboundClient *returns*, and the defect this file's comments are
+// about was the gateway handed to a handler not carrying it. Deleting
+// gatewayFor's one assignment left every assertion above passing while a
+// handler's reads went out over the unauthenticated fallback.
+//
+// So this drives the production gateway client at a platform host that requires
+// a caller's certificate, and asks the host who called. The answer has to be
+// this workload.
+func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T) {
+	c := newCell(t)
+	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
+	host := newPlatformHost(t, c, testGatewayPrincipal)
+
+	server := New(Manifest{ID: testSolutionID})
+	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal), gatewayURL: host.URL}
+	server.principal = testPrincipal
+	outbound, err := server.outboundClient(nil)
+	if err != nil {
+		t.Fatalf("outboundClient: %v", err)
+	}
+	server.outbound = outbound
+
+	gateway := server.gatewayFor(http.Header{"authorization": {viewerBearer()}})
+	resp, err := gateway.HTTPClient().Get(host.URL + "/v1/things/search")
+	if err != nil {
+		t.Fatalf("a handler's gateway could not reach a platform host that requires this workload's certificate: %v\n"+
+			"a gateway that does not carry the boot's transport dials the platform as an anonymous client", err)
+	}
+	_ = resp.Body.Close()
+	called := host.called()
+	if len(called) == 0 {
+		t.Fatal("the platform host recorded no caller")
+	}
+	if called[0] != testPrincipal {
+		t.Errorf("the platform saw a request from %q, want this workload's own %q", called[0], testPrincipal)
 	}
 }
 
@@ -2288,7 +1301,7 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 // for a viewer with no organization selected.
 func TestForModuleRefusesWithoutTheViewersOrg(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	_, err := newGateway(gw.URL, "Bearer viewer-token", "", viewerSession).
+	_, err := newGateway(gw.URL, viewerBearer(), "", viewerSession).
 		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 	if err == nil {
 		t.Fatal("ForModule minted a work context with no organization")
@@ -2319,7 +1332,7 @@ func TestGatewayWithoutAModuleCarriesOnlyTheBearer(t *testing.T) {
 	if call.WorkContext != "" {
 		t.Errorf("undelegated gateway sent work context %q, want none", call.WorkContext)
 	}
-	if call.Bearer != "Bearer viewer-token" {
+	if call.Bearer != viewerBearer() {
 		t.Errorf("undelegated gateway sent bearer %q, want the viewer's", call.Bearer)
 	}
 	if got := gw.mintCount(); got != 0 {
@@ -2370,7 +1383,7 @@ func TestMintRootsTheTaskInTheViewersVerifiedSession(t *testing.T) {
 // session to name at all — an API key.
 func TestForModuleRefusesWithoutTheViewersSession(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
-	_, err := newGateway(gw.URL, "Bearer viewer-token", viewerOrg, "").
+	_, err := newGateway(gw.URL, viewerBearer(), viewerOrg, "").
 		ForModule(context.Background(), "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
 	if err == nil {
 		t.Fatal("ForModule minted a work context with no viewer session")
@@ -2400,20 +1413,21 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("authorization", "Bearer viewer-token")
+	req.Header.Set("authorization", viewerBearer())
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
-	req.Header.Set(codefly.WorkContextHeaderName, "forged.capability")
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+	req.Header.Set(workcontext.HeaderName, capability("forged"))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)
 	}
 	defer drainAndClose(resp)
 
-	if mint := <-gw.mints; mint.WorkContext != "" {
-		t.Errorf("mint carried work context %q, want none — a caller-supplied capability must not authenticate the mint", mint.WorkContext)
+	if mint := <-gw.mints; mint.WorkContext == capability("forged") {
+		t.Error("the mint presented the capability the browser sent: a caller-supplied capability must not authenticate anything")
 	}
-	if call := <-gw.calls; call.WorkContext != "context-documents.1" {
+	if call := <-gw.calls; call.WorkContext != capability("context-documents.1") {
 		t.Errorf("module read carried work context %q, want the minted one", call.WorkContext)
 	}
 }
@@ -2449,9 +1463,10 @@ func TestRefusedBoundariesAnswerAStatusTheCallerCanAct(t *testing.T) {
 			if err != nil {
 				t.Fatalf("new request: %v", err)
 			}
-			req.Header.Set("authorization", "Bearer viewer-token")
+			req.Header.Set("authorization", viewerBearer())
 			req.Header.Set(orgHeader, tt.org)
 			req.Header.Set(sessionHeader, tt.session)
+			req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("call solution: %v", err)
@@ -2480,50 +1495,22 @@ func TestRefusedBoundariesAnswerAStatusTheCallerCanAct(t *testing.T) {
 	}
 }
 
-// internalTokenAuth presents the shared cluster-internal token and nothing else.
-// It is a test stub, not a credential this runtime can present: both
-// registration surfaces refuse the shared token, so no production path builds
-// one (module-saas-starter#540). It lives here so heartbeat's status handling
-// can be exercised without standing up a credential exchange — and so that the
-// fallback this runtime deliberately removed cannot be reinstated by wiring one
-// line, which is what leaving it in the package would have allowed.
-type internalTokenAuth string
-
-func (t internalTokenAuth) authorize(_ context.Context, req *http.Request) (time.Time, error) {
-	if t != "" {
-		req.Header.Set(internalTokenHeader, string(t))
-	}
-	// No expiry: injected configuration, so it cannot lapse mid-request.
-	return time.Time{}, nil
-}
-
-func (internalTokenAuth) invalidate() {}
-
-func (internalTokenAuth) succeeded() {}
-
-// TestManifestURLIsNeverTheListenAddress pins where the registered manifestUrl
-// points. Unset PUBLIC_URL used to yield "http://localhost:<port>/assets/...",
-// this process's own loopback address, so every deployed solution registered a
-// manifest no browser could load and the product showed it as failed to load.
-// Without an explicit origin the URL is now the path on this backend, which the
-// host resolves against the route by which it reaches the solution.
-func TestManifestURLIsNeverTheListenAddress(t *testing.T) {
-	for _, tc := range []struct {
-		public string
-		want   string
-	}{
-		{public: "", want: "/assets/mf-manifest.json"},
-		{public: "https://solutions.example.com/lastlogin", want: "https://solutions.example.com/lastlogin/assets/mf-manifest.json"},
-		{public: "https://solutions.example.com/", want: "https://solutions.example.com/assets/mf-manifest.json"},
-	} {
-		t.Setenv("PUBLIC_URL", tc.public)
-		t.Setenv("PORT", "8080")
-		s := New(Manifest{ID: "lastlogin-go"})
-		s.cfg = loadConfig(context.Background(), s.manifest.ID)
-		frontend, _ := s.manifestMap()["frontend"].(map[string]any)
-		if got := frontend["manifestUrl"]; got != tc.want {
-			t.Errorf("PUBLIC_URL=%q: manifestUrl = %v, want %q", tc.public, got, tc.want)
-		}
+// TestManifestURLIsNeverAnAbsoluteOrigin pins where the served manifestUrl
+// points. It used to be absolute: on PUBLIC_URL when one was set, and otherwise
+// on "http://localhost:<port>", this process's own loopback address — so every
+// deployed solution published a manifest no browser could load and the product
+// showed it as failed to load. It is now the path on this backend and nothing
+// else, which the host resolves against the route its presence document names;
+// PUBLIC_URL is gone with the registration that was the only reason to build an
+// origin here.
+func TestManifestURLIsNeverAnAbsoluteOrigin(t *testing.T) {
+	t.Setenv("PUBLIC_URL", "https://solutions.example.com/widgets")
+	t.Setenv("PORT", "8080")
+	s := New(Manifest{ID: testSolutionID})
+	s.cfg = loadConfig(context.Background(), testSolutionID, nil)
+	frontend, _ := s.manifestMap()["frontend"].(map[string]any)
+	if got := frontend["manifestUrl"]; got != federationManifestPath {
+		t.Errorf("manifestUrl = %v, want %q: no environment variable may make it absolute again", got, federationManifestPath)
 	}
 }
 
@@ -2557,5 +1544,523 @@ func TestWorkContextPrincipalsReportsWhomAccountsIssuedFor(t *testing.T) {
 	}
 	if n := gw.mintCount(); n != 1 {
 		t.Fatalf("minted %d capabilities, want 1: reading the principals reuses the capability", n)
+	}
+}
+
+// optionalIdentitiesFile is identitiesFile, or no path at all for an empty set
+// — the distinction a boot-refusal table needs, since "the platform never
+// provisioned a path" and "the path is there and names nobody" are two
+// different refusals and each has its own row.
+func optionalIdentitiesFile(t *testing.T, identities string) string {
+	t.Helper()
+	if identities == "" {
+		return ""
+	}
+	return identitiesFile(t, identities)
+}
+
+// TestABootWithoutAResolvedMintURLIsRefused: the previous revision derived the
+// mint address from the resolved gateway and labelled the result a guess — the
+// field was literally named mintURLGuessed, the code said the endpoint was "NOT
+// settled" and that "neither endpoint exists yet", and the README and the boot
+// log both said "settled". Both could not be true.
+//
+// This is the address the projected service-account token goes to, which is the
+// strongest statement this process can make about which workload it is. A
+// guessed address for that is what fail-closed forbids, and this package
+// already refuses rather than guesses when it cannot pair a token-exchange URL.
+func TestABootWithoutAResolvedMintURLIsRefused(t *testing.T) {
+	cfg := config{port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("the boot accepted a configuration with no mint URL, so this runtime would POST its projected token to an address nobody resolved")
+	}
+	if !strings.Contains(err.Error(), CredentialMintURLEnvironmentVariable) {
+		t.Errorf("the refusal %q does not name %s, the variable that sets it", err, CredentialMintURLEnvironmentVariable)
+	}
+	// And the refusal must not read as a provisioning gap in the gateway,
+	// which resolved perfectly well.
+	if strings.Contains(err.Error(), "unresolved gateway") {
+		t.Errorf("the refusal %q blames the gateway, which resolved: that sends an operator to inspect endpoint resolution over a value that is simply not set", err)
+	}
+}
+
+// TestNoProductionCodeDerivesTheMintAddress pins the absence. A default address
+// is the thing this repository's rules single out, and the previous one came
+// back as a "labelled stopgap" that the README then described as settled.
+func TestNoProductionCodeDerivesTheMintAddress(t *testing.T) {
+	for _, name := range moduleSources(t) {
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		body := string(source)
+		for _, derived := range []string{"gatewayURL + credentialMintPath", "gatewayURL+credentialMintPath"} {
+			if strings.Contains(body, derived) {
+				t.Errorf("%s derives the credential mint address from the resolved gateway: the gateway's address says where the gateway is, not where this host mints a credential, and the projected token this runtime sends there is not something to address by assumption", name)
+			}
+		}
+		if strings.Contains(body, "mintURLGuessed") {
+			t.Errorf("%s still carries mintURLGuessed: a guessed address for the endpoint this runtime attests itself to is refused now, so there is nothing to label", name)
+		}
+	}
+}
+
+// TestTwoAdmissionSourcesAreRefusedRatherThanRanked: an admission set answered
+// by both an operator override and the platform's provisioning is two sources
+// for one authorization fact. The previous revision logged which one won, which
+// reports the conflict without resolving it — whichever this process picked, the
+// other is a decision somebody made that is not in force, and for admission
+// being wrong admits a caller.
+//
+// It is the stance the SDK already takes on the same question: a value
+// delivered inline and by file carrier is refused as two sources for one fact.
+func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
+	base := func(t *testing.T) config {
+		t.Helper()
+		return config{
+			port: "8080", gatewayURL: "https://gateway:42152",
+			mintURL: "https://gateway:42152" + credentialMintPath,
+			profile: localProfile,
+		}
+	}
+
+	t.Run("an override alone is accepted", func(t *testing.T) {
+		cfg := base(t)
+		cfg.allowedCallersFile = identitiesFile(t, testGatewayPrincipal)
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("an override with no provisioning behind it was refused: %v", err)
+		}
+	})
+
+	// Driven through the real resolver, not injected. The comment that used to
+	// stand here said a test cannot make the SDK's workspace configuration
+	// answer, and that was simply false — authorityValues does it for the
+	// authority group, the same way. So the conflict rule had no behavioural
+	// test at all and three mutants of it survived.
+	t.Run("both answering is refused, through the resolver", func(t *testing.T) {
+		provisionedWorkloadValue(t, WorkloadIdentityAllowedCallersFileKey, "/provisioned/callers")
+		t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, "/override/callers")
+		conflict := conflictingAdmissionSources(context.Background(), nil)
+		if conflict == nil {
+			t.Fatal("the resolver saw no conflict while both the override and the platform answered for the caller set")
+		}
+		for _, named := range []string{"/override/callers", "/provisioned/callers"} {
+			if !strings.Contains(conflict.Error(), named) {
+				t.Errorf("the refusal %q does not name %s, so an operator cannot tell which two answers are in play", conflict, named)
+			}
+		}
+
+		cfg := base(t)
+		cfg.admissionConflict = conflict
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("a boot accepted an admission set answered by two sources: ranking them silently is how a caller set gets widened with nothing recording that the platform's decision was not in force")
+		}
+		if !strings.Contains(err.Error(), "answered twice") {
+			t.Errorf("the refusal %q does not say the set has two answers", err)
+		}
+		// And it is reported before every other provisioning message, or it
+		// reads as ordinary advice next to them.
+		cfg.port = "not-a-port"
+		if again := cfg.validate(); again == nil || !strings.Contains(again.Error(), "answered twice") {
+			t.Errorf("with another refusal also pending, validate reported %v: the conflicting-authorization refusal is the one that says a decision is not in force", again)
+		}
+	})
+
+	t.Run("the resolver finds no conflict with no override set", func(t *testing.T) {
+		provisionedWorkloadValue(t, WorkloadIdentityAllowedCallersFileKey, "/provisioned/callers")
+		if err := conflictingAdmissionSources(context.Background(), nil); err != nil {
+			t.Errorf("a conflict was reported with no override set: %v", err)
+		}
+	})
+
+	// And an override against provisioning this process cannot READ is a
+	// conflict too. The resolver discarded the SDK's error, saw no second
+	// answer, and put the override in force — against provisioning it simply
+	// could not see.
+	t.Run("an unreadable platform answer is a conflict, not an absent one", func(t *testing.T) {
+		t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, "/override/wide")
+		// No workspace configuration loaded at all, so the SDK errors rather
+		// than answering empty.
+		withoutWorkloadValues(t)
+		// With a failed environment load, which is the one signal that
+		// separates "never provisioned" from "could not be read": the SDK
+		// answers both with the same error.
+		err := conflictingAdmissionSources(context.Background(), errors.New("loading the injected environment failed"))
+		if err == nil {
+			t.Fatal("an override was put in force while the platform's own answer could not be read: an unreadable answer is still an answer somebody provisioned, and choosing between two is exactly what this rule refuses")
+		}
+		if !strings.Contains(err.Error(), "cannot be read") {
+			t.Errorf("the refusal %q does not say the platform's answer was unreadable", err)
+		}
+	})
+}
+
+// TestAnAdmissionFileIsReadWholeOrRefused: each entry has to be a complete
+// line, which is the part that is not obvious.
+//
+// The previous reader split whatever it was handed, so a file caught mid-write
+// — a platform rewriting it without an atomic swap, an operator's `>` redirect
+// — truncated an entry and the truncation was admitted as an identity of its
+// own. The executed review showed ".../sa/gateway-internal" read as
+// ".../sa/gateway", admitting a caller the set never named.
+func TestAnAdmissionFileIsReadWholeOrRefused(t *testing.T) {
+	const gateway = "spiffe://codefly.test/ns/platform/sa/gateway"
+	const internal = "spiffe://codefly.test/ns/platform/sa/gateway-internal"
+
+	read := func(t *testing.T, content string) ([]string, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "identities")
+		writeFile(t, path, content)
+		return resolvedIdentities(path, "unresolved")()
+	}
+
+	t.Run("a truncated last line is refused, not admitted", func(t *testing.T) {
+		// What a reader sees partway through a non-atomic rewrite of a file
+		// whose only entry is the -internal identity.
+		got, err := read(t, internal[:len(internal)-len("-internal")])
+		if err == nil {
+			t.Fatalf("a file caught mid-write resolved to %v: the fragment %q is a different identity from the one being written, and admitting it lets in a caller the set never named", got, gateway)
+		}
+		if !strings.Contains(err.Error(), "newline") {
+			t.Errorf("the refusal %q does not say why the file is not whole", err)
+		}
+	})
+
+	t.Run("a terminated file is read", func(t *testing.T) {
+		got, err := read(t, gateway+"\n"+internal+"\n")
+		if err != nil {
+			t.Fatalf("a complete file was refused: %v", err)
+		}
+		if len(got) != 2 || got[0] != gateway || got[1] != internal {
+			t.Errorf("resolved %v, want both identities", got)
+		}
+	})
+
+	t.Run("entries that can never match are refused at the file", func(t *testing.T) {
+		for _, tc := range []struct{ name, content string }{
+			{"a byte-order mark", "\ufeff" + gateway + "\n"},
+			{"a NUL in an entry", "spiffe://codefly.test/ns/platform/sa/gate\x00way\n"},
+			{"not a URI at all", "gateway\n"},
+			{"another scheme", "https://codefly.test/ns/platform/sa/gateway\n"},
+			{"no path", "spiffe://codefly.test\n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if got, err := read(t, tc.content); err == nil {
+					t.Errorf("resolved %v: an entry that cannot match any peer is a provisioning mistake, and carrying it silently turns into a caller nobody admits at a handshake far from the cause", got)
+				}
+			})
+		}
+	})
+
+	t.Run("a file too large to re-read every second is refused", func(t *testing.T) {
+		big := strings.Repeat(gateway+"\n", (admissionFileLimit/(len(gateway)+1))+16)
+		got, err := read(t, big)
+		if err == nil {
+			t.Fatalf("resolved %d identities from a file over the limit: this is read on every handshake, every dial, and once a second per established connection in each direction", len(got))
+		}
+		// And refused BY THE CAP. Without this the case passes for the wrong
+		// reason: the reader stops at the limit, so the last line it sees is a
+		// fragment and the whole-line rule refuses it — which means removing
+		// the cap entirely left this green.
+		if !strings.Contains(err.Error(), "larger than") {
+			t.Errorf("the refusal %q is not about the file's size, so this case does not cover the cap", err)
+		}
+	})
+
+	t.Run("comments, CRLF and commas still work", func(t *testing.T) {
+		got, err := read(t, "# the gateway\r\n"+gateway+", "+internal+"\r\n")
+		if err != nil {
+			t.Fatalf("a conforming file was refused: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("resolved %v, want two identities", got)
+		}
+	})
+}
+
+// TestACredentialBearingURLCarriesNothingButADestination: userinfo, a query and
+// a fragment were all accepted on both credential-bearing destinations, and the
+// first two were written to the boot log verbatim — a secret that is disclosed
+// and, in the userinfo case, that net/http strips before the request is even
+// sent, so it is never used for anything except being logged.
+func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
+	for _, tc := range []struct{ name, mint, names string }{
+		{"userinfo", "https://ops:s3cr3t@mint.cell/platform/_credential", "userinfo"},
+		{"a query", "https://mint.cell/platform/_credential?token=s3cr3t", "query"},
+		{"a fragment", "https://mint.cell/platform/_credential#part", "fragment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config{port: "8080", gatewayURL: "https://gateway:42152", mintURL: tc.mint, profile: localProfile}
+			err := cfg.validate()
+			if err == nil {
+				t.Fatalf("a credential mint URL carrying %s was accepted", tc.names)
+			}
+			if !strings.Contains(err.Error(), tc.names) {
+				t.Errorf("the refusal %q does not say the URL carries %s", err, tc.names)
+			}
+		})
+	}
+
+	for _, tc := range []struct{ raw, hidden string }{
+		{"https://ops:s3cr3t@mint.cell/x", "s3cr3t"},
+		{"https://mint.cell/x?token=s3cr3t", "s3cr3t"},
+	} {
+		if got := redactedURL(tc.raw); strings.Contains(got, tc.hidden) {
+			t.Errorf("redactedURL(%q) = %q, which still carries the secret", tc.raw, got)
+		}
+	}
+
+	// And the boot log actually uses it. Asserting on the helper alone left
+	// the *call site* free to pass the raw URL, which is where the secret was
+	// being written — the helper being correct is not the property.
+	t.Run("the boot log carries no secret", func(t *testing.T) {
+		var captured bytes.Buffer
+		log.SetOutput(&captured)
+		t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+		cfg := config{port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile,
+			mintURL: "https://ops:s3cr3t-password@mint.cell/platform/_credential"}
+		// validate() refuses this URL, and the log line still must not carry
+		// the secret: the refusal and the logging are independent, which is
+		// the whole reason the log redacts regardless.
+		_ = cfg.validate()
+		cfg.mintURL = "https://mint.cell/platform/_credential"
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("a conforming configuration was refused: %v", err)
+		}
+		cfg.mintURL = "https://ops:s3cr3t-password@mint.cell/platform/_credential"
+		cfg.logResolved()
+		if got := captured.String(); strings.Contains(got, "s3cr3t-password") {
+			t.Errorf("the boot log carries the secret from the mint URL:\n%s", got)
+		}
+	})
+}
+
+// TestTheEnvironmentLoadErrorReachesTheRefusals: three refusals and a boot log
+// exist to tell "the SDK resolved nothing" apart from "loading the injected
+// environment failed first", and a signature refactor dropped the value they
+// read, so all of them reported the former.
+//
+// That is the exact mistake validate() was written to stop making: its own
+// comment records that a single generic message sent an operator to inspect
+// endpoint resolution over a variable they had broken themselves.
+func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
+	loadErr := errors.New("the injected carriers could not be read")
+
+	t.Run("loadConfig carries it onto the configuration", func(t *testing.T) {
+		cfg := loadConfig(context.Background(), testSolutionID, loadErr)
+		if cfg.environmentLoadErr == nil {
+			t.Fatal("loadConfig dropped the environment-load error, so every refusal below reads as absent provisioning rather than as an environment that never loaded")
+		}
+	})
+
+	t.Run("an unresolved destination says which it is", func(t *testing.T) {
+		cfg := config{port: "8080", profile: localProfile, environmentLoadErr: loadErr}
+		err := cfg.validate()
+		if err == nil {
+			t.Fatal("a configuration with no gateway was accepted")
+		}
+		if !strings.Contains(err.Error(), "injected environment failed first") {
+			t.Errorf("the refusal %q does not say the environment never loaded, so it sends an operator to inspect provisioning that may well be in place", err)
+		}
+	})
+
+	t.Run("a missing path says which it is", func(t *testing.T) {
+		cfg := config{environmentLoadErr: loadErr}
+		err := cfg.requirePath("workload identity certificate", "", "OVERRIDE", "CERT_FILE")
+		if err == nil {
+			t.Fatal("an unresolved path was accepted")
+		}
+		if !strings.Contains(err.Error(), "environment failed first") {
+			t.Errorf("the refusal %q does not distinguish an unprovisioned path from an environment that never loaded", err)
+		}
+	})
+}
+
+// TestAUsernameCredentialIsNotLogged: url.Redacted() masks the password and
+// keeps the username, so a token carried as a username — which is how a great
+// many of them are carried — came through the redaction intact.
+func TestAUsernameCredentialIsNotLogged(t *testing.T) {
+	for _, raw := range []string{
+		"https://s3cr3t-token@mint.cell/platform/_credential",
+		"https://s3cr3t-token:@mint.cell/platform/_credential",
+		"https://user:s3cr3t-token@mint.cell/platform/_credential",
+	} {
+		if got := redactedURL(raw); strings.Contains(got, "s3cr3t-token") {
+			t.Errorf("redactedURL(%q) = %q, which still carries the secret: Redacted() only masks the password", raw, got)
+		}
+		// And it still says where, or it is useless in a log.
+		if got := redactedURL(raw); !strings.Contains(got, "mint.cell") {
+			t.Errorf("redactedURL(%q) = %q, which no longer names the destination", raw, got)
+		}
+	}
+}
+
+// clearSelfEnvironment unsets every carrier the configuration tests key on, so
+// a variable exported in the shell running the suite cannot decide an
+// assertion.
+//
+// It lived in deployed_registration_test.go, which went with the
+// registrations. The MCP configuration tests that arrived on main need it, and
+// the reason it exists outlives what it was written for: these assertions are
+// about what the SDK resolves, and an exported variable answering instead is a
+// green run that proves nothing.
+func clearSelfEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{"SELF_UPSTREAM", "PUBLIC_URL", "CODEFLY__RUNTIME_CONTEXT",
+		"CODEFLY__MODULE", "CODEFLY__SERVICE", "CODEFLY__ENVIRONMENT"} {
+		t.Setenv(key, "")
+	}
+	// Every self-endpoint carrier, by prefix rather than by name.
+	//
+	// The restored version named one deployment's:
+	// CODEFLY__SELF_ENDPOINT__LASTLOGIN_GO__BACKEND__HTTP__HTTP. A carrier's
+	// name is built from the module and service it belongs to, so naming one
+	// puts a particular deployment in a runtime that is generic by rule — and
+	// it clears exactly that deployment's variable and no other, which is the
+	// weaker half of the problem: an operator running the suite with any other
+	// service's carrier exported still has it answering these assertions.
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, resources.SelfEndpointPrefix) {
+			t.Setenv(key, "")
+		}
+	}
+}
+
+// TestAnAskCannotBeEditedAfterItsCeilingIsChecked is round fourteen's B2.
+//
+// workContextScopes converted Scope to its wire form, which copies the struct
+// and leaves both pointing at the CALLER's backing arrays. The ask is retained
+// on the delegation and its JSON is the cache key, computed once — so a caller
+// could hand over Actions: []string{"read"}, take the delegated gateway, write
+// "delete" into that array, and wait for the cached capability to expire. The
+// next mint serialized "delete", under the key computed for "read", with the
+// ceiling having been checked against "read". No concurrency, no second call
+// to ForModule, and nothing in the published contract to stop it.
+func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{})
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	module := passthroughModule()
+	module.Scopes = []Scope{{ResourceKind: "things", Actions: []string{"read"}}}
+	module.Methods = nil
+	server := New(Manifest{ID: testSolutionID}).Consumes(module).
+		Credential(mintClientFor(t, mint, tokenFile)).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}})
+	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, apiConsumes: consumesThings}
+	server.principal = testPrincipal
+	contract, err := server.resolveContract()
+	if err != nil {
+		t.Fatalf("resolve the published contract: %v", err)
+	}
+	server.contract, server.contractResolved = contract, true
+
+	header := http.Header{}
+	header.Set("authorization", viewerBearer())
+	header.Set(orgHeader, viewerOrg)
+	header.Set(sessionHeader, viewerSession)
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+	gateway := server.gatewayFor(header)
+
+	// The ask the ceiling is checked against, in a slice the caller keeps.
+	actions := []string{"read"}
+	acting, err := gateway.ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: actions})
+	if err != nil {
+		t.Fatalf("the declared ask was refused: %v", err)
+	}
+	first := <-gw.mints
+	if len(first.AuthorityScopes) != 1 || len(first.AuthorityScopes[0].Actions) != 1 ||
+		first.AuthorityScopes[0].Actions[0] != "read" {
+		t.Fatalf("the first mint asked for %+v, want read", first.AuthorityScopes)
+	}
+
+	// The caller edits the array it still holds, and the capability it was
+	// handed is retired — which is what expiry does, with no second call to
+	// ForModule and no concurrency.
+	actions[0] = "delete"
+	if _, err := acting.workContext(context.Background()); err != nil {
+		t.Fatalf("read the delegated capability: %v", err)
+	}
+	// Expire the held capability, which is what forces the next read to mint.
+	// This used the cache's supersede primitive, which existed only to serve
+	// the 409 inference and went with it; expiring the entry directly says
+	// what the test means — a LATER mint must not carry the edited slice —
+	// without a production method nothing calls.
+	acting.contexts.mu.Lock()
+	delete(acting.contexts.minted, acting.delegation.key)
+	acting.contexts.mu.Unlock()
+
+	// A refusal here is also a correct answer. What must not happen is a
+	// silent mint for "delete".
+	if _, err := acting.workContext(context.Background()); err != nil {
+		t.Logf("the renewal was refused, which is the other acceptable answer: %v", err)
+		return
+	}
+	second := <-gw.mints
+	for _, scope := range second.AuthorityScopes {
+		for _, action := range scope.Actions {
+			if action == "delete" {
+				t.Fatalf("a mint asked the issuer for %q after the ceiling had been checked against read: the ask was retained with the caller's own backing array, so editing it changed what was minted under a cache key computed for something else — and the published ceiling is the guarantee that cannot hold", action)
+			}
+		}
+	}
+}
+
+// TestAnOrdinaryConflictDoesNotRetireAValidCapability is round sixteen's first
+// major.
+//
+// supersededCapability accepted ANY 409 carrying a non-empty installation
+// header, and a 409 is an ordinary business answer: a duplicate, a lost
+// update, a version conflict. A module answering one with installation
+// metadata beside it therefore evicted a perfectly valid cached capability,
+// and the next call minted again — needless mints and needless audit traffic
+// on the one path whose whole purpose is one mint per execution.
+//
+// The header is matched against the installation the capability THAT WAS
+// PRESENTED is sealed to now, so a conflict about somebody else's
+// installation says nothing about this one.
+func TestAnOrdinaryConflictDoesNotRetireAValidCapability(t *testing.T) {
+	gw := newWorkContextGateway(t, &workContextGateway{conflictFirstCall: true})
+	solution := serveHandler(t, gw.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		docs, err := g.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+		if err != nil {
+			return nil, err
+		}
+		// Two reads: the first gets the ordinary 409, the second must present
+		// the SAME capability rather than a freshly minted one.
+		if _, err := getThrough(ctx, docs); err != nil {
+			return nil, err
+		}
+		status, err := getThrough(ctx, docs)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]int{"status": status}, nil
+	})
+
+	resp := viewerRequest(t, solution.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the handler answered %d, want 200", resp.StatusCode)
+	}
+
+	// ONE mint. An ordinary conflict that retired the capability would show up
+	// here as two.
+	if got := gw.mintCount(); got != 1 {
+		t.Errorf("the issuer minted %d capabilities for one ask, want 1: an ordinary 409 retired a valid capability, so every business conflict a module answers costs this solution a fresh audited mint", got)
+	}
+	// And the second call presented the same capability.
+	first, second := <-gw.calls, <-gw.calls
+	if first.WorkContext == "" || second.WorkContext == "" {
+		t.Fatal("a module call arrived with no capability at all")
+	}
+	if first.WorkContext != second.WorkContext {
+		t.Error("the second call presented a different capability than the first: the ordinary conflict evicted the cached one, which is the re-mint this check exists to prevent")
 	}
 }

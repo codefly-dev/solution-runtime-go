@@ -86,8 +86,8 @@ type InterfaceInfo struct {
 	// "/solutions/<id>": the backend serves them at its own root, but a caller
 	// only ever reaches them prefixed.
 	BasePath string
-	// OperationPrefix starts every operationId ("Wiki" renders "/sources" as
-	// "Wiki_Sources"); Tag is the one tag every operation carries.
+	// OperationPrefix starts every operationId ("Notes" renders "/sources" as
+	// "Notes_Sources"); Tag is the one tag every operation carries.
 	OperationPrefix string
 	Tag             string
 }

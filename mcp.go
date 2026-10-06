@@ -2,6 +2,8 @@ package solution
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 )
@@ -175,7 +178,7 @@ func (s *Server) mountMCP(mux *http.ServeMux) error {
 }
 
 // MCPEnvironment is what Serve resolves from the composition for the MCP
-// surface, supplied instead by a caller of MCPHandler.
+// surface, supplied instead by a caller of mcpHandler.
 type MCPEnvironment struct {
 	// GatewayURL is the host gateway a tool call's Work Context is minted
 	// through and its composed-module reads go to.
@@ -189,20 +192,43 @@ type MCPEnvironment struct {
 	PublicURL string
 }
 
-// MCPHandler is the MCP surface exactly as Serve serves it — the same endpoint,
-// the same metadata document, the same refusals, mounted by the same code —
-// against an environment the caller supplies instead of the one Serve resolves.
-// Nothing else of the solution is served, and nothing registers anywhere.
+// mcpHandler is the MCP surface exactly as Serve serves it, for a test in this
+// package.
+//
+// NOT exported, and it must not become so. It was `MCPHandler`, and its only
+// callers are tests: an exported method that hands back a servable handler is
+// the PassthroughHandler defect again — whoever mounts it serves the viewer's
+// bearer and this workload's credential over whatever they mounted it on,
+// having skipped validate(), the mTLS boot, the caller allow-list, the ceiling
+// and authenticated outbound. This one also writes boot configuration from
+// values its caller supplies, which is the one thing loadConfig exists to be
+// the only source of.
+//
+// It is the same endpoint, the same metadata document, the same refusals,
+// mounted by the same code, against an environment the caller supplies instead
+// of the one Serve resolves. Nothing else of the solution is served, and
+// nothing registers anywhere.
+//
+// TestNoExportedPathHandsOutAServableHandler fails if an exported path
+// reappears; it is what caught this.
 //
 // It exists for tests: a solution drives its own tools under the runtime's
 // identity handling, with a fake host standing in for the gateway. A solution
 // serves with Serve, which overwrites the environment set here when it resolves
 // its own.
-func (s *Server) MCPHandler(env MCPEnvironment) (http.Handler, error) {
+func (s *Server) mcpHandler(env MCPEnvironment) (http.Handler, error) {
 	if s.mcp == nil {
 		return nil, fmt.Errorf("solution %q declares no MCP server (ServeMCP)", s.manifest.ID)
 	}
 	s.cfg.gatewayURL, s.cfg.mcpIssuerURL, s.cfg.mcpPublicURL = env.GatewayURL, env.IssuerURL, env.PublicURL
+	// And the derived set, because this overwrites what it was derived FROM.
+	//
+	// cfg.dialled is assembled in loadConfig; assigning the gateway URL here
+	// without rebuilding it left the set empty on exactly the seam a consumer
+	// runs, so the net that stops a tool naming an address this runtime
+	// dialled was silently off there. A derived field whose sources are
+	// reassigned is stale until it is not.
+	s.cfg.dialled = dialledAddresses(s.cfg.gatewayURL, s.cfg.mintURL)
 	// The caller named both, so they are as explicit as the composition's
 	// declared values: what validate() refuses is an issuer nobody chose, and
 	// what a refusal has to name for a public URL is whoever set it.
@@ -248,6 +274,46 @@ func ViewerFromContext(ctx context.Context) (*Gateway, error) {
 	return gw, nil
 }
 
+// actsForNobody reports whether an MCP method runs nothing on a viewer's
+// behalf: the handshake, the keepalive, and the listings that describe what
+// this solution declares.
+//
+// Everything else is held to this execution's credential. The list is what a
+// method must be ON to skip that check, so a method nobody here has heard of is
+// checked.
+func actsForNobody(method string) bool {
+	switch method {
+	// The handshake, the keepalive and the listings that describe what this
+	// solution declares.
+	case "initialize", "ping",
+		"tools/list", "prompts/list", "resources/list", "resources/templates/list",
+		// The notifications the SDK itself sends, named one by one.
+		//
+		// This was strings.HasPrefix(method, "notifications/"), which is a
+		// DENYLIST wearing an allowlist's clothes: the namespace is open, the
+		// SDK's extension API lets author code register methods under it, and
+		// one registered there would have run with a viewer's gateway and no
+		// credential check — the round-nine defect, still reachable. An exact
+		// list cannot be widened by someone else's naming.
+		"notifications/initialized", "notifications/cancelled",
+		"notifications/progress", "notifications/roots/list_changed":
+		return true
+	}
+	return false
+}
+
+// mcpCredentialUnavailableCode is what an MCP client is told when this process
+// will not act for a viewer: -32001, in JSON-RPC's implementation-defined
+// server range, beside the SDK's own CodeResourceNotFound (-32002).
+//
+// I claimed this could not be set because the SDK's wire-error type was
+// internal. That was wrong, and wrong because I grepped for the type and
+// stopped: package jsonrpc exports it as an alias
+// (jsonrpc.Error = jsonrpc2.WireError) precisely so a server can set a code. A
+// client that only gets a generic protocol error cannot tell "this solution
+// cannot act right now" from a broken tool, so it cannot back off.
+const mcpCredentialUnavailableCode = -32001
+
 // mcpViewer binds each incoming MCP request to the viewer it arrived as, so a
 // tool handler reads composed modules on their behalf and not as the solution.
 //
@@ -270,9 +336,88 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 		if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
 			log.Printf("solution %q: mcp tool %q", s.manifest.ID, call.Params.Name)
 		}
-		id := stampedIdentity(header)
-		gw := newGateway(s.cfg.gatewayURL, id.bearer, id.orgID, id.sessionID)
-		return next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
+		// Through gatewayFor, not newGateway. A raw gateway carries the
+		// viewer's headers and nothing else: no credential acquirer, so a tool
+		// call could not attest which module was asking; no attestation report
+		// and no terminal hook; and — the one that matters most — none of the
+		// published contract's ceilings, so a mint from an MCP tool call was
+		// held to nothing the contract claims. Every other path a viewer
+		// reaches this runtime on is built here, and this one has to be too.
+		gw := s.gatewayFor(header)
+		// A tool's error becomes content the client reads, below this
+		// middleware, so the runtime's own errors are sanitized before the
+		// author ever holds one. See Gateway.surfaced.
+		gw.sanitizeErrors = true
+		// The credential gate, before anything author-written runs.
+		//
+		// This is R4-3 on the MCP path, and it arrived with the surface rather
+		// than being missed in it: a plain handler and a ViewerBearer
+		// passthrough are both held here, and a tool call was not. A tool
+		// receives a gateway carrying the viewer's bearer, so running one while
+		// the issuer has withdrawn this execution's credential is acting for a
+		// viewer without authority — and a tool that mints nothing still sends
+		// that bearer wherever it dials.
+		//
+		// An ALLOWLIST of the methods that act for nobody, not a denylist of
+		// the ones that act. A denylist over a method set this package does not
+		// own is the mistake the TLS posture made three times: whatever it does
+		// not name, the far side keeps. A method the SDK adds tomorrow is gated
+		// here by default, and the cost of that being wrong is a refusal rather
+		// than an ungated viewer action.
+		if !actsForNobody(method) {
+			if err := s.actingForAViewer(ctx); err != nil {
+				// The sanitized sentence, not the error: it wraps whatever the
+				// source said — a mint URL, an issuer's own text, a dial
+				// failure naming an internal address — and an MCP client is as
+				// much a viewer's channel as a browser is.
+				log.Printf("solution %q: refusing an MCP %s for a viewer: %v", s.manifest.ID, method, err)
+				return nil, &jsonrpc.Error{
+					Code:    mcpCredentialUnavailableCode,
+					Message: credentialRefusalForAViewer(err),
+				}
+			}
+		}
+		result, err := next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
+		// An error RESULT, which is not an error at all as far as this
+		// middleware is concerned.
+		//
+		// The SDK's typed AddTool wrapper turns a tool's returned error into
+		// CallToolResult{IsError: true} and returns a NIL err, so the branch
+		// below never runs on that path and the text travels as content. The
+		// runtime's own errors are sanitized where they leave its hands now
+		// (Gateway.surfaced, bearerTransport), which removes the issuer's
+		// words — but http.Client.Do prepends the URL it dialled to whatever
+		// the transport returned, and the author did not author that.
+		//
+		// So this is a net over the one thing left: if what a tool is about to
+		// tell a client contains an address THIS RUNTIME configured, the
+		// content is replaced wholesale and the original goes to the log. It
+		// matches on exact values the runtime knows — its gateway and mint
+		// URLs — not on a pattern, so a tool's own message about its own
+		// domain is untouched.
+		//
+		// It is a net and not the boundary. The boundary is surfaced; this
+		// catches what net/http adds after it.
+		if err == nil {
+			result = s.withoutRuntimeAddresses(result, method)
+		}
+		if err != nil {
+			// Sanitized on the way out, through the same function the handler
+			// routes use. A tool that called ForModule and was refused handed
+			// the viewer's agent client the whole chain: "mint returned HTTP
+			// 503", and with the issuer unreachable the mint's own URL and
+			// dial address. The gate above stops a tool running without a
+			// credential; this stops what a tool learned about the issuer
+			// reaching the client when one fails mid-call.
+			//
+			// The author's own errors are sanitized by the same rule as a
+			// handler's, which is what that rule is for: a tool's error is
+			// written for a model and read by whoever is driving it.
+			_, message := handlerErrorResponse(err)
+			log.Printf("solution %q: mcp %s failed: %v", s.manifest.ID, method, err)
+			return result, errors.New(message)
+		}
+		return result, nil
 	}
 }
 
@@ -359,6 +504,29 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 			}
 			http.Error(w, fmt.Sprintf("MCP requires a user session: the gateway stamped %s and %s empty%s. A credential that authenticates without a session cannot act for a viewer: every tool call that does mints a Work Context rooted in one. Connect as a signed-in person.",
 				stamped, sessionHeader, detail), http.StatusForbidden)
+			return
+		}
+		// And this execution's own credential, at the HTTP boundary.
+		//
+		// The method-layer gate in mcpViewer refuses the same thing, and both
+		// are here on purpose. This one answers a real HTTP 503, which
+		// JSON-RPC has no equivalent for at all, and it holds anything that
+		// reaches this handler without going through the method middleware.
+		//
+		// The method layer is not codeless: it carries -32001 through
+		// jsonrpc.Error. This comment said the SDK's wire-error type was
+		// internal and a code could not be set, which was my own false claim —
+		// I grepped for the type, found internal/jsonrpc2, and stopped looking
+		// for the exported alias. Corrected in the code one commit and left
+		// standing here.
+		if err := s.actingForAViewer(r.Context()); err != nil {
+			// The sanitized sentence, never the source's error: it wraps
+			// whatever the issuer said, which is a mint URL and sometimes a
+			// dial failure naming an internal address. An agent client is a
+			// viewer's channel like a browser is, and this was the disclosure
+			// executed round eight reproduced.
+			log.Printf("solution %q: refusing an MCP request for a viewer: %v", s.manifest.ID, err)
+			http.Error(w, credentialRefusalForAViewer(err), http.StatusServiceUnavailable)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -516,13 +684,16 @@ func firstForwarded(r *http.Request, name string) string {
 
 // MCPConfigurationGroup names the workspace-configuration group a composition
 // declares for a solution that serves MCP, and MCPIssuerURLKey and
-// MCPPublicURLKey the two values in it. They are resolved through the SDK the
-// way the registration secret is (see SolutionRegistrationSecretGroup), because
-// a Codefly composition has no way to set a bare environment variable on a
-// service: every value a service receives is either an endpoint the SDK
+// MCPPublicURLKey the two values in it. They are resolved through the SDK
+// because a Codefly composition has no way to set a bare environment variable
+// on a service: every value a service receives is either an endpoint the SDK
 // resolves or a declared configuration the render projects. Both were read as
 // bare environment variables when ServeMCP landed, which named a provisioning
 // path that does not exist.
+//
+// This used to say "the way the registration secret is", naming
+// SolutionRegistrationSecretGroup. That group and the registrations it fed are
+// deleted; the comparison outlived the thing it compared to.
 //
 // MCPIssuerURLKey is the origin MCP clients authenticate against — the host as
 // an authorization server. A deployment must supply it: what the SDK resolves
@@ -530,12 +701,17 @@ func firstForwarded(r *http.Request, name string) string {
 // by no client. It is the one value a composition has to declare for MCP, and
 // it stops being one when module-saas-starter#1003 settles what `iss` is.
 //
-// MCPPublicURLKey overrides the public MCP URL, which the runtime otherwise
-// derives by construction (see resolveMCPPublicURL). It exists for a host whose
-// gateway fronts solutions under some other route; it must end in MCPPath,
-// because the metadata document's own URL is derived from it by swapping that
-// suffix — the same pairing the registration token URLs use, and refused at
-// boot for the same reason when it cannot be made.
+// MCPPublicURLKey is the public MCP URL. A deployed MCP surface must declare
+// it: the runtime can derive one from PUBLIC_URL, but the derivation builds
+// <PUBLIC_URL>/solutions/<id>/mcp, which encodes the route the HOST serves this
+// solution on — a layout this runtime does not know. The derivation stands for
+// a local run, where whoever made the guess can check it.
+//
+// It must end in MCPPath, because the metadata document's own URL is derived
+// from it by swapping that suffix, and a value that cannot be paired is
+// refused at boot rather than guessed at. The pairing is siblingURL, which the
+// deleted registration token URLs used for the same reason — it is the only
+// caller left.
 const (
 	MCPConfigurationGroup = "mcp"
 	MCPIssuerURLKey       = "issuer-url"
@@ -624,10 +800,10 @@ func (c config) validateMCP() error {
 	if u, err := url.Parse(c.mcpIssuerURL); err != nil || !u.IsAbs() || u.Host == "" {
 		if c.environmentLoadErr != nil {
 			return fmt.Errorf("unresolved host issuer %q, and loading Codefly's injected environment failed first: %w — nothing the SDK resolves can be trusted to be absent until that is fixed",
-				c.mcpIssuerURL, c.environmentLoadErr)
+				redactedURL(c.mcpIssuerURL), c.environmentLoadErr)
 		}
 		return fmt.Errorf("unresolved host issuer %q: ServeMCP publishes it as the authorization server of this MCP resource, so a client has nowhere to authenticate without it. Provision the workspace configuration %s with the origin MCP clients authenticate against and declare that group as a workspace-configuration dependency of this backend, or ensure the SDK resolves the host frontend's http endpoint",
-			c.mcpIssuerURL, mcpConfigurationValue(MCPIssuerURLKey))
+			redactedURL(c.mcpIssuerURL), mcpConfigurationValue(MCPIssuerURLKey))
 	}
 	// In a deployment neither value below can be resolved from inside the
 	// cluster, for the reason the loopback refusals above exist: the runtime
@@ -640,24 +816,74 @@ func (c config) validateMCP() error {
 		if c.mcpPublicURL == "" {
 			// Only reachable with PUBLIC_URL unresolved and no override
 			// declared: the identifier is otherwise derived by construction.
-			return fmt.Errorf("no public MCP URL in the deployed runtime context %q: it is derived as <PUBLIC_URL>%s<id>%s, and PUBLIC_URL resolved nothing — so the identifier would be reconstructed per request from the forwarded headers, missing the route the gateway strips (and naming the scheme of the hop, not the client's), and an MCP client binds its token to the identifier it dialled and rejects any other. Set PUBLIC_URL to the origin clients reach this product at, or provision the workspace configuration %s with the URL they dial, ending in %s",
-				c.runtimeContext, gatewaySolutionsRoute, MCPPath, mcpConfigurationValue(MCPPublicURLKey), MCPPath)
+			//
+			// And this must NOT offer PUBLIC_URL as the remedy. It did, and
+			// setting it in a deployment reaches the very next refusal below —
+			// a derived identifier is refused in a deployed context, because
+			// the derivation encodes the route the host serves this solution
+			// on. So the diagnostic sent an operator one step further and then
+			// failed the boot again, which is worse than the first refusal
+			// because it reads as progress. There is one remedy in a
+			// deployment and this names only that one.
+			return fmt.Errorf("no public MCP URL in the deployed runtime context %q: the identifier an MCP client binds its token to has to be the one it dialled, and nothing here knows that — PUBLIC_URL resolved nothing, so it would be reconstructed per request from the forwarded headers, missing the route the gateway strips and naming the scheme of the hop rather than the client's. Provision the workspace configuration %s with the URL clients dial, ending in %s, and declare the %s group as a workspace-configuration dependency of this backend. Setting PUBLIC_URL does not answer this in a deployment: a derived identifier is refused here too, because the derivation encodes the route the HOST serves this solution on",
+				c.runtimeContext, mcpConfigurationValue(MCPPublicURLKey), MCPPath, MCPConfigurationGroup)
 		}
 		if !c.mcpIssuerExplicit {
 			return fmt.Errorf("no %s provisioned in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Provision that workspace configuration with the origin clients authenticate against and declare the %s group as a workspace-configuration dependency of this backend",
-				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, c.mcpIssuerURL, MCPConfigurationGroup)
+				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, redactedURL(c.mcpIssuerURL), MCPConfigurationGroup)
 		}
+		// Declared, not derived. The derived identifier satisfied a check for
+		// "a public URL is set", so this refusal never fired in the one case
+		// it matters: a deployment with PUBLIC_URL resolved, where
+		// <PUBLIC_URL>/solutions/<id>/mcp is this runtime encoding the HOST's
+		// route layout. That is what the manifest URL was changed to stop
+		// doing in this cutover — the route a client reaches a solution
+		// through is the host's to resolve, and a runtime guessing it was
+		// wrong in every deployment but the author's machine. Locally the
+		// derivation stands, because there the guess is checkable by the
+		// person making it.
+		if c.mcpPublicURL != "" && !c.mcpPublicExplicit {
+			return fmt.Errorf("the public MCP URL in the deployed runtime context %q is derived (%q), not declared: it is built as <PUBLIC_URL>%s<id>%s, which encodes the route the HOST serves this solution on — a layout this runtime does not know and must not assume. Provision the workspace configuration %s with the URL clients actually dial, ending in %s",
+				c.runtimeContext, redactedURL(c.mcpPublicURL), gatewaySolutionsRoute, MCPPath,
+				mcpConfigurationValue(MCPPublicURLKey), MCPPath)
+		}
+	}
+	// After the deployed block, whose refusals name the specific value an
+	// operator has not provisioned; this one reports a defect in a value they
+	// did. Put first, it answered "not https" for an in-cluster address whose
+	// real problem is that no MCP client can reach it at all.
+	if err := usablePublishedURL("host issuer", c.mcpIssuerURL,
+		mcpConfigurationValue(MCPIssuerURLKey), deployedRuntimeContext(c.runtimeContext)); err != nil {
+		return err
 	}
 	if c.mcpPublicURL == "" {
 		return nil
 	}
 	if u, err := url.Parse(c.mcpPublicURL); err != nil || !u.IsAbs() || u.Host == "" {
 		return fmt.Errorf("unusable %s (%q): it is the resource identifier an MCP client binds its token to, so it must be the absolute URL clients dial",
-			c.mcpPublicURLSource(), c.mcpPublicURL)
+			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL))
+	}
+	// Before the pairing check, because a URL carrying a query or a fragment
+	// cannot pair either — and the pairing refusal would then report the wrong
+	// defect while printing the value verbatim. It did exactly that: an
+	// identifier ending "/mcp?token=s3cr3t" was refused as "unpairable", with
+	// the token in the message and so in the boot log.
+	//
+	// Both URLs are held to what the mint and gateway URLs are held to. They
+	// are published rather than dialled — the issuer as this resource's
+	// authorization server, the public URL as the identifier a client binds a
+	// token to — which makes the same three defects worse rather than milder:
+	// userinfo is a credential this runtime publishes to every client that
+	// reads the document, a query travels with the identifier, and a fragment
+	// is never sent so the identifier is not the one it appears to be.
+	deployed := deployedRuntimeContext(c.runtimeContext)
+	if err := usablePublishedURL(c.mcpPublicURLSource(), c.mcpPublicURL,
+		mcpConfigurationValue(MCPPublicURLKey), deployed); err != nil {
+		return err
 	}
 	if siblingURL(c.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath) == "" {
 		return fmt.Errorf("unpairable %s (%q): it must end in %s, because the metadata document a 401 points a client to is derived from it by swapping that suffix",
-			c.mcpPublicURLSource(), c.mcpPublicURL, MCPPath)
+			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), MCPPath)
 	}
 	return nil
 }
@@ -671,4 +897,195 @@ func (c config) mcpPublicURLSource() string {
 		return "workspace configuration " + mcpConfigurationValue(MCPPublicURLKey)
 	}
 	return "public MCP URL derived from PUBLIC_URL"
+}
+
+// usablePublishedURL holds a URL this runtime publishes to what validate()
+// holds the addresses it dials to.
+//
+// The same three refusals, for a reason that is stronger here: a dialled URL
+// carrying userinfo is a secret this process logs and net/http then strips, and
+// a published one is a secret handed to every client that reads the document.
+// https is required only in a deployment, because http://localhost is what a
+// developer machine serves and refusing it there would refuse the local run
+// this runtime is also meant to support.
+func usablePublishedURL(name, value, fixWith string, deployed bool) error {
+	u, err := url.Parse(value)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("unusable %s (%q): it is published to MCP clients, so it must be an absolute URL. Provision %s", name, redactedURL(value), fixWith)
+	}
+	if deployed && u.Scheme != "https" {
+		return fmt.Errorf("%s (%q) is not https in a deployed runtime context: MCP clients authenticate against it and dial it, so a plaintext hop hands their credentials to anything on the path. Provision %s with an https URL",
+			name, redactedURL(value), fixWith)
+	}
+	switch {
+	case u.User != nil:
+		return fmt.Errorf("%s carries userinfo (%q): this URL is published in a document clients read, so credentials in it are disclosed to every one of them. Provision %s with the origin and path and nothing else",
+			name, redactedURL(value), fixWith)
+	case u.RawQuery != "":
+		return fmt.Errorf("%s carries a query string (%q): clients bind a token to this identifier and dial it, and anything secret in a query is logged by every hop that sees it. Provision %s with the origin and path and nothing else",
+			name, redactedURL(value), fixWith)
+	case u.Fragment != "":
+		return fmt.Errorf("%s carries a fragment (%q): a fragment is never sent, so this is not the identifier it appears to be. Provision %s with the URL clients actually dial",
+			name, redactedURL(value), fixWith)
+	}
+	return nil
+}
+
+// namedInJSON decodes one JSON document and reports the first string value or
+// key inside it that names something the given test matches.
+//
+// Decoded rather than textual, because JSON escaping means the serialized form
+// and the form a client reads are not the same string: `https:\/\/host` and
+// `https://host` are one value with two spellings, and a search over the bytes
+// sees only the one it was given. A document this runtime cannot decode is
+// reported as offending for the same reason an unmarshalable value is — it
+// cannot be cleared if it cannot be read.
+func namedInJSON(document []byte, named func(string) (string, bool)) (string, bool) {
+	var decoded any
+	if err := json.Unmarshal(document, &decoded); err != nil {
+		return "undecodable structured content: " + err.Error(), true
+	}
+	var walk func(any) (string, bool)
+	walk = func(value any) (string, bool) {
+		switch typed := value.(type) {
+		case string:
+			if _, found := named(typed); found {
+				return typed, true
+			}
+		case []any:
+			for _, item := range typed {
+				if offending, found := walk(item); found {
+					return offending, true
+				}
+			}
+		case map[string]any:
+			for key, item := range typed {
+				// The KEY as well: a map keyed by the address discloses it
+				// just as a value does.
+				if _, found := named(key); found {
+					return key, true
+				}
+				if offending, found := walk(item); found {
+					return offending, true
+				}
+			}
+		}
+		return "", false
+	}
+	return walk(decoded)
+}
+
+// withoutRuntimeAddresses replaces an error result that names an address this
+// runtime dialled.
+//
+// Only an IsError result, and only when the text contains the gateway or mint
+// URL this process was configured with: a tool's own refusal is its own to
+// word, and rewriting every error result would take that away.
+func (s *Server) withoutRuntimeAddresses(result mcp.Result, method string) mcp.Result {
+	call, ok := result.(*mcp.CallToolResult)
+	if !ok || call == nil || !call.IsError {
+		return result
+	}
+	// The TEXT content, and the STRUCTURED content.
+	//
+	// This read only Content. The pinned SDK serializes StructuredContent as
+	// well, so a result with generic text and
+	// StructuredContent{"error": err.Error()} went to the agent client with
+	// the mint's address in it — the net was installed for exactly that
+	// disclosure and looked in one of the two places the SDK sends.
+	//
+	// Structured content is arbitrary JSON, so it is rendered once and
+	// searched as a whole rather than walked field by field: a rule that
+	// inspected a field named "error" would be a rule about this round's
+	// example.
+	named := func(text string) (string, bool) {
+		for _, dialled := range s.cfg.dialled {
+			if dialled != "" && strings.Contains(text, dialled) {
+				return dialled, true
+			}
+		}
+		return "", false
+	}
+	replaced := func(where, offending string) mcp.Result {
+		log.Printf("solution %q: an MCP %s error result named an address this runtime dialled (in its %s); replaced: %s",
+			s.manifest.ID, method, where, offending)
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{&mcp.TextContent{
+				Text: "this solution could not complete the call",
+			}},
+		}
+	}
+	// SERIALIZE EVERYTHING FIRST, THEN INSPECT, THEN PUBLISH AN OWNED SNAPSHOT.
+	//
+	// The order is the whole fix, and getting it wrong twice is why it is
+	// spelled out. First this inspected the object and returned it for the SDK
+	// to serialize later, so a MarshalJSON answering differently the second
+	// time disclosed on the second call. Then the structured half was frozen
+	// and the text half was not — and the text was read BEFORE the structured
+	// marshalling ran, so a structured value holding a pointer to the result's
+	// own *mcp.TextContent could rewrite the text, from inside MarshalJSON,
+	// after it had passed inspection. `{}` is a clean serialization of a value
+	// whose side effect put the mint's address in a sibling field.
+	//
+	// So: every marshaller runs first, then nothing is inspected that is not
+	// about to be published, and what is published is a value built here from
+	// strings and bytes this runtime owns. Nothing the caller still holds a
+	// pointer to can change it, and no marshaller is asked twice.
+	var rendered []byte
+	if call.StructuredContent != nil {
+		// Marshalling failure is itself a reason to replace: a structured
+		// value this runtime cannot read is one it cannot clear either, and
+		// the SDK is about to serialize it.
+		var err error
+		if rendered, err = json.Marshal(call.StructuredContent); err != nil {
+			return replaced("structured content", "unreadable structured content: "+err.Error())
+		}
+	}
+	// Only now are the texts read, and they are COPIED as they are read, so
+	// what is inspected below and what is published are the same strings.
+	snapshot := make([]mcp.Content, 0, len(call.Content))
+	for _, content := range call.Content {
+		text, isText := content.(*mcp.TextContent)
+		if !isText {
+			// Content this runtime cannot read is content it cannot clear.
+			// Replacing is the fail-closed answer: the alternative is
+			// publishing a type whose serialization nothing here inspected.
+			return replaced("non-text content", fmt.Sprintf("%T", content))
+		}
+		snapshot = append(snapshot, &mcp.TextContent{
+			Text:        text.Text,
+			Annotations: text.Annotations,
+			Meta:        text.Meta,
+		})
+	}
+	for _, content := range snapshot {
+		text := content.(*mcp.TextContent)
+		if _, found := named(text.Text); found {
+			return replaced("text content", text.Text)
+		}
+	}
+	if rendered != nil {
+		// The DECODED strings, not the serialization.
+		//
+		// This searched the marshalled bytes for the configured URL, and JSON
+		// has more than one spelling for the same string: a json.RawMessage
+		// holding {"error":"https:\/\/mint…"} keeps those escapes through
+		// Marshal, the search for "https://mint…" misses, and the client
+		// decodes the address back out. So the bytes are decoded and every
+		// string inside them — and every key — is checked, which is the
+		// representation the client actually sees.
+		if offending, found := namedInJSON(rendered, named); found {
+			return replaced("structured content", offending)
+		}
+	}
+	clean := &mcp.CallToolResult{
+		IsError: true,
+		Content: snapshot,
+		Meta:    call.Meta,
+	}
+	if rendered != nil {
+		clean.StructuredContent = json.RawMessage(rendered)
+	}
+	return clean
 }
