@@ -78,16 +78,17 @@ func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
 	pkgs := gatePackages(t, nil)
 	readers := servingReaders(t, pkgs)
 
-	var names []string
-	for name := range readers {
-		names = append(names, name)
+	var sites []string
+	for site := range readers {
+		sites = append(sites, site)
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		t.Errorf("%s is reachable from the post-boot surface without passing through loadConfig:\n    %s\n"+
+	sort.Strings(sites)
+	for _, site := range sites {
+		found := readers[site]
+		t.Errorf("%s reads the environment (%s) and is reachable from the post-boot surface without passing through loadConfig:\n    %s\n"+
 			"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
 			"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
-			name, readers[name])
+			found.site, found.reader, found.path)
 	}
 }
 
@@ -177,16 +178,37 @@ func ExportedLateHost() string {
 	source = strings.ReplaceAll(source, "os.LookupEnvValue(", "os.Getenv(")
 
 	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
-	if len(readers) == 0 {
-		t.Fatal("the gate reported no post-boot reader for a fixture that reads on seven serving paths")
+
+	// Per SHAPE, by the function the read sits in. Asserting a few reader
+	// names over seven paths let one path stand for another: a gate that lost
+	// the stored method value while still finding the parenthesised one
+	// reported os.Getenv either way and passed.
+	holders := map[string]bool{}
+	for _, found := range readers {
+		holders[found.holder] = true
 	}
-	// Both readers these shapes reach, so a gate that saw one kind of read and
-	// not the other cannot pass: env for the in-package helper, os.Getenv for
-	// the direct and aliased ones, os.Environ for the whole-environment scan.
-	for _, want := range []string{"env", "os.Getenv", "os.Environ"} {
-		if _, ok := readers[want]; !ok {
-			t.Errorf("the gate did not report %s: readers=%v", want, readers)
+	for _, want := range []string{
+		"ServedParenthesisedRead", // a parenthesised callee
+		"fixtureMountedRead",      // reached only as a handler value
+		"fixtureStoredRead",       // reached only through a stored method value
+		"servingAliasRead",        // an aliased reader with a constant key
+		"discoverHostModule",      // the whole environment, via an exported wrapper
+	} {
+		if !holders[want] {
+			t.Errorf("no post-boot read reported inside %s, so that shape is unwalked; reported: %v", want, holders)
 		}
+	}
+	// And the closure assigned to an exported variable, which has no name of
+	// its own: its read sits in an anonymous function, so it is asserted by
+	// the reader it reaches from a closure holder.
+	closure := false
+	for _, found := range readers {
+		if strings.Contains(found.holder, "$") || found.holder == "ExportedClosure" {
+			closure = true
+		}
+	}
+	if !closure {
+		t.Errorf("no post-boot read reported inside a closure, so the exported-variable closure is unwalked; reported: %v", readers)
 	}
 }
 
@@ -210,7 +232,15 @@ func ExportedLateHost() string {
 // wrapper of a function using it reads changing configuration after boot.
 var readerNames = map[string]map[string]bool{
 	"os":      {"Getenv": true, "LookupEnv": true, "Environ": true, "ExpandEnv": true},
-	"syscall": {"Getenv": true, "Environ": true},
+	"syscall": {"Getenv": true, "LookupEnv": true, "Environ": true},
+	// A dependency that wraps the syscall layer is a reader too, and a
+	// SUMMARY is how one gets modelled without its body: x/sys/unix.Getenv
+	// delegates to syscall.Getenv, so calling it reads the environment just as
+	// directly. Every way Go reads the environment bottoms out in one of these
+	// three packages; a wrapper in a fourth is the residual this list carries,
+	// and the escape rule below is what keeps that residual from being silent
+	// when a reader VALUE is what travels into it.
+	"golang.org/x/sys/unix": {"Getenv": true, "Setenv": true, "Clearenv": true, "Environ": true},
 }
 
 // readerPackageOf is the import path a reader package goes by, since SSA names
@@ -256,7 +286,13 @@ var keylessReaders = map[string]bool{"Environ": true, "ExpandEnv": true}
 
 // servingReaders is every environment reader reachable from the post-boot
 // roots, named by the function that reads, with the path that reaches it.
-func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
+type servingRead struct {
+	// site is where the read is written, holder the function it is in, and
+	// reader which reader it calls.
+	site, holder, reader, path string
+}
+
+func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]servingRead {
 	t.Helper()
 
 	// SSA for THIS package only, not the whole dependency closure. Building
@@ -302,7 +338,7 @@ func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
 	}
 
 	// Breadth-first from the roots, never through loadConfig.
-	readers := map[string]string{}
+	readers := map[string]servingRead{}
 	seen := map[*callgraph.Node]bool{}
 	path := map[*callgraph.Node]string{}
 	var queue []*callgraph.Node
@@ -363,7 +399,17 @@ func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
 			if holder == nil {
 				continue
 			}
-			readers[site.name] = path[holder] + " → " + site.name
+			// Keyed by SITE, not by reader name: seven serving paths reaching
+			// os.Getenv are seven findings, and keying by the reader let one
+			// of them stand for all. A fixture losing its own path could then
+			// be masked by another fixture reporting the same name.
+			position := pkg.Fset.Position(site.pos).String()
+			readers[position] = servingRead{
+				site:   position,
+				holder: holder.Func.Name(),
+				reader: site.name,
+				path:   path[holder] + " → " + site.name,
+			}
 		}
 	}
 	return readers
