@@ -2034,7 +2034,7 @@ func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
 	}
 }
 
-// TestURLHostReadsWhatAURLConsumerReads pins the host reading itself, apart
+// TestHostOfReadsWhatAURLConsumerReads pins the host reading itself, apart
 // from the refusals that consume it: the three outcomes are a name, an address,
 // and a host that is neither, which is refused rather than admitted as a name.
 //
@@ -2042,7 +2042,7 @@ func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
 // loopback listener with DNS disabled, plus the Unicode forms a URL consumer
 // maps before dialling. The name cases are what must NOT be mistaken for an
 // address, including a host whose labels merely look numeric.
-func TestURLHostReadsWhatAURLConsumerReads(t *testing.T) {
+func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
 	t.Run("addresses", func(t *testing.T) {
 		for _, tc := range []struct{ host, want string }{
 			// inet_aton spellings.
@@ -2086,17 +2086,13 @@ func TestURLHostReadsWhatAURLConsumerReads(t *testing.T) {
 			{"::", "::"},
 			{"::ffff:127.0.0.1", "127.0.0.1"},
 		} {
-			name, ip, err := urlHost(tc.host)
-			if err != nil {
-				t.Errorf("urlHost(%q) = error %v, want the address %s", tc.host, err, tc.want)
-				continue
-			}
-			if ip == nil {
-				t.Errorf("urlHost(%q) read the name %q, want the address %s", tc.host, name, tc.want)
+			kind, name, ip, err := hostOf(tc.host)
+			if kind != hostIsAddress {
+				t.Errorf("hostOf(%q) = (%v, %q, %v, %v), want the address %s", tc.host, kind, name, ip, err, tc.want)
 				continue
 			}
 			if ip.String() != tc.want {
-				t.Errorf("urlHost(%q) = %s, want %s", tc.host, ip, tc.want)
+				t.Errorf("hostOf(%q) = %s, want %s", tc.host, ip, tc.want)
 			}
 		}
 	})
@@ -2108,7 +2104,7 @@ func TestURLHostReadsWhatAURLConsumerReads(t *testing.T) {
 			{"127.0.0.1.example.com", "127.0.0.1.example.com"},
 			{"0x7f.example.com", "0x7f.example.com"},
 			{"localhost", "localhost"},
-			{"localhost\u3002", "localhost."},
+			{"localhost\u3002", "localhost"},
 			{"\u24db\u24de\u24d2\u24d0\u24db\u24d7\u24de\u24e2\u24e3", "localhost"},
 			{"xn--e1afmkfd.xn--p1ai", "xn--e1afmkfd.xn--p1ai"},
 			// Hosts a stricter profile would wrongly refuse: STD3 rules are
@@ -2118,17 +2114,13 @@ func TestURLHostReadsWhatAURLConsumerReads(t *testing.T) {
 			{"9to5.example.com", "9to5.example.com"},
 			{"1host.example.com", "1host.example.com"},
 		} {
-			name, ip, err := urlHost(tc.host)
-			if err != nil {
-				t.Errorf("urlHost(%q) = error %v, want the name %q", tc.host, err, tc.want)
-				continue
-			}
-			if ip != nil {
-				t.Errorf("urlHost(%q) read the address %s, want the name %q", tc.host, ip, tc.want)
+			kind, name, ip, err := hostOf(tc.host)
+			if kind != hostIsName {
+				t.Errorf("hostOf(%q) = (%v, %q, %v, %v), want the name %q", tc.host, kind, name, ip, err, tc.want)
 				continue
 			}
 			if name != tc.want {
-				t.Errorf("urlHost(%q) = %q, want %q", tc.host, name, tc.want)
+				t.Errorf("hostOf(%q) = %q, want %q", tc.host, name, tc.want)
 			}
 		}
 	})
@@ -2138,18 +2130,55 @@ func TestURLHostReadsWhatAURLConsumerReads(t *testing.T) {
 	// as names is what let an address-shaped host through.
 	t.Run("neither", func(t *testing.T) {
 		for _, host := range []string{
-			"127.0.0.999",  // a part over one byte
+			// An absent host. A URL's authority can be non-empty and name no
+			// host, as "https://:443/" does, and a client dialling one reaches
+			// its own machine.
+			"",
+			// Each of these pins one guard in the address parser, and each has
+			// to be rejected BY that guard: another check catching it first
+			// would leave the guard unpinned.
+			"127.0.0.999",  // a final part over one byte
+			"256.0.0.1",    // a leading part over one byte
+			"127.0.0.0.0",  // five parts, the last fitting the byte it spans
 			"127.0.0.0.1",  // five parts
 			"127..1",       // an empty part
 			"4294967296",   // over 32 bits
 			"127.16777216", // a final part over the bytes it spans
 			"0178.0.0.1",   // 8 is not an octal digit
-			"[::1",         // bracketed like IPv6 and not one
-			"::fffg:1",     // malformed IPv6
+			// Numeric and too large to hold: a label recognised by a 64-bit
+			// conversion succeeding read these as names.
+			"0x10000000000000000",
+			"0X10000000000000001",
+			"example.0xfffffffffffffffff",
+			// A code point a URL consumer forbids in a host. Go's URL parsing
+			// decodes "%25" to "%" before the host is read, and UTS-46 with
+			// STD3 rules off permits it.
+			"127%2e1",
+			"%",
+			"host%name.example",
+			"a b.example.com",
+			"a\tb.example.com",
+			// Bracketed like IPv6 and not one, and malformed IPv6.
+			"[::1",
+			"::fffg:1",
 		} {
-			if name, ip, err := urlHost(host); err == nil {
-				t.Errorf("urlHost(%q) = (%q, %v, nil), want a refusal: it is neither a name nor an address", host, name, ip)
+			kind, name, ip, err := hostOf(host)
+			if kind != hostIsUnreadable {
+				t.Errorf("hostOf(%q) = (%v, %q, %v, %v), want hostIsUnreadable: it is neither a name nor an address", host, kind, name, ip, err)
+				continue
 			}
+			if err == nil {
+				t.Errorf("hostOf(%q) read as unreadable with no reason, which is what a refusal names", host)
+			}
+		}
+		// The absent host has its own reason, and the reason is the whole
+		// point of the branch: "https://:443/mcp" is the one unreadable host
+		// an operator can read and think is fine, so a generic "cannot be
+		// read" would leave them looking at the wrong thing. Mapping an empty
+		// host also yields an empty result, so without this the branch is
+		// unpinned.
+		if _, _, _, err := hostOf(""); err == nil || !strings.Contains(err.Error(), "port and no host") {
+			t.Errorf("hostOf(%q) reason = %v, want it to say the authority names a port and no host", "", err)
 		}
 	})
 }
@@ -2209,7 +2238,13 @@ func TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling(t *testing.T) {
 
 	// A host that is neither a name nor an address is refused too, naming the
 	// declaration — not admitted because it failed to look like an address.
-	for _, host := range []string{"127.0.0.999", "127..1", "127.16777216"} {
+	// "" is the authority that names only a port, which a client dialling
+	// reaches its own machine through.
+	for _, host := range []string{
+		"127.0.0.999", "127..1", "127.16777216", "256.0.0.1", "127.0.0.0.0",
+		"0x10000000000000000", "example.0xfffffffffffffffff",
+		"127%252e1", "host%25name.example", "",
+	} {
 		t.Run("unreadable "+host, func(t *testing.T) {
 			err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP()
 			if err == nil {
@@ -2282,16 +2317,22 @@ func TestDeployedMCPIssuerRefusesAnUnreachableAddress(t *testing.T) {
 	}
 
 	// Neither a name nor an address: refused naming the issuer declaration,
-	// rather than published as an authorization server nobody can read.
-	t.Run("unreadable", func(t *testing.T) {
-		err := deployed(t, "https://127.0.0.999:3000").validateMCP()
-		if err == nil {
-			t.Fatal("a declared issuer whose host is neither a name nor an address was accepted")
-		}
-		if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
-			t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPIssuerURLKey))
-		}
-	})
+	// rather than published as an authorization server nobody can read. The
+	// empty host is the authority that names only a port.
+	for _, issuer := range []string{
+		"https://127.0.0.999:3000", "https://0x10000000000000000:3000",
+		"https://127%252e1:3000", "https://:3000",
+	} {
+		t.Run("unreadable "+issuer, func(t *testing.T) {
+			err := deployed(t, issuer).validateMCP()
+			if err == nil {
+				t.Fatal("a declared issuer whose host is neither a name nor an address was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+				t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPIssuerURLKey))
+			}
+		})
+	}
 
 	t.Run("reachable", func(t *testing.T) {
 		if err := deployed(t, "https://login.example.com").validateMCP(); err != nil {

@@ -1304,14 +1304,26 @@ point for code point, so `…/mcp/` and `…/mcp` are two different identifiers 
 a trailing slash is refused at boot naming the declaration rather than quietly
 turned into the other one. In a deployed runtime context it is also refused when
 its host is one a URL consumer reads as a **loopback or unspecified address**,
-or is `localhost` or a name under it. The host is mapped with UTS-46 and then
-read by WHATWG's host rules — the same path a client takes before dialling —
-and the **result** is classified, so the refusal does not depend on notation:
+or is `localhost` or a name under it. The host is mapped with UTS-46
+(`golang.org/x/net/idna`) and then read by the subset of WHATWG's host rules
+that decides what a host *is* — forbidden code points, domain versus
+address, and the IPv4 parser — and the **result** is classified. This is not a
+general URL parser and does not claim to be one; what it gives is that the
+decision does not depend on notation:
 dotted-quad `127.0.0.0/8` and `0.0.0.0`, IPv6 `[::1]` and `[::]` with or without
 a zone, the inet_aton forms (fewer than four parts, a bare integer, octal,
 hexadecimal, a bare `0x` component) and their Unicode spellings all classify
-alike. A host that ends in a number and is *not* a valid address — `127.0.0.999`
-— is refused too, because WHATWG makes that an invalid URL rather than a name.
+alike. There are exactly three outcomes and the third is a refusal, not a fallback: a
+host either reads as an address, or as a name, or as **neither** — a host that
+ends in a number and is not a valid address (`127.0.0.999`), one whose numeric
+label is too large to be one (`0x10000000000000000`), one carrying a code point
+forbidden in a host (a decoded `%`), or an authority that names a port and no
+host at all (`https://:443/mcp`). Each of those is refused naming the
+configuration that supplied it, because treating an unreadable host as a name is
+how an address-shaped authority gets published.
+
+Both published URLs — the identifier and `issuer-url` — go through the same
+decision, so neither can disagree with the other about what a host is.
 
 Two limits are worth stating exactly, because "every spelling" would be a
 stronger claim than the code makes. `https` does not launder such an address.

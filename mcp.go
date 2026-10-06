@@ -898,27 +898,6 @@ func (c config) validateMCP() error {
 			return fmt.Errorf("no %s provisioned in the deployed runtime context %q: the issuer resolved from the SDK (%q) is the address this composition dials the host at, which no MCP client can reach, and it would be published as this resource's authorization server. Provision that workspace configuration with the origin clients authenticate against and declare the %s group as a workspace-configuration dependency of this backend",
 				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, redactedURL(c.mcpIssuerURL), MCPConfigurationGroup)
 		}
-		// The issuer is published as this resource's authorization server, so
-		// the same address refusal applies to it: a client told to
-		// authenticate against this machine has nowhere to authenticate, and
-		// the document saying so is well-formed and served with a 200. The
-		// issuer is the one value a deployment must declare, which is exactly
-		// why declaring a reachable-looking one is not enough.
-		if loopbackURL(c.mcpIssuerURL) {
-			return fmt.Errorf("the %s in the deployed runtime context %q (%q) is a loopback address: it is published as this MCP resource's authorization server, so a client reading it is sent to authenticate against its own machine. Provision that workspace configuration with the origin clients authenticate against",
-				mcpConfigurationValue(MCPIssuerURLKey), c.runtimeContext, redactedURL(c.mcpIssuerURL))
-		}
-		// A declared identifier passes every check above and can still name
-		// this machine, and this package holds the only address classifier
-		// left after the registration refusals were removed. The damage is the
-		// silent kind the rest of validateMCP exists for: the document is
-		// well-formed, served with a 200, and names an address only this
-		// process can reach, with a client's token bound to it.
-		if loopbackURL(c.mcpPublicURL) {
-			return fmt.Errorf("%s (%q) is a loopback address in the deployed runtime context %q: it is the resource identifier an MCP client binds its token to, so a client dialling it reaches its own machine, not this solution. Provision %s with the URL clients actually dial",
-				c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), c.runtimeContext,
-				mcpConfigurationValue(MCPPublicURLKey))
-		}
 		// Declared, not derived. The derived identifier satisfied a check for
 		// "a public URL is set", so this refusal never fired in the one case
 		// it matters: a deployment with PUBLIC_URL resolved, where
@@ -943,9 +922,14 @@ func (c config) validateMCP() error {
 		mcpConfigurationValue(MCPIssuerURLKey), deployedRuntimeContext(c.runtimeContext)); err != nil {
 		return err
 	}
-	if err := unusableURLHost(c.mcpIssuerURL); err != nil {
-		return fmt.Errorf("unusable host issuer (%q): its host is %w. It is published as this MCP resource's authorization server, so it has to be a URL a client can read and dial. Provision %s with the origin clients authenticate against",
-			redactedURL(c.mcpIssuerURL), err, mcpConfigurationValue(MCPIssuerURLKey))
+	// The issuer's host, through the one decision point. It is published as
+	// this resource's authorization server, so a host no client can read or
+	// reach sends every client nowhere — on a document that is well-formed and
+	// served with a 200. The issuer is the one value a deployment must declare,
+	// which is why declaring a reachable-LOOKING one is not enough.
+	if err := publishedHostError(c.mcpIssuerURL, deployedRuntimeContext(c.runtimeContext)); err != nil {
+		return fmt.Errorf("unusable %s (%q): its host is %w. It is published as this MCP resource's authorization server, so it has to be a URL a client can read and dial. Provision that workspace configuration with the origin clients authenticate against",
+			mcpConfigurationValue(MCPIssuerURLKey), redactedURL(c.mcpIssuerURL), err)
 	}
 	if c.mcpPublicURL == "" {
 		return nil
@@ -972,10 +956,11 @@ func (c config) validateMCP() error {
 		mcpConfigurationValue(MCPPublicURLKey), deployed); err != nil {
 		return err
 	}
-	// Before the trailing-slash and pairing checks, because a host that is
-	// neither a name nor an address cannot be dialled at all, and those two
-	// would report a suffix defect in a URL whose authority is the problem.
-	if err := unusableURLHost(c.mcpPublicURL); err != nil {
+	// The identifier's host, through the same decision point, and before the
+	// trailing-slash and pairing checks: a host a client cannot read or reach
+	// cannot be dialled at all, and those two would report a suffix defect in a
+	// URL whose authority is the problem.
+	if err := publishedHostError(c.mcpPublicURL, deployed); err != nil {
 		return fmt.Errorf("unusable %s (%q): its host is %w. It is the resource identifier an MCP client binds its token to, so it has to be a URL a client can read and dial. Provision %s with the URL they dial",
 			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), err,
 			mcpConfigurationValue(MCPPublicURLKey))
@@ -997,35 +982,122 @@ func (c config) validateMCP() error {
 	return nil
 }
 
-// loopbackURL reports whether raw names this machine. Every caller is a
-// refusal, so a spelling it misses is an address that passes.
+// hostKind is what a published URL's host turns out to be once it is read the
+// way the client that dials it reads it. There are exactly three outcomes, and
+// the defect this type exists to prevent is the third being treated as the
+// second: a host nothing can read is not a domain, and admitting it as one is
+// how an address-shaped authority reached a cell unclassified, three rounds
+// running. Every caller goes through hostOf, and hostOf is the only place the
+// three are decided.
+type hostKind int
+
+const (
+	// hostIsUnreadable is neither a name nor an address. Always refused, naming
+	// the configuration that supplied it.
+	hostIsUnreadable hostKind = iota
+	// hostIsName is a domain. Admitted, unless the name is one reserved for this
+	// machine.
+	hostIsName
+	// hostIsAddress is an IP literal or a numeric host, in any notation a URL
+	// consumer reads as one. Classified.
+	hostIsAddress
+)
+
+// publishedHostError is why a URL this runtime publishes cannot be published,
+// or nil. It is the one decision point: both published URLs — the resource
+// identifier and the issuer — go through it, so neither can grow a predicate
+// of its own that disagrees about what a host is.
 //
-// It classifies what urlHost read, never the text. The rule is that one
-// address classifies the same however it is written, and the only way to hold
-// it is to normalise the host the way the consumer that dials it does and
-// classify the result — an enumeration of notations is a list, and the property
-// has to cover the notation nobody listed.
-//
-// A host that is a name, rather than an address, is only loopback when the name
-// is reserved for it: localhost and anything under it resolve to this machine
-// everywhere. Any other name is the resolver's to answer, and what it answers
-// is not knowable here without a lookup at boot.
-func loopbackURL(raw string) bool {
+// deployed selects what is merely local rather than broken. A loopback address
+// and a name reserved for loopback are both right on a developer's machine and
+// reachable by nobody from a cell. A host that does not read at all is broken
+// in either.
+func publishedHostError(raw string, deployed bool) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return false
+		// Reported by the absolute-URL refusal, which names the whole value
+		// rather than its authority.
+		return nil
 	}
-	name, ip, hostErr := urlHost(u.Hostname())
-	if hostErr != nil {
-		// Not readable as a name or an address. validateMCP refuses it by
-		// name rather than this reporting it as reachable.
-		return false
+	kind, name, ip, why := hostOf(u.Hostname())
+	switch kind {
+	case hostIsUnreadable:
+		return why
+	case hostIsAddress:
+		if deployed && (ip.IsLoopback() || ip.IsUnspecified()) {
+			return fmt.Errorf("the loopback address %s, which no client but this machine's can dial", ip)
+		}
+	case hostIsName:
+		if deployed && (name == "localhost" || strings.HasSuffix(name, ".localhost")) {
+			return fmt.Errorf("%q, a name reserved for this machine's loopback interface, which no client but this machine's can dial", name)
+		}
 	}
-	if ip != nil {
-		return ip.IsLoopback() || ip.IsUnspecified()
+	return nil
+}
+
+// hostOf reads a URL's host the way a URL consumer does and reports which of
+// the three outcomes it is. The error is set only for hostIsUnreadable, and it
+// says what about the host could not be read.
+//
+// It is UTS-46 through x/net/idna and then WHATWG's host rules: the mapping
+// table is Unicode's and the rules are the specification a client's URL library
+// implements, so one address classifies the same however it is written without
+// this package enumerating notations.
+func hostOf(hostname string) (hostKind, string, net.IP, error) {
+	if hostname == "" {
+		// A URL's authority can be non-empty while naming no host: "https://:443/"
+		// has the authority ":443". Admitting that as a name let it through
+		// every check, and a client dialling a URL with no host reaches its own
+		// machine.
+		return hostIsUnreadable, "", nil, errors.New("absent: the authority names a port and no host")
 	}
-	name = strings.TrimSuffix(name, ".")
-	return name == "localhost" || strings.HasSuffix(name, ".localhost")
+	// An IPv6 literal, which url.Hostname returns without its brackets. A zone
+	// selects the interface an address is reached on, not which address it is,
+	// so it is dropped before parsing.
+	if strings.Contains(hostname, ":") {
+		literal := hostname
+		if zone := strings.IndexByte(literal, '%'); zone >= 0 {
+			literal = literal[:zone]
+		}
+		if parsed := net.ParseIP(literal); parsed != nil {
+			return hostIsAddress, hostname, parsed, nil
+		}
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, bracketed like an IPv6 address and not one", hostname)
+	}
+	mapped, err := urlHostProfile.ToASCII(hostname)
+	if err != nil || mapped == "" {
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which UTS-46 mapping cannot read: %v", hostname, err)
+	}
+	if bad := forbiddenDomainRune(mapped); bad >= 0 {
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which contains %q — a code point a URL consumer forbids in a host", hostname, bad)
+	}
+	if !hostEndsInNumber(mapped) {
+		return hostIsName, strings.TrimSuffix(mapped, "."), nil, nil
+	}
+	parsed, ok := ipv4FromHost(mapped)
+	if !ok {
+		// WHATWG makes a host whose last label is a number an invalid URL when
+		// it does not parse as an address. Treating it as a name is what let a
+		// malformed authority through.
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which ends in a number and so has to be an address, and is not a valid one", hostname)
+	}
+	return hostIsAddress, mapped, parsed, nil
+}
+
+// forbiddenDomainRune is the first code point WHATWG forbids in a domain, or
+// -1. That is the forbidden host code points, the C0 controls, DELETE and "%".
+//
+// "%" is the one that has to be checked here rather than assumed away. Go's URL
+// parsing decodes "%25" to "%" before url.Hostname is read, and a UTS-46
+// profile with STD3 rules off permits the result — so a percent-encoded
+// separator would otherwise survive mapping and read as an ordinary label.
+func forbiddenDomainRune(host string) rune {
+	for _, r := range host {
+		if r <= 0x20 || r == 0x7f || strings.ContainsRune("#/:<>?@[\\]^|%", r) {
+			return r
+		}
+	}
+	return -1
 }
 
 // urlHostProfile maps a host the way a URL consumer does before dialling it:
@@ -1040,62 +1112,13 @@ var urlHostProfile = idna.New(
 	idna.StrictDomainName(false),
 )
 
-// urlHost reads a URL's host the way a URL consumer does, and reports what it
-// denotes: the mapped name, and the address when the host is one.
-//
-// The error is the third outcome, and having it is what makes the other two
-// sound. A host whose last label is a number MUST parse as an IPv4 address —
-// WHATWG makes a failure there an invalid URL, not a domain — so a value like
-// "127.0.0.999" is neither a name nor an address. Treating such a host as a
-// name would admit an address-shaped authority unclassified, so it is refused,
-// naming the configuration that supplied it.
-func urlHost(hostname string) (string, net.IP, error) {
-	if hostname == "" {
-		return "", nil, nil
-	}
-	// An IPv6 literal, which url.Hostname returns without its brackets. A zone
-	// selects the interface an address is reached on, not which address it is,
-	// so it is dropped before parsing.
-	if strings.Contains(hostname, ":") {
-		literal := hostname
-		if zone := strings.IndexByte(literal, '%'); zone >= 0 {
-			literal = literal[:zone]
-		}
-		if parsed := net.ParseIP(literal); parsed != nil {
-			return hostname, parsed, nil
-		}
-		return "", nil, fmt.Errorf("%q is bracketed like an IPv6 address and is not one", hostname)
-	}
-	mapped, err := urlHostProfile.ToASCII(hostname)
-	if err != nil || mapped == "" {
-		return "", nil, fmt.Errorf("%q is not a host a URL consumer can read: %v", hostname, err)
-	}
-	if !hostEndsInNumber(mapped) {
-		return mapped, nil, nil
-	}
-	parsed, ok := ipv4FromHost(mapped)
-	if !ok {
-		return "", nil, fmt.Errorf("%q ends in a number, so it has to be an address, and it is not a valid one", hostname)
-	}
-	return mapped, parsed, nil
-}
-
-// unusableURLHost is urlHost's error for one URL, or nil when its host reads as
-// a name or an address. A URL that does not parse at all is reported by the
-// absolute-URL refusal instead, which names the whole value rather than its
-// host.
-func unusableURLHost(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil
-	}
-	_, _, hostErr := urlHost(u.Hostname())
-	return hostErr
-}
-
 // hostEndsInNumber is WHATWG's "ends in a number": the test that decides
 // whether a host has to be an address rather than a name. A trailing empty
 // label is the root dot, which does not change the answer.
+//
+// It asks whether the last label IS a number, not whether it is a number this
+// platform can hold. Those came apart once: a label was recognised by a 64-bit
+// conversion succeeding, so one that overflowed read as a name.
 func hostEndsInNumber(host string) bool {
 	parts := strings.Split(host, ".")
 	if len(parts) > 1 && parts[len(parts)-1] == "" {
@@ -1108,8 +1131,8 @@ func hostEndsInNumber(host string) bool {
 	if strings.IndexFunc(last, func(r rune) bool { return r < '0' || r > '9' }) < 0 {
 		return true
 	}
-	_, ok := ipv4Number(last)
-	return ok
+	_, numeric, _ := ipv4Number(last)
+	return numeric
 }
 
 // ipv4FromHost is WHATWG's IPv4 parser: one to four parts, every part before
@@ -1125,8 +1148,8 @@ func ipv4FromHost(host string) (net.IP, bool) {
 	}
 	numbers := make([]uint64, len(parts))
 	for i, part := range parts {
-		value, ok := ipv4Number(part)
-		if !ok {
+		value, numeric, inRange := ipv4Number(part)
+		if !numeric || !inRange {
 			return nil, false
 		}
 		numbers[i] = value
@@ -1145,13 +1168,18 @@ func ipv4FromHost(host string) (net.IP, bool) {
 	return net.IPv4(byte(packed>>24), byte(packed>>16), byte(packed>>8), byte(packed)), true
 }
 
-// ipv4Number is WHATWG's IPv4 number parser: the radix comes from the prefix,
-// and a prefix with no digits after it is zero rather than a failure. The
-// second half of that is easy to read past and load-bearing: a bare "0x"
-// component is a zero byte, which makes the host it appears in an address.
-func ipv4Number(part string) (uint64, bool) {
+// ipv4Number reads one part of a numeric address, in the base its prefix names:
+// "0x" hexadecimal, a leading "0" octal, otherwise decimal. A prefix with no
+// digits after it is zero rather than a failure, which is easy to read past and
+// load-bearing — a bare "0x" component is a zero byte.
+//
+// It reports whether the part is a NUMBER at all, separately from whether that
+// number is in range, because those are different answers: a part that is
+// numeric and too large makes the host malformed, where one that is not numeric
+// at all makes it a name.
+func ipv4Number(part string) (uint64, bool, bool) {
 	if part == "" {
-		return 0, false
+		return 0, false, false
 	}
 	base, digits := 10, part
 	switch {
@@ -1161,10 +1189,16 @@ func ipv4Number(part string) (uint64, bool) {
 		base, digits = 8, part[1:]
 	}
 	if digits == "" {
-		return 0, true
+		return 0, true, true
 	}
 	value, err := strconv.ParseUint(digits, base, 64)
-	return value, err == nil
+	switch {
+	case err == nil:
+		return value, true, true
+	case errors.Is(err, strconv.ErrRange):
+		return 0, true, false
+	}
+	return 0, false, false
 }
 
 // mcpPublicURLSource names where the public MCP URL came from, so a refusal

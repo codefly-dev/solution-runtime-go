@@ -581,9 +581,13 @@ against.
    is published verbatim for the same code-point reason, so a trailing slash is a
    different identifier and is refused, not trimmed. A loopback or unspecified
    address is refused by classifying what a URL consumer reads after UTS-46
-   mapping and WHATWG's host rules, not by matching notations — but a *name*
-   that merely resolves to loopback is not, because that needs a lookup this
-   runtime does not do at boot. `PUBLIC_URL` itself went with the manifest
+   mapping and the subset of WHATWG's host rules that decides what a host is,
+   not by matching notations. A host is one of exactly three things — an
+   address, a name, or neither — and the third is a refusal naming the
+   provisioning key, never a fallback to the second; both published URLs go
+   through the one function that decides it. A *name* that merely resolves to
+   loopback is not refused, because that needs a lookup this runtime does not
+   do at boot. `PUBLIC_URL` itself went with the manifest
    registration it fed and came back for this one consumer: whether a runtime
    should derive the host's route at all is an open follow-up, not a settled
    answer.
