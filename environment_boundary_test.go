@@ -337,6 +337,86 @@ func pkgOf(fn *types.Func) string {
 	return fn.Pkg().Path()
 }
 
+// TestThePostBootGateCatchesTheServedAndParenthesisedReaders drives the gate
+// against the shapes that defeated the name-matching graph, compiled into this
+// package.
+//
+// Each is an environment read on the serving surface that a callee-name walker
+// rooted at two functions reported nothing about: one because the callee is
+// parenthesised, one because the function is never called anywhere — it is
+// mounted on the mux and invoked per request — and one because it is reached
+// only through a func-typed field.
+func TestThePostBootGateCatchesTheServedAndParenthesisedReaders(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_post_boot_fixture.go")
+
+	for _, tc := range []struct {
+		name   string
+		source string
+	}{
+		{
+			name: "a parenthesised callee on an exported path",
+			source: `package solution
+
+func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
+`,
+		},
+		{
+			name: "a reader reached only as a mounted handler value",
+			source: `package solution
+
+import "net/http"
+
+func (s *Server) MountFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/fixture", fixtureHandler)
+}
+
+func fixtureHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("x-fixture", fixtureRead())
+}
+
+func fixtureRead() string { return env("ANYTHING", "") }
+`,
+		},
+		{
+			name: "a reader reached only through a func-typed field",
+			source: `package solution
+
+type fixtureHooks struct{ read func(string, string) string }
+
+func ServedThroughAField() string {
+	hooks := fixtureHooks{read: fixtureFieldRead}
+	return hooks.read("ANYTHING", "")
+}
+
+func fixtureFieldRead(k, d string) string { return env(k, d) }
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reported []string
+			for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(tc.source)}) {
+				if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+					continue
+				}
+				graph := newCallGraph(pkg)
+				reached, _ := graph.servingSurface()
+				for name := range reached {
+					if graph.readsEnvironment[name] {
+						reported = append(reported, name)
+					}
+				}
+			}
+			if len(reported) == 0 {
+				t.Error("the gate reported no post-boot environment reader for this fixture")
+			}
+		})
+	}
+}
+
 // And the read has to happen at boot, not merely be written there.
 //
 // Static reachability is not the claim AGENTS.md makes, and the difference was

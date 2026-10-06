@@ -522,6 +522,57 @@ func FacadeSecretHeader() string {
 			rule: claimShapeFindings,
 		},
 		{
+			// C5: function-local constants, which a package-level-only
+			// collector never saw.
+			name: "function-local constants for a claim and the carrier",
+			source: `package solution
+
+func FacadeClaimLocal(gatewayURL string) string {
+	const claim = "/modules/" + "_register"
+	return gatewayURL + claim
+}
+
+func FacadeCredentialLocal() string {
+	const carrier = "CODEFLY__MODULE" + "_REGISTRATION_SECRETS"
+	return env(carrier, "")
+}
+`,
+			want: "CODEFLY__MODULE_REGISTRATION_SECRETS",
+			rule: claimShapeFindings,
+		},
+		{
+			// C6: a chain longer than any iteration limit, declared in
+			// reverse so a single forward pass resolves none of it.
+			name: "a reverse-declared constant chain",
+			source: `package solution
+
+const (
+	chain00 = "/" + chain01
+	chain01 = "m" + chain02
+	chain02 = "o" + chain03
+	chain03 = "d" + chain04
+	chain04 = "u" + chain05
+	chain05 = "l" + chain06
+	chain06 = "e" + chain07
+	chain07 = "s" + chain08
+	chain08 = "/" + chain09
+	chain09 = "_" + chain10
+	chain10 = "r" + chain11
+	chain11 = "e" + chain12
+	chain12 = "g" + chain13
+	chain13 = "i" + chain14
+	chain14 = "s" + chain15
+	chain15 = "t" + chain16
+	chain16 = "e" + chain17
+	chain17 = "r"
+)
+
+func FacadeClaimChain() string { return chain00 }
+`,
+			want: "/modules/_register",
+			rule: claimShapeFindings,
+		},
+		{
 			name: "an environment key that is not constant at all",
 			source: `package solution
 
