@@ -2038,10 +2038,14 @@ func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
 // from the refusals that consume it: the three outcomes are a name, an address,
 // and a host that is neither, which is refused rather than admitted as a name.
 //
-// The address cases are every spelling the conformance review drove to a
-// loopback listener with DNS disabled, plus the Unicode forms a URL consumer
-// maps before dialling. The name cases are what must NOT be mistaken for an
-// address, including a host whose labels merely look numeric.
+// The loopback cases include the spellings the conformance reviews drove to a
+// loopback-only listener with DNS disabled, plus Unicode forms a URL consumer
+// maps before dialling. They are a selection of that corpus rather than all of
+// it, and the table also holds public addresses, which were never dialled and
+// are here as controls — notation is not the refusal. The name cases are what
+// must NOT be mistaken for an address, including hosts whose labels merely look
+// numeric. The "neither" cases are each chosen to be rejected BY the guard it
+// pins, since a case another check catches first leaves that guard unpinned.
 func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
 	// Built at run time rather than written as literals: Go's scanner refuses
 	// a byte order mark in source, and these read better named anyway.
@@ -2130,6 +2134,17 @@ func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
 			{"example.0X10000000000000000Z", "example.0x10000000000000000z"},
 			{"18446744073709551616z", "18446744073709551616z"},
 			{"02000000000000000000000g", "02000000000000000000000g"},
+			// The same, with PUNCTUATION where those carry a letter. A letter
+			// is a character with a digit value that this radix does not
+			// reach, so those cases are caught by the radix comparison and
+			// defend nothing about a character with no digit value at all.
+			// These are the ones that die when digitsInBase stops rejecting
+			// it — by being refused as malformed addresses when they are
+			// ordinary names.
+			{"0x10000000000000000_", "0x10000000000000000_"},
+			{"example.0x10000000000000000-0", "example.0x10000000000000000-0"},
+			{"18446744073709551616_", "18446744073709551616_"},
+			{"02000000000000000000000-0", "02000000000000000000000-0"},
 			// The rooted dot is the one trailing dot a name may carry.
 			{"example.test.", "example.test"},
 			// 63 bytes is the longest label and 253 the longest name.
@@ -2291,6 +2306,7 @@ func TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling(t *testing.T) {
 		// holding a non-digit.
 		"mcp.example.com.", strings.Repeat("a", 63) + ".example.com",
 		"my_host.example.com", "0x10000000000000000g.example.com",
+		"0x10000000000000000_.example.com", "18446744073709551616_.example.com",
 	} {
 		t.Run("reachable "+host, func(t *testing.T) {
 			if err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP(); err != nil {

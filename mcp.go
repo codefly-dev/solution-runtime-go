@@ -1045,10 +1045,10 @@ func publishedHostError(raw string, deployed bool) error {
 // this package enumerating notations.
 func hostOf(hostname string) (hostKind, string, net.IP, error) {
 	if hostname == "" {
-		// A URL's authority can be non-empty while naming no host: "https://:443/"
-		// has the authority ":443". Admitting that as a name let it through
-		// every check, and a client dialling a URL with no host reaches its own
-		// machine.
+		// A URL's authority can be non-empty while naming no host:
+		// "https://:443/" has the authority ":443" and no hostname. So a
+		// non-empty authority is not evidence of a host, and a client dialling
+		// a URL with no host reaches its own machine.
 		return hostIsUnreadable, "", nil, errors.New("absent: the authority names a port and no host")
 	}
 	// An IPv6 literal, which url.Hostname returns without its brackets. A zone
@@ -1091,13 +1091,11 @@ func hostOf(hostname string) (hostKind, string, net.IP, error) {
 // unusableDomainName is why name cannot be a domain, or nil. It takes the name
 // with its single rooted dot already removed.
 //
-// Mapping a host successfully is not the same as the host being usable, and
-// treating it as the same is what made the NAME branch the soft one: UTS-46
+// Mapping a host successfully is not the same as the host being usable: UTS-46
 // maps each label it is given without caring how the labels are divided or how
-// long they are, so an empty label, a leading dot or a label past the length a
-// resolver accepts all mapped cleanly and were published. A host that is
-// neither a valid address nor a valid name is the third outcome, not the
-// second.
+// long they are, so an empty label, a leading dot and a label past the length a
+// resolver accepts all map cleanly. A host that is neither a valid address nor
+// a valid name is the third outcome, not the second.
 //
 // The limits are DNS's: 63 bytes a label, 253 bytes a name. What this must NOT
 // do is tighten what the mapping deliberately allows — an underscore is a name
