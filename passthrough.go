@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/solution/manifest"
+	"github.com/codefly-dev/sdk-go/workcontext"
+	"github.com/codefly-dev/solution-runtime-go/internal/seam"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -142,7 +145,24 @@ const (
 // chainable and may be called more than once; Serve refuses a declaration that
 // cannot be served before it listens.
 func (s *Server) Consumes(modules ...ConsumedModule) *Server {
-	s.consumed = append(s.consumed, modules...)
+	// Frozen at the declaration boundary, for the reason Contract() gives:
+	// `append` copies the structs and leaves every slice inside them pointing
+	// at the caller's arrays. These are the ASKED scopes — the other operand
+	// of the ceiling comparison and what the published contract reports — so a
+	// caller editing one after boot changes what this process claims to ask
+	// for.
+	for _, module := range modules {
+		module.Scopes = frozenScopes(module.Scopes)
+		methods := make([]ConsumedMethod, len(module.Methods))
+		for i, method := range module.Methods {
+			method.Scopes = frozenScopes(method.Scopes)
+			methods[i] = method
+		}
+		if module.Methods != nil {
+			module.Methods = methods
+		}
+		s.consumed = append(s.consumed, module)
+	}
 	return s
 }
 
@@ -279,20 +299,21 @@ func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
 	if err != nil || len(s.consumed) == 0 {
 		return routes, err
 	}
-	// Decoded at boot (loadConfig), and validate() has already refused a
-	// malformed one by name. Still reported here rather than assumed away: a
-	// caller that builds a config itself has not been through validate().
-	if s.cfg.apiConsumesErr != nil {
-		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", s.cfg.apiConsumesErr)
+	consumed, err := manifest.ParseConsumedAPIs(s.cfg.apiConsumes)
+	if err != nil {
+		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", err)
 	}
-	return routes, checkConsumed(s.consumed, s.cfg.consumedAPIs)
+	return routes, checkConsumed(s.consumed, consumed)
 }
 
-// mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix,
-// as serve does and as PassthroughHandler does: the one place the passthrough
-// is wired, so a test through PassthroughHandler serves what Serve serves.
-// Serve has already resolved and checked the routes; a test that calls serve
-// directly has not, and resolves them here.
+// mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix:
+// the one place the passthrough is wired, so the test seam serves what Serve
+// serves. Serve has already resolved and checked the routes; a test that calls
+// serve directly has not, and resolves them here.
+//
+// It named Server.PassthroughHandler as the other caller, which was removed —
+// an exported constructor for a credential-bearing handler with no boot behind
+// it. The seam reached through internal/seam replaced it.
 func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 	if len(s.consumed) == 0 {
 		return nil
@@ -308,38 +329,40 @@ func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 	return nil
 }
 
-// PassthroughEnvironment is what Serve resolves from the composition for the
-// passthrough, supplied instead by a caller of PassthroughHandler.
-type PassthroughEnvironment struct {
-	// GatewayURL is the host gateway every call goes through: the Work Context
-	// mint and the consumed modules' /v1/<as> prefixes.
-	GatewayURL string
-	// Consumes is the solution's api.consumes projection, which Serve reads
-	// from CODEFLY__API_CONSUMES. Every declared module must be in it.
-	Consumes []manifest.ConsumedAPI
+// init registers the passthrough seam for package passthroughtest, which is the
+// only caller that can reach it: internal/seam is importable inside this module
+// and nowhere else.
+func init() {
+	seam.Passthrough = passthroughSeam
 }
 
-// PassthroughHandler is the consumed-module passthrough exactly as Serve
-// serves it — the declaration checked by the same boot check, mounted by the
-// same code at PassthroughPathPrefix — against an environment the caller
-// supplies instead of the one Serve resolves. Nothing else of the solution is
-// served, and nothing registers anywhere.
+// passthroughSeam is what Server.PassthroughHandler used to be, minus the
+// "exported" part.
 //
-// It exists for tests: package passthroughtest builds on it, with a fake host
-// standing in for the gateway. A solution serves with Serve, which overwrites
-// the environment set here when it resolves its own.
-func (s *Server) PassthroughHandler(env PassthroughEnvironment) (http.Handler, error) {
+// Exported, it was a production bypass: a solution could build a usable
+// credential-bearing handler that had skipped validate(), the mTLS boot, the
+// caller allow-list, the published ceiling and authenticated outbound, and a
+// deployment calling it completed a viewer mint and a module call over
+// plaintext, 200, with the viewer's bearer and this workload's own credential
+// on the wire. Supplying a credential source — which a real deployment does —
+// defeated the "no source, nothing to mint with" mitigation it relied on. Fail
+// closed admits no exception for a shape that exists to make testing
+// convenient, so the shape moved behind the compiler instead: see
+// internal/seam.
+//
+// What it builds is otherwise unchanged, and deliberately so — it is the
+// declaration checked by the same boot check and mounted by the same code at
+// PassthroughPathPrefix, so a consumer's test serves what Serve serves. Serve
+// overwrites the environment set here when it resolves its own.
+func passthroughSeam(server any, gatewayURL, consumesJSON string) (http.Handler, error) {
+	s, ok := server.(*Server)
+	if !ok {
+		return nil, fmt.Errorf("the passthrough seam was handed a %T rather than a solution server", server)
+	}
 	if len(s.consumed) == 0 {
 		return nil, fmt.Errorf("solution %q declares no consumed modules (Consumes)", s.manifest.ID)
 	}
-	projection, err := json.Marshal(env.Consumes)
-	if err != nil {
-		return nil, err
-	}
-	s.cfg.gatewayURL, s.cfg.apiConsumes = env.GatewayURL, string(projection)
-	// The caller handed us the decoded projection, so there is nothing to
-	// decode and nothing that could have failed to.
-	s.cfg.consumedAPIs, s.cfg.apiConsumesErr = env.Consumes, nil
+	s.cfg.gatewayURL, s.cfg.apiConsumes = gatewayURL, consumesJSON
 	routes, err := s.validatePassthrough()
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
@@ -455,7 +478,23 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 // this method (or the bearer alone, for a ViewerBearer module), and the
 // declared pin merged into the request.
 func (s *Server) authorize(ctx context.Context, route passthroughRoute, header http.Header, msg *dynamicpb.Message) (*Gateway, error) {
-	gw := newGateway(s.cfg.gatewayURL, header.Get("authorization"), header.Get(orgHeader), header.Get(sessionHeader))
+	// Whether or not this route mints anything. A ViewerBearer route forwards
+	// the viewer's bearer and asks the credential for nothing, so it was the
+	// one route that never consulted it — and it kept forwarding that bearer
+	// to the gateway after the issuer refused this build. See
+	// actingForAViewer: the credential is what authorises this process to act
+	// for a viewer, not merely what it mints with.
+	if err := s.actingForAViewer(ctx); err != nil {
+		// Sanitized, for the reason wrapRequest records: the error wraps what
+		// the source said, and this branch handed it to the page verbatim.
+		code := connect.CodeUnavailable
+		if errors.Is(err, ErrCredentialRefused) {
+			code = connect.CodeFailedPrecondition
+		}
+		log.Printf("solution: refusing to act for a viewer on %s: %v", route.module.As, err)
+		return nil, connect.NewError(code, errors.New(credentialRefusalForAViewer(err)))
+	}
+	gw := s.gatewayFor(header)
 	if !route.module.ViewerBearer {
 		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)
 		if err != nil {
@@ -537,6 +576,42 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
+	case errors.Is(err, workcontext.ErrRevoked):
+		// Checked before ErrNotAttested, which now wraps it: a renewal the
+		// issuer refuses because the state the credential is sealed to has
+		// moved arrives here as both, and the first matching branch decides
+		// what a page is told. Reported as unavailable it reads as "retry
+		// shortly", which is the one thing that cannot help.
+		//
+		// The capability was sound when it was minted and the state moved under
+		// it — an installation revision, a principal's epoch, a build
+		// incarnation, a binding. The holder's answer to every one of those is
+		// the same and it is not "retry": it is to mint again. Reported as the
+		// unavailable fallthrough below, a page or a client policy would retry
+		// against a credential guaranteed to keep failing; reported as a plain
+		// denial, a condition one mint fixes would reach the viewer as their
+		// own authorization failing. Aborted is neither, and a caller that
+		// re-asks gets a fresh mint because the cache no longer holds a current
+		// one.
+		return connect.NewError(connect.CodeAborted, errors.New("the authority this solution presented has been superseded; the call was not made"))
+	case errors.Is(err, ErrNotAttested):
+		// This solution could not attest which module is asking, so it did not
+		// ask. The viewer's authority is not in question and the condition is
+		// one renewal away, which is what unavailable says and what neither
+		// internal nor permission_denied would.
+		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
+	case errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
+		// A capability this solution could not present is this solution's
+		// problem, not a module that is briefly unreachable, and not the
+		// viewer's authorization. Reported as the unavailable fallthrough it
+		// would be retried against a credential that will be exactly as
+		// unusable next time, and the one signal that the issuer handed back
+		// something this runtime cannot carry would be spent on a retry loop.
+		// The three are kept apart from each other at the point they are
+		// logged, not here: "another format", "no seal" and "bad capability"
+		// have different owners, and core deliberately does not let one
+		// errors.Is branch reach all three.
+		return connect.NewError(connect.CodeInternal, errors.New("this solution could not present a usable credential for the module"))
 	}
 	return connect.NewError(connect.CodeUnavailable, errors.New("the module call failed"))
 }

@@ -230,7 +230,7 @@ func (g *Gateway) TranscodedStream(ctx context.Context, prefix, method string, r
 func readStream(ctx context.Context, call transcodedCall, httpResp *http.Response, options streamOptions, newMsg func() proto.Message, each func(proto.Message) error) error {
 	// Closed, never drained: a stream has no end to drain to, and the
 	// request's context cancellation has already stopped it on the way out.
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 	if httpResp.StatusCode < 200 || httpResp.StatusCode > 299 {
 		detail, _ := io.ReadAll(io.LimitReader(httpResp.Body, gatewayErrorDetailLimit))
 		return fmt.Errorf("%s %s: %w", call.verb, call.template, &GatewayError{StatusCode: httpResp.StatusCode, detail: detail})

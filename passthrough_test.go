@@ -3,6 +3,7 @@ package solution
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,7 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/solution/manifest"
-	codefly "github.com/codefly-dev/sdk-go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -38,8 +39,18 @@ type moduleGateway struct {
 	status int
 	reply  string
 	// deny, when set, is an action the viewer does not hold: a mint asking for
-	// it is refused the way accounts refuses one.
+	// it is refused the way accounts refuses one — with 403.
 	deny string
+	// conflict, when set, is an action whose mint is answered with 409 rather
+	// than 403: the status that means "the state you were sealed to has moved"
+	// for a capability and "this viewer lacks that authority" for a viewer,
+	// which is the ambiguity nothing in this runtime may resolve by guessing.
+	//
+	// It exists because a test named after a CONFLICT was driving `deny` and
+	// therefore asserting against a 403. A 409-specific regression — inferring
+	// supersession and poisoning the process — would have survived it, which a
+	// reviewer caught twice before it was fixed.
+	conflict string
 
 	mu    sync.Mutex
 	mints []mintRequest
@@ -58,9 +69,17 @@ func newModuleGateway(t *testing.T, status int, reply string) *moduleGateway {
 			var mint mintRequest
 			_ = json.Unmarshal(body, &mint)
 			mint.Bearer = r.Header.Get("authorization")
+			mint.WorkContext = r.Header.Get(workcontext.HeaderName)
 			g.mints = append(g.mints, mint)
 			for _, scope := range mint.AuthorityScopes {
 				for _, action := range scope.Actions {
+					if g.conflict != "" && action == g.conflict {
+						writeJSON(w, http.StatusConflict, map[string]any{
+							"code":    "aborted",
+							"message": "the state this capability was sealed to has moved",
+						})
+						return
+					}
 					if g.deny != "" && action == g.deny {
 						writeJSON(w, http.StatusForbidden, map[string]any{
 							"code":    "permission_denied",
@@ -71,7 +90,7 @@ func newModuleGateway(t *testing.T, status int, reply string) *moduleGateway {
 				}
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
-				"token": "context-" + mint.Audience + ".1", "orgId": mint.OrgID,
+				"token": capability("context-" + mint.Audience + ".1"), "orgId": mint.OrgID,
 				"ownerPrincipalId": "viewer", "currentActorPrincipalId": "viewer",
 				"expiresAt": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
 			})
@@ -84,6 +103,13 @@ func newModuleGateway(t *testing.T, status int, reply string) *moduleGateway {
 	}))
 	t.Cleanup(g.Close)
 	return g
+}
+
+// observedMints is every mint this fake gateway was asked for.
+func (g *moduleGateway) observedMints() []mintRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]mintRequest{}, g.mints...)
 }
 
 // call sends one Connect unary JSON request, as connect-es does, to the
@@ -102,6 +128,7 @@ func call(t *testing.T, s *Server, path, bearer, body string) (int, map[string]a
 	}
 	req.Header.Set(orgHeader, "org-1")
 	req.Header.Set(sessionHeader, "session-1")
+	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	rec := httptest.NewRecorder()
 	s.passthroughHandler(routes).ServeHTTP(rec, req)
 	var out map[string]any
@@ -113,19 +140,37 @@ func call(t *testing.T, s *Server, path, bearer, body string) (int, map[string]a
 	return rec.Code, out
 }
 
-func passthroughServer(gatewayURL string, modules ...ConsumedModule) *Server {
-	s := New(Manifest{ID: "test"}).Consumes(modules...)
+// passthroughServer is a solution serving the passthrough against a fake
+// gateway, holding a real execution credential.
+//
+// The credential is not optional furniture here: minting for a viewer is
+// fail-closed, so a server without one refuses every call (see
+// TestAServerWithNoCredentialSourceMintsNothing). Every passthrough test
+// therefore stands up the same mint a booted runtime would.
+func passthroughServer(t *testing.T, gatewayURL string, modules ...ConsumedModule) *Server {
+	t.Helper()
+	s := New(Manifest{ID: "test"}).Consumes(modules...).Credential(attestingSource(t))
 	s.cfg.gatewayURL = gatewayURL
 	return s
+}
+
+// attestingSource is an execution credential from a fake host, for a test that
+// is about something other than the mint.
+func attestingSource(t *testing.T) CredentialSource {
+	t.Helper()
+	mint := newHostMint(t, &hostMint{})
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	writeFile(t, tokenFile, "projected")
+	return mintClientFor(t, mint, tokenFile)
 }
 
 const searchPath = "/modules/things/things.v1.Things/Search"
 
 func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1","big":"7","secret":"s3cret","sub":{"name":"x"}}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 
-	status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1","pageSize":3}`)
+	status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1","pageSize":3}`)
 	if status != http.StatusOK {
 		t.Fatalf("status %d: %v", status, body)
 	}
@@ -141,10 +186,10 @@ func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
 	if err := json.Unmarshal([]byte(gw.bodys[0]), &sent); err != nil || sent["entryId"] != "e1" || sent["pageSize"] != float64(3) {
 		t.Fatalf("module received %q", gw.bodys[0])
 	}
-	if got := gw.calls[0].Header.Get(codefly.WorkContextHeaderName); got != "context-things.1" {
+	if got := gw.calls[0].Header.Get(workcontext.HeaderName); got != capability("context-things.1") {
 		t.Fatalf("work context = %q, want the one minted for the module", got)
 	}
-	if gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
+	if gw.calls[0].Header.Get("authorization") != viewerBearer() {
 		t.Fatal("the viewer's bearer was not forwarded")
 	}
 	if len(gw.mints) != 1 || gw.mints[0].Audience != "things" || gw.mints[0].OrgID != "org-1" || gw.mints[0].SessionID != "session-1" ||
@@ -157,29 +202,29 @@ func TestPassthroughForwardsOnlyTheBearerToAModuleThatAuthenticatesTheViewer(t *
 	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1"}`)
 	module := passthroughModule()
 	module.Scopes, module.ViewerBearer = nil, true
-	s := passthroughServer(gw.URL, module)
+	s := passthroughServer(t, gw.URL, module)
 
-	if status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1"}`); status != http.StatusOK {
+	if status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1"}`); status != http.StatusOK {
 		t.Fatalf("status %d: %v", status, body)
 	}
 	if len(gw.mints) != 0 {
 		t.Fatalf("minted %d capabilities for a module that reads the bearer", len(gw.mints))
 	}
-	if gw.calls[0].Header.Get(codefly.WorkContextHeaderName) != "" || gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
+	if gw.calls[0].Header.Get(workcontext.HeaderName) != "" || gw.calls[0].Header.Get("authorization") != viewerBearer() {
 		t.Fatal("want the viewer's bearer and no capability")
 	}
 }
 
 func TestPassthroughServesOnlyWhatIsDeclared(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 	for _, path := range []string{
 		"/modules/things/things.v1.Things/Get",     // the module's, but not declared
 		"/modules/other/things.v1.Things/Search",   // not a consumed module
 		"/modules/things/../things/x",              // not a procedure
 		"/modules/things/things.v1.Things/Search/", // not the procedure
 	} {
-		status, body := call(t, s, path, "Bearer viewer", `{}`)
+		status, body := call(t, s, path, viewerBearer(), `{}`)
 		if status != http.StatusNotFound || body["code"] != "not_found" {
 			t.Errorf("%s: status %d %v, want not_found", path, status, body)
 		}
@@ -191,7 +236,7 @@ func TestPassthroughServesOnlyWhatIsDeclared(t *testing.T) {
 
 func TestPassthroughRequiresTheViewersBearer(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 	status, body := call(t, s, searchPath, "", `{}`)
 	if status != http.StatusUnauthorized || body["code"] != "unauthenticated" {
 		t.Fatalf("status %d %v", status, body)
@@ -203,11 +248,11 @@ func TestPassthroughRequiresTheViewersBearer(t *testing.T) {
 
 func TestPassthroughForwardsOnlyTheMethodsOwnFields(t *testing.T) {
 	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(gw.URL, passthroughModule())
+	s := passthroughServer(t, gw.URL, passthroughModule())
 	// A field the method's request does not declare is not the page's to add:
 	// the request is re-encoded from the method's message, so it never reaches
 	// the module, and it can name no path or prefix of its own.
-	status, body := call(t, s, searchPath, "Bearer viewer", `{"entryId":"e1","path":"/v1/other","prefix":"/v1/admin"}`)
+	status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1","path":"/v1/other","prefix":"/v1/admin"}`)
 	if status != http.StatusOK {
 		t.Fatalf("status %d %v", status, body)
 	}
@@ -230,8 +275,8 @@ func TestPassthroughRelaysTheModulesRefusal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := newModuleGateway(t, tc.status, tc.reply)
-			s := passthroughServer(gw.URL, passthroughModule())
-			status, body := call(t, s, searchPath, "Bearer viewer", `{}`)
+			s := passthroughServer(t, gw.URL, passthroughModule())
+			status, body := call(t, s, searchPath, viewerBearer(), `{}`)
 			if status != tc.wantStatus || body["code"] != tc.wantCode || body["message"] != tc.wantMessage {
 				t.Fatalf("status %d %v, want %d %s %q", status, body, tc.wantStatus, tc.wantCode, tc.wantMessage)
 			}
@@ -323,9 +368,9 @@ func TestPassthroughMergesTheDeclaredPinIntoEveryRequest(t *testing.T) {
 	pin.Set(pin.Descriptor().Fields().ByName("ids"), ids)
 	module := passthroughModule()
 	module.Methods[0].Pin = pin
-	s := passthroughServer(gw.URL, module)
+	s := passthroughServer(t, gw.URL, module)
 
-	if status, body := call(t, s, searchPath, "Bearer viewer", `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
+	if status, body := call(t, s, searchPath, viewerBearer(), `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
 		t.Fatalf("status %d %v", status, body)
 	}
 	var sent struct {
@@ -371,4 +416,79 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 	if _, err := InterfaceArtifact(t.TempDir(), InterfaceInfo{}, nil); err == nil {
 		t.Fatal("a backend with no service manifest rendered a version")
 	}
+}
+
+// TestAViewerBearerRouteRefusesToActWithoutACredential: a ViewerBearer route
+// mints nothing, so it asked the credential for nothing — and it was therefore
+// the one route that kept forwarding the viewer's bearer to the gateway after
+// the issuer refused this build.
+//
+// The credential is what authorises this process to act for a viewer, not
+// merely what it mints with. A route that forwards a viewer's bearer under a
+// withdrawn credential is acting without authority, whatever it does not mint.
+func TestAViewerBearerRouteRefusesToActWithoutACredential(t *testing.T) {
+	gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
+	bearerOnly := ConsumedModule{
+		As:           "pages",
+		ViewerBearer: true,
+		Methods:      []ConsumedMethod{{Name: "/things.v1.Things/Search", Response: MustFieldMask(thingMessage("Thing"), "entry_id", "big")}},
+	}
+	build := func(t *testing.T, source CredentialSource) (*Server, passthroughRoute) {
+		t.Helper()
+		server := New(Manifest{ID: testSolutionID}).Consumes(bearerOnly)
+		if source != nil {
+			server.Credential(source)
+		}
+		server.cfg.profile = localProfile
+		server.cfg.gatewayURL = gw.URL
+		route := passthroughRoute{module: bearerOnly, method: bearerOnly.Methods[0]}
+		return server, route
+	}
+
+	header := http.Header{}
+	header.Set("authorization", viewerBearer())
+	header.Set(orgHeader, "org-1")
+	header.Set(sessionHeader, "session-1")
+	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+
+	t.Run("a refused build", func(t *testing.T) {
+		server, route := build(t, failingCredentialSource{
+			err: fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused),
+		})
+		if _, err := server.authorize(context.Background(), route, header, nil); err == nil {
+			t.Fatal("a ViewerBearer route acted for a viewer while this execution's credential was refused: it forwards that viewer's bearer to the gateway under an authority the issuer has withdrawn")
+		}
+	})
+
+	t.Run("an issuer that cannot answer", func(t *testing.T) {
+		server, route := build(t, failingCredentialSource{
+			err: fmt.Errorf("%w: the issuer cannot reach its own dependencies", workcontext.ErrMintUnavailable),
+		})
+		if _, err := server.authorize(context.Background(), route, header, nil); err == nil {
+			t.Fatal("a ViewerBearer route acted for a viewer while this execution's credential could not be obtained")
+		}
+	})
+
+	// The survive-control: with a credential the issuer approves, the same
+	// route authorises normally. Without this, a route refusing everything
+	// passes both cases above.
+	t.Run("an approved credential", func(t *testing.T) {
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		writeFile(t, tokenFile, "projected")
+		mint := newHostMint(t, &hostMint{})
+		server, route := build(t, mintClientFor(t, mint, tokenFile))
+		if _, err := server.authorize(context.Background(), route, header, nil); err != nil {
+			t.Fatalf("a ViewerBearer route was refused while this process holds an approved credential: %v", err)
+		}
+	})
+
+	// And a server with no credential source at all still serves: a solution
+	// that mints nothing and declares nothing to mint with is a valid shape,
+	// and the ask is only about a source that exists and is failing.
+	t.Run("no credential source declared", func(t *testing.T) {
+		server, route := build(t, nil)
+		if _, err := server.authorize(context.Background(), route, header, nil); err != nil {
+			t.Fatalf("a ViewerBearer route was refused on a solution that declares no credential source: %v", err)
+		}
+	})
 }
