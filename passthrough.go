@@ -299,11 +299,13 @@ func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
 	if err != nil || len(s.consumed) == 0 {
 		return routes, err
 	}
-	consumed, err := manifest.ParseConsumedAPIs(s.cfg.apiConsumes)
-	if err != nil {
-		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", err)
+	// Decoded at boot (loadConfig), where validate() has already refused an
+	// undecodable one by name. Reported here rather than assumed away: the
+	// seam below builds a config without going through validate().
+	if s.cfg.consumes.err != nil {
+		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", s.cfg.consumes.err)
 	}
-	return routes, checkConsumed(s.consumed, consumed)
+	return routes, checkConsumed(s.consumed, s.cfg.consumes.targets)
 }
 
 // mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix:
@@ -362,7 +364,10 @@ func passthroughSeam(server any, gatewayURL, consumesJSON string) (http.Handler,
 	if len(s.consumed) == 0 {
 		return nil, fmt.Errorf("solution %q declares no consumed modules (Consumes)", s.manifest.ID)
 	}
-	s.cfg.gatewayURL, s.cfg.apiConsumes = gatewayURL, consumesJSON
+	// The seam supplies the projection instead of resolving it, so it decodes
+	// here what loadConfig decodes at a boot — through the same constructor,
+	// which is the only one there is.
+	s.cfg.gatewayURL, s.cfg.consumes = gatewayURL, newProjection(consumesJSON)
 	routes, err := s.validatePassthrough()
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)

@@ -168,7 +168,42 @@ embedding it.
   with a log line while the solution served on — and it went with the
   registrations. Every environment read now sits in `loadConfig`'s call tree,
   which `environment_boundary_test.go` pins: a new read outside it fails the
-  suite until this file describes the exception.
+  suite until this file describes the exception — and so does a read reachable
+  from the serving surface, because a helper boot shares with serving code sits
+  in that tree while running long after `validate()`.
+- Those gates ask the compiler, not the source text, and that is not a style
+  choice: four review rounds each found one more spelling a syntactic rule
+  lost. Constants come from `types.Info` (a conversion, a chain, a local
+  constant all fold); reachability is CHA over SSA from `golang.org/x/tools`,
+  rooted at `serve`, every exported declaration, the package initializer and
+  every address-taken function — a handler mounted on a mux is never *called*
+  here, so a graph of call expressions has no edge to it. A reader is an
+  OBJECT (`os.Getenv`/`LookupEnv`/`Environ`/`ExpandEnv`, `syscall`'s, the
+  SDK's accessors, this package's `env`) followed wherever its identity flows,
+  with one definition shared by both gates, and an environment key that cannot
+  be traced to constants is refused rather than skipped. If you add a gate
+  here, resolve rather than match: `facade_claim_test.go` and
+  `environment_boundary_test.go` carry the compiled fixtures for every spelling
+  that beat an earlier version.
+- Resolving a value in `loadConfig` is half the rule; the other half is a
+  refusal in `validate()` that fires **whether or not the feature using it is
+  switched on**. The `api.consumes` projection was resolved at boot and decoded
+  only by the code that consumes it, which returns early for a solution
+  declaring no `Consumes` — so one undecodable projection had two answers:
+  refused for a solution with a passthrough, accepted and served for one
+  without. It is decoded now in `loadConfig` (`parseAPIConsumes`) and refused by
+  `validate()` either way, naming the variable it arrived in, since it is the
+  composition's output and no override repairs it. `projection_boundary_test.go`
+  pins that, including that unset and whitespace mean "consumes nothing" rather
+  than "malformed".
+- A solution claims no module's facade route and holds no credential that would
+  let it: a route for a module is claimed by the module that serves it, under a
+  credential bound to that module (#51, SA-F-GWREGISTRY). The passthrough and
+  the gateway client *read* a consumed module at `/v1/<as>/*`; nothing here
+  decides that the prefix points there. `facade_claim_test.go` evaluates the
+  package's constant string expressions and fails on any that is one of those
+  wire shapes — folded, so a shape split across a concatenation, parenthesised,
+  built from named constants or cased differently is the same shape to it.
 - **Never sign, parse or verify a Work Context here.** There is one
   implementation, Core's; this runtime obtains a credential through the SDK's
   mint client, carries it as the string it travels as, and lets the far end

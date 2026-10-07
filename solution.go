@@ -462,10 +462,15 @@ type config struct {
 	// so validate() must say so rather than report each empty value as
 	// something the composition forgot to provision.
 	environmentLoadErr error
-	// apiConsumes is the api.consumes projection Codefly injected, which the
-	// passthrough declaration and the published contract are both checked
-	// against before the boot listens.
-	apiConsumes string
+	// consumes is the api.consumes projection Codefly injected, decoded once at
+	// the boundary it enters by. There is no raw string beside it: the two were
+	// separate fields, and a config could then be built with only the raw one —
+	// which validate() passed, because the decoded pair was empty and an empty
+	// projection is a legitimate one, and the passthrough then refused every
+	// declared module as if the composition projected nothing. A second
+	// representation of one value is a second thing to get wrong, so there is
+	// one, and newProjection is the only way to make it.
+	consumes projection
 	// mcp says the solution declared an MCP surface (ServeMCP), which is what
 	// makes the two values below load-bearing: validate() checks them only
 	// then, so a solution that serves no MCP is unaffected by a host whose
@@ -622,6 +627,32 @@ func resolveGateway(ctx context.Context, module, gateway string) string {
 	return hostAddress(ctx, module, gateway, "rest", "rest")
 }
 
+// projection is the api.consumes projection as this runtime holds it: the
+// decoded targets and the error decoding produced, together, because they are
+// one answer about one value. It is constructed only by newProjection, so
+// nothing can hold targets that disagree with the text they came from.
+type projection struct {
+	targets []manifest.ConsumedAPI
+	err     error
+}
+
+// newProjection decodes the projection at the boundary it arrives on — the
+// environment, for a boot, or the test seam's own argument.
+//
+// Whitespace alone is not a projection, and not a defect either: a render that
+// emits a bare newline for a value this solution does not set means "consumes
+// nothing", so it decodes to no entries rather than to a JSON error. Refusing
+// that would fail a boot over a newline. Anything else that will not decode is
+// a defect in what the composition projected, and the error is kept for
+// validate() to refuse by name.
+func newProjection(raw string) projection {
+	if strings.TrimSpace(raw) == "" {
+		return projection{}
+	}
+	targets, err := manifest.ParseConsumedAPIs(raw)
+	return projection{targets: targets, err: err}
+}
+
 // loadConfig resolves every address, port, and path through the Codefly SDK so
 // nothing is hardcoded. The host it plugs into is named by Codefly-convention
 // roles (overridable), and their concrete addresses are resolved from the SDK —
@@ -688,7 +719,6 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 		gatewayPeersFile:   workloadPath(ctx, IdentityGatewayPeersFileEnvironmentVariable, WorkloadIdentityGatewayPeersFileKey),
 		profile:            strings.TrimSpace(env(ContractProfileEnvironmentVariable, codefly.Environment())),
 		runtimeContext:     strings.TrimSpace(env(resources.RuntimeContextPrefix, "")),
-		apiConsumes:        env(manifest.APIConsumesEnvironmentVariable, ""),
 		// Carried here, which the refactor that changed this function's
 		// signature dropped: three refusals and a boot log exist to tell an
 		// operator "the SDK resolved nothing" apart from "loading the injected
@@ -723,6 +753,7 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 	// in-cluster address in a deployment, where no public client could reach
 	// it: that is what the declared configuration is for. The public MCP URL
 	// needs no declaration at all, being derived from the two values above it.
+	cfg.consumes = newProjection(env(manifest.APIConsumesEnvironmentVariable, ""))
 	cfg.mcpIssuerURL, cfg.mcpIssuerExplicit = resolveMCPIssuer(ctx, frontendURL)
 	cfg.mcpPublicURL, cfg.mcpPublicExplicit = resolveMCPPublicURL(ctx, public, id)
 	return cfg
@@ -977,6 +1008,14 @@ func (c config) validate() error {
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
 			c.profile, err, ContractProfileEnvironmentVariable)
+	}
+	// Judged whether or not this solution declares a passthrough. The
+	// projection is the composition's output, so no override an operator can
+	// set repairs it, and the variable it arrived in is the only handle a
+	// refusal has.
+	if c.consumes.err != nil {
+		return fmt.Errorf("the api.consumes projection in %s cannot be decoded: %w — it is projected by the composition (`codefly run solution`), so it is fixed there; a solution that consumes nothing leaves it unset",
+			manifest.APIConsumesEnvironmentVariable, c.consumes.err)
 	}
 	// The MCP surface's own configuration, checked here because that is where
 	// boot configuration is checked. It is a no-op for a solution that declared

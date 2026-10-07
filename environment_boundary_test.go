@@ -4,11 +4,18 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/callgraph"
+	"golang.org/x/tools/go/callgraph/cha"
+	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
 // AGENTS.md tells an agent that configuration is resolved in one place and
@@ -41,6 +48,475 @@ func TestEnvironmentIsReadOnlyWhereAgentsFileSaysItIs(t *testing.T) {
 			"Either resolve the value in loadConfig, or document the new exception in AGENTS.md — a value read after boot is never refused, it degrades while the solution serves.",
 			strings.Join(undocumented, ", "))
 	}
+}
+
+// And a helper that boot resolution uses must not also be used after it.
+//
+// The gate above asks only whether an environment reader sits in loadConfig's
+// call tree. A helper can sit there and be called from serving code as well,
+// and then it passes: `env` is reachable from loadConfig, so a serve-time call
+// to `env` reads the environment after validate() has had its say while every
+// boot-reachability check stays green.
+//
+// ON THE TYPE CHECKER, and over function VALUES, because the two things this
+// gate must follow are exactly the two a name-matching graph loses:
+//
+//   - `(env)(...)` is a call to env that no callee-NAME walker sees, because
+//     the callee is a parenthesised expression rather than an identifier;
+//   - a handler mounted on the mux is never "called" anywhere. `handleHealth`
+//     is passed to HandleFunc as a value and invoked by net/http per request,
+//     so a graph built from call expressions contains no edge to it at all —
+//     and a read inside it happens on every request, which is as far from boot
+//     as a read gets.
+//
+// So calls are resolved through types.Info, and a function mentioned as a
+// VALUE is an edge too: if serving code can hand it to something, something
+// can call it. Roots are `serve` plus every exported declaration, to a fixed
+// point — a library's exported surface is callable by a consumer at any time,
+// and a list of two names was a list an author adds to without noticing.
+func TestNoEnvironmentReadIsReachableAfterBoot(t *testing.T) {
+	pkgs := gatePackages(t, nil)
+	readers := servingReaders(t, pkgs)
+
+	var names []string
+	for name := range readers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		t.Errorf("%s is reachable from the post-boot surface without passing through loadConfig:\n    %s\n"+
+			"A value read after boot is never refused by validate(): it changes what a running solution does, with nothing judging it. "+
+			"Resolve it in loadConfig and carry the resolved value, rather than reading the environment where it is used.",
+			name, readers[name])
+	}
+}
+
+// And the gate has to be able to see a read at all, or its silence means
+// nothing. Every serving shape a previous version of this gate lost, in ONE
+// compiled fixture: each load shells out to the go command and builds SSA for
+// the whole program, so one overlay answers for all of them. Each shape has
+// its own reader, and each is asserted by name, so a gate that followed one
+// edge kind and missed the others fails.
+func TestThePostBootGateSeesEveryServingShape(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_post_boot_fixture.go")
+
+	source := `package solution
+
+import (
+	"context"
+	"net/http"
+	"os"
+)
+
+// A parenthesised callee on an exported path.
+func ServedParenthesisedRead() string { return (env)("ANYTHING", "") }
+
+// A reader reached only as a handler value mounted on a mux, with the handler
+// itself never called in this package.
+func (s *Server) MountFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/fixture", fixtureHandler)
+}
+
+func fixtureHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("x-fixture", fixtureMountedRead())
+}
+
+func fixtureMountedRead() string { return os.Getenv("ANYTHING") }
+
+// A method value stored in a package-level struct and mounted from there, so
+// the only edge to it is the stored field.
+type fixtureReceiver struct{}
+
+func (fixtureReceiver) fixtureServe(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("x-stored", fixtureStoredRead())
+}
+
+func fixtureStoredRead() string { return os.LookupEnvValue("ANYTHING") }
+
+var fixtureHandlers = struct {
+	h func(http.ResponseWriter, *http.Request)
+}{h: fixtureReceiver{}.fixtureServe}
+
+func MountStoredFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/stored", fixtureHandlers.h)
+}
+
+// An exported variable holding a closure that reads.
+var ExportedClosure = func() string { return (env)("ANYTHING", "") }
+
+// An ALIASED reader with a perfectly constant key, on a served path. This is
+// the shape that passed both gates at once: the key resolves, so the key gate
+// has nothing to say, and the call is indirect, so a CHA edge into os.Getenv
+// is an over-approximation the serving graph discards.
+type servingEnvReader = func(string) string
+
+var servingRead servingEnvReader = os.Getenv
+
+func servingAliasRead() string { return servingRead("ANYTHING") }
+
+func (s *Server) MountAliasFixture(mux *http.ServeMux) {
+	mux.HandleFunc("/alias", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("x-alias", servingAliasRead())
+	})
+}
+
+// And the whole environment at once, through a function boot also uses:
+// discoverHostModule scans os.Environ, so an exported wrapper of it reads
+// changing configuration after boot. os.Environ was missing from the reader
+// set entirely.
+func ExportedLateHost() string {
+	return discoverHostModule(context.Background(), "auth-gateway", "rest", "rest")
+}
+`
+	// os.LookupEnvValue does not exist; the fixture must compile, so use the
+	// real reader.
+	source = strings.ReplaceAll(source, "os.LookupEnvValue(", "os.Getenv(")
+
+	readers := servingReaders(t, gatePackages(t, map[string][]byte{fixture: []byte(source)}))
+	if len(readers) == 0 {
+		t.Fatal("the gate reported no post-boot reader for a fixture that reads on seven serving paths")
+	}
+	// Both readers these shapes reach, so a gate that saw one kind of read and
+	// not the other cannot pass: env for the in-package helper, os.Getenv for
+	// the direct and aliased ones, os.Environ for the whole-environment scan.
+	for _, want := range []string{"env", "os.Getenv", "os.Environ"} {
+		if _, ok := readers[want]; !ok {
+			t.Errorf("the gate did not report %s: readers=%v", want, readers)
+		}
+	}
+}
+
+// --- One reader definition, by object identity ---
+//
+// A reader is an OBJECT, not a spelling. Both gates share this, because the
+// two of them disagreeing about what a read is is how a read gets past both:
+//
+//	read := r2Reader(os.Getenv)
+//	read(strings.Join([]string{"CODEFLY", "", "MODULE", ...}, "_"))
+//
+// recognising readers by callee name sees no read at all — the callee is
+// `read` — while a graph that merely records an edge to Getenv never marks it
+// as a reader when its value is taken rather than called. So the identity is
+// followed wherever it flows: converted, aliased, assigned, stored in a field,
+// passed as an argument, returned.
+//
+// readerNames are the readers by package and name. os.ExpandEnv reads every
+// variable named in its argument, syscall.Getenv is the same read one package
+// down, and os.Environ reads all of them at once — which is why an exported
+// wrapper of a function using it reads changing configuration after boot.
+var readerNames = map[string]map[string]bool{
+	"os":      {"Getenv": true, "LookupEnv": true, "Environ": true, "ExpandEnv": true},
+	"syscall": {"Getenv": true, "Environ": true},
+}
+
+// readerPackageOf is the import path a reader package goes by, since SSA names
+// a package by path and the syntax names it by identifier.
+func readerPackageOf(path string) string { return path }
+
+// sdkReaderNames are the SDK's own accessors, by method name. They are matched
+// by name because they are methods on the SDK's query value rather than
+// package functions, and the older gate's round-four finding was precisely a
+// closure reading configuration through one of them.
+var sdkReaderNames = map[string]bool{
+	"WorkspaceConfiguration": true, "WorkspaceSecret": true,
+	"Environment": true, "Endpoint": true, "Secret": true,
+}
+
+// keylessReaders read the whole environment rather than one named variable, so
+// there is no key to resolve and nothing to constrain: the read itself is the
+// finding when it happens after boot.
+var keylessReaders = map[string]bool{"Environ": true, "ExpandEnv": true}
+
+// --- The serving surface, on a sound call graph ---
+//
+// Reachability is CHA (class hierarchy analysis) over SSA, from
+// golang.org/x/tools, rather than a graph this test builds.
+//
+// Three rounds of hand-written graph each lost one more Go construct: a
+// parenthesised callee, a handler mounted as a value, a method value stored in
+// a package-level struct, a callback in a variadic option, a func field on an
+// interface. Every fix was right and the next construct arrived anyway,
+// because a graph assembled from the shapes somebody thought of is a graph
+// about those shapes. CHA resolves an indirect call to every type-compatible
+// function in the program — an over-approximation, which is the safe
+// direction — so there is no "unresolved edge" category left to fail closed
+// on: the analysis has an answer for every call site by construction.
+//
+// What this gate still chooses is the ROOTS. Everything that can run after
+// boot: `serve`, which Serve calls once configuration is resolved; every
+// exported function and method, this being a library a consumer calls into;
+// and the package initializer, where a served callback is stored
+// (`var h = struct{f func(...)}{f: method}`) and where an exported
+// `var X = func() { ... }` lives. loadConfig is excluded as a NODE, so a
+// helper boot shares with serving code is judged by the serving path.
+
+// servingReaders is every environment reader reachable from the post-boot
+// roots, named by the function that reads, with the path that reaches it.
+func servingReaders(t *testing.T, pkgs []*packages.Package) map[string]string {
+	t.Helper()
+
+	// SSA for THIS package only, not the whole dependency closure. Building
+	// everything cost 40s of the suite under -race and bought nothing: the
+	// graph is used for in-package reachability, and re-entry into this
+	// package from a dependency always happens through a function whose
+	// address was taken — net/http invoking a mounted handler is exactly that
+	// — which is already a root. Reader identification does not come from
+	// this graph at all.
+	prog, _ := ssautil.Packages(pkgs, 0)
+	prog.Build()
+	graph := cha.CallGraph(prog)
+	graph.DeleteSyntheticNodes()
+
+	target := ""
+	for _, pkg := range pkgs {
+		if pkg.PkgPath == "github.com/codefly-dev/solution-runtime-go" {
+			target = pkg.PkgPath
+		}
+	}
+	if target == "" {
+		t.Fatal("the package under test was not loaded: this gate is inert")
+	}
+
+	// Address-taken functions are roots too. A handler mounted on a mux and a
+	// closure assigned to an exported variable are never CALLED in this
+	// package, so the call graph holds no edge to them — whoever holds the
+	// value chooses when it runs, and that is after boot. These two shapes
+	// survived a gate that rooted only at named entry points.
+	escaping := addressTaken(prog, target)
+
+	var roots []*callgraph.Node
+	for fn, node := range graph.Nodes {
+		if fn == nil || !inPackage(fn, target) {
+			continue
+		}
+		if isPostBootRoot(fn) || escaping[fn] {
+			roots = append(roots, node)
+		}
+	}
+	if len(roots) == 0 {
+		t.Fatal("no post-boot roots found: this gate is inert")
+	}
+
+	// Breadth-first from the roots, never through loadConfig.
+	readers := map[string]string{}
+	seen := map[*callgraph.Node]bool{}
+	path := map[*callgraph.Node]string{}
+	var queue []*callgraph.Node
+	for _, root := range roots {
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		path[root] = root.Func.Name()
+		queue = append(queue, root)
+	}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, edge := range current.Out {
+			next := edge.Callee
+			if next == nil || next.Func == nil || seen[next] {
+				continue
+			}
+			if isBootResolution(next.Func) {
+				continue
+			}
+			// A reader is reported only when THIS package's code is what
+			// calls it. The walk still goes through dependencies, because a
+			// handler this package mounts is invoked by net/http and the path
+			// back to it runs through there — but a dependency reading its own
+			// configuration is not this package's boundary. Reporting every
+			// reader on the path named four that are all somebody else's: the
+			// SDK rechecking a rotated value, grpc's resolver, viper's init,
+			// none of which this package could resolve in loadConfig.
+			// Which calls are reads is the identity model's answer, below,
+			// and it is the same model the key gate uses: CHA resolves an
+			// indirect call to every type-compatible function, so a callback
+			// of shape func(string) (string, bool) resolves to os.LookupEnv
+			// whether or not anything puts it there.
+			if !inPackage(next.Func, target) {
+				continue
+			}
+			seen[next] = true
+			path[next] = path[current] + " → " + next.Func.Name()
+			queue = append(queue, next)
+		}
+	}
+
+	// Which calls are reads comes from the reader identity model, not from
+	// this graph: an aliased reader — `var read reviewEnvReader = os.Getenv`,
+	// called through `read` — is an indirect call CHA can only guess at, while
+	// the identity model resolves it exactly. Each invocation is attributed to
+	// the innermost function containing it, and reported when that function is
+	// reachable after boot.
+	for _, pkg := range pkgs {
+		if pkg.PkgPath != target {
+			continue
+		}
+		identity := newReaderIdentity(pkg)
+		for _, site := range identity.invocations {
+			holder := innermostContaining(seen, site.pos)
+			if holder == nil {
+				continue
+			}
+			readers[site.name] = path[holder] + " → " + site.name
+		}
+	}
+	return readers
+}
+
+// innermostContaining is the reachable function whose source extent contains a
+// position most tightly, so a read inside a closure is attributed to the
+// closure rather than to whatever encloses it.
+func innermostContaining(reached map[*callgraph.Node]bool, pos token.Pos) *callgraph.Node {
+	var best *callgraph.Node
+	var bestSize token.Pos
+	for node := range reached {
+		syntax := node.Func.Syntax()
+		if syntax == nil {
+			continue
+		}
+		if pos < syntax.Pos() || pos >= syntax.End() {
+			continue
+		}
+		if size := syntax.End() - syntax.Pos(); best == nil || size < bestSize {
+			best, bestSize = node, size
+		}
+	}
+	return best
+}
+
+// isPostBootRoot reports whether a function can run after boot.
+func isPostBootRoot(fn *ssa.Function) bool {
+	if fn.Synthetic == "package initializer" || fn.Name() == "init" {
+		// Where a package-level callback is stored and where an exported
+		// func-valued variable is initialised.
+		return true
+	}
+	if fn.Name() == "serve" {
+		return true
+	}
+	// A method on an exported or unexported receiver is still reachable from a
+	// consumer when the method itself is exported.
+	return ast.IsExported(fn.Name())
+}
+
+// staticCall reports whether an edge is a call that names its callee, rather
+// than one CHA resolved from a function type.
+func staticCall(edge *callgraph.Edge, callee *ssa.Function) bool {
+	if edge.Site == nil {
+		return false
+	}
+	return edge.Site.Common().StaticCallee() == callee
+}
+
+// addressTaken is every function of the package whose value is used as a
+// value rather than called: stored in a variable or a struct, handed to a
+// registration call, closed over. SSA makes this visible — a function
+// appearing as an operand anywhere other than a call's static callee is one
+// somebody can invoke later.
+func addressTaken(prog *ssa.Program, target string) map[*ssa.Function]bool {
+	taken := map[*ssa.Function]bool{}
+	for fn := range ssautil.AllFunctions(prog) {
+		for _, block := range fn.Blocks {
+			for _, instruction := range block.Instrs {
+				call, isCall := instruction.(ssa.CallInstruction)
+				var static *ssa.Function
+				if isCall {
+					static = call.Common().StaticCallee()
+				}
+				var operands []*ssa.Value
+				operands = instruction.Operands(operands)
+				for _, operand := range operands {
+					if operand == nil || *operand == nil {
+						continue
+					}
+					referenced, ok := (*operand).(*ssa.Function)
+					if !ok || referenced == static {
+						continue
+					}
+					if referenced.Pkg != nil && referenced.Pkg.Pkg.Path() == target {
+						taken[referenced] = true
+					}
+					// An anonymous function's parent is what wrote it; the
+					// literal itself is the thing being handed out.
+					if referenced.Parent() != nil && referenced.Parent().Pkg != nil &&
+						referenced.Parent().Pkg.Pkg.Path() == target {
+						taken[referenced] = true
+					}
+				}
+			}
+		}
+	}
+	return taken
+}
+
+// inPackage reports whether a function belongs to the package under test.
+func inPackage(fn *ssa.Function, path string) bool {
+	return fn.Pkg != nil && fn.Pkg.Pkg.Path() == path
+}
+
+// isBootResolution reports whether a function IS boot configuration
+// resolution, which the walk does not pass through.
+func isBootResolution(fn *ssa.Function) bool {
+	return fn.Name() == "loadConfig" && fn.Pkg != nil &&
+		fn.Pkg.Pkg.Path() == "github.com/codefly-dev/solution-runtime-go"
+}
+
+// environmentReader reports whether an SSA function is one of the readers, by
+// the SAME definition the key gate uses: package and name for the os and
+// syscall readers, method name for the SDK's accessors, and this package's own
+// env helper.
+func environmentReader(fn *ssa.Function) (string, bool) {
+	if fn.Pkg != nil {
+		path := fn.Pkg.Pkg.Path()
+		if readerNames[path][fn.Name()] {
+			return path + "." + fn.Name(), true
+		}
+		if path == "github.com/codefly-dev/solution-runtime-go" && fn.Name() == "env" {
+			return "env", true
+		}
+	}
+	// The SDK's own accessors, matched by the package they belong to as well
+	// as the name: a bare name match reported grpc's resolver `Endpoint` as a
+	// configuration read, which it is not.
+	if fn.Pkg != nil && sdkReaderNames[fn.Name()] && strings.HasPrefix(fn.Pkg.Pkg.Path(), "github.com/codefly-dev/sdk-go") {
+		return "the SDK's " + fn.Name(), true
+	}
+	return "", false
+}
+
+// unparen removes every layer of parentheses, so `(env)(...)` is a call to env
+// rather than a call to something this gate has never heard of.
+func unparen(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
+}
+
+// isFuncTyped reports whether a type is a function type.
+func isFuncTyped(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := types.Unalias(t).Underlying().(*types.Signature)
+	return ok
+}
+
+// pkgOf is the import path of the package a function belongs to.
+func pkgOf(fn *types.Func) string {
+	if fn.Pkg() == nil {
+		return ""
+	}
+	return fn.Pkg().Path()
 }
 
 // And the read has to happen at boot, not merely be written there.

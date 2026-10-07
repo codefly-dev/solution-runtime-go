@@ -21,7 +21,7 @@ func contractServer(t *testing.T, profile string, contract ModuleContract, modul
 		modules = []ConsumedModule{passthroughModule()}
 	}
 	server := New(Manifest{ID: testSolutionID}).Consumes(modules...).Contract(contract)
-	server.cfg = config{profile: profile, apiConsumes: consumesThings}
+	server.cfg = config{profile: profile, consumes: newProjection(consumesThings)}
 	server.principal = testPrincipal
 	return server
 }
@@ -706,7 +706,7 @@ func TestTheDeclaredCeilingIsFrozenAtDeclaration(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: ceilingActions}}},
 		}})
-	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, apiConsumes: consumesThings}
+	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
 	server.principal = testPrincipal
 	contract, err := server.resolveContract()
 	if err != nil {
