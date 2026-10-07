@@ -478,6 +478,14 @@ func newReaderIdentity(pkg *packages.Package) *readerIdentity {
 }
 
 func buildReaderIdentity(pkg *packages.Package) *readerIdentity {
+	return buildReaderIdentityWithin(pkg, maxReaderFlowRounds)
+}
+
+// buildReaderIdentityWithin is the analysis with the round budget named, so the
+// refusal below can be asked directly. No fixture can exhaust sixty-four
+// rounds — that is what a budget is for — and a branch no test reaches is a
+// claim, not a guarantee.
+func buildReaderIdentityWithin(pkg *packages.Package, rounds int) *readerIdentity {
 	r := &readerIdentity{pkg: pkg, readerAliases: map[types.Object]bool{}, decls: map[*types.Func]*ast.FuncDecl{}}
 	for _, file := range r.files() {
 		for _, d := range file.Decls {
@@ -493,7 +501,7 @@ func buildReaderIdentity(pkg *packages.Package) *readerIdentity {
 	// rounds is a skip wearing a loop: whatever had not propagated yet simply
 	// was not there, and nothing said so.
 	settled := false
-	for round := 0; round < maxReaderFlowRounds; round++ {
+	for round := 0; round < rounds; round++ {
 		if !r.grow() {
 			settled = true
 			break
@@ -501,7 +509,7 @@ func buildReaderIdentity(pkg *packages.Package) *readerIdentity {
 	}
 	if !settled {
 		r.unresolved = append(r.unresolved, "reader flow did not reach a fixed point within "+
-			strconv.Itoa(maxReaderFlowRounds)+" rounds, so what else may hold a reader is unknown")
+			strconv.Itoa(rounds)+" rounds, so what else may hold a reader is unknown")
 	}
 	r.checkEscapes()
 	r.checkInvocations()
@@ -1128,4 +1136,60 @@ func mentionsFunction(t *testing.T, source, findings, name string) bool {
 		}
 	}
 	return false
+}
+
+// The fixpoint's refusal, asked directly.
+//
+// "Reach a fixed point or refuse exhaustion" is half a rule until the refusing
+// half has a test, and no fixture can supply one against the real budget: the
+// budget exists precisely so that nothing in a real package reaches it. So the
+// budget is named, and the branch is asked at one round against a fixture whose
+// reader identities need several — the chain is declared in REVERSE, so a
+// single forward pass resolves one link and no more.
+//
+// The control is the same fixture at the full budget. Without it this test
+// would pass on a tree that reported exhaustion unconditionally, which is the
+// mirror of the defect it pins: the previous loop stopped after sixteen rounds
+// and said nothing, so a partial reader set and a complete one were
+// indistinguishable to every caller.
+func TestTheReaderFixpointRefusesExhaustionRatherThanStoppingQuietly(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_reader_chain_fixture.go")
+
+	source := `package solution
+
+import "os"
+
+// Declared in reverse, so each round of the propagation resolves exactly one
+// link: four links need four rounds, and one round leaves three unknown.
+var chainReader3 = chainReader2
+var chainReader2 = chainReader1
+var chainReader1 = chainReader0
+var chainReader0 = os.Getenv
+
+func ChainedRead() string { return chainReader3("ANYTHING") }
+`
+
+	const refusal = "did not reach a fixed point"
+	checked := false
+	for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(source)}) {
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+			continue
+		}
+		checked = true
+		starved := strings.Join(buildReaderIdentityWithin(pkg, 1).unresolved, "\n")
+		if !strings.Contains(starved, refusal) {
+			t.Errorf("the propagation ran out of rounds and reported no finding, so a partial reader set reads as a complete one.\nfindings:\n%s", starved)
+		}
+		settled := strings.Join(buildReaderIdentityWithin(pkg, maxReaderFlowRounds).unresolved, "\n")
+		if strings.Contains(settled, refusal) {
+			t.Errorf("the propagation does not settle within %d rounds on this fixture, so the refusal above proves nothing.\nfindings:\n%s", maxReaderFlowRounds, settled)
+		}
+	}
+	if !checked {
+		t.Fatal("the fixture package was not loaded, so neither branch was asked")
+	}
 }
