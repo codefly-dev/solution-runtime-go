@@ -420,8 +420,8 @@ embedding it.
   workspace-configuration group read through the SDK (`mcp/issuer-url`,
   `mcp/public-url`) and a refusal names that group/key. In a deployed runtime
   context the MCP resource identifier must be **declared, not derived**: the
-  derivation builds `<PUBLIC_URL>/solutions/<id>/mcp`, which is this runtime
-  encoding the route the *host* serves it on — the assumption the Module
+  derivation builds `<PUBLIC_URL>/api/solutions/<id>/proxy/mcp`, which is this
+  runtime encoding the route the *host* serves it on — the assumption the Module
   Federation manifest URL was changed to stop making, for the same reason. A
   derived value satisfied the older "a public URL is set" check, so nothing
   refused it in the one case that mattered. Both MCP URLs are refused for
@@ -599,11 +599,37 @@ against.
    deriving one the owner has not published, you are encoding a guess about
    somebody else's deployment.
    The MCP resource identifier is derived the same way — from the resolved
-   `PUBLIC_URL` and the solution id — and is the one place the gateway's
-   `/solutions/<id>` route is encoded here. `PUBLIC_URL` itself went with the
-   manifest registration it fed and came back for this one consumer: whether a
-   runtime should derive the host's route at all is an open follow-up, not a
-   settled answer.
+   `PUBLIC_URL` and the solution id — and is the one place a route of the host's
+   is encoded here: its **public** proxy route, `/api/solutions/<id>/proxy`, not
+   the gateway's in-cluster `/solutions/<id>`, which on the public origin is a
+   page of the host's frontend. It derived and *suggested* the in-cluster one,
+   and a suggestion is the worse half — an operator reads it as the answer.
+   `TestMCPIdentifierNamesTheHostsPublicProxyRoute` pins the constants against a
+   literal, which keeps anyone from changing them here unnoticed and cannot do
+   more: nothing in this suite can see the host, so a host that changes its route
+   leaves this repository green and breaks a client's discovery, with no
+   automated alarm for that case today: the test for it must compare the host's
+   own rendered route against the identifier this runtime advertises, so it
+   belongs where the host is visible, in module-saas-starter. What limits that
+   is the deployed refusal, not a test — a deployment declares the identifier,
+   so no cell depends on these constants. A declared one
+   is published verbatim for the same code-point reason, so a trailing slash is a
+   different identifier and is refused, not trimmed. A loopback or unspecified
+   address is refused by classifying what a URL consumer reads after UTS-46
+   mapping and the subset of WHATWG's host rules that decides what a host is,
+   not by matching notations. A host is one of exactly three things — an
+   address, a name, or neither — and the third is a refusal naming the
+   provisioning key, never a fallback to the second; both published URLs go
+   through the one function that decides it. Mapping a host successfully is not
+   the same as the host being usable, which is how the name branch was the soft
+   one twice: it now checks label boundaries and DNS lengths as well, without
+   tightening what the mapping allows on purpose (an underscore, a leading
+   digit, one rooted dot). A *name* that merely resolves to
+   loopback is not refused, because that needs a lookup this runtime does not
+   do at boot. `PUBLIC_URL` itself went with the manifest
+   registration it fed and came back for this one consumer: whether a runtime
+   should derive the host's route at all is an open follow-up, not a settled
+   answer.
 5. **Diagnose, do not pattern-match.** "It started working when I set X" is not
    a diagnosis — set X back and confirm it breaks. Do not trust an error message
    before checking it: in the session above, *"the provisioned secret does not

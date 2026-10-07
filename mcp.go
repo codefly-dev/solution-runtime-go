@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	codefly "github.com/codefly-dev/sdk-go"
@@ -15,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"golang.org/x/net/idna"
 )
 
 // --- MCP ---
@@ -172,7 +175,7 @@ func (s *Server) mountMCP(mux *http.ServeMux) error {
 		// stripped — which a conforming client rejects and a tolerant one
 		// silently binds to the wrong resource.
 		log.Printf("solution %q: MCP resource identifier derived per request from forwarded headers (no PUBLIC_URL and no %s): set PUBLIC_URL to the origin clients reach this product at, so the identifier is %q",
-			s.manifest.ID, mcpConfigurationValue(MCPPublicURLKey), "https://<host>"+gatewaySolutionsRoute+s.manifest.ID+MCPPath)
+			s.manifest.ID, mcpConfigurationValue(MCPPublicURLKey), hostSolutionPublicMCPURL("https://<host>", s.manifest.ID))
 	}
 	return nil
 }
@@ -330,8 +333,8 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 		}
 		// The one thing a tool call leaves nowhere else. Minting is audited on
 		// accounts and names the viewer and the module, but not which tool
-		// asked — so an operator reading that audit cannot tell an "ask the
-		// wiki" from a bulk export. The name only: arguments are the viewer's
+		// asked — so an operator reading that audit cannot tell a single
+		// lookup from a bulk export. The name only: arguments are the viewer's
 		// content and the headers carry their credentials.
 		if call, ok := req.(*mcp.CallToolRequest); ok && call.Params != nil {
 			log.Printf("solution %q: mcp tool %q", s.manifest.ID, call.Params.Name)
@@ -703,9 +706,16 @@ func firstForwarded(r *http.Request, name string) string {
 //
 // MCPPublicURLKey is the public MCP URL. A deployed MCP surface must declare
 // it: the runtime can derive one from PUBLIC_URL, but the derivation builds
-// <PUBLIC_URL>/solutions/<id>/mcp, which encodes the route the HOST serves this
-// solution on — a layout this runtime does not know. The derivation stands for
-// a local run, where whoever made the guess can check it.
+// <PUBLIC_URL>/api/solutions/<id>/proxy/mcp, which encodes the route the HOST
+// serves this solution on — a layout this runtime does not know. The derivation
+// stands for a local run, where whoever made the guess can check it.
+//
+// A declared value is published verbatim. It is the resource identifier, which
+// RFC 9728 §3.3 has a client compare code point for code point against the URL
+// it dialled, so "…/mcp/" and "…/mcp" are two different identifiers and only
+// one of them can be the one a client reached. Trimming the trailing slash
+// turned the first into the second and published an identifier nobody declared
+// and no client dialled, which is a 401 on a document that validates.
 //
 // It must end in MCPPath, because the metadata document's own URL is derived
 // from it by swapping that suffix, and a value that cannot be paired is
@@ -718,19 +728,71 @@ const (
 	MCPPublicURLKey       = "public-url"
 )
 
-// gatewaySolutionsRoute is the route prefix the host gateway fronts a solution
-// under, "/solutions/<id>" — the one piece of the host's route layout this
-// runtime does encode, and only for the resource identifier.
+// hostSolutionProxyRoute and hostSolutionProxySuffix bracket the host's PUBLIC
+// route to a solution's backend, "/api/solutions/<id>/proxy" — the one piece of
+// the host's route layout this runtime does encode, and only for the resource
+// identifier.
 //
-// Everywhere else it deliberately does not: the manifest URL is registered
-// root-relative and the host resolves it against the route it reached the
-// solution by (see frontendManifestURL). An MCP client cannot do that. The
-// resource identifier is what its token is audience-bound to (RFC 8707), so it
-// has to be byte-exact with the URL the client dialled, and a client that is
-// handed any other identifier rejects it. Deriving it is what makes a
-// composition supply nothing; MCPPublicURLKey is the way out for a host that
-// routes differently.
-const gatewaySolutionsRoute = "/solutions/"
+// It is the PUBLIC route, not the gateway's internal one. The host's gateway
+// fronts a solution under "/solutions/<id>" in-cluster, but that prefix is not
+// reachable from outside: on the host's public origin it is a page of the
+// host's frontend, so a client dialling it does not arrive here. This runtime
+// derived that in-cluster prefix and published it, and the published identifier
+// is the one thing a client cannot work around — RFC 9728 §3.3 has it compare
+// the identifier in this document against the URL it dialled, so discovery
+// stopped there. Both the derivation and the value this package SUGGESTS to an
+// operator were the unreachable route; the suggestion is worse, because it
+// reads as the answer and provisions the same failure by hand.
+//
+// Everywhere else it deliberately encodes nothing: the manifest URL is
+// registered root-relative and the host resolves it against the route it
+// reached the solution by (see frontendManifestURL). An MCP client cannot do
+// that — it has only this document. The resource identifier is what its token
+// is audience-bound to (RFC 8707), so it has to be byte-exact with the URL the
+// client dialled, and a client handed any other identifier rejects it.
+//
+// These are compiled constants, so the identifier tracks PUBLIC_URL but not a
+// change to the host's route shape. That gap is why a DEPLOYED surface must
+// declare MCPPublicURLKey rather than derive anything (see validateMCP): the
+// route is the host's to resolve and this runtime does not know it. What
+// remains derived is the local run, where whoever made the guess can check it,
+// and the suggestion in that boot log. Nothing projects the route to a composed
+// solution's backend today — the SDK resolves endpoints as
+// resources.NetworkInstance (host, hostname, port, address; no path), a
+// basev0.Endpoint carries no public URL or route template, and core's one
+// public-route concept, resources.EnvironmentIngressRoute, binds hosts to a
+// service endpoint, is CLI-side and is not serialized to proto. Closing it
+// belongs to the host that serves "/api/solutions/<id>/proxy", projecting that
+// route as resolved configuration for this runtime to consume and refuse by its
+// provisioning key. TestMCPIdentifierNamesTheHostsPublicProxyRoute pins these
+// against a literal so nobody changes them here unnoticed — and that is all it
+// can do: this module has no dependency on the host, so if the HOST changes its
+// route, this repository stays green and a client's discovery breaks.
+//
+// NO automated alarm covers that case today. The test for it has to compare the
+// host's OWN rendered solution-proxy route against the identifier this runtime
+// advertises, and fail when either side moves — which it can only do where the
+// host is visible, so it belongs in module-saas-starter and not here. Until it
+// exists, a host route change is caught by whoever notices that discovery
+// stopped working.
+//
+// What bounds the exposure meanwhile is the refusal below, and it — not a test
+// — is the mitigation: a DEPLOYED surface DECLARES the identifier, so no cell
+// depends on these constants at all. What they govern is a local run, where the
+// person who made the guess can check it, and the value the boot log suggests.
+// Carried as an ACCEPTED limitation; the specification for closing it is in
+// README's resource-identifier section.
+const (
+	hostSolutionProxyRoute  = "/api/solutions/"
+	hostSolutionProxySuffix = "/proxy"
+)
+
+// hostSolutionPublicMCPURL is the identifier a client dials for the solution
+// id, on the given origin: the host's public proxy route plus MCPPath.
+func hostSolutionPublicMCPURL(origin, id string) string {
+	return strings.TrimRight(origin, "/") + hostSolutionProxyRoute + id +
+		hostSolutionProxySuffix + MCPPath
+}
 
 // mcpConfigurationValue names one value in the group above, as a refusal and
 // the README both name it: group/key, never an environment variable.
@@ -742,7 +804,7 @@ func mcpConfigurationValue(key string) string {
 // dials, which is the resource identifier its token is bound to.
 //
 // It is derived by construction from the origin this product is reachable at
-// and this solution's id — PUBLIC_URL + gatewaySolutionsRoute + id + MCPPath —
+// and this solution's id — PUBLIC_URL + the host's public proxy route + MCPPath —
 // so a composition that renders a solution serving MCP declares nothing for
 // it. Empty when PUBLIC_URL resolved nothing and no override was declared,
 // which validate() refuses in a deployed runtime context: the identifier would
@@ -750,17 +812,21 @@ func mcpConfigurationValue(key string) string {
 //
 // The declared override wins, for a host whose gateway routes solutions
 // elsewhere. It is read through the SDK rather than from the environment for
-// the reason the group's doc comment gives.
+// the reason the group's doc comment gives, and it is returned exactly as
+// declared: only surrounding whitespace is dropped, which a URL cannot contain
+// and a carrier can pick up. Nothing inside the string is normalised, for the
+// reason MCPPublicURLKey's comment gives — validateMCP refuses what cannot be
+// paired instead, naming the declaration.
 func resolveMCPPublicURL(ctx context.Context, publicURL, id string) (string, bool) {
 	if declared, err := codefly.For(ctx).WorkspaceConfiguration(MCPConfigurationGroup, MCPPublicURLKey); err == nil {
-		if declared = strings.TrimRight(strings.TrimSpace(declared), "/"); declared != "" {
+		if declared = strings.TrimSpace(declared); declared != "" {
 			return declared, true
 		}
 	}
 	if publicURL == "" || id == "" {
 		return "", false
 	}
-	return strings.TrimRight(publicURL, "/") + gatewaySolutionsRoute + id + MCPPath, false
+	return hostSolutionPublicMCPURL(publicURL, id), false
 }
 
 // resolveMCPIssuer is the host's OAuth issuer, published as this resource's
@@ -843,8 +909,8 @@ func (c config) validateMCP() error {
 		// derivation stands, because there the guess is checkable by the
 		// person making it.
 		if c.mcpPublicURL != "" && !c.mcpPublicExplicit {
-			return fmt.Errorf("the public MCP URL in the deployed runtime context %q is derived (%q), not declared: it is built as <PUBLIC_URL>%s<id>%s, which encodes the route the HOST serves this solution on — a layout this runtime does not know and must not assume. Provision the workspace configuration %s with the URL clients actually dial, ending in %s",
-				c.runtimeContext, redactedURL(c.mcpPublicURL), gatewaySolutionsRoute, MCPPath,
+			return fmt.Errorf("the public MCP URL in the deployed runtime context %q is derived (%q), not declared: it is built as <PUBLIC_URL>%s<id>%s%s, which encodes the route the HOST serves this solution on — a layout this runtime does not know and must not assume. Provision the workspace configuration %s with the URL clients actually dial, ending in %s",
+				c.runtimeContext, redactedURL(c.mcpPublicURL), hostSolutionProxyRoute, hostSolutionProxySuffix, MCPPath,
 				mcpConfigurationValue(MCPPublicURLKey), MCPPath)
 		}
 	}
@@ -855,6 +921,15 @@ func (c config) validateMCP() error {
 	if err := usablePublishedURL("host issuer", c.mcpIssuerURL,
 		mcpConfigurationValue(MCPIssuerURLKey), deployedRuntimeContext(c.runtimeContext)); err != nil {
 		return err
+	}
+	// The issuer's host, through the one decision point. It is published as
+	// this resource's authorization server, so a host no client can read or
+	// reach sends every client nowhere — on a document that is well-formed and
+	// served with a 200. The issuer is the one value a deployment must declare,
+	// which is why declaring a reachable-LOOKING one is not enough.
+	if err := publishedHostError(c.mcpIssuerURL, deployedRuntimeContext(c.runtimeContext)); err != nil {
+		return fmt.Errorf("unusable %s (%q): its host is %w. It is published as this MCP resource's authorization server, so it has to be a URL a client can read and dial. Provision that workspace configuration with the origin clients authenticate against",
+			mcpConfigurationValue(MCPIssuerURLKey), redactedURL(c.mcpIssuerURL), err)
 	}
 	if c.mcpPublicURL == "" {
 		return nil
@@ -881,11 +956,314 @@ func (c config) validateMCP() error {
 		mcpConfigurationValue(MCPPublicURLKey), deployed); err != nil {
 		return err
 	}
+	// The identifier's host, through the same decision point, and before the
+	// trailing-slash and pairing checks: a host a client cannot read or reach
+	// cannot be dialled at all, and those two would report a suffix defect in a
+	// URL whose authority is the problem.
+	if err := publishedHostError(c.mcpPublicURL, deployed); err != nil {
+		return fmt.Errorf("unusable %s (%q): its host is %w. It is the resource identifier an MCP client binds its token to, so it has to be a URL a client can read and dial. Provision %s with the URL they dial",
+			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), err,
+			mcpConfigurationValue(MCPPublicURLKey))
+	}
+	// A trailing slash is a different identifier, not a cosmetic variant: RFC
+	// 9728 §3.3 has the client compare the `resource` in this document against
+	// the URL it dialled, code point for code point. Refused on its own rather
+	// than falling through to the pairing refusal below, which would tell an
+	// operator that a value ending in "/mcp/" has to end in "/mcp".
+	if strings.HasSuffix(c.mcpPublicURL, "/") {
+		return fmt.Errorf("unusable %s (%q): the trailing slash makes it a different identifier from %q, and only one of the two can be the URL a client dialled — it compares the one published here against that URL code point for code point. Declare it ending in %s, with no trailing slash",
+			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL),
+			redactedURL(strings.TrimRight(c.mcpPublicURL, "/")), MCPPath)
+	}
 	if siblingURL(c.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath) == "" {
 		return fmt.Errorf("unpairable %s (%q): it must end in %s, because the metadata document a 401 points a client to is derived from it by swapping that suffix",
 			c.mcpPublicURLSource(), redactedURL(c.mcpPublicURL), MCPPath)
 	}
 	return nil
+}
+
+// hostKind is what a published URL's host turns out to be once it is read the
+// way the client that dials it reads it. There are exactly three outcomes, and
+// the defect this type exists to prevent is the third being treated as the
+// second: a host nothing can read is not a domain, and admitting it as one is
+// how an address-shaped authority reached a cell unclassified, three rounds
+// running. Every caller goes through hostOf, and hostOf is the only place the
+// three are decided.
+type hostKind int
+
+const (
+	// hostIsUnreadable is neither a name nor an address. Always refused, naming
+	// the configuration that supplied it.
+	hostIsUnreadable hostKind = iota
+	// hostIsName is a domain. Admitted, unless the name is one reserved for this
+	// machine.
+	hostIsName
+	// hostIsAddress is an IP literal or a numeric host, in any notation a URL
+	// consumer reads as one. Classified.
+	hostIsAddress
+)
+
+// publishedHostError is why a URL this runtime publishes cannot be published,
+// or nil. It is the one decision point: both published URLs — the resource
+// identifier and the issuer — go through it, so neither can grow a predicate
+// of its own that disagrees about what a host is.
+//
+// deployed selects what is merely local rather than broken. A loopback address
+// and a name reserved for loopback are both right on a developer's machine and
+// reachable by nobody from a cell. A host that does not read at all is broken
+// in either.
+func publishedHostError(raw string, deployed bool) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Reported by the absolute-URL refusal, which names the whole value
+		// rather than its authority.
+		return nil
+	}
+	kind, name, ip, why := hostOf(u.Hostname())
+	switch kind {
+	case hostIsUnreadable:
+		return why
+	case hostIsAddress:
+		if deployed && (ip.IsLoopback() || ip.IsUnspecified()) {
+			return fmt.Errorf("the loopback address %s, which no client but this machine's can dial", ip)
+		}
+	case hostIsName:
+		if deployed && (name == "localhost" || strings.HasSuffix(name, ".localhost")) {
+			return fmt.Errorf("%q, a name reserved for this machine's loopback interface, which no client but this machine's can dial", name)
+		}
+	}
+	return nil
+}
+
+// hostOf reads a URL's host the way a URL consumer does and reports which of
+// the three outcomes it is. The error is set only for hostIsUnreadable, and it
+// says what about the host could not be read.
+//
+// It is UTS-46 through x/net/idna and then WHATWG's host rules: the mapping
+// table is Unicode's and the rules are the specification a client's URL library
+// implements, so one address classifies the same however it is written without
+// this package enumerating notations.
+func hostOf(hostname string) (hostKind, string, net.IP, error) {
+	if hostname == "" {
+		// A URL's authority can be non-empty while naming no host:
+		// "https://:443/" has the authority ":443" and no hostname. So a
+		// non-empty authority is not evidence of a host, and a client dialling
+		// a URL with no host reaches its own machine.
+		return hostIsUnreadable, "", nil, errors.New("absent: the authority names a port and no host")
+	}
+	// An IPv6 literal, which url.Hostname returns without its brackets. A zone
+	// selects the interface an address is reached on, not which address it is,
+	// so it is dropped before parsing.
+	if strings.Contains(hostname, ":") {
+		literal := hostname
+		if zone := strings.IndexByte(literal, '%'); zone >= 0 {
+			literal = literal[:zone]
+		}
+		if parsed := net.ParseIP(literal); parsed != nil {
+			return hostIsAddress, hostname, parsed, nil
+		}
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, bracketed like an IPv6 address and not one", hostname)
+	}
+	mapped, err := urlHostProfile.ToASCII(hostname)
+	if err != nil || mapped == "" {
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which UTS-46 mapping cannot read: %v", hostname, err)
+	}
+	if bad := forbiddenDomainRune(mapped); bad >= 0 {
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which contains %q — a code point a URL consumer forbids in a host", hostname, bad)
+	}
+	if !hostEndsInNumber(mapped) {
+		name := strings.TrimSuffix(mapped, ".")
+		if why := unusableDomainName(name); why != nil {
+			return hostIsUnreadable, "", nil, why
+		}
+		return hostIsName, name, nil, nil
+	}
+	parsed, ok := ipv4FromHost(mapped)
+	if !ok {
+		// WHATWG makes a host whose last label is a number an invalid URL when
+		// it does not parse as an address. Treating it as a name is what let a
+		// malformed authority through.
+		return hostIsUnreadable, "", nil, fmt.Errorf("%q, which ends in a number and so has to be an address, and is not a valid one", hostname)
+	}
+	return hostIsAddress, mapped, parsed, nil
+}
+
+// unusableDomainName is why name cannot be a domain, or nil. It takes the name
+// with its single rooted dot already removed.
+//
+// Mapping a host successfully is not the same as the host being usable: UTS-46
+// maps each label it is given without caring how the labels are divided or how
+// long they are, so an empty label, a leading dot and a label past the length a
+// resolver accepts all map cleanly. A host that is neither a valid address nor
+// a valid name is the third outcome, not the second.
+//
+// The limits are DNS's: 63 bytes a label, 253 bytes a name. What this must NOT
+// do is tighten what the mapping deliberately allows — an underscore is a name
+// here (STD3 rules are off, see urlHostProfile) and a label may start with a
+// digit, so this checks boundaries and lengths and nothing about the characters
+// inside a label.
+func unusableDomainName(name string) error {
+	if name == "" {
+		return errors.New("empty once its rooted dot is removed, so it names nothing")
+	}
+	if len(name) > 253 {
+		return fmt.Errorf("%d bytes long, past the 253 a name can be", len(name))
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" {
+			return fmt.Errorf("%q, which has an empty label — a leading dot, or two in a row, or a second trailing one", name)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("%q, whose label %q is %d bytes long, past the 63 a label can be", name, label, len(label))
+		}
+	}
+	return nil
+}
+
+// forbiddenDomainRune is the first code point WHATWG forbids in a domain, or
+// -1. That is the forbidden host code points, the C0 controls, DELETE and "%".
+//
+// "%" is the one that has to be checked here rather than assumed away. Go's URL
+// parsing decodes "%25" to "%" before url.Hostname is read, and a UTS-46
+// profile with STD3 rules off permits the result — so a percent-encoded
+// separator would otherwise survive mapping and read as an ordinary label.
+func forbiddenDomainRune(host string) rune {
+	for _, r := range host {
+		if r <= 0x20 || r == 0x7f || strings.ContainsRune("#/:<>?@[\\]^|%", r) {
+			return r
+		}
+	}
+	return -1
+}
+
+// urlHostProfile maps a host the way a URL consumer does before dialling it:
+// UTS-46, with the options WHATWG's "domain to ASCII" uses outside strict mode.
+// It is x/net/idna's table rather than one written here: the mapping is
+// Unicode's, a classifier that reads only ASCII is not reading the host the
+// client dialled, and re-deriving the table is not a thing this runtime should
+// be doing.
+var urlHostProfile = idna.New(
+	idna.MapForLookup(),
+	idna.BidiRule(),
+	idna.StrictDomainName(false),
+)
+
+// hostEndsInNumber is WHATWG's "ends in a number": the test that decides
+// whether a host has to be an address rather than a name. A trailing empty
+// label is the root dot, which does not change the answer.
+//
+// It asks whether the last label IS a number, not whether it is a number this
+// platform can hold. Those came apart once: a label was recognised by a 64-bit
+// conversion succeeding, so one that overflowed read as a name.
+func hostEndsInNumber(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) > 1 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	last := parts[len(parts)-1]
+	if last == "" {
+		return false
+	}
+	if strings.IndexFunc(last, func(r rune) bool { return r < '0' || r > '9' }) < 0 {
+		return true
+	}
+	_, numeric, _ := ipv4Number(last)
+	return numeric
+}
+
+// ipv4FromHost is WHATWG's IPv4 parser: one to four parts, every part before
+// the last naming one byte and the last spanning the bytes that are left. So
+// "127.1", "2130706433", "0x7f000001" and "017700000001" are all 127.0.0.1.
+func ipv4FromHost(host string) (net.IP, bool) {
+	parts := strings.Split(host, ".")
+	if len(parts) > 1 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) > 4 {
+		return nil, false
+	}
+	numbers := make([]uint64, len(parts))
+	for i, part := range parts {
+		value, numeric, inRange := ipv4Number(part)
+		if !numeric || !inRange {
+			return nil, false
+		}
+		numbers[i] = value
+	}
+	last := numbers[len(numbers)-1]
+	if last >= 1<<(8*uint(5-len(numbers))) {
+		return nil, false
+	}
+	packed := last
+	for i, value := range numbers[:len(numbers)-1] {
+		if value > 0xff {
+			return nil, false
+		}
+		packed |= value << (8 * uint(3-i))
+	}
+	return net.IPv4(byte(packed>>24), byte(packed>>16), byte(packed>>8), byte(packed)), true
+}
+
+// ipv4Number reads one part of a numeric address, in the base its prefix names:
+// "0x" hexadecimal, a leading "0" octal, otherwise decimal. A prefix with no
+// digits after it is zero rather than a failure, which is easy to read past and
+// load-bearing — a bare "0x" component is a zero byte.
+//
+// It reports whether the part is a NUMBER at all, separately from whether that
+// number is in range, because those are different answers: a part that is
+// numeric and too large makes the host malformed, where one that is not numeric
+// at all makes it a name.
+func ipv4Number(part string) (uint64, bool, bool) {
+	if part == "" {
+		return 0, false, false
+	}
+	base, digits := 10, part
+	switch {
+	case len(part) >= 2 && part[0] == '0' && (part[1] == 'x' || part[1] == 'X'):
+		base, digits = 16, part[2:]
+	case len(part) >= 2 && part[0] == '0':
+		base, digits = 8, part[1:]
+	}
+	if digits == "" {
+		return 0, true, true
+	}
+	// Before converting, not after. Go reports an out-of-range error as soon
+	// as the accumulator overflows, which can happen before it reaches a
+	// character that is not a digit at all — so taking that error as proof the
+	// label is numeric read "0x10000000000000000g" as a malformed address when
+	// it is an ordinary name. Once the characters are known to be digits, an
+	// out-of-range error is the only one left and does mean numeric.
+	if !digitsInBase(digits, base) {
+		return 0, false, false
+	}
+	value, err := strconv.ParseUint(digits, base, 64)
+	if err != nil {
+		return 0, true, false
+	}
+	return value, true, true
+}
+
+// digitsInBase reports whether every byte of digits is a digit in base, which
+// is WHATWG's own check and the one that has to come first.
+func digitsInBase(digits string, base int) bool {
+	for i := 0; i < len(digits); i++ {
+		c := digits[i]
+		var value int
+		switch {
+		case c >= '0' && c <= '9':
+			value = int(c - '0')
+		case c >= 'a' && c <= 'z':
+			value = int(c-'a') + 10
+		case c >= 'A' && c <= 'Z':
+			value = int(c-'A') + 10
+		default:
+			return false
+		}
+		if value >= base {
+			return false
+		}
+	}
+	return true
 }
 
 // mcpPublicURLSource names where the public MCP URL came from, so a refusal

@@ -78,7 +78,7 @@ func viewerStamp() stampedTransport {
 const (
 	testIssuer    = "https://host.test"
 	mcpToolName   = "read_collection"
-	mcpServerName = "wiki"
+	mcpServerName = "example"
 )
 
 type askInput struct {
@@ -98,7 +98,7 @@ func serveMCP(t *testing.T, env MCPEnvironment, register func(*mcp.Server)) *htt
 	// Before the cutover nothing here held one; the refusal is the point, and
 	// a test seam that skipped it would be testing a path no deployment has.
 	mint := newHostMint(t, &hostMint{})
-	s := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	s := New(Manifest{ID: mcpServerName, Title: "Example"}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(stubCredentialSource{credential: mintedCredential(t, mint, testProjectionAudience)})
 	handler, err := s.mcpHandler(env)
@@ -242,12 +242,12 @@ func post(t *testing.T, server *httptest.Server, header http.Header) *http.Respo
 func TestMCPChallengesARequestWithNoBearer(t *testing.T) {
 	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer}, readCollectionTool)
 
-	resp := post(t, server, http.Header{"x-forwarded-proto": {"https"}, "x-forwarded-host": {"host.test"}, "x-forwarded-prefix": {"/solutions/wiki"}})
+	resp := post(t, server, http.Header{"x-forwarded-proto": {"https"}, "x-forwarded-host": {"host.test"}, "x-forwarded-prefix": {"/solutions/example"}})
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("answered %d, want 401", resp.StatusCode)
 	}
 	challenge := resp.Header.Get("WWW-Authenticate")
-	want := `Bearer resource_metadata="https://host.test/solutions/wiki` + ProtectedResourceMetadataPath + `"`
+	want := `Bearer resource_metadata="https://host.test/solutions/example` + ProtectedResourceMetadataPath + `"`
 	if challenge != want {
 		t.Errorf("challenge = %q, want %q", challenge, want)
 	}
@@ -259,7 +259,7 @@ func TestMCPChallengesARequestWithNoBearer(t *testing.T) {
 // serve — and it is answered with the challenge rather than a bare 401 so that a
 // caller which reached the wrong address has something to act on.
 func TestMCPChallengesARequestTheGatewayDidNotStamp(t *testing.T) {
-	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer, PublicURL: "https://host.test/solutions/wiki" + MCPPath}, readCollectionTool)
+	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer, PublicURL: "https://host.test/solutions/example" + MCPPath}, readCollectionTool)
 
 	resp := post(t, server, http.Header{"authorization": {"Bearer whatever"}})
 	if resp.StatusCode != http.StatusUnauthorized {
@@ -375,9 +375,9 @@ func TestMCPMetadataNamesTheResolvedIssuer(t *testing.T) {
 	document := metadata(t, server, http.Header{
 		"x-forwarded-proto":  {"https"},
 		"x-forwarded-host":   {"host.test"},
-		"x-forwarded-prefix": {"/solutions/wiki"},
+		"x-forwarded-prefix": {"/solutions/example"},
 	})
-	if got, want := document["resource"], "https://host.test/solutions/wiki"+MCPPath; got != want {
+	if got, want := document["resource"], "https://host.test/solutions/example"+MCPPath; got != want {
 		t.Errorf("resource = %v, want %q — the identifier a client binds its token to must be the URL it dialled", got, want)
 	}
 	if got, want := document["authorization_servers"], []any{testIssuer}; len(document["authorization_servers"].([]any)) != 1 || got.([]any)[0] != want[0] {
@@ -386,7 +386,7 @@ func TestMCPMetadataNamesTheResolvedIssuer(t *testing.T) {
 	if got := document["bearer_methods_supported"]; len(got.([]any)) != 1 || got.([]any)[0] != "header" {
 		t.Errorf("bearer_methods_supported = %v, want [header]", got)
 	}
-	if got := document["resource_name"]; got != "Wiki" {
+	if got := document["resource_name"]; got != "Example" {
 		t.Errorf("resource_name = %v, want the solution's title", got)
 	}
 }
@@ -412,7 +412,7 @@ func TestMCPMetadataIssuerIsNotRequestDerived(t *testing.T) {
 // the configured URL is what the document and the challenge name — whatever the
 // request carried.
 func TestMCPMetadataPrefersTheConfiguredPublicURL(t *testing.T) {
-	const public = "https://app.example.com/solutions/wiki" + MCPPath
+	const public = "https://app.example.com/solutions/example" + MCPPath
 	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer, PublicURL: public}, readCollectionTool)
 
 	document := metadata(t, server, http.Header{"x-forwarded-host": {"evil.test"}, "x-forwarded-prefix": {"/elsewhere"}})
@@ -429,7 +429,7 @@ func TestMCPMetadataPrefersTheConfiguredPublicURL(t *testing.T) {
 func TestMCPMetadataDropsAnUnusablePrefix(t *testing.T) {
 	server := serveMCP(t, MCPEnvironment{IssuerURL: testIssuer}, readCollectionTool)
 
-	for _, prefix := range []string{"//evil.test", "/solutions/wiki?x=1", "/solutions/wiki#f", "solutions/wiki"} {
+	for _, prefix := range []string{"//evil.test", "/solutions/example?x=1", "/solutions/example#f", "solutions/example"} {
 		document := metadata(t, server, http.Header{
 			"x-forwarded-proto":  {"https"},
 			"x-forwarded-host":   {"host.test"},
@@ -602,8 +602,8 @@ func TestMCPEndpointServesNoCORS(t *testing.T) {
 func TestServeMCPRefusesAMisDeclaredSurface(t *testing.T) {
 	for name, surface := range map[string]*mcpSurface{
 		"no name":     {version: "v1", register: readCollectionTool},
-		"no version":  {name: "wiki", register: readCollectionTool},
-		"no register": {name: "wiki", version: "v1"},
+		"no version":  {name: "example", register: readCollectionTool},
+		"no register": {name: "example", version: "v1"},
 	} {
 		if err := surface.validate(); err == nil {
 			t.Errorf("%s: declaration accepted, want a refusal", name)
@@ -614,7 +614,7 @@ func TestServeMCPRefusesAMisDeclaredSurface(t *testing.T) {
 // TestTheMCPSeamRefusesWithoutAServeMCPDeclaration keeps the test seam honest:
 // it serves the surface Serve serves, and there is none to serve here.
 func TestTheMCPSeamRefusesWithoutAServeMCPDeclaration(t *testing.T) {
-	if _, err := New(Manifest{ID: "wiki"}).mcpHandler(MCPEnvironment{IssuerURL: testIssuer}); err == nil {
+	if _, err := New(Manifest{ID: "example"}).mcpHandler(MCPEnvironment{IssuerURL: testIssuer}); err == nil {
 		t.Error("mcpHandler accepted a solution that declares no MCP server")
 	}
 }
@@ -648,7 +648,7 @@ func TestValidateRefusesAnUnresolvedIssuerOnlyWhenMCPIsServed(t *testing.T) {
 // fixed in different places: a declared override is the composition's, and a
 // derived identifier is unusable only because PUBLIC_URL is.
 func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
-	for _, public := range []string{"https://host.test/solutions/wiki", "https://host.test/mcp/", "/solutions/wiki/mcp"} {
+	for _, public := range []string{"https://host.test/solutions/example", "https://host.test/mcp/", "/solutions/example/mcp"} {
 		cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: public, mcpPublicExplicit: true}
 		err := cfg.validateMCP()
 		if err == nil {
@@ -669,7 +669,7 @@ func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
 			t.Errorf("refusal %q for a derived identifier does not send the operator to PUBLIC_URL", err)
 		}
 	}
-	cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: "https://host.test/solutions/wiki" + MCPPath}
+	cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: "https://host.test/solutions/example" + MCPPath}
 	if err := cfg.validateMCP(); err != nil {
 		t.Errorf("a pairable public URL was refused: %v", err)
 	}
@@ -680,9 +680,9 @@ func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
 // would simply not exist — with tools/list answering as if that were all there
 // is. Refused at boot rather than resolved by call order.
 func TestServeMCPRefusesARedeclaredSurface(t *testing.T) {
-	s := New(Manifest{ID: "wiki"}).
-		ServeMCP("wiki", "v1", readCollectionTool).
-		ServeMCP("wiki", "v1", readCollectionTool)
+	s := New(Manifest{ID: "example"}).
+		ServeMCP("example", "v1", readCollectionTool).
+		ServeMCP("example", "v1", readCollectionTool)
 	err := s.validateMCPDeclaration()
 	if err == nil {
 		t.Fatal("two ServeMCP calls were accepted")
@@ -701,7 +701,7 @@ func TestServeMCPRefusesARedeclaredSurface(t *testing.T) {
 // both instead.
 func TestServeMCPRefusesAHandlerOnItsOwnPath(t *testing.T) {
 	for _, path := range []string{MCPPath, ProtectedResourceMetadataPath} {
-		s := New(Manifest{ID: "wiki"}).ServeMCP("wiki", "v1", readCollectionTool)
+		s := New(Manifest{ID: "example"}).ServeMCP("example", "v1", readCollectionTool)
 		s.Handle(path, func(context.Context, *Gateway) (any, error) { return nil, nil })
 		err := s.validateMCPDeclaration()
 		if err == nil {
@@ -713,7 +713,7 @@ func TestServeMCPRefusesAHandlerOnItsOwnPath(t *testing.T) {
 		}
 	}
 	// The same solution without the collision is served.
-	if err := New(Manifest{ID: "wiki"}).ServeMCP("wiki", "v1", readCollectionTool).
+	if err := New(Manifest{ID: "example"}).ServeMCP("example", "v1", readCollectionTool).
 		Handle("/search", func(context.Context, *Gateway) (any, error) { return nil, nil }).
 		validateMCPDeclaration(); err != nil {
 		t.Errorf("a handler on its own path was refused: %v", err)
@@ -730,7 +730,7 @@ func TestServeMCPRefusesAHandlerOnItsOwnPath(t *testing.T) {
 // same way.
 func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
 	const inCluster = "http://frontend.saas.svc.cluster.local:3000"
-	const public = "https://app.example.com/solutions/wiki" + MCPPath
+	const public = "https://app.example.com/solutions/example" + MCPPath
 
 	deployed := config{mcp: true, runtimeContext: "kubernetes", mcpIssuerURL: inCluster}
 	err := deployed.validateMCP()
@@ -838,7 +838,7 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 				}
 				seen.Store(true)
 				ceilings.Store(gw.ceilings != nil)
-				_, declared := gw.ceilings["wiki-api"]
+				_, declared := gw.ceilings["example-api"]
 				audience.Store(declared)
 				acquirer.Store(gw.workload != nil)
 				reporting.Store(gw.report != nil)
@@ -847,14 +847,14 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 			})
 	}
 
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(stubCredentialSource{credential: mintedCredential(t, mint, testProjectionAudience)})
 	// A resolved contract with one audience, which is what the ceiling is read
 	// off; contractResolved is the flag that makes it governing.
 	server.contract = effectiveContract{
 		Solution: mcpServerName,
-		Bindings: []contractBinding{{Audience: "wiki-api", Ceiling: []Scope{{ResourceKind: "collection", Actions: []string{"read"}}}}},
+		Bindings: []contractBinding{{Audience: "example-api", Ceiling: []Scope{{ResourceKind: "collection", Actions: []string{"read"}}}}},
 	}
 	server.contractResolved = true
 
@@ -928,13 +928,21 @@ func declareMCPConfiguration(t *testing.T, key, value string) {
 // the URL an MCP client dials cannot be one an operator exports. It is built
 // from the origin this product is reachable at and this solution's id — the two
 // things the runtime already has — and a composition declares nothing for it.
+// A deployment declares it anyway (validateMCP refuses a derived identifier
+// there), so what this covers is the local run and the value the boot log
+// suggests to an operator.
+//
+// It derives the host's PUBLIC route to a solution, "/api/solutions/<id>/proxy".
+// The gateway's internal "/solutions/<id>" is not reachable from outside, and an
+// identifier naming it is one no client can dial — which RFC 9728 §3.3 has the
+// client detect and reject, ending discovery.
 func TestMCPPublicURLIsDerivedFromTheProductOrigin(t *testing.T) {
 	clearSelfEnvironment(t)
 	t.Setenv("PORT", "8080")
 	t.Setenv("PUBLIC_URL", "https://app.example.com/")
 
-	cfg := loadConfig(context.Background(), "wiki", nil)
-	if want := "https://app.example.com/solutions/wiki" + MCPPath; cfg.mcpPublicURL != want {
+	cfg := loadConfig(context.Background(), "example", nil)
+	if want := "https://app.example.com/api/solutions/example/proxy" + MCPPath; cfg.mcpPublicURL != want {
 		t.Fatalf("mcpPublicURL = %q, want the derived %q", cfg.mcpPublicURL, want)
 	}
 	if cfg.mcpPublicExplicit {
@@ -944,13 +952,13 @@ func TestMCPPublicURLIsDerivedFromTheProductOrigin(t *testing.T) {
 	// points a client at is this URL with MCPPath swapped for the well-known
 	// path, so the derivation can never produce the shape validate() refuses.
 	paired := siblingURL(cfg.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath)
-	if want := "https://app.example.com/solutions/wiki" + ProtectedResourceMetadataPath; paired != want {
+	if want := "https://app.example.com/api/solutions/example/proxy" + ProtectedResourceMetadataPath; paired != want {
 		t.Errorf("metadata URL = %q, want %q", paired, want)
 	}
 	// It is also what the served document names, with no request-derived part:
 	// mcpResource returns the configured identifier before it looks at any
 	// forwarded header.
-	s := New(Manifest{ID: "wiki"})
+	s := New(Manifest{ID: "example"})
 	s.cfg = cfg
 	request := httptest.NewRequest(http.MethodPost, MCPPath, nil)
 	request.Header.Set(forwardedHostHeader, "attacker.test")
@@ -961,7 +969,7 @@ func TestMCPPublicURLIsDerivedFromTheProductOrigin(t *testing.T) {
 	// No origin to derive from: the identifier falls back to the forwarded
 	// headers, which validate() refuses in a deployment.
 	t.Setenv("PUBLIC_URL", "")
-	if got := loadConfig(context.Background(), "wiki", nil).mcpPublicURL; got != "" {
+	if got := loadConfig(context.Background(), "example", nil).mcpPublicURL; got != "" {
 		t.Errorf("with no PUBLIC_URL, mcpPublicURL = %q, want empty", got)
 	}
 }
@@ -974,10 +982,13 @@ func TestMCPPublicURLOverrideIsADeclaredConfiguration(t *testing.T) {
 	clearSelfEnvironment(t)
 	t.Setenv("PORT", "8080")
 	t.Setenv("PUBLIC_URL", "https://app.example.com")
-	const declared = "https://mcp.example.com/wiki" + MCPPath
-	declareMCPConfiguration(t, MCPPublicURLKey, declared+"/")
+	const declared = "https://mcp.example.com/elsewhere" + MCPPath
+	// Declared with the surrounding whitespace a carrier can pick up, which a
+	// URL cannot contain. Nothing inside the string is touched — see
+	// TestDeclaredMCPPublicURLIsTheIdentifierVerbatim.
+	declareMCPConfiguration(t, MCPPublicURLKey, "  "+declared+"\n")
 
-	cfg := loadConfig(context.Background(), "wiki", nil)
+	cfg := loadConfig(context.Background(), "example", nil)
 	if cfg.mcpPublicURL != declared {
 		t.Fatalf("mcpPublicURL = %q, want the declared %q", cfg.mcpPublicURL, declared)
 	}
@@ -987,7 +998,7 @@ func TestMCPPublicURLOverrideIsADeclaredConfiguration(t *testing.T) {
 	// The bare environment variable is gone: an operator who exports the name
 	// the runtime used to read gets the derived URL, not theirs.
 	t.Setenv("MCP_PUBLIC_URL", "https://exported.example.com/mcp")
-	if got := loadConfig(context.Background(), "wiki", nil).mcpPublicURL; got != declared {
+	if got := loadConfig(context.Background(), "example", nil).mcpPublicURL; got != declared {
 		t.Errorf("mcpPublicURL = %q, want the declared %q — a bare MCP_PUBLIC_URL must have no effect", got, declared)
 	}
 }
@@ -1004,7 +1015,7 @@ func TestMCPIssuerIsADeclaredConfiguration(t *testing.T) {
 	const declared = "https://login.example.com"
 	declareMCPConfiguration(t, MCPIssuerURLKey, declared+"/")
 
-	cfg := loadConfig(context.Background(), "wiki", nil)
+	cfg := loadConfig(context.Background(), "example", nil)
 	if cfg.mcpIssuerURL != declared {
 		t.Fatalf("mcpIssuerURL = %q, want the declared %q", cfg.mcpIssuerURL, declared)
 	}
@@ -1013,7 +1024,7 @@ func TestMCPIssuerIsADeclaredConfiguration(t *testing.T) {
 	}
 	// The bare environment variable is gone here too.
 	t.Setenv("HOST_ISSUER_URL", "https://exported.example.com")
-	if got := loadConfig(context.Background(), "wiki", nil).mcpIssuerURL; got != declared {
+	if got := loadConfig(context.Background(), "example", nil).mcpIssuerURL; got != declared {
 		t.Errorf("mcpIssuerURL = %q, want the declared %q — a bare HOST_ISSUER_URL must have no effect", got, declared)
 	}
 }
@@ -1029,7 +1040,7 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 		t.Setenv("PORT", "8080")
 		t.Setenv("CODEFLY__RUNTIME_CONTEXT", "kubernetes")
 		t.Setenv("GATEWAY_URL", "http://auth-gateway.saas.svc.cluster.local:8080")
-		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg := loadConfig(context.Background(), "example", nil)
 		cfg.mcp = true
 		return cfg
 	}
@@ -1062,7 +1073,7 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 		// PUBLIC_URL lands after it, so the config has to be loaded again.
 		deployed(t)
 		t.Setenv("PUBLIC_URL", "https://app.example.com")
-		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg := loadConfig(context.Background(), "example", nil)
 		cfg.mcp = true
 		if cfg.mcpIssuerExplicit {
 			t.Fatal("an issuer nobody declared reads as explicit")
@@ -1094,7 +1105,7 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 		declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
 		deployed(t)
 		t.Setenv("PUBLIC_URL", "https://app.example.com")
-		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg := loadConfig(context.Background(), "example", nil)
 		cfg.mcp = true
 		err := cfg.validateMCP()
 		if err == nil {
@@ -1107,30 +1118,30 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 
 	t.Run("both declared values are enough", func(t *testing.T) {
 		declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
-		declareMCPConfiguration(t, MCPPublicURLKey, "https://app.example.com/wiki"+MCPPath)
+		declareMCPConfiguration(t, MCPPublicURLKey, "https://app.example.com/example"+MCPPath)
 		deployed(t)
-		cfg := loadConfig(context.Background(), "wiki", nil)
+		cfg := loadConfig(context.Background(), "example", nil)
 		cfg.mcp = true
 		if err := cfg.validateMCP(); err != nil {
 			t.Fatalf("a deployed MCP surface with both values declared was refused: %v", err)
 		}
-		if want := "https://app.example.com/wiki" + MCPPath; cfg.mcpPublicURL != want {
+		if want := "https://app.example.com/example" + MCPPath; cfg.mcpPublicURL != want {
 			t.Errorf("mcpPublicURL = %q, want the declared %q", cfg.mcpPublicURL, want)
 		}
 	})
 
 	t.Run("a published URL is held to what a dialled one is", func(t *testing.T) {
 		for _, tc := range []struct{ name, value, names string }{
-			{"userinfo", "https://ops:s3cr3t@app.example.com/wiki" + MCPPath, "userinfo"},
-			{"a query string", "https://app.example.com/wiki" + MCPPath + "?token=s3cr3t", "query"},
-			{"a fragment", "https://app.example.com/wiki" + MCPPath + "#frag", "fragment"},
-			{"plaintext", "http://app.example.com/wiki" + MCPPath, "https"},
+			{"userinfo", "https://ops:s3cr3t@app.example.com/example" + MCPPath, "userinfo"},
+			{"a query string", "https://app.example.com/example" + MCPPath + "?token=s3cr3t", "query"},
+			{"a fragment", "https://app.example.com/example" + MCPPath + "#frag", "fragment"},
+			{"plaintext", "http://app.example.com/example" + MCPPath, "https"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
 				declareMCPConfiguration(t, MCPPublicURLKey, tc.value)
 				deployed(t)
-				cfg := loadConfig(context.Background(), "wiki", nil)
+				cfg := loadConfig(context.Background(), "example", nil)
 				cfg.mcp = true
 				err := cfg.validateMCP()
 				if err == nil {
@@ -1182,7 +1193,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 						return nil, askOutput{Status: 200}, nil
 					})
 			}
-			server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+			server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 				ServeMCP(mcpServerName, "v1.2.3", register).
 				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/platform/_credential (dial tcp 10.4.1.9:8443: connection refused)", tc.err)})
 
@@ -1236,7 +1247,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		// A withdrawn credential must not read as "this solution serves no
 		// MCP": one is a back-off, the other sends a client looking for an
 		// endpoint that does not exist.
-		server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+		server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 			ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
 			Credential(refusingSource{err: workcontext.ErrMintRefused})
 		handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
@@ -1324,7 +1335,7 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 				return nil, askOutput{Status: 200}, nil
 			})
 	}
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(attestingSource(t))
 	server.cfg.gatewayURL = gw.URL
@@ -1374,7 +1385,7 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 // through that handler — and it is the layer that knows the method name, so it
 // is where the allowlist lives.
 func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 		ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
 		Credential(refusingSource{err: fmt.Errorf("%w: at https://mint.internal.example/platform/_credential", workcontext.ErrMintUnavailable)})
 
@@ -1438,27 +1449,27 @@ func TestNoMCPRefusalEverPrintsASecret(t *testing.T) {
 	// unpairable, plaintext, and a secret in each of the three positions a URL
 	// can hide one.
 	withSecret := []string{
-		"https://ops:" + secret + "@app.example.com/wiki" + MCPPath,
-		"https://app.example.com/wiki" + MCPPath + "?token=" + secret,
-		"https://app.example.com/wiki" + MCPPath + "#" + secret,
-		"http://app.example.com/wiki" + MCPPath + "?token=" + secret,
+		"https://ops:" + secret + "@app.example.com/example" + MCPPath,
+		"https://app.example.com/example" + MCPPath + "?token=" + secret,
+		"https://app.example.com/example" + MCPPath + "#" + secret,
+		"http://app.example.com/example" + MCPPath + "?token=" + secret,
 		"https://" + secret + ":x@app.example.com/not-the-suffix",
 		"not-a-url-at-all?token=" + secret,
 		// Scheme-less and opaque forms. url.Parse accepts
 		// "ops:SECRET@host/path" as scheme "ops" with everything after the
 		// colon opaque, so User is nil and RawQuery empty and the ordinary
 		// strips touch nothing — the secret came through redactedURL intact.
-		"ops:" + secret + "@app.example.com/wiki" + MCPPath,
+		"ops:" + secret + "@app.example.com/example" + MCPPath,
 		"mailto:ops:" + secret + "@app.example.com",
-		"app.example.com:8443/wiki" + MCPPath + "?token=" + secret,
-		"https://app.example.com/wiki?token=" + secret,
+		"app.example.com:8443/example" + MCPPath + "?token=" + secret,
+		"https://app.example.com/example?token=" + secret,
 	}
 	for _, runtimeContext := range []string{"", "kubernetes"} {
 		for _, value := range withSecret {
 			for _, which := range []string{"issuer", "public"} {
 				cfg := config{mcp: true, runtimeContext: runtimeContext,
 					mcpIssuerURL: "https://login.example.com", mcpIssuerExplicit: true,
-					mcpPublicURL: "https://app.example.com/wiki" + MCPPath, mcpPublicExplicit: true}
+					mcpPublicURL: "https://app.example.com/example" + MCPPath, mcpPublicExplicit: true}
 				switch which {
 				case "issuer":
 					cfg.mcpIssuerURL = value
@@ -1613,7 +1624,7 @@ func TestAToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 				return nil, askOutput{Status: resp.StatusCode}, nil
 			})
 	}
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(attestingSource(t))
 	server.cfg.gatewayURL = gw.URL
@@ -1660,10 +1671,10 @@ func TestAToolsOwnRefusalIsLeftAlone(t *testing.T) {
 	register := func(srv *mcp.Server) {
 		mcp.AddTool(srv, &mcp.Tool{Name: "ask", Description: "refuses in its own words"},
 			func(context.Context, *mcp.CallToolRequest, askInput) (*mcp.CallToolResult, askOutput, error) {
-				return nil, askOutput{}, errors.New("no such collection in this wiki")
+				return nil, askOutput{}, errors.New("no such collection in this solution")
 			})
 	}
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Title: "Example"}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(attestingSource(t))
 	server.cfg.gatewayURL = gw.URL
@@ -1682,7 +1693,7 @@ func TestAToolsOwnRefusalIsLeftAlone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tools/call: %v", err)
 	}
-	if !strings.Contains(toolErrorText(result), "no such collection in this wiki") {
+	if !strings.Contains(toolErrorText(result), "no such collection in this solution") {
 		t.Errorf("the tool's own refusal was rewritten: %q — a tool's vocabulary is its own, and a model driving it reads that text", toolErrorText(result))
 	}
 }
@@ -1734,7 +1745,7 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		// structured error about their own domain is untouched.
 		own := &mcp.CallToolResult{
 			IsError:           true,
-			Content:           []mcp.Content{&mcp.TextContent{Text: "the wiki rejected that page title"}},
+			Content:           []mcp.Content{&mcp.TextContent{Text: "the backend rejected that page title"}},
 			StructuredContent: map[string]any{"error": "title must not be empty", "field": "title"},
 		}
 		// The CONTENT survives, which is what "left alone" means. Pointer
@@ -1749,7 +1760,7 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		if !got.IsError || len(got.Content) != 1 {
 			t.Fatalf("the filter reshaped a tool's own refusal: %+v", got)
 		}
-		if text, isText := got.Content[0].(*mcp.TextContent); !isText || text.Text != "the wiki rejected that page title" {
+		if text, isText := got.Content[0].(*mcp.TextContent); !isText || text.Text != "the backend rejected that page title" {
 			t.Errorf("the filter replaced a tool's own message: %+v", got.Content[0])
 		}
 		rendered, err := json.Marshal(got.StructuredContent)
@@ -1914,4 +1925,515 @@ type sabotagingMarshaler struct {
 func (v sabotagingMarshaler) MarshalJSON() ([]byte, error) {
 	v.text.Text = v.to
 	return []byte(`{}`), nil
+}
+
+// --- the identifier is the host's public route, exactly, and reachable ---
+
+// deployedMCPConfig is a deployed runtime context with both MCP values declared
+// — what a cell actually provisions, since validateMCP refuses a derived
+// identifier there. The caller overrides whichever value it is testing.
+func deployedMCPConfig(t *testing.T, publicURL string) config {
+	t.Helper()
+	clearSelfEnvironment(t)
+	t.Setenv("PORT", "8080")
+	t.Setenv("CODEFLY__RUNTIME_CONTEXT", "kubernetes")
+	declareMCPConfiguration(t, MCPIssuerURLKey, "https://login.example.com")
+	declareMCPConfiguration(t, MCPPublicURLKey, publicURL)
+	cfg := loadConfig(context.Background(), "example", nil)
+	cfg.mcp = true
+	return cfg
+}
+
+// TestMCPIdentifierNamesTheHostsPublicProxyRoute pins the one piece of the
+// host's route layout this runtime encodes, against a literal written out here
+// rather than built from the constants — so changing either constant turns this
+// red instead of silently re-pointing what a local run publishes and what the
+// boot log tells an operator to provision.
+//
+// It is pinned by a literal because nothing projects it. The host owns
+// "/api/solutions/<id>/proxy" and there is no contract by which it reaches a
+// composed solution's backend: the SDK resolves endpoints as
+// resources.NetworkInstance (host, hostname, port, address — no path), a
+// basev0.Endpoint carries no public URL or route template, and core's only
+// public-route concept, resources.EnvironmentIngressRoute, binds hosts to a
+// service endpoint, is CLI-side and is not serialized to proto.
+//
+// What this pins, exactly: nobody changes the runtime's route constants without
+// a red suite. It does NOT detect the host changing its route — this module has
+// no dependency on the host and nothing here observes the host's routing, so
+// that case leaves this suite green and breaks a client's discovery. The test
+// for that drives the host's own source and lives where the host is visible.
+// What limits the damage meanwhile is that a DEPLOYED surface must declare the
+// identifier; the derivation is the local run's.
+func TestMCPIdentifierNamesTheHostsPublicProxyRoute(t *testing.T) {
+	clearSelfEnvironment(t)
+	t.Setenv("PORT", "8080")
+	t.Setenv("PUBLIC_URL", "https://app.example.com")
+
+	cfg := loadConfig(context.Background(), "example", nil)
+	const identifier = "https://app.example.com/api/solutions/example/proxy/mcp"
+	if cfg.mcpPublicURL != identifier {
+		t.Fatalf("resource identifier = %q, want the host's public proxy route %q", cfg.mcpPublicURL, identifier)
+	}
+	// The gateway's in-cluster route is a page of the host's frontend on the
+	// public origin, so an identifier naming it is one no client can dial.
+	if strings.Contains(cfg.mcpPublicURL, "https://app.example.com/solutions/") {
+		t.Errorf("resource identifier %q names the gateway's in-cluster route, which is not reachable from outside the cell", cfg.mcpPublicURL)
+	}
+	// The metadata document a 401 points at is this URL with the suffix
+	// swapped, so it must land on the same public route.
+	const metadata = "https://app.example.com/api/solutions/example/proxy/.well-known/oauth-protected-resource"
+	if got := siblingURL(cfg.mcpPublicURL, MCPPath, ProtectedResourceMetadataPath); got != metadata {
+		t.Errorf("metadata URL = %q, want %q", got, metadata)
+	}
+	// And the value this package SUGGESTS to an operator is the same route. It
+	// named the in-cluster one, which is the worse half of the bug: a
+	// derivation an operator never sees is a default, but a suggestion is read
+	// as the answer and provisions the same unreachable identifier by hand.
+	if got := hostSolutionPublicMCPURL("https://<host>", "example"); got != "https://<host>/api/solutions/example/proxy/mcp" {
+		t.Errorf("suggested identifier = %q, want the public proxy route", got)
+	}
+}
+
+// TestDeclaredMCPPublicURLIsTheIdentifierVerbatim: a declared identifier is
+// published exactly as declared. RFC 9728 §3.3 has the client compare the
+// `resource` in this document against the URL it dialled code point for code
+// point, so ".../mcp/" and ".../mcp" are two different identifiers — trimming
+// the slash published one nobody declared and no client dialled, and the 401
+// that followed was on a document that validates.
+//
+// It goes through loadConfig, which is where the trimming was: a test that
+// builds config directly never reaches the SDK path that normalized the value.
+func TestDeclaredMCPPublicURLIsTheIdentifierVerbatim(t *testing.T) {
+	const declared = "https://mcp.example.com/elsewhere" + MCPPath
+	for _, raw := range []string{declared, declared + "/"} {
+		t.Run(raw, func(t *testing.T) {
+			cfg := deployedMCPConfig(t, raw)
+			if cfg.mcpPublicURL != raw {
+				t.Fatalf("mcpPublicURL = %q, want the declared %q unchanged", cfg.mcpPublicURL, raw)
+			}
+			err := cfg.validateMCP()
+			if raw == declared {
+				if err != nil {
+					t.Fatalf("the declared identifier was refused: %v", err)
+				}
+				return
+			}
+			// Not silently corrected into the other identifier: refused, and
+			// the refusal names the declaration an operator can change.
+			if err == nil {
+				t.Fatal("a declared identifier ending in a trailing slash was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+				t.Errorf("refusal %q does not name %s, the declaration that fixes it", err, mcpConfigurationValue(MCPPublicURLKey))
+			}
+			if !strings.Contains(err.Error(), "trailing slash") {
+				t.Errorf("refusal %q does not say the trailing slash is the problem, so it reads as a value that must end in %s already ending in it", err, MCPPath)
+			}
+		})
+	}
+}
+
+// TestHostOfReadsWhatAURLConsumerReads pins the host reading itself, apart
+// from the refusals that consume it: the three outcomes are a name, an address,
+// and a host that is neither, which is refused rather than admitted as a name.
+//
+// The loopback cases include the spellings the conformance reviews drove to a
+// loopback-only listener with DNS disabled, plus Unicode forms a URL consumer
+// maps before dialling. They are a selection of that corpus rather than all of
+// it, and the table also holds public addresses, which were never dialled and
+// are here as controls — notation is not the refusal. The name cases are what
+// must NOT be mistaken for an address, including hosts whose labels merely look
+// numeric. The "neither" cases are each chosen to be rejected BY the guard it
+// pins, since a case another check catches first leaves that guard unpinned.
+func TestHostOfReadsWhatAURLConsumerReads(t *testing.T) {
+	// Built at run time rather than written as literals: Go's scanner refuses
+	// a byte order mark in source, and these read better named anyway.
+	var (
+		zeroWidthJoiner    = string(rune(0x200d))
+		zeroWidthNonJoiner = string(rune(0x200c))
+		hebrewAlef         = string(rune(0x05d0))
+		softHyphen         = string(rune(0x00ad))
+		zeroWidthSpace     = string(rune(0x200b))
+		byteOrderMark      = string(rune(0xfeff))
+	)
+	t.Run("addresses", func(t *testing.T) {
+		for _, tc := range []struct{ host, want string }{
+			// inet_aton spellings.
+			{"127.1", "127.0.0.1"},
+			{"127.0.1", "127.0.0.1"},
+			{"127.000.000.001", "127.0.0.1"},
+			{"2130706433", "127.0.0.1"},
+			{"017700000001", "127.0.0.1"},
+			{"0177.0.0.1", "127.0.0.1"},
+			{"0x7f000001", "127.0.0.1"},
+			{"0X7F000001", "127.0.0.1"},
+			{"0x7f.0.0.1", "127.0.0.1"},
+			{"0x7f.1", "127.0.0.1"},
+			// A prefix with no digits after it is zero, not a failure.
+			{"127.0x.1", "127.0.0.1"},
+			{"0x7f.0x.0x.1", "127.0.0.1"},
+			{"0X7F.0X.0X.1", "127.0.0.1"},
+			{"0x7f.0x", "127.0.0.0"},
+			{"0x.0x.0x.0x", "0.0.0.0"},
+			{"0", "0.0.0.0"},
+			{"0x0", "0.0.0.0"},
+			// Unicode a URL consumer maps before dialling: fullwidth digits,
+			// three spellings of a full stop, mathematical digits, a trailing
+			// ideographic stop.
+			{"\uff11\uff12\uff17.\uff10.\uff10.\uff11", "127.0.0.1"},
+			{"127\u30021", "127.0.0.1"},
+			{"127\uff0e1", "127.0.0.1"},
+			{"127\uff611", "127.0.0.1"},
+			{"\uff10\uff38\uff17\uff26\uff10\uff10\uff10\uff10\uff10\uff11", "127.0.0.1"},
+			{"\U0001d7cf\U0001d7d0\U0001d7d5.\U0001d7cf", "127.0.0.1"},
+			{"127.1\u3002", "127.0.0.1"},
+			// Reachable addresses, in the same spellings: notation is not the
+			// refusal.
+			{"93.184.216.34", "93.184.216.34"},
+			{"1572395042", "93.184.216.34"},
+			{"0x5db8d822", "93.184.216.34"},
+			{"0135.0270.0330.042", "93.184.216.34"},
+			// IPv6, bracketless as url.Hostname returns it, zone included.
+			{"::1", "::1"},
+			{"::1%eth0", "::1"},
+			{"::", "::"},
+			{"::ffff:127.0.0.1", "127.0.0.1"},
+		} {
+			kind, name, ip, err := hostOf(tc.host)
+			if kind != hostIsAddress {
+				t.Errorf("hostOf(%q) = (%v, %q, %v, %v), want the address %s", tc.host, kind, name, ip, err, tc.want)
+				continue
+			}
+			if ip.String() != tc.want {
+				t.Errorf("hostOf(%q) = %s, want %s", tc.host, ip, tc.want)
+			}
+		}
+	})
+
+	t.Run("names", func(t *testing.T) {
+		for _, tc := range []struct{ host, want string }{
+			{"mcp.example.com", "mcp.example.com"},
+			{"MCP.EXAMPLE.COM", "mcp.example.com"},
+			{"127.0.0.1.example.com", "127.0.0.1.example.com"},
+			{"0x7f.example.com", "0x7f.example.com"},
+			{"localhost", "localhost"},
+			{"localhost\u3002", "localhost"},
+			{"\u24db\u24de\u24d2\u24d0\u24db\u24d7\u24de\u24e2\u24e3", "localhost"},
+			{"xn--e1afmkfd.xn--p1ai", "xn--e1afmkfd.xn--p1ai"},
+			// Hosts a stricter profile would wrongly refuse: STD3 rules are
+			// off, so an underscore is a name, and a label may start with a
+			// digit as long as the LAST one is not a number.
+			{"my_host.example.com", "my_host.example.com"},
+			{"9to5.example.com", "9to5.example.com"},
+			{"1host.example.com", "1host.example.com"},
+			// A label that overflows AND holds a character that is no digit
+			// in its radix is an ordinary name. Reading the conversion's
+			// out-of-range error as proof the label was numeric refused these.
+			{"0x10000000000000000g", "0x10000000000000000g"},
+			{"example.0X10000000000000000Z", "example.0x10000000000000000z"},
+			{"18446744073709551616z", "18446744073709551616z"},
+			{"02000000000000000000000g", "02000000000000000000000g"},
+			// The same, with PUNCTUATION where those carry a letter. A letter
+			// is a character with a digit value that this radix does not
+			// reach, so those cases are caught by the radix comparison and
+			// defend nothing about a character with no digit value at all.
+			// These are the ones that die when digitsInBase stops rejecting
+			// it — by being refused as malformed addresses when they are
+			// ordinary names.
+			{"0x10000000000000000_", "0x10000000000000000_"},
+			{"example.0x10000000000000000-0", "example.0x10000000000000000-0"},
+			{"18446744073709551616_", "18446744073709551616_"},
+			{"02000000000000000000000-0", "02000000000000000000000-0"},
+			// The rooted dot is the one trailing dot a name may carry.
+			{"example.test.", "example.test"},
+			// 63 bytes is the longest label and 253 the longest name.
+			{strings.Repeat("a", 63) + ".test", strings.Repeat("a", 63) + ".test"},
+		} {
+			kind, name, ip, err := hostOf(tc.host)
+			if kind != hostIsName {
+				t.Errorf("hostOf(%q) = (%v, %q, %v, %v), want the name %q", tc.host, kind, name, ip, err, tc.want)
+				continue
+			}
+			if name != tc.want {
+				t.Errorf("hostOf(%q) = %q, want %q", tc.host, name, tc.want)
+			}
+		}
+	})
+
+	// Neither a name nor an address. WHATWG makes a host whose last label is a
+	// number an invalid URL when it does not parse as IPv4, so admitting these
+	// as names is what let an address-shaped host through.
+	t.Run("neither", func(t *testing.T) {
+		for _, host := range []string{
+			// An absent host. A URL's authority can be non-empty and name no
+			// host, as "https://:443/" does, and a client dialling one reaches
+			// its own machine.
+			"",
+			// Each of these pins one guard in the address parser, and each has
+			// to be rejected BY that guard: another check catching it first
+			// would leave the guard unpinned.
+			"127.0.0.999",  // a final part over one byte
+			"256.0.0.1",    // a leading part over one byte
+			"127.0.0.0.0",  // five parts, the last fitting the byte it spans
+			"127.0.0.0.1",  // five parts
+			"127..1",       // an empty part
+			"4294967296",   // over 32 bits
+			"127.16777216", // a final part over the bytes it spans
+			"0178.0.0.1",   // 8 is not an octal digit
+			// Numeric and too large to hold: a label recognised by a 64-bit
+			// conversion succeeding read these as names.
+			"0x10000000000000000",
+			"0X10000000000000001",
+			"example.0xfffffffffffffffff",
+			// A code point a URL consumer forbids in a host. Go's URL parsing
+			// decodes "%25" to "%" before the host is read, and UTS-46 with
+			// STD3 rules off permits it.
+			"127%2e1",
+			"%",
+			"host%name.example",
+			"a b.example.com",
+			"a\tb.example.com",
+			// Bracketed like IPv6 and not one, and malformed IPv6.
+			"[::1",
+			"::fffg:1",
+			// A final label of only decimal digits has to enter the address
+			// parser, even when it is not a valid number there. Without that,
+			// each of these reads as a name.
+			"08",
+			"09",
+			"0178",
+			// Mapping errors have to propagate rather than be ignored: an
+			// invalid joiner, and the bidi rule.
+			"a" + zeroWidthJoiner + "b.example",
+			"a" + zeroWidthNonJoiner + "b.example",
+			"a" + hebrewAlef + ".example",
+			hebrewAlef + "a.example",
+			// Mapping to nothing is not a host. These map cleanly, with no
+			// error, to the empty string.
+			softHyphen,
+			zeroWidthSpace,
+			byteOrderMark,
+			softHyphen + zeroWidthSpace,
+			// A name UTS-46 maps cleanly and no resolver accepts: an empty
+			// label, a second trailing dot, a label past 63 bytes, a name past
+			// 253. Mapping does not care how labels are divided or how long
+			// they are, so each of these used to be published.
+			".example.test",
+			"a..example.test",
+			"localhost..",
+			"127.1..",
+			".",
+			strings.Repeat("a", 64) + ".test",
+			strings.Repeat("ab.", 86) + "test",
+		} {
+			kind, name, ip, err := hostOf(host)
+			if kind != hostIsUnreadable {
+				t.Errorf("hostOf(%q) = (%v, %q, %v, %v), want hostIsUnreadable: it is neither a name nor an address", host, kind, name, ip, err)
+				continue
+			}
+			if err == nil {
+				t.Errorf("hostOf(%q) read as unreadable with no reason, which is what a refusal names", host)
+			}
+		}
+		// The absent host has its own reason, and the reason is the whole
+		// point of the branch: "https://:443/mcp" is the one unreadable host
+		// an operator can read and think is fine, so a generic "cannot be
+		// read" would leave them looking at the wrong thing. Mapping an empty
+		// host also yields an empty result, so without this the branch is
+		// unpinned.
+		if _, _, _, err := hostOf(""); err == nil || !strings.Contains(err.Error(), "port and no host") {
+			t.Errorf("hostOf(%q) reason = %v, want it to say the authority names a port and no host", "", err)
+		}
+		// A host of only ignorable code points has its own reason for the same
+		// reason: the name check would refuse the empty mapping too, so
+		// without this the branch is unpinned — and what an operator staring
+		// at an invisible host needs to be told is that it mapped to nothing,
+		// not that the result has no labels.
+		if _, _, _, err := hostOf(softHyphen); err == nil || !strings.Contains(err.Error(), "UTS-46") {
+			t.Errorf("hostOf(softHyphen) reason = %v, want it to say UTS-46 mapping cannot read the host", err)
+		}
+	})
+}
+
+// TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling is the property, not a
+// list: for every host a URL consumer reads as a loopback or unspecified
+// address, a deployed surface refuses the declaration. The spellings come from
+// the conformance review, which drove each one to a loopback-only listener with
+// DNS disabled and got a 204 back, so these are addresses that really do reach
+// this machine rather than strings that look like it.
+func TestDeployedMCPPublicURLRefusesEveryLoopbackSpelling(t *testing.T) {
+	for _, host := range []string{
+		"localhost", "app.localhost", "LOCALHOST.",
+		"127.0.0.1", "127.9.9.9", "0.0.0.0",
+		"127.1", "127.0.1", "127.000.000.001", "2130706433", "017700000001",
+		"0177.0.0.1", "0x7f000001", "0X7F000001", "0x7f.0.0.1", "0x7f.1",
+		"127.0x.1", "0x7f.0x.0x.1", "0X7F.0X.0X.1", "0x7f.0x", "0x.0x.0x.0x",
+		"0", "0x0",
+		"１２７.０.０.１", "127。1", "127．1", "127｡1",
+		"０Ｘ７Ｆ０００００１",
+		"𝟏𝟐𝟕.𝟏", "127.1。",
+		"localhost。", "ⓛⓞⓒⓐⓛⓗⓞⓢⓣ",
+		"[::1]", "[::]", "[::1%25eth0]", "[::1%25lo0]",
+		"[0:0:0:0:0:0:0:1%25lo0]", "[::%25lo0]", "[::ffff:127.0.0.1]",
+	} {
+		declared := "https://" + host + ":8443" + MCPPath
+		t.Run(host, func(t *testing.T) {
+			cfg := deployedMCPConfig(t, declared)
+			if cfg.mcpPublicURL != declared {
+				t.Fatalf("mcpPublicURL = %q, want the declared %q preserved byte for byte", cfg.mcpPublicURL, declared)
+			}
+			err := cfg.validateMCP()
+			if err == nil {
+				t.Fatal("a deployed MCP surface publishing a loopback identifier was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+				t.Errorf("refusal %q does not name %s, the declaration that supplied the address", err, mcpConfigurationValue(MCPPublicURLKey))
+			}
+			if !strings.Contains(err.Error(), "loopback") {
+				t.Errorf("refusal %q does not say the address is a loopback one", err)
+			}
+		})
+	}
+
+	// Reachable declarations in the same context and the same notations: the
+	// refusal is the address, not the spelling.
+	for _, host := range []string{
+		"mcp.example.com", "[fe80::1%25lo0]",
+		"93.184.216.34", "1572395042", "0x5db8d822", "0135.0270.0330.042",
+		// Valid names that the structural checks must not refuse: the rooted
+		// dot, the longest label, an underscore, and a numeric-looking label
+		// holding a non-digit.
+		"mcp.example.com.", strings.Repeat("a", 63) + ".example.com",
+		"my_host.example.com", "0x10000000000000000g.example.com",
+		"0x10000000000000000_.example.com", "18446744073709551616_.example.com",
+	} {
+		t.Run("reachable "+host, func(t *testing.T) {
+			if err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP(); err != nil {
+				t.Fatalf("a reachable declared identifier was refused in a deployment: %v", err)
+			}
+		})
+	}
+
+	// A host that is neither a name nor an address is refused too, naming the
+	// declaration — not admitted because it failed to look like an address.
+	// "" is the authority that names only a port, which a client dialling
+	// reaches its own machine through.
+	for _, host := range []string{
+		"127.0.0.999", "127..1", "127.16777216", "256.0.0.1", "127.0.0.0.0",
+		"0x10000000000000000", "example.0xfffffffffffffffff",
+		"127%252e1", "host%25name.example", "",
+		".example.test", "a..example.test", "localhost..", "127.1..",
+		"08", "0178",
+	} {
+		t.Run("unreadable "+host, func(t *testing.T) {
+			err := deployedMCPConfig(t, "https://"+host+":8443"+MCPPath).validateMCP()
+			if err == nil {
+				t.Fatal("a declared identifier whose host is neither a name nor an address was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPPublicURLKey)) {
+				t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPPublicURLKey))
+			}
+		})
+	}
+
+	// Locally a loopback identifier is the right one, and refusing it there
+	// would refuse the local run this runtime also serves.
+	t.Run("local", func(t *testing.T) {
+		clearSelfEnvironment(t)
+		t.Setenv("PORT", "8080")
+		declareMCPConfiguration(t, MCPIssuerURLKey, "http://localhost:3000")
+		declareMCPConfiguration(t, MCPPublicURLKey, "http://localhost:8080"+MCPPath)
+		cfg := loadConfig(context.Background(), "example", nil)
+		cfg.mcp = true
+		if err := cfg.validateMCP(); err != nil {
+			t.Fatalf("a local loopback identifier was refused: %v", err)
+		}
+	})
+}
+
+// TestDeployedMCPIssuerRefusesAnUnreachableAddress: the issuer is published as
+// this resource's authorization server, so it gets the address refusal the
+// resource identifier gets. A client handed a loopback issuer is sent to
+// authenticate against its own machine, on a document that is well-formed and
+// served with a 200 — the silent damage validateMCP exists for, one field over
+// from where it was first caught.
+//
+// The spellings are the identifier's, because the classification is shared: a
+// notation that hides an address in one value hides it in the other.
+func TestDeployedMCPIssuerRefusesAnUnreachableAddress(t *testing.T) {
+	deployed := func(t *testing.T, issuer string) config {
+		t.Helper()
+		clearSelfEnvironment(t)
+		t.Setenv("PORT", "8080")
+		t.Setenv("CODEFLY__RUNTIME_CONTEXT", "kubernetes")
+		declareMCPConfiguration(t, MCPIssuerURLKey, issuer)
+		declareMCPConfiguration(t, MCPPublicURLKey, "https://mcp.example.com/elsewhere"+MCPPath)
+		cfg := loadConfig(context.Background(), "example", nil)
+		cfg.mcp = true
+		return cfg
+	}
+
+	for _, host := range []string{
+		"localhost", "127.0.0.1", "0.0.0.0", "127.1", "0x7f000001", "127.0x.1",
+		"１２７.０.０.１", "127。1", "[::1]", "[::1%25eth0]",
+	} {
+		issuer := "https://" + host + ":3000"
+		t.Run(host, func(t *testing.T) {
+			cfg := deployed(t, issuer)
+			if cfg.mcpIssuerURL != issuer {
+				t.Fatalf("mcpIssuerURL = %q, want the declared %q", cfg.mcpIssuerURL, issuer)
+			}
+			err := cfg.validateMCP()
+			if err == nil {
+				t.Fatal("a deployed MCP surface publishing a loopback authorization server was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+				t.Errorf("refusal %q does not name %s, the declaration that supplied the address", err, mcpConfigurationValue(MCPIssuerURLKey))
+			}
+			if !strings.Contains(err.Error(), "loopback") {
+				t.Errorf("refusal %q does not say the address is a loopback one", err)
+			}
+		})
+	}
+
+	// Neither a name nor an address: refused naming the issuer declaration,
+	// rather than published as an authorization server nobody can read. The
+	// empty host is the authority that names only a port.
+	for _, issuer := range []string{
+		"https://127.0.0.999:3000", "https://0x10000000000000000:3000",
+		"https://127%252e1:3000", "https://:3000",
+		"https://.example.test:3000", "https://a..example.test:3000",
+		"https://" + strings.Repeat("a", 64) + ".test:3000",
+	} {
+		t.Run("unreadable "+issuer, func(t *testing.T) {
+			err := deployed(t, issuer).validateMCP()
+			if err == nil {
+				t.Fatal("a declared issuer whose host is neither a name nor an address was accepted")
+			}
+			if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
+				t.Errorf("refusal %q does not name %s", err, mcpConfigurationValue(MCPIssuerURLKey))
+			}
+		})
+	}
+
+	t.Run("reachable", func(t *testing.T) {
+		if err := deployed(t, "https://login.example.com").validateMCP(); err != nil {
+			t.Fatalf("a reachable declared issuer was refused in a deployment: %v", err)
+		}
+	})
+
+	// Locally the issuer IS loopback — that is where a developer's host runs —
+	// so the refusal must not reach a local run.
+	t.Run("local", func(t *testing.T) {
+		clearSelfEnvironment(t)
+		t.Setenv("PORT", "8080")
+		declareMCPConfiguration(t, MCPIssuerURLKey, "http://localhost:3000")
+		declareMCPConfiguration(t, MCPPublicURLKey, "http://localhost:8080"+MCPPath)
+		cfg := loadConfig(context.Background(), "example", nil)
+		cfg.mcp = true
+		if err := cfg.validateMCP(); err != nil {
+			t.Fatalf("a local loopback issuer was refused: %v", err)
+		}
+	})
 }
