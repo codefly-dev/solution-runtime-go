@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -172,7 +173,7 @@ func unresolvedKeyFindings(t *testing.T, pkg *packages.Package) []string {
 	if len(identity.readerAliases) == 0 {
 		t.Fatal("no readers identified at all: this gate is inert")
 	}
-	return identity.unresolvedKeys
+	return append(append([]string{}, identity.unresolvedKeys...), identity.unresolved...)
 }
 
 // --- The fixture that escaped, as a compiled negative case ---
@@ -198,7 +199,12 @@ func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
 
 	source := `package solution
 
-import "os"
+import (
+	"os"
+	"reflect"
+
+	"golang.org/x/sys/unix"
+)
 
 // A constant conversion splicing the carrier's name.
 func FacadeCredentialViaConversion() string {
@@ -289,6 +295,38 @@ func AliasedThroughParentheses(parts []string) string {
 
 var osGetenv = os.Getenv
 
+// The ways of moving a function value this analysis does not model. None is
+// handled by teaching the model about maps, reflection or instantiation —
+// that would leave the NEXT way silent. Each is a reader value in a position
+// grow() does not propagate through, so each fails for the same reason, and so
+// will the one nobody has thought of.
+func EscapeViaMap() string {
+	readers := map[string]func(string) string{"get": os.Getenv}
+	return readers["get"](joinedKey(nil))
+}
+
+func EscapeViaReflect() string {
+	return reflect.ValueOf(os.Getenv).Call([]reflect.Value{reflect.ValueOf(joinedKey(nil))})[0].String()
+}
+
+func escapeApply[F ~func(string) string](reader F, key string) string { return reader(key) }
+
+func EscapeViaGeneric() string {
+	return escapeApply[func(string) string](os.Getenv, joinedKey(nil))
+}
+
+func EscapeViaSlice() string {
+	readers := []func(string) string{os.Getenv}
+	return readers[0](joinedKey(nil))
+}
+
+// And a dependency that wraps the syscall layer is a reader by SUMMARY: its
+// body is not here, so calling it is modelled as the read it is.
+func WrapperRead(parts []string) string {
+	value, _ := unix.Getenv(joinedKey(parts))
+	return value
+}
+
 func joinedKey(parts []string) string {
 	out := ""
 	for _, part := range parts {
@@ -317,10 +355,19 @@ func joinedKey(parts []string) string {
 			t.Errorf("the claim-shape gate did not catch %q.\nfindings:\n%s", want, shapes)
 		}
 	}
-	// Every spelling, not just one of each shape: the chain and the local
-	// constant both produce the claim path, so two findings name it.
-	if strings.Count(shapes, "/modules/_register") < 2 {
-		t.Errorf("the claim path was caught in only one spelling.\nfindings:\n%s", shapes)
+	// Every spelling, by DISTINCT finding. Counting occurrences of the string
+	// did not require two: one finding names the shape twice, once as the
+	// constant's value and once as the shape it matched, so a gate that found
+	// the conversion and lost the chain still counted two.
+	distinct := map[string]bool{}
+	for _, line := range strings.Split(shapes, "\n") {
+		if strings.Contains(line, "/modules/_register") {
+			distinct[strings.SplitN(line, ":", 4)[0]+":"+strings.SplitN(line, ":", 4)[1]] = true
+		}
+	}
+	if len(distinct) < 2 {
+		t.Errorf("the claim path was caught at %d distinct places, want the conversion, the chain and the local constant.\nfindings:\n%s",
+			len(distinct), shapes)
 	}
 
 	// Four aliased reader invocations: through a conversion, a struct field,
@@ -328,6 +375,21 @@ func joinedKey(parts []string) string {
 	// spelling that defeated recognising readers by callee name.
 	if got := strings.Count(keys, "does not resolve to constants"); got < 5 {
 		t.Errorf("the key gate caught %d of the five untraceable-key invocations.\nfindings:\n%s", got, keys)
+	}
+
+	// Per escape, by its own source line: an aggregate count lets one stand
+	// for another.
+	for _, want := range []string{
+		"EscapeViaMap", "EscapeViaReflect", "EscapeViaGeneric", "EscapeViaSlice",
+	} {
+		if !mentionsFunction(t, source, keys, want) {
+			t.Errorf("no finding inside %s, so that escape is still silent.\nfindings:\n%s", want, keys)
+		}
+	}
+	// The dependency wrapper is a read by summary, so its runtime key is
+	// refused like any other reader's.
+	if !mentionsFunction(t, source, keys, "WrapperRead") {
+		t.Errorf("a dependency wrapper of the syscall layer was not treated as a reader.\nfindings:\n%s", keys)
 	}
 }
 
@@ -370,7 +432,25 @@ type readerIdentity struct {
 	// one model, so an alias the key gate resolves is an alias that gate sees
 	// too.
 	invocations []readerSite
+	// decls caches the declaration of each of this package's functions. The
+	// propagation asks for them once per call expression per round, and
+	// re-walking every file each time was most of this gate's cost.
+	decls map[*types.Func]*ast.FuncDecl
+	// unresolved is every reader flow this analysis does not model, and the
+	// exhaustion of the fixpoint if it happens. These FAIL the gate.
+	//
+	// This is the whole shape of the rule. An analysis that skips what it
+	// cannot follow reports a boundary intact because it did not look: a map
+	// of functions, a reflect.Value.Call, a generic instantiation each carried
+	// a reader somewhere this model has no edge for, and each produced
+	// silence. Refusing instead means a new way of moving a function value
+	// fails the suite until somebody models it or decides it is fine.
+	unresolved []string
 }
+
+// maxReaderFlowRounds bounds the propagation. Reaching it is a finding rather
+// than a stopping condition.
+const maxReaderFlowRounds = 64
 
 // readerSite is one resolved reader invocation.
 type readerSite struct {
@@ -378,14 +458,60 @@ type readerSite struct {
 	name string
 }
 
+// readerIdentityCache holds one analysis per loaded package. Several gates ask
+// the same package the same question, and the propagation is the expensive
+// part of this suite — recomputing it per gate cost ninety seconds.
+var (
+	readerIdentityMu    sync.Mutex
+	readerIdentityCache = map[*packages.Package]*readerIdentity{}
+)
+
 func newReaderIdentity(pkg *packages.Package) *readerIdentity {
-	r := &readerIdentity{pkg: pkg, readerAliases: map[types.Object]bool{}}
+	readerIdentityMu.Lock()
+	defer readerIdentityMu.Unlock()
+	if cached, ok := readerIdentityCache[pkg]; ok {
+		return cached
+	}
+	identity := buildReaderIdentity(pkg)
+	readerIdentityCache[pkg] = identity
+	return identity
+}
+
+func buildReaderIdentity(pkg *packages.Package) *readerIdentity {
+	return buildReaderIdentityWithin(pkg, maxReaderFlowRounds)
+}
+
+// buildReaderIdentityWithin is the analysis with the round budget named, so the
+// refusal below can be asked directly. No fixture can exhaust sixty-four
+// rounds — that is what a budget is for — and a branch no test reaches is a
+// claim, not a guarantee.
+func buildReaderIdentityWithin(pkg *packages.Package, rounds int) *readerIdentity {
+	r := &readerIdentity{pkg: pkg, readerAliases: map[types.Object]bool{}, decls: map[*types.Func]*ast.FuncDecl{}}
+	for _, file := range r.files() {
+		for _, d := range file.Decls {
+			if decl, ok := d.(*ast.FuncDecl); ok && decl.Name != nil {
+				if fn, ok := pkg.TypesInfo.Defs[decl.Name].(*types.Func); ok {
+					r.decls[fn] = decl
+				}
+			}
+		}
+	}
 	r.seed()
-	for round := 0; round < 16; round++ {
+	// A fixed point, or a refusal. Stopping silently after a fixed number of
+	// rounds is a skip wearing a loop: whatever had not propagated yet simply
+	// was not there, and nothing said so.
+	settled := false
+	for round := 0; round < rounds; round++ {
 		if !r.grow() {
+			settled = true
 			break
 		}
 	}
+	if !settled {
+		r.unresolved = append(r.unresolved, "reader flow did not reach a fixed point within "+
+			strconv.Itoa(rounds)+" rounds, so what else may hold a reader is unknown")
+	}
+	r.checkEscapes()
 	r.checkInvocations()
 	return r
 }
@@ -507,6 +633,148 @@ func (r *readerIdentity) holds(expr ast.Expr) bool {
 	return false
 }
 
+// checkEscapes finds every reader VALUE in a position this analysis does not
+// model, and reports it.
+//
+// The modelled flows are the ones grow() propagates through: an assignment to
+// a name, a variable specification, a struct literal field, an argument to one
+// of this package's own functions, a conversion, and being called. A reader
+// anywhere else — a map literal, an argument to a dependency, a generic
+// instantiation, a return value, a channel — is a reader this model loses, and
+// losing it silently is how a map of functions and a reflect.Value.Call both
+// read the environment while both gates reported nothing.
+//
+// Refusing rather than enumerating is the point. Teaching the model about maps
+// and reflection and instantiation would leave the NEXT way of moving a
+// function value silent again; refusing means it fails the suite instead,
+// until somebody models it or decides it is fine.
+func (r *readerIdentity) checkEscapes() {
+	for _, file := range r.files() {
+		// The stack is kept by hand rather than with a defer in the visitor:
+		// a defer per AST node is a defer per node of the whole package, and
+		// that alone cost this suite a minute and a half under -race.
+		var stack []ast.Node
+		ast.Inspect(file, func(n ast.Node) bool {
+			if n == nil {
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+				return true
+			}
+			var parent ast.Node
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1]
+			}
+			stack = append(stack, n)
+
+			expr, ok := n.(ast.Expr)
+			if !ok {
+				return true
+			}
+			// A DECLARATION is not a flow: `func env(...)` names the reader,
+			// it does not move it. Only a use can carry one somewhere.
+			if ident, isIdent := expr.(*ast.Ident); isIdent && r.pkg.TypesInfo.Defs[ident] != nil {
+				return true
+			}
+			if !r.holds(expr) || r.modelledFlow(expr, parent, stack) {
+				return true
+			}
+			r.unresolved = append(r.unresolved,
+				r.pkg.Fset.Position(expr.Pos()).String()+": a reader value flows into "+
+					describeNode(parent)+", which this analysis does not model, so where it is "+
+					"called and with what key is unknown")
+			return true
+		})
+	}
+	sort.Strings(r.unresolved)
+}
+
+// modelledFlow reports whether a reader expression sits in a position grow()
+// propagates through.
+func (r *readerIdentity) modelledFlow(expr ast.Expr, parent ast.Node, stack []ast.Node) bool {
+	switch p := parent.(type) {
+	case nil:
+		return false
+	case *ast.ParenExpr:
+		return true // judged at the enclosing position
+	case *ast.SelectorExpr:
+		return true // `os.Getenv` is judged as the selector, not as its halves
+	case *ast.AssignStmt:
+		// Only when the destination is a name this model can mark.
+		for i, rhs := range p.Rhs {
+			if rhs == expr && i < len(p.Lhs) {
+				return r.object(p.Lhs[i]) != nil
+			}
+		}
+		return false
+	case *ast.ValueSpec:
+		for _, value := range p.Values {
+			if value == expr {
+				return true
+			}
+		}
+		return false
+	case *ast.KeyValueExpr:
+		// A struct field is modelled; a map entry is not — the key decides
+		// which element a call reads, and that is not resolved here.
+		if p.Value != expr {
+			return false
+		}
+		for i := len(stack) - 1; i >= 0; i-- {
+			if lit, ok := stack[i].(*ast.CompositeLit); ok {
+				_, isStruct := structTypeOf(r.pkg.TypesInfo.TypeOf(lit))
+				return isStruct
+			}
+		}
+		return false
+	case *ast.CallExpr:
+		if p.Fun == expr {
+			return true // being called IS the invocation
+		}
+		// A conversion carries the reader through.
+		if tv, ok := r.pkg.TypesInfo.Types[p.Fun]; ok && tv.IsType() {
+			return true
+		}
+		// An argument, only to one of this package's own functions, whose
+		// parameter grow() marks. Anything else — a dependency, a generic
+		// instantiation whose callee is an IndexExpr, a call through a value —
+		// takes the reader somewhere with no body here to follow.
+		fn, isFunc := r.object(p.Fun).(*types.Func)
+		return isFunc && fn.Pkg() == r.pkg.Types
+	}
+	return false
+}
+
+// describeNode names a syntax position for a finding.
+func describeNode(n ast.Node) string {
+	switch node := n.(type) {
+	case nil:
+		return "an unattached position"
+	case *ast.CallExpr:
+		if ident, ok := unparen(node.Fun).(*ast.Ident); ok {
+			return "a call to " + ident.Name
+		}
+		if selector, ok := unparen(node.Fun).(*ast.SelectorExpr); ok {
+			return "a call to " + selector.Sel.Name
+		}
+		if _, ok := unparen(node.Fun).(*ast.IndexExpr); ok {
+			return "a generic instantiation"
+		}
+		return "a call through a value"
+	case *ast.KeyValueExpr:
+		return "a keyed composite element"
+	case *ast.CompositeLit:
+		return "a composite literal"
+	case *ast.ReturnStmt:
+		return "a return"
+	case *ast.SendStmt:
+		return "a channel send"
+	case *ast.IndexExpr:
+		return "an index expression"
+	}
+	return "an unmodelled position"
+}
+
 // checkInvocations requires every resolved reader invocation's key to be
 // traceable to constants. A keyless reader reads the whole environment, so
 // there is no key: that read is the post-boot gate's finding, not this one's.
@@ -588,17 +856,7 @@ func (r *readerIdentity) field(lit *ast.CompositeLit, name string) types.Object 
 }
 
 // decl is the declaration of one of this package's functions.
-func (r *readerIdentity) decl(fn *types.Func) *ast.FuncDecl {
-	for _, file := range r.files() {
-		for _, d := range file.Decls {
-			if decl, ok := d.(*ast.FuncDecl); ok && decl.Name != nil &&
-				r.pkg.TypesInfo.Defs[decl.Name] == fn {
-				return decl
-			}
-		}
-	}
-	return nil
-}
+func (r *readerIdentity) decl(fn *types.Func) *ast.FuncDecl { return r.decls[fn] }
 
 // keyTracer follows an environment key back to the constants that reach it.
 type keyTracer struct {
@@ -847,4 +1105,91 @@ func structTypeOf(t types.Type) (*types.Struct, bool) {
 	}
 	structType, ok := t.Underlying().(*types.Struct)
 	return structType, ok
+}
+
+// mentionsFunction reports whether any finding falls on a line belonging to
+// the named function in the fixture source.
+func mentionsFunction(t *testing.T, source, findings, name string) bool {
+	t.Helper()
+	lines := strings.Split(source, "\n")
+	start, end := -1, len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(line, "func "+name) || strings.HasPrefix(line, "func "+name+"[") {
+			start = i + 1
+			continue
+		}
+		if start > 0 && line == "}" {
+			end = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("the fixture has no function %s", name)
+	}
+	for _, finding := range strings.Split(findings, "\n") {
+		parts := strings.Split(finding, ":")
+		if len(parts) < 2 {
+			continue
+		}
+		if at, err := strconv.Atoi(parts[1]); err == nil && at >= start && at <= end {
+			return true
+		}
+	}
+	return false
+}
+
+// The fixpoint's refusal, asked directly.
+//
+// "Reach a fixed point or refuse exhaustion" is half a rule until the refusing
+// half has a test, and no fixture can supply one against the real budget: the
+// budget exists precisely so that nothing in a real package reaches it. So the
+// budget is named, and the branch is asked at one round against a fixture whose
+// reader identities need several — the chain is declared in REVERSE, so a
+// single forward pass resolves one link and no more.
+//
+// The control is the same fixture at the full budget. Without it this test
+// would pass on a tree that reported exhaustion unconditionally, which is the
+// mirror of the defect it pins: the previous loop stopped after sixteen rounds
+// and said nothing, so a partial reader set and a complete one were
+// indistinguishable to every caller.
+func TestTheReaderFixpointRefusesExhaustionRatherThanStoppingQuietly(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(dir, "zz_reader_chain_fixture.go")
+
+	source := `package solution
+
+import "os"
+
+// Declared in reverse, so each round of the propagation resolves exactly one
+// link: four links need four rounds, and one round leaves three unknown.
+var chainReader3 = chainReader2
+var chainReader2 = chainReader1
+var chainReader1 = chainReader0
+var chainReader0 = os.Getenv
+
+func ChainedRead() string { return chainReader3("ANYTHING") }
+`
+
+	const refusal = "did not reach a fixed point"
+	checked := false
+	for _, pkg := range gatePackages(t, map[string][]byte{fixture: []byte(source)}) {
+		if pkg.PkgPath != "github.com/codefly-dev/solution-runtime-go" {
+			continue
+		}
+		checked = true
+		starved := strings.Join(buildReaderIdentityWithin(pkg, 1).unresolved, "\n")
+		if !strings.Contains(starved, refusal) {
+			t.Errorf("the propagation ran out of rounds and reported no finding, so a partial reader set reads as a complete one.\nfindings:\n%s", starved)
+		}
+		settled := strings.Join(buildReaderIdentityWithin(pkg, maxReaderFlowRounds).unresolved, "\n")
+		if strings.Contains(settled, refusal) {
+			t.Errorf("the propagation does not settle within %d rounds on this fixture, so the refusal above proves nothing.\nfindings:\n%s", maxReaderFlowRounds, settled)
+		}
+	}
+	if !checked {
+		t.Fatal("the fixture package was not loaded, so neither branch was asked")
+	}
 }

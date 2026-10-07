@@ -185,6 +185,39 @@ embedding it.
   here, resolve rather than match: `facade_claim_test.go` and
   `environment_boundary_test.go` carry the compiled fixtures for every spelling
   that beat an earlier version.
+- **Those two gates have no skip, for the same reason `typeWalk` has none.**
+  Resolving instead of matching closed the spellings and left the last form of
+  the defect in place: a reader value moved somewhere the propagation had no
+  edge for — a map of functions, a `reflect.Value.Call`, a generic
+  instantiation, a slice — produced *silence* from both gates, which reads
+  exactly like a clean package. So the default is inverted. The modelled flows
+  are the ones the propagation follows (a name, a variable specification, a
+  struct-literal field, a conversion, an argument to one of this package's own
+  functions, being called) and a reader in any other position is an
+  **unresolved finding**. Teaching it about maps and reflection was explicitly
+  not the fix: the author picks the carrier, so the next one would be silent
+  again. The four spellings are committed as fixtures because they are evidence
+  for the rule, not the rule.
+  A dependency's body is not here, so a wrapper of the syscall layer is modelled
+  by **summary** — `golang.org/x/sys/unix` beside `os` and `syscall`, which is
+  where every environment read in Go bottoms out. A wrapper in a fourth package
+  is the residual, and the escape rule is what keeps that residual from being
+  silent whenever a reader *value* is what travels into it.
+  The propagation reaches a fixed point **or refuses**: stopping after a fixed
+  number of rounds was a skip wearing a loop, since whatever had not propagated
+  yet simply was not there and nothing said so.
+  `TestTheReaderFixpointRefusesExhaustionRatherThanStoppingQuietly` asks that
+  branch directly against a reverse-declared alias chain at a one-round budget,
+  because no fixture can exhaust sixty-four rounds — the same reason
+  `TestTheWalkRefusesWhatItCannotFinish` exists.
+- **A gate's fixtures are asserted per site, never in aggregate.** Two of these
+  asserted totals and both were satisfiable with a shape missing: three reader
+  *names* across seven serving paths passed with the mounted handler and the
+  stored method value gone, because another path reported the same reader; and
+  counting occurrences of a claim path passed on a single finding, which names
+  the shape twice — once as the constant's value and once as the shape matched.
+  They assert the function each read sits in, and the distinct sites a shape was
+  caught at.
 - Resolving a value in `loadConfig` is half the rule; the other half is a
   refusal in `validate()` that fires **whether or not the feature using it is
   switched on**. The `api.consumes` projection was resolved at boot and decoded
