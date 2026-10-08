@@ -563,3 +563,10 @@ so calls still pass through the host gateway. An unscoped gateway refuses this
 method. Do not persist tokens, log them, send them to the browser, or retain the
 provider beyond the current handler request. This is an SDK handoff, not new
 authority or a direct-module endpoint resolver.
+
+This registration-generation compatibility branch uses `sdk-go v0.2.0` and the
+separate `sdk-go/workcontext` module, matching the public module client generation
+used in local qualification. Work Context tokens and attachment come from that
+owner package. Its selected historical version is retracted upstream; this branch
+is a local compatibility experiment and is not a release recommendation. Moving
+to the current delivered-presence runtime is a separate host migration.

@@ -3,6 +3,7 @@ package solution
 import (
 	"context"
 	"encoding/json"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/solution/manifest"
-	codefly "github.com/codefly-dev/sdk-go"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -141,7 +141,7 @@ func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
 	if err := json.Unmarshal([]byte(gw.bodys[0]), &sent); err != nil || sent["entryId"] != "e1" || sent["pageSize"] != float64(3) {
 		t.Fatalf("module received %q", gw.bodys[0])
 	}
-	if got := gw.calls[0].Header.Get(codefly.WorkContextHeaderName); got != "context-things.1" {
+	if got := gw.calls[0].Header.Get(workcontext.WorkContextHeaderName); got != "context-things.1" {
 		t.Fatalf("work context = %q, want the one minted for the module", got)
 	}
 	if gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
@@ -165,7 +165,7 @@ func TestPassthroughForwardsOnlyTheBearerToAModuleThatAuthenticatesTheViewer(t *
 	if len(gw.mints) != 0 {
 		t.Fatalf("minted %d capabilities for a module that reads the bearer", len(gw.mints))
 	}
-	if gw.calls[0].Header.Get(codefly.WorkContextHeaderName) != "" || gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
+	if gw.calls[0].Header.Get(workcontext.WorkContextHeaderName) != "" || gw.calls[0].Header.Get("authorization") != "Bearer viewer" {
 		t.Fatal("want the viewer's bearer and no capability")
 	}
 }

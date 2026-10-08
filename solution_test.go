@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"io"
 	"log"
 	"net"
@@ -1828,7 +1829,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 		var mint mintRequest
 		_ = json.NewDecoder(r.Body).Decode(&mint)
 		mint.Bearer = r.Header.Get("authorization")
-		mint.WorkContext = r.Header.Get(codefly.WorkContextHeaderName)
+		mint.WorkContext = r.Header.Get(workcontext.WorkContextHeaderName)
 		send(g.mints, mint)
 		if g.mintStatus != 0 {
 			writeJSON(w, g.mintStatus, map[string]string{
@@ -1853,7 +1854,7 @@ func (g *workContextGateway) serve(w http.ResponseWriter, r *http.Request) {
 	case modulePath:
 		call := moduleCall{
 			Bearer:      r.Header.Get("authorization"),
-			WorkContext: r.Header.Get(codefly.WorkContextHeaderName),
+			WorkContext: r.Header.Get(workcontext.WorkContextHeaderName),
 		}
 		send(g.calls, call)
 		if call.WorkContext == "" {
@@ -2141,9 +2142,9 @@ func TestForModuleRefusesAnExpiryThisHostCannotUse(t *testing.T) {
 func TestWorkContextCacheReMintsALapsedCapability(t *testing.T) {
 	cache := newWorkContextCache()
 	mints := 0
-	lapsed := func(context.Context) (codefly.WorkContextToken, time.Time, error) {
+	lapsed := func(context.Context) (workcontext.WorkContextToken, time.Time, error) {
 		mints++
-		token, err := codefly.ParseWorkContextToken(fmt.Sprintf("payload.%d", mints))
+		token, err := workcontext.ParseWorkContextToken(fmt.Sprintf("payload.%d", mints))
 		if err != nil {
 			t.Fatalf("parse token: %v", err)
 		}
@@ -2403,7 +2404,7 @@ func TestBrowserSuppliedWorkContextIsNeverForwarded(t *testing.T) {
 	req.Header.Set("authorization", "Bearer viewer-token")
 	req.Header.Set(orgHeader, viewerOrg)
 	req.Header.Set(sessionHeader, viewerSession)
-	req.Header.Set(codefly.WorkContextHeaderName, "forged.capability")
+	req.Header.Set(workcontext.WorkContextHeaderName, "forged.capability")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call solution: %v", err)

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"io"
 	"io/fs"
 	"log"
@@ -2182,8 +2183,8 @@ type delegation struct {
 
 // workContext resolves the capability this gateway acts under, minting one if
 // the cache holds none that will outlive the call.
-func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, error) {
-	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (codefly.WorkContextToken, time.Time, error) {
+func (g *Gateway) workContext(ctx context.Context) (workcontext.WorkContextToken, error) {
+	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (workcontext.WorkContextToken, time.Time, error) {
 		ask := g.delegation.ask
 		if g.authorizeMint == nil {
 			ask.TaskID = uuid.NewString()
@@ -2196,9 +2197,9 @@ func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, er
 // It is a provider for public module SDKs and shares the request's mint cache;
 // it does not add scopes or change the audience. Keep it within this handler's
 // request lifetime, and never return or log the token.
-func (g *Gateway) WorkContext(ctx context.Context) (codefly.WorkContextToken, error) {
+func (g *Gateway) WorkContext(ctx context.Context) (workcontext.WorkContextToken, error) {
 	if g == nil || g.delegation == nil {
-		return codefly.WorkContextToken{}, errors.New("this gateway acts under no work context; derive one with ForModule")
+		return workcontext.WorkContextToken{}, errors.New("this gateway acts under no work context; derive one with ForModule")
 	}
 	return g.workContext(ctx)
 }
@@ -2234,26 +2235,26 @@ type startTaskRequest struct {
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
 }
 
-func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkContextToken, time.Time, error) {
+func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (workcontext.WorkContextToken, time.Time, error) {
 	body, err := json.Marshal(ask)
 	if err != nil {
-		return codefly.WorkContextToken{}, time.Time{}, err
+		return workcontext.WorkContextToken{}, time.Time{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, workContextMintTimeout)
 	defer cancel()
 	post, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+workContextStartTaskProcedure, bytes.NewReader(body))
 	if err != nil {
-		return codefly.WorkContextToken{}, time.Time{}, err
+		return workcontext.WorkContextToken{}, time.Time{}, err
 	}
 	post.Header.Set("content-type", "application/json")
 	if g.authorizeMint != nil {
 		if err := g.authorizeMint(ctx, post); err != nil {
-			return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("cannot authenticate solution runtime boundary: %w", err)
+			return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("cannot authenticate solution runtime boundary: %w", err)
 		}
 	}
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
+		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
 	}
 	defer drainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
@@ -2266,7 +2267,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 			Message string `json:"message"`
 		}
 		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
-		return codefly.WorkContextToken{}, time.Time{}, &WorkContextRefusal{
+		return workcontext.WorkContextToken{}, time.Time{}, &WorkContextRefusal{
 			Audience: ask.Audience, StatusCode: resp.StatusCode, Code: refusal.Code, Message: refusal.Message,
 		}
 	}
@@ -2276,11 +2277,11 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 		WorkContextPrincipals
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
+		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
 	}
-	token, err := codefly.ParseWorkContextToken(issued.Token)
+	token, err := workcontext.ParseWorkContextToken(issued.Token)
 	if err != nil {
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned an unusable token: %w", ask.Audience, err)
+		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q returned an unusable token: %w", ask.Audience, err)
 	}
 	// An expiry this process cannot use is a boundary error, not a capability to
 	// cache. Treated as "already lapsed" it would look like success while
@@ -2291,11 +2292,11 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 	lifetime := issued.ExpiresAt.Sub(now)
 	switch {
 	case issued.ExpiresAt.IsZero():
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf(
+		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf(
 			"work context mint for %q returned no expiry: the issuer omitted expiresAt, or spelled it differently (protobuf JSON spells it expires_at, which does not decode into this field)",
 			ask.Audience)
 	case lifetime < workContextMinimumLifetime:
-		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf(
+		return workcontext.WorkContextToken{}, time.Time{}, fmt.Errorf(
 			"work context mint for %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
 			ask.Audience, issued.ExpiresAt.UTC().Format(time.RFC3339), workContextMinimumLifetime)
 	}
@@ -2363,13 +2364,13 @@ type workContextCache struct {
 	issuedFor map[string]WorkContextPrincipals
 }
 
-func (c *workContextCache) remember(token codefly.WorkContextToken, principals WorkContextPrincipals) {
+func (c *workContextCache) remember(token workcontext.WorkContextToken, principals WorkContextPrincipals) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.issuedFor[token.Encoded()] = principals
 }
 
-func (c *workContextCache) principals(token codefly.WorkContextToken) (WorkContextPrincipals, bool) {
+func (c *workContextCache) principals(token workcontext.WorkContextToken) (WorkContextPrincipals, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	principals, ok := c.issuedFor[token.Encoded()]
@@ -2385,7 +2386,7 @@ func newWorkContextCache() *workContextCache {
 }
 
 type issuedWorkContext struct {
-	token codefly.WorkContextToken
+	token workcontext.WorkContextToken
 	// reuseUntil is when this capability stops being worth presenting — its
 	// expiry less the renewal lead mint already applied.
 	reuseUntil time.Time
@@ -2395,7 +2396,7 @@ type issuedWorkContext struct {
 // is closed and read only after, so the close/receive pair orders them.
 type pendingMint struct {
 	done  chan struct{}
-	token codefly.WorkContextToken
+	token workcontext.WorkContextToken
 	err   error
 }
 
@@ -2405,8 +2406,8 @@ type pendingMint struct {
 func (c *workContextCache) resolve(
 	ctx context.Context,
 	key string,
-	mint func(context.Context) (codefly.WorkContextToken, time.Time, error),
-) (codefly.WorkContextToken, error) {
+	mint func(context.Context) (workcontext.WorkContextToken, time.Time, error),
+) (workcontext.WorkContextToken, error) {
 	c.mu.Lock()
 	if issued, ok := c.minted[key]; ok && time.Now().Before(issued.reuseUntil) {
 		c.mu.Unlock()
@@ -2420,7 +2421,7 @@ func (c *workContextCache) resolve(
 			// failure here would turn one refusal into one mint per waiter.
 			return inflight.token, inflight.err
 		case <-ctx.Done():
-			return codefly.WorkContextToken{}, ctx.Err()
+			return workcontext.WorkContextToken{}, ctx.Err()
 		}
 	}
 	inflight := &pendingMint{done: make(chan struct{})}
@@ -2470,7 +2471,7 @@ func (t bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := codefly.AttachWorkContext(r, token); err != nil {
+		if err := workcontext.AttachWorkContext(r, token); err != nil {
 			return nil, err
 		}
 	}
