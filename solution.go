@@ -53,6 +53,10 @@ type Manifest struct {
 	// validation are owned by the host, so this stays an opaque declaration to
 	// keep the runtime host-agnostic.
 	Dashboard any
+	// UseHostRuntimeBoundary requests the host-derived solution boundary on
+	// viewer Work Contexts. Requires a host supporting solution-authenticated
+	// StartTask; refusal never falls back to a caller-selected task ID.
+	UseHostRuntimeBoundary bool
 	// Surfaces are what this solution offers inside a client application — a
 	// Word add-in, a Slack app — rather than as a page the host renders. The
 	// host's registry projects them so a client can discover, without a table
@@ -1085,7 +1089,16 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		result, err := handler(r, newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader), r.Header.Get(sessionHeader)))
+		gateway := newGateway(s.cfg.gatewayURL, bearer, r.Header.Get(orgHeader), r.Header.Get(sessionHeader))
+		if s.manifest.UseHostRuntimeBoundary {
+			gateway.authorizeMint = func(ctx context.Context, request *http.Request) error {
+				// Each mint gets its own single-use credential and bookkeeping;
+				// parallel module calls never share a mutable credential.
+				_, err := s.newSolutionCredential().authorize(ctx, request)
+				return err
+			}
+		}
+		result, err := handler(r, gateway)
 		if err != nil {
 			status, message := handlerErrorResponse(err)
 			writeJSON(w, status, map[string]string{"error": message})
@@ -1914,8 +1927,11 @@ func (c *solutionCredential) exchange(ctx context.Context) (string, time.Time, e
 // A module that authenticates by signed Work Context refuses a bearer alone;
 // ForModule derives a gateway that carries both.
 type Gateway struct {
-	baseURL string
-	bearer  string
+	// authorizeMint authenticates this solution only at the host mint endpoint.
+	// It is never copied into an outgoing module request's headers.
+	authorizeMint func(context.Context, *http.Request) error
+	baseURL       string
+	bearer        string
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
@@ -2169,7 +2185,9 @@ type delegation struct {
 func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, error) {
 	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (codefly.WorkContextToken, time.Time, error) {
 		ask := g.delegation.ask
-		ask.TaskID = uuid.NewString()
+		if g.authorizeMint == nil {
+			ask.TaskID = uuid.NewString()
+		}
 		return g.mint(ctx, ask)
 	})
 }
@@ -2217,6 +2235,11 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (codefly.WorkC
 		return codefly.WorkContextToken{}, time.Time{}, err
 	}
 	post.Header.Set("content-type", "application/json")
+	if g.authorizeMint != nil {
+		if err := g.authorizeMint(ctx, post); err != nil {
+			return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("cannot authenticate solution runtime boundary: %w", err)
+		}
+	}
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
 		return codefly.WorkContextToken{}, time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)

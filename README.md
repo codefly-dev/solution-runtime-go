@@ -289,6 +289,19 @@ and nothing more. The returned gateway then carries **both** credentials — the
 bearer and the capability — on every request, so a module verifying either one
 is satisfied.
 
+For a host supporting solution-authenticated runtime boundaries, set
+`Manifest.UseHostRuntimeBoundary: true`. Each viewer mint then presents a fresh
+solution registration credential and leaves `taskId` empty: the host derives the
+stable boundary for this solution and tenant. The viewer's session, bearer and
+requested scopes remain unchanged. An exchange or mint refusal fails closed;
+there is no fallback to an ordinary task. Registration credentials are presented
+only to the host mint, never forwarded with module data calls.
+
+This opt-in is a compatibility experiment for the registration-based host
+protocol. It does not implement the newer delivered-presence/mTLS protocol and
+must not be treated as a bridge between those generations. Host boundary
+verification and downstream admission remain the owners' responsibilities.
+
 The returned gateway holds the *ask*, not the capability: it resolves one per
 request. A handler may therefore keep it for as long as it keeps the viewer's
 request. A capability captured once at derivation would lapse while the handler
