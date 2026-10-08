@@ -67,6 +67,12 @@ func TestHostRuntimeBoundaryAuthenticatesMintOnlyAndRefusesDowngrade(t *testing.
 				if err != nil {
 					return nil, err
 				}
+				for i := 0; i < 2; i++ {
+					token, err := scoped.WorkContext(ctx)
+					if err != nil || token.Encoded() != "signed.context" {
+						t.Fatal("public provider did not return cached issued context")
+					}
+				}
 				req, _ := http.NewRequestWithContext(ctx, "GET", upstream.URL+"/data", nil)
 				response, err := scoped.HTTPClient().Do(req)
 				if err != nil {
@@ -90,5 +96,13 @@ func TestHostRuntimeBoundaryAuthenticatesMintOnlyAndRefusesDowngrade(t *testing.
 				t.Fatalf("status=%d mints=%d reads=%d", response.StatusCode, mints.Load(), reads.Load())
 			}
 		})
+	}
+}
+
+func TestWorkContextProviderRefusesUnscopedGateway(t *testing.T) {
+	for _, gateway := range []*Gateway{nil, {}} {
+		if token, err := gateway.WorkContext(context.Background()); err == nil || token.Encoded() != "" {
+			t.Fatal("unscoped gateway returned a capability")
+		}
 	}
 }

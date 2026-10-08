@@ -552,3 +552,14 @@ descriptor, with protobuf JSON names.
 > out-of-repo host depends on codefly-core accepting the composed module path in
 > its workspace loader (codefly-dev/core#365, merged); the `core`/`sdk-go` pins
 > in `go.mod` carry that fix, so no `replace` is needed.
+
+### Passing authority to a public module SDK
+
+After `ForModule` succeeds, `scoped.WorkContext` is a token-provider function
+for a public SDK that requires explicit Work Context. It uses the same
+request-scoped cache as `scoped.HTTPClient()` and preserves the chosen audience
+and scopes. Use the gateway's resolved `BaseURL()` and authenticated HTTP client
+so calls still pass through the host gateway. An unscoped gateway refuses this
+method. Do not persist tokens, log them, send them to the browser, or retain the
+provider beyond the current handler request. This is an SDK handoff, not new
+authority or a direct-module endpoint resolver.

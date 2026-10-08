@@ -2192,6 +2192,17 @@ func (g *Gateway) workContext(ctx context.Context) (codefly.WorkContextToken, er
 	})
 }
 
+// WorkContext resolves the current token for a gateway derived by ForModule.
+// It is a provider for public module SDKs and shares the request's mint cache;
+// it does not add scopes or change the audience. Keep it within this handler's
+// request lifetime, and never return or log the token.
+func (g *Gateway) WorkContext(ctx context.Context) (codefly.WorkContextToken, error) {
+	if g == nil || g.delegation == nil {
+		return codefly.WorkContextToken{}, errors.New("this gateway acts under no work context; derive one with ForModule")
+	}
+	return g.workContext(ctx)
+}
+
 // WorkContextRefusal is the issuer's refusal to mint a Work Context: most
 // often an authority the viewer does not hold ("owner is not allowed
 // kind:action at requested scope"). It keeps the issuer's Connect code and
