@@ -11,8 +11,8 @@ import (
 )
 
 func TestHostRuntimeBoundaryAuthenticatesMintOnlyAndRefusesDowngrade(t *testing.T) {
-	for _, refuse := range []bool{false, true} {
-		t.Run(map[bool]string{false: "bound mint", true: "exchange refused"}[refuse], func(t *testing.T) {
+	for _, scenario := range []string{"bound mint", "exchange refused", "mint refused"} {
+		t.Run(scenario, func(t *testing.T) {
 			var mints, reads atomic.Int32
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -23,7 +23,7 @@ func TestHostRuntimeBoundaryAuthenticatesMintOnlyAndRefusesDowngrade(t *testing.
 					if r.Header.Get("authorization") != "" {
 						t.Error("viewer bearer leaked to registration exchange")
 					}
-					if refuse {
+					if scenario == "exchange refused" {
 						w.WriteHeader(http.StatusForbidden)
 						return
 					}
@@ -42,6 +42,10 @@ func TestHostRuntimeBoundaryAuthenticatesMintOnlyAndRefusesDowngrade(t *testing.
 					}
 					if r.Header.Get(solutionSecretHeader) != "" {
 						t.Error("raw registration secret leaked to mint")
+					}
+					if scenario == "mint refused" {
+						w.WriteHeader(http.StatusForbidden)
+						return
 					}
 					writeJSON(w, 200, map[string]any{"token": "signed.context", "expiresAt": time.Now().Add(time.Minute), "orgId": viewerOrg, "ownerPrincipalId": "viewer", "actorPrincipalId": "viewer"})
 				case "/data":
@@ -74,8 +78,12 @@ func TestHostRuntimeBoundaryAuthenticatesMintOnlyAndRefusesDowngrade(t *testing.
 			defer page.Close()
 			response := viewerRequest(t, page.URL)
 			defer drainAndClose(response)
-			if refuse {
-				if response.StatusCode == 200 || mints.Load() != 0 || reads.Load() != 0 {
+			if scenario != "bound mint" {
+				wantMints := int32(0)
+				if scenario == "mint refused" {
+					wantMints = 1
+				}
+				if response.StatusCode == 200 || mints.Load() != wantMints || reads.Load() != 0 {
 					t.Fatal("credential refusal downgraded to ordinary access")
 				}
 			} else if response.StatusCode != 200 || mints.Load() != 1 || reads.Load() != 1 {
