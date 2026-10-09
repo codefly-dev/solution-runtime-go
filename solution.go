@@ -3463,6 +3463,12 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 				lifetime.Round(time.Second), workContextRenewal, lead.Round(time.Second))
 		})
 	}
+	// An explicit lifetime is also the reuse floor: an older cached token
+	// must not shorten the authority the next call requested. A newly issued
+	// token remains the issuer's answer even when transit consumed some life.
+	if requested := time.Duration(ask.TTLSeconds) * time.Second; requested > lead {
+		lead = requested
+	}
 	g.contexts.remember(token, issued.WorkContextPrincipals)
 	return token, issued.ExpiresAt.Add(-lead), nil
 }

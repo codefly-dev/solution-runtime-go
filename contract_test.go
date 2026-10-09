@@ -359,7 +359,16 @@ func TestThisRuntimesContractDoesNotClaimTheRenderersSchema(t *testing.T) {
 // This boots a real runtime with a declared ceiling and drives all three cases
 // through its handler, counting what the host was asked — a refusal that still
 // minted would be no refusal.
+func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
+	testBootedRuntimeModuleCeiling(t, false)
+}
+
 func TestABootedRuntimeHoldsForModuleLifetimeToThePublishedCeiling(t *testing.T) {
+	testBootedRuntimeModuleCeiling(t, true)
+}
+
+func testBootedRuntimeModuleCeiling(t *testing.T, explicitLifetime bool) {
+	t.Helper()
 	type ask struct {
 		audience string
 		scope    Scope
@@ -393,7 +402,11 @@ func TestABootedRuntimeHoldsForModuleLifetimeToThePublishedCeiling(t *testing.T)
 					localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 				}}).
 				Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
-					_, mintErr = gw.ForModuleWithLifetime(ctx, tc.ask.audience, 601*time.Second, tc.ask.scope)
+					if explicitLifetime {
+						_, mintErr = gw.ForModuleWithLifetime(ctx, tc.ask.audience, 601*time.Second, tc.ask.scope)
+					} else {
+						_, mintErr = gw.ForModule(ctx, tc.ask.audience, tc.ask.scope)
+					}
 					return map[string]string{"ok": "yes"}, nil
 				}), mint)
 

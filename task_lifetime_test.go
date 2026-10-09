@@ -106,3 +106,38 @@ func TestForModuleLifetimeInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestForModuleLifetimeDoesNotReuseAuthorityBelowRequestedLife(t *testing.T) {
+	mints := 0
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var ask startTaskRequest
+		if err := json.NewDecoder(r.Body).Decode(&ask); err != nil {
+			t.Error(err)
+			return
+		}
+		if ask.TTLSeconds != 601 {
+			t.Errorf("requested lifetime %d, want 601", ask.TTLSeconds)
+		}
+		mints++
+		writeJSON(w, 200, map[string]any{"token": capability("bounded-life"), "expiresAt": time.Now().Add(601 * time.Second), "orgId": ask.OrgID, "ownerPrincipalId": "viewer", "currentActorPrincipalId": "viewer"})
+	}))
+	defer issuer.Close()
+	srv := serveHandler(t, issuer.URL, func(ctx context.Context, g *Gateway) (any, error) {
+		scope := Scope{ResourceKind: "runtime.tasks", Actions: []string{"create"}}
+		if _, err := g.ForModuleWithLifetime(ctx, "runtime", 601*time.Second, scope); err != nil {
+			return nil, err
+		}
+		// The issuer's 601-second answer is now shorter than a 600-second
+		// operation. This elapsed ruler exercises the real request cache.
+		time.Sleep(2 * time.Second)
+		if _, err := g.ForModuleWithLifetime(ctx, "runtime", 601*time.Second, scope); err != nil {
+			return nil, err
+		}
+		return "ok", nil
+	})
+	resp := viewerRequest(t, srv.URL)
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK || mints != 2 {
+		t.Fatalf("elapsed explicit lifetime: status=%d issuer mints=%d, want 200 and 2", resp.StatusCode, mints)
+	}
+}
