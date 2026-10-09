@@ -6,8 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/codefly-dev/core/solution/manifest"
+	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
 func TestForModuleLifetimeWireAndCache(t *testing.T) {
@@ -100,10 +104,47 @@ func TestForModuleLifetimeIssuerRefusal(t *testing.T) {
 }
 
 func TestForModuleLifetimeInvalid(t *testing.T) {
-	for _, d := range []time.Duration{-time.Second, time.Millisecond, time.Duration(1<<31) * time.Second} {
-		if _, err := (&Gateway{}).ForModuleWithLifetime(context.Background(), "runtime", d); err == nil {
-			t.Fatalf("accepted invalid lifetime %s", d)
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
+	mint := newHostMint(t, &hostMint{})
+	var invalidErrors []error
+	var invalidMintCount int
+	var validError error
+	solution := boot(t, New(Manifest{ID: testSolutionID}).
+		Consumes(passthroughModule()).
+		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+		}}).
+		Handle("/lifetime", func(ctx context.Context, gw *Gateway) (any, error) {
+			scope := Scope{ResourceKind: "things", Actions: []string{"read"}}
+			for _, duration := range []time.Duration{-time.Second, time.Millisecond, time.Duration(1<<31) * time.Second} {
+				_, err := gw.ForModuleWithLifetime(ctx, "things", duration, scope)
+				invalidErrors = append(invalidErrors, err)
+			}
+			invalidMintCount = len(mint.observedStartTasks())
+			// The same installed viewer gateway must actually mint a valid ask.
+			_, validError = gw.ForModuleWithLifetime(ctx, "things", 601*time.Second, scope)
+			return "ok", nil
+		}), mint)
+	request, err := http.NewRequest(http.MethodGet, solution.base+"/lifetime", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("authorization", viewerBearer())
+	request.Header.Set(orgHeader, "org-1")
+	request.Header.Set(sessionHeader, "session-1")
+	request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+	resp, err := solution.client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainAndClose(resp)
+	for index, err := range invalidErrors {
+		if err == nil || !strings.Contains(err.Error(), "nonnegative whole seconds fitting int32") {
+			t.Errorf("invalid duration %d did not reach lifetime guard: %v", index, err)
 		}
+	}
+	if len(invalidErrors) != 3 || invalidMintCount != 0 || validError != nil || len(mint.observedStartTasks()) != 1 {
+		t.Fatalf("same viewer fixture: invalid outcomes=%d invalid issuer calls=%d valid error=%v total issuer calls=%d, want3 guarded errors,0 invalid mints and only1 valid mint", len(invalidErrors), invalidMintCount, validError, len(mint.observedStartTasks()))
 	}
 }
 
