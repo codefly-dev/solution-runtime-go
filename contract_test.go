@@ -344,7 +344,7 @@ func TestThisRuntimesContractDoesNotClaimTheRenderersSchema(t *testing.T) {
 	}
 }
 
-// TestABootedRuntimeHoldsForModuleToThePublishedCeiling is the authority bypass
+// TestABootedRuntimeHoldsForModuleLifetimeToThePublishedCeiling is the authority bypass
 // a second reviewer found, and it defeats the point of publishing a ceiling at
 // all.
 //
@@ -359,7 +359,7 @@ func TestThisRuntimesContractDoesNotClaimTheRenderersSchema(t *testing.T) {
 // This boots a real runtime with a declared ceiling and drives all three cases
 // through its handler, counting what the host was asked — a refusal that still
 // minted would be no refusal.
-func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
+func TestABootedRuntimeHoldsForModuleLifetimeToThePublishedCeiling(t *testing.T) {
 	type ask struct {
 		audience string
 		scope    Scope
@@ -393,7 +393,7 @@ func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
 					localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 				}}).
 				Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
-					_, mintErr = gw.ForModule(ctx, tc.ask.audience, tc.ask.scope)
+					_, mintErr = gw.ForModuleWithLifetime(ctx, tc.ask.audience, 601*time.Second, tc.ask.scope)
 					return map[string]string{"ok": "yes"}, nil
 				}), mint)
 

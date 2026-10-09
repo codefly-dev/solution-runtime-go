@@ -784,6 +784,12 @@ if err != nil {
 resp, err := solution.Unary[Req, Resp](ctx, docs, "/docs.v1.Documents/List", &Req{})
 ```
 
+`ForModuleWithLifetime(ctx, audience, lifetime, scopes...)` requests an explicit
+issuer-controlled lifetime in whole seconds. Zero preserves the issuer default;
+the issuer enforces its maximum. Lifetime participates in the per-request mint
+cache identity alongside audience and scopes. It follows the same published
+authority ceiling and installation checks as `ForModule`.
+
 `ForModule` mints a Task Work Context through accounts' `StartTask`, presenting
 the viewer's bearer so accounts resolves the same subject the module would have
 seen, and this execution's own credential beside it so the issuer knows which

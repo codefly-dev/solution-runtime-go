@@ -3104,6 +3104,20 @@ func scopesOfAsk(wire []workContextScope) []Scope {
 // request. Minting here as well means an ask accounts refuses fails at this
 // call rather than inside some later round trip.
 func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scope) (*Gateway, error) {
+	return g.forModule(ctx, audience, 0, scopes...)
+}
+
+// ForModuleWithLifetime requests an explicit issuer-controlled lifetime for the
+// scoped capability. Zero retains the issuer default; nonzero lifetimes must
+// be positive whole seconds. The issuer still enforces its maximum lifetime.
+func (g *Gateway) ForModuleWithLifetime(ctx context.Context, audience string, lifetime time.Duration, scopes ...Scope) (*Gateway, error) {
+	if lifetime < 0 || lifetime%time.Second != 0 || lifetime/time.Second > 1<<31-1 {
+		return nil, fmt.Errorf("work context lifetime must be nonnegative whole seconds fitting int32")
+	}
+	return g.forModule(ctx, audience, int32(lifetime/time.Second), scopes...)
+}
+
+func (g *Gateway) forModule(ctx context.Context, audience string, ttlSeconds int32, scopes ...Scope) (*Gateway, error) {
 	// The contract first, before anything about the caller: asking for
 	// authority this solution never published is this solution's defect, true
 	// of every caller, and it should not be reported only to the ones who
@@ -3160,6 +3174,7 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 		SessionID:       g.sessionID,
 		Audience:        audience,
 		AuthorityScopes: workContextScopes(scopes),
+		TTLSeconds:      ttlSeconds,
 	}
 	// The ask is the cache identity. The task id names one mint rather than
 	// what was asked for, so it is filled in per mint, below.
@@ -3353,6 +3368,7 @@ type startTaskRequest struct {
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
+	TTLSeconds      int32              `json:"ttlSeconds,omitempty"`
 }
 
 func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.Time, error) {
