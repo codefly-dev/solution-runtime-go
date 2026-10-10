@@ -930,7 +930,9 @@ func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
 }
 
 // boundPort binds a listener and returns it with its port, so a test hands the
-// *listener* to the boot rather than a port number.
+// *listener* to the boot rather than a port number. The test clients dial
+// IPv4 loopback; binding that same address prevents a wildcard socket from
+// sharing its port with a different namespace's IPv4 listener.
 //
 // This replaces a helper that bound :0, read the port, closed the socket and
 // returned the number — a time-of-check/time-of-use race against everything
@@ -940,7 +942,7 @@ func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
 // the port is released by construction. Nothing is released here.
 func boundPort(t *testing.T) (net.Listener, string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", ":0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
