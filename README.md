@@ -100,6 +100,42 @@ same path. Untyped errors retain the existing 502/public-error-string behavior,
 so handlers must not put private details in them. Consumers using an older runtime
 or flattening failures into strings must adopt these typed errors to benefit.
 
+## Install step
+
+`Server.OnInstall(func(context.Context, Installation) error)` declares an
+optional install step and returns the server for chaining. `Installation`
+contains `ID`, `OrganizationID`, `Revision` and the granted `Scope` (`[]Scope`).
+`POST /_codefly/installations` accepts a JSON object with `installation_id`,
+`organization_id`, a positive `revision`, and `scope` (entries use
+`resourceKind`, `actions`, and `resourceIds`); unknown fields and bodies over
+64 KiB return 400.
+
+The route is mounted only on the workload-identity listener, whose mutual TLS
+and gateway-only `ALLOWED_CALLERS_FILE` admit the caller; the runtime requires
+exactly one structurally valid Work Context via the SDK's `FromHeaders`
+(including its installation carriers), carries it to the step through
+`ViewerFromContext(ctx)`, and leaves verification to the host on every outgoing
+call.
+Missing or malformed carriers return 401 before the step runs. Use the returned
+gateway's `HTTPClient` or `Unary` directly to carry that context on outgoing
+calls; `ForModule` is for viewer-driven mints. The bearer is never logged or
+echoed. Success, including when no step is registered, returns 204.
+
+Return `RefuseInstall("public reason")` for an intentional refusal: it wraps
+`ErrInstallRefused` and retains at most 256 printable ASCII bytes. Wrapping
+diagnostics are never included in the public reason. Refusals return 409 with
+`{"reason":"..."}`; other errors return 503 with only `installation step failed`.
+A bare or wrapped `ErrInstallRefused` without a
+`RefuseInstall` reason receives `installation refused`.
+
+Concurrent duplicates wait for the first call. An acknowledgement (204) is
+answered from memory for the most recent 1024 installation revisions; a 409 or
+a 503 is not remembered, so the host's retry — or an administrator's Retry
+after fixing the cause — runs the step again, and at most
+64 steps run at once (past that the call is 503 and the host retries). The step
+must therefore converge: it may run again for an installation it already set
+up, after a retry, an eviction or a restart.
+
 ## Configuration
 
 On boot `Serve` calls
