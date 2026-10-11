@@ -268,6 +268,11 @@ func (e *ClientError) Error() string { return e.Message }
 type Server struct {
 	manifest Manifest
 	handlers map[string]RequestHandler
+	// installStep is declared before Serve, like the handlers. Outcomes and
+	// in-flight calls are shared by installation ID and revision.
+	installStep   func(context.Context, Installation) error
+	installMu     sync.Mutex
+	installations map[installationKey]*installationResult
 	// consumed is the passthrough declaration (Consumes); passthrough is its
 	// resolved routes, checked by Serve before it listens.
 	consumed    []ConsumedModule
@@ -1575,6 +1580,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	// presence document names; this process does not report its liveness
 	// anywhere, and has no way to make itself present by answering.
 	mux.HandleFunc(HealthPath, s.handleHealth)
+	mux.HandleFunc("POST "+installationPath, s.handleInstallation)
 	for path, handler := range s.handlers {
 		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
 	}
@@ -2340,6 +2346,10 @@ func drainAndClose(resp *http.Response) {
 type Gateway struct {
 	baseURL string
 	bearer  string
+	// carriedContext is the install call's opaque bearer, carried unchanged
+	// to the host for verification. Viewer gateways never inherit an inbound
+	// capability: their Work Context is minted through ForModule instead.
+	carriedContext string
 	// orgID is the viewer's organization, which the bearer alone does not
 	// carry. A Work Context is minted inside exactly one org.
 	orgID string
@@ -2445,10 +2455,11 @@ func (g *Gateway) OrgID() string { return g.orgID }
 
 // HTTPClient returns an http.Client that injects the caller's bearer — and, on
 // a gateway derived by ForModule, the viewer's Work Context — on every request.
+// During an install step it carries the supplied installation Work Context.
 // Satisfies connect.HTTPClient. Advanced escape hatch — prefer Unary.
 func (g *Gateway) HTTPClient() *http.Client {
 	transport := bearerTransport{bearer: g.bearer, base: g.roundTripper()}
-	if g.delegation != nil {
+	if g.delegation != nil || g.carriedContext != "" {
 		transport.acting = g
 	}
 	// No timeout: this client carries streams, whose bound is the method's
@@ -3283,6 +3294,9 @@ type delegation struct {
 // workContext resolves the capability this gateway acts under, minting one if
 // the cache holds none that will outlive the call.
 func (g *Gateway) workContext(ctx context.Context) (string, error) {
+	if g.carriedContext != "" {
+		return g.carriedContext, nil
+	}
 	return g.contexts.resolve(ctx, g.delegation.key, func(ctx context.Context) (string, time.Time, error) {
 		ask := g.delegation.ask
 		// The ceiling, against the ask that is about to be MINTED.

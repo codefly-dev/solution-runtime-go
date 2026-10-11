@@ -253,6 +253,8 @@ type mcpViewerKey struct{}
 // this tool call belongs to: the same caller-bound Gateway a Handler is given,
 // carrying the viewer's bearer and the organization and session the gateway
 // stamped, so ForModule mints the viewer's own Work Context.
+// In an OnInstall callback it instead returns a gateway carrying the install
+// call's Work Context: use Unary or HTTPClient directly, without ForModule.
 //
 // It is the one line a tool handler writes:
 //
@@ -269,7 +271,7 @@ type mcpViewerKey struct{}
 func ViewerFromContext(ctx context.Context) (*Gateway, error) {
 	gw, _ := ctx.Value(mcpViewerKey{}).(*Gateway)
 	if gw == nil {
-		return nil, fmt.Errorf("no viewer in this context: a tool handler receives one only on a request served through ServeMCP, which reads the identity the host gateway stamped")
+		return nil, fmt.Errorf("no viewer in this context: only a request served through ServeMCP or OnInstall supplies a caller-bound gateway")
 	}
 	return gw, nil
 }
