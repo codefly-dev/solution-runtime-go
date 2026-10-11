@@ -33,18 +33,35 @@ import (
 // evaluate. A skip is a silent pass, and this compiles to the forbidden key
 // while matching none of its fragments:
 //
-//	const key = "CODEFLY__MODULE_" + string(rune(82)) + "EGISTRATION_SECRETS"
+//	const key = prefix + string(rune(82)) + suffix
 //
 // `string(rune(82))` is a constant conversion, which the hand evaluator did not
 // implement. There is no list of expression forms to finish here: the compiler
 // has already folded every constant, conversions and concatenation alike, so
 // the value is taken from it. That fixture is a compiled negative case below.
-var claimShapes = map[string]string{
-	"/modules/_register":                   "the gateway's module route-claim path",
-	"/modules/_registration-token":         "the exchange that credentials a module route claim",
-	"X-Codefly-Module-Secret":              "the header carrying a module's route-claim secret",
-	"X-Codefly-Module-Registration":        "the header carrying a module route-claim credential",
-	"CODEFLY__MODULE_REGISTRATION_SECRETS": "the carrier delivering another module's route-claim secret",
+// Pin canonical wire spellings independently of documentation and fixture
+// generation. Archive edits must never redefine the boundary.
+func removedClaimShape(t *testing.T, kind string) string {
+	t.Helper()
+	switch kind {
+	case "header":
+		return "X-Codefly-Module-Secret"
+	case "carrier":
+		return "CODEFLY__MODULE_REGISTRATION_SECRETS"
+	}
+	t.Fatalf("unknown removed claim kind %q", kind)
+	return ""
+}
+
+func claimShapes(t *testing.T) map[string]string {
+	return map[string]string{
+		"CODEFLY__SOLUTION_REGISTRATION_SECRET": "the removed solution credential carrier",
+		"/modules/_register":                    "the gateway's module route-claim path",
+		"/modules/_registration-token":          "the exchange that credentials a module route claim",
+		"X-Codefly-Module-Registration":         "the header carrying a module route-claim credential",
+		removedClaimShape(t, "header"):          "the removed module credential header",
+		removedClaimShape(t, "carrier"):         "the removed module credential carrier",
+	}
 }
 
 // TestNoModuleFacadeClaimOnTheSDKSurface refuses any constant string in the
@@ -67,6 +84,7 @@ func claimShapeFindings(t *testing.T, pkg *packages.Package) []string {
 	t.Helper()
 
 	var findings []string
+	shapes := claimShapes(t)
 	evaluated := 0
 	for _, file := range pkg.Syntax {
 		name := filepath.Base(pkg.Fset.Position(file.Pos()).Filename)
@@ -85,7 +103,7 @@ func claimShapeFindings(t *testing.T, pkg *packages.Package) []string {
 				return true
 			}
 			evaluated++
-			for shape, what := range claimShapes {
+			for shape, what := range shapes {
 				if strings.Contains(foldShape(value), foldShape(shape)) {
 					findings = append(findings, pkg.Fset.Position(expr.Pos()).String()+
 						": the constant "+strconv.Quote(value)+" is "+what+" ("+shape+")")
@@ -200,9 +218,13 @@ func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
 
 import "os"
 
+func LegacySolutionCredential() string {
+ return os.Getenv("CODEFLY__SOLUTION_REGISTRATION_SECRET")
+}
+
 // A constant conversion splicing the carrier's name.
 func FacadeCredentialViaConversion() string {
-	const key = "CODEFLY__MODULE_" + string(rune(82)) + "EGISTRATION_SECRETS"
+	const key = __CARRIER_CONVERSION__
 	return env(key, "")
 }
 
@@ -213,7 +235,7 @@ func FacadeClaimPath() string { return facadeClaimPath }
 
 // A header assembled through a conversion.
 func FacadeSecretHeader() string {
-	return "X-Codefly-Module-" + string(rune(83)) + "ecret"
+	return __HEADER_CONVERSION__
 }
 
 // Function-local constants, which a package-level-only collector never saw.
@@ -223,7 +245,7 @@ func FacadeClaimLocal(gatewayURL string) string {
 }
 
 func FacadeCredentialLocal() string {
-	const carrier = "CODEFLY__MODULE" + "_REGISTRATION_SECRETS"
+	const carrier = __CARRIER_LOCAL__
 	return env(carrier, "")
 }
 
@@ -298,6 +320,18 @@ func joinedKey(parts []string) string {
 }
 `
 
+	// Independent of claimShapes: changing the gate's vocabulary must fail
+	// against these canonical wire inputs, even if the archive changes too.
+	carrier, header := "CODEFLY__MODULE_REGISTRATION_SECRETS", "X-Codefly-Module-Secret"
+	conversion := func(value string) string {
+		return strconv.Quote(value[:1]) + " + string(rune(" + strconv.Itoa(int(value[1])) + ")) + " + strconv.Quote(value[2:])
+	}
+	source = strings.NewReplacer(
+		"__CARRIER_CONVERSION__", conversion(carrier),
+		"__HEADER_CONVERSION__", conversion(header),
+		"__CARRIER_LOCAL__", strconv.Quote(carrier[:len(carrier)/2])+" + "+strconv.Quote(carrier[len(carrier)/2:]),
+	).Replace(source)
+
 	// One load for both rules: each shells out to the go command, and the
 	// fixture is the same package either way.
 	shapes, keys := "", ""
@@ -309,9 +343,10 @@ func joinedKey(parts []string) string {
 		keys = strings.Join(unresolvedKeyFindings(t, pkg), "\n")
 	}
 	for _, want := range []string{
-		"CODEFLY__MODULE_REGISTRATION_SECRETS",
+		"CODEFLY__SOLUTION_REGISTRATION_SECRET",
+		carrier,
 		"/modules/_register",
-		"X-Codefly-Module-Secret",
+		header,
 	} {
 		if !strings.Contains(shapes, want) {
 			t.Errorf("the claim-shape gate did not catch %q.\nfindings:\n%s", want, shapes)

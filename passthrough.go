@@ -530,20 +530,7 @@ func (s *Server) authorize(ctx context.Context, route passthroughRoute, header h
 func relayedError(err error) error {
 	var refusal *WorkContextRefusal
 	if errors.As(err, &refusal) && refusal != nil && refusal.StatusCode >= 400 && refusal.StatusCode < 500 {
-		// The issuer refused the viewer's authority for this call: say so, in
-		// its own code and words (they name the missing permission), rather
-		// than as a failed module call. It is the viewer's own authorization,
-		// so nothing of another principal is disclosed.
-		code := codeForStatus(refusal.StatusCode)
-		var parsed connect.Code
-		if refusal.Code != "" && parsed.UnmarshalText([]byte(refusal.Code)) == nil && parsed != connect.CodeUnknown {
-			code = parsed
-		}
-		message := "the viewer's authority for the " + refusal.Audience + " module was refused"
-		if refusal.Message != "" {
-			message += ": " + truncated(refusal.Message)
-		}
-		return connect.NewError(code, errors.New(message))
+		return connect.NewError(codeForStatus(refusal.StatusCode), errors.New("the viewer's authority for this module was refused"))
 	}
 	var streamErr *StreamError
 	if errors.As(err, &streamErr) && streamErr != nil {

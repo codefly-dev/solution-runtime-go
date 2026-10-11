@@ -37,21 +37,6 @@ func TestARefusedMintFailsTheBootAndIsNeverRetried(t *testing.T) {
 	}{
 		{"the host refuses this workload's build or identity", http.StatusForbidden},
 		{"the projected token is not acceptable", http.StatusUnauthorized},
-		// 404 is NOT here any more, and that is sdk-go v0.3.0 inverting the
-		// default rather than this test being relaxed.
-		//
-		// The rule was "429 and 5xx retry, everything else is terminal", which
-		// made every status anything between the host and this process might
-		// invent into a permanent stop — measured: a 408 from a proxy, with a
-		// valid credential in hand, latched for the life of the process, and a
-		// 404 from an ingress mid-rollout would do the same. Only 401 and 403
-		// latch now, because those are the two the host signs: the projected
-		// token is not acceptable, or the build is not approved.
-		//
-		// An old runtime against a new host still does not recover — it waits
-		// out its bounded window and exits non-zero for the orchestrator
-		// instead of failing on the first answer. Covered by the unavailable
-		// cases, and AGENTS.md says so now.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mint := newHostMint(t, &hostMint{status: tc.status})
@@ -311,16 +296,16 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 	}
 }
 
-// TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet is the cutover
+// TestABootedRuntimeRegistersNothing is the cutover
 // evidence the earlier version of this test did not provide.
 //
 // That version called the SDK's mint client directly and asserted no legacy
 // header was on the request — which would have stayed green with the whole
 // registration path still in the runtime. This one boots the real runtime with
-// every deleted configuration key set to a value a host would once have acted
-// on, and asserts what the host received: one request, to the mint, and
+// the deleted endpoint settings aimed at an observer, and asserts what the
+// host received: one request, to the mint, and
 // nothing resembling a registration.
-func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
+func TestABootedRuntimeRegistersNothing(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 
 	// A listener of its own for every deleted URL, which boot cannot move.
@@ -347,7 +332,7 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 	}))
 	t.Cleanup(legacy.Close)
 
-	// Every key the cutover deleted. If any of them still reaches a code path,
+	// Removed endpoint settings must reach no code path. If any still does,
 	// the observer above sees a request — or a header it should never be shown
 	// again.
 	for key, value := range map[string]string{
@@ -358,9 +343,9 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 		"GATEWAY_MODULE_REGISTER_URL":             legacy.URL + "/modules/_register",
 		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   legacy.URL + "/modules/_registration-token",
 		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": legacy.URL + "/solutions/_registration-token",
+		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "legacy-solution-secret",
+		"CODEFLY__MODULE_REGISTRATION_SECRETS":    `{"widgets-go":"legacy-module-secret"}`,
 		"CODEFLY_INTERNAL_TOKEN":                  "internal-token-that-must-not-travel",
-		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "solution-secret-that-must-not-travel",
-		"CODEFLY__MODULE_REGISTRATION_SECRETS":    "things:module-secret-that-must-not-travel",
 		"CODEFLY__SOLUTION_REGISTRATION_INTERVAL": "1s",
 		"CODEFLY_HOST_FRONTEND":                   "frontend",
 	} {
@@ -472,11 +457,15 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 	if got := mint.count(); got != 1 {
 		t.Errorf("the host received %d requests, want exactly 1 (the mint): anything more is a registration that survived", got)
 	}
+	// The broker requires a perimeter header, but its value must come from the
+	// declared workspace secret, never the nonempty legacy variable above.
+	if mint.headers[0].Get("X-Codefly-Internal-Token") != "broker-perimeter-token" {
+		t.Error("broker perimeter header did not use the declared secret")
+	}
 	for _, header := range []string{
-		"x-codefly-internal-token",
 		"x-codefly-solution-registration",
 		"x-codefly-module-registration",
-		"x-codefly-module-secret",
+		removedClaimShape(t, "header"),
 	} {
 		if value := mint.headers[0].Get(header); value != "" {
 			t.Errorf("the one request this runtime made presented %s=%q: this runtime has no registration credential to present", header, value)
@@ -654,7 +643,7 @@ func (s stubCredentialSource) Credential(context.Context) (workcontext.Credentia
 func mintClientFor(t *testing.T, mint *hostMint, tokenFile string) CredentialSource {
 	t.Helper()
 	client, err := workcontext.NewMintClient(workcontext.MintOptions{
-		URL: mint.URL + credentialMintPath,
+		URL: mint.URL + "/platform/_credential",
 		// The audience is named as a pinned value now, not passed as a string
 		// beside the pin: a string alongside meant the drift check guarded a
 		// value the mint did not use.
@@ -775,7 +764,7 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 				default:
 					t.Error("the process was not asked to end: a credential the host has stopped honouring cannot be waited out")
 				}
-				if stored := server.terminalErr.Load(); stored == nil || !errors.Is(*stored, tc.err) {
+				if stored := server.terminalErr.Load(); stored == nil || !errors.Is(*stored, workcontext.ErrMintRefused) {
 					t.Error("the reason this process is ending was not recorded, so its exit would say nothing")
 				}
 			} else {
@@ -1068,7 +1057,7 @@ func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
 
 	// The control: with the authority as this process froze it, a renewal is
 	// handed over.
-	if _, err := server.credential.Credential(ctx); err != nil {
+	if _, err := server.nextCredential(ctx); err != nil {
 		t.Fatalf("a renewal was refused while the authority had not drifted: %v", err)
 	}
 
@@ -1079,7 +1068,7 @@ func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
 	if err := codefly.LoadEnvironmentVariables(); err != nil {
 		t.Fatal(err)
 	}
-	_, err := server.credential.Credential(ctx)
+	_, err := server.nextCredential(ctx)
 	if err == nil {
 		t.Fatal("a renewal proceeded after an authority-bearing value drifted from the one this process froze: that renewal is the one moment the drift would be laundered into a differently-sealed credential")
 	}
@@ -1420,7 +1409,7 @@ func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
 	if err := codefly.LoadEnvironmentVariables(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.credential.Credential(ctx); err == nil {
+	if _, err := server.nextCredential(ctx); err == nil {
 		t.Fatal("an ask proceeded under a drifted authority")
 	}
 	// And the source was never reached, so nothing was minted under it.
@@ -1704,7 +1693,7 @@ func TestDriftDuringAnAskIsCaughtAfterIt(t *testing.T) {
 	server.authority = authorityFor(t, ctx)
 	server.credential = heldToTheFrozenAuthority(source, server.authority)
 
-	_, err := server.credential.Credential(ctx)
+	_, err := server.nextCredential(ctx)
 	<-drifted
 	if err == nil {
 		t.Fatal("a credential obtained while an authority-bearing value drifted mid-ask was handed over: the recheck before the ask cannot see a drift that lands after it, so the one after the ask is what catches this — and gating that on the token changing means a first credential, an unchanged one, and a mid-ask drift all go unchecked")
@@ -2088,7 +2077,7 @@ func expiredCredential(t *testing.T, mint *hostMint, tokenFile string) workconte
 	}
 	mint.ttl = 10 * time.Minute
 	client, err := workcontext.NewMintClient(workcontext.MintOptions{
-		URL:                mint.URL + credentialMintPath,
+		URL:                mint.URL + "/platform/_credential",
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
 		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
@@ -2387,13 +2376,23 @@ func TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs(t *testing.T) {
 // test that re-asked would pass against a client that never re-checked
 // anything. Refresh is the call that re-mints, so it is the call that reaches
 // the readers under test.
-func freshMint(t *testing.T, source CredentialSource, held workcontext.Credential) (workcontext.Credential, error) {
+func freshMint(t *testing.T, source any, held executionCredential) (executionCredential, error) {
+	if broker, ok := source.(*brokerCredentialSource); ok {
+		broker.mu.Lock()
+		broker.renewAt = time.Time{}
+		broker.mu.Unlock()
+		return broker.Credential(context.Background())
+	}
 	t.Helper()
+	// These checks inspect the SDK transport directly, below error redaction.
+	if redacted, ok := source.(*redactedMintSource); ok {
+		source = redacted.client
+	}
 	client, ok := source.(*workcontext.MintClient)
 	if !ok {
 		t.Fatalf("the source under test is %T, not the SDK's mint client, so this would not exercise the transport at all", source)
 	}
-	return client.Refresh(context.Background(), held)
+	return client.Refresh(context.Background(), held.(workcontext.Credential))
 }
 
 // mintClientWith is a mint client against the fake endpoint, with one or more
@@ -2401,7 +2400,7 @@ func freshMint(t *testing.T, source CredentialSource, held workcontext.Credentia
 func mintClientWith(t *testing.T, mint *hostMint, tokenFile string, with ...func(*workcontext.MintOptions)) CredentialSource {
 	t.Helper()
 	options := workcontext.MintOptions{
-		URL:                mint.URL + credentialMintPath,
+		URL:                mint.URL + "/platform/_credential",
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
 		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
@@ -2527,14 +2526,15 @@ func TestTheMintRefusesToPresentARotatedIdentity(t *testing.T) {
 
 	server := New(Manifest{ID: testSolutionID})
 	server.cfg = config{
-		identityCertFile:   certFile,
-		identityKeyFile:    keyFile,
-		trustBundleFile:    bundleFile,
-		allowedCallersFile: identitiesFile(t, testGatewayPrincipal),
-		mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile:   identitiesFile(t, testGatewayPrincipal),
-		mintURL:            mint.URL + credentialMintPath,
-		projectedTokenPath: tokenFile,
+		identityCertFile:    certFile,
+		identityKeyFile:     keyFile,
+		trustBundleFile:     bundleFile,
+		allowedCallersFile:  identitiesFile(t, testGatewayPrincipal),
+		mintPeersFile:       identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		brokerInternalToken: "broker-perimeter-token",
+		mintURL:             mint.URL + credentialMintPath,
+		projectedTokenPath:  tokenFile,
 	}
 	server.principal = testPrincipal
 	// The frozen authority, read through the SDK the way a boot reads it.
@@ -2569,44 +2569,27 @@ func TestTheMintRefusesToPresentARotatedIdentity(t *testing.T) {
 		}
 	}
 
-	// THE FINDING: a valid, same-CA certificate for another workload.
+	// An ordinary rotation remains usable by this same client.
+	rotate(testPrincipal)
+	if _, err := freshMint(t, source, held); err != nil {
+		t.Fatalf("ordinary identity rotation refused: %v", err)
+	}
+	// A valid same-CA certificate for another workload is refused before HTTP.
 	rotate(rivalPrincipal)
 	before := mint.count()
-	if _, err := freshMint(t, source, held); err == nil {
-		t.Fatal("the mint was dialled presenting a certificate issued for another workload: the host holds this process to the identity its presence document approved, and this hop is the one that carries the projected service-account token")
-	} else if !strings.Contains(err.Error(), "another workload") && !strings.Contains(err.Error(), "issued for") {
-		t.Errorf("the refusal %q does not say the certificate names another workload", err)
+	if _, err := freshMint(t, source, held); !terminalCredentialFailure(err) {
+		t.Fatalf("wrong workload identity was not terminal: %v", err)
 	}
 	if got := mint.count(); got != before {
-		t.Errorf("the issuer served %d more requests while this workload was presenting another identity: the refusal has to come before the projected service-account token is on the wire, not after", got-before)
+		t.Fatalf("wrong identity sent %d requests", got-before)
+	}
+	// The new retry allowlist makes this permanent TLS/configuration failure
+	// terminal, even if the files are repaired. Only a restarted process retries.
+	rotate(testPrincipal)
+	if _, err := freshMint(t, source, held); !terminalCredentialFailure(err) || mint.count() != before {
+		t.Fatalf("terminal identity failure was retried: %v", err)
 	}
 
-	// And a rotation that is ordinary — a fresh certificate for the same
-	// principal — still works, so the check is about the identity and not
-	// about the pair having changed.
-	rotate(testPrincipal)
-	// Through the SDK's hold-off, not around it.
-	//
-	// The refusal above is a failed ask, and the mint client backs off after
-	// one — "held off until …" — so the next attempt is refused by the backoff
-	// rather than by anything about the certificate. That is correct behaviour
-	// and it is also the reason this step waits: asserting the recovery
-	// against a brand-new client would prove that a fresh client works, which
-	// is not what is in question.
-	var recovered error
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if _, recovered = freshMint(t, source, held); recovered == nil {
-			break
-		}
-		if !strings.Contains(recovered.Error(), "held off until") || time.Now().After(deadline) {
-			t.Fatalf("an ordinary rotation to a fresh certificate for this workload was refused, which would make every projected-pair renewal fatal: %v", recovered)
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	if got := mint.count(); got <= before {
-		t.Errorf("the issuer served %d requests after a valid rotation, want more than %d", got, before)
-	}
 }
 
 // TestEachSealedFieldIsComparedOnItsOwn isolates the three comparisons that

@@ -691,10 +691,6 @@ func firstForwarded(r *http.Request, name string) string {
 // bare environment variables when ServeMCP landed, which named a provisioning
 // path that does not exist.
 //
-// This used to say "the way the registration secret is", naming
-// SolutionRegistrationSecretGroup. That group and the registrations it fed are
-// deleted; the comparison outlived the thing it compared to.
-//
 // MCPIssuerURLKey is the origin MCP clients authenticate against — the host as
 // an authorization server. A deployment must supply it: what the SDK resolves
 // is the address this composition dials the host at, in-cluster and reachable
@@ -769,8 +765,7 @@ func resolveMCPPublicURL(ctx context.Context, publicURL, id string) (string, boo
 // a deployment that was told the origin clients authenticate against from one
 // that resolved the host's in-cluster address, which validate() refuses.
 //
-// The SDK's error is dropped for the reason solutionRegistrationSecret drops
-// it: it is the same "no workspace configuration value" whether the group was
+// The SDK reports the same "no workspace configuration value" whether the group was
 // never declared or its carriers never loaded, and the one signal that
 // distinguishes them is config.environmentLoadErr.
 func resolveMCPIssuer(ctx context.Context, frontendURL string) (string, bool) {

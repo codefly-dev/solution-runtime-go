@@ -64,6 +64,7 @@ const (
 // authorityValues provisions the module-authority group the way the platform
 // does, through the carriers the SDK reads.
 func authorityValues(t *testing.T) {
+	t.Setenv("CODEFLY__WORKSPACE_SECRET_CONFIGURATION__MODULE_AUTHORITY__INTERNAL_TOKEN", "broker-perimeter-token")
 	t.Helper()
 	for key, value := range map[string]string{
 		AuthorityPrincipalKey:          testPrincipal,
@@ -357,6 +358,13 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.URL.Path == "/modules/_work-context" {
+		var body map[string]string
+		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 1 || body["prefix"] != testSolutionID {
+			http.Error(w, "invalid broker request", http.StatusBadRequest)
+			return
+		}
+	}
 	atomic.AddInt64(&m.mints, 1)
 	// recoverAfter 0 means this host never issues; a positive one means it
 	// issues once that many asks have been answered with status.
@@ -390,7 +398,11 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stand-in issuer: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"work_context": token})
+	if r.URL.Path == "/modules/_work-context" {
+		writeJSON(w, http.StatusOK, map[string]string{"token": token, "expiresAt": time.Now().Add(m.ttl).UTC().Format(time.RFC3339), "principalId": corework.FixturePrincipal, "tenant": corework.FixtureTenant})
+	} else {
+		writeJSON(w, http.StatusOK, map[string]string{"work_context": token})
+	}
 }
 
 func (m *hostMint) count() int64 { return atomic.LoadInt64(&m.mints) }
@@ -1083,7 +1095,7 @@ func TestABootWithAnUnusableAdmissionFileIsRefused(t *testing.T) {
 				writeFile(t, path, tc.contents)
 			}
 			server := New(Manifest{ID: testSolutionID})
-			server.cfg = config{
+			server.cfg = config{brokerInternalToken: "broker-perimeter-token",
 				port: "8080", gatewayURL: "https://gateway:42152",
 				mintURL:            "https://gateway:42152" + credentialMintPath,
 				identityCertFile:   certFile,
@@ -1497,7 +1509,7 @@ func TestTheListenerDoesNotNegotiateHTTP2(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
 		allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
@@ -1522,10 +1534,8 @@ func TestTheListenerDoesNotNegotiateHTTP2(t *testing.T) {
 // see. The executed round validated these in scratch; they belong here.
 //
 // The issuer answers correctly for the first credential and switches shape
-// afterwards. A credential whose whole remaining lifetime sits inside the
-// renewal lead cannot be installed at all (the SDK floors that lead at five
-// seconds), so the TTL is just above it: the first install succeeds and the
-// next ask renews.
+// afterwards. The broker renews at one fifth of the issued lifetime (capped
+// at thirty seconds), so the first install and control call precede renewal.
 func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1535,24 +1545,9 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 		{"a renewal sealing a different build", &hostMint{incarnation: 99}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// The TTL sets the margin between the boot and the renewal, and
-			// six seconds was not a margin at all.
-			//
-			// The SDK floors the renewal lead at five seconds
-			// (minRenewalLeadTime), so a six-second credential is due for
-			// renewal ONE second after it is issued. The control call below
-			// has to land before that, and on a loaded CI runner the boot —
-			// cert generation, the TLS listener, the first mint — does not
-			// finish within a second, so the control call itself triggered the
-			// renewal, the switched issuer answered it, the process went
-			// terminal mid-request and the control saw a closed connection.
-			// It failed in CI with "the route answered 0 before any renewal"
-			// and passes six times out of six locally, which is what a margin
-			// that depends on machine speed looks like.
-			//
-			// Twelve seconds puts the renewal at ~7s and leaves the control
-			// call seven seconds of room. The wall-clock cost is the price of
-			// a test that does not depend on the boot being fast.
+			// Twelve seconds leaves roughly nine seconds for the control call
+			// before the native broker's renewal lead. Keep that margin: an
+			// earlier version depended on a loaded runner booting in a second.
 			mint := newHostMint(t, &hostMint{
 				ttl:         12 * time.Second,
 				switchAfter: 1,
@@ -1650,8 +1645,28 @@ func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
 			if !errors.Is(err, workcontext.ErrMintRefused) {
 				t.Errorf("serve ended with %v, which does not wrap ErrMintRefused: a transient answer must not end this process, and only a terminal one may", err)
 			}
-			if !strings.Contains(err.Error(), "execution") {
-				t.Errorf("serve ended with %q, which does not say the execution was replaced", err)
+			if tc.after.executionFree {
+				if !strings.Contains(err.Error(), "seals no execution") {
+					t.Errorf("serve ended with %q, which does not identify the missing execution", err)
+				}
+			} else {
+				// The native broker retains the terminal classification and
+				// redacts the old/new seals, unlike the former SDK wrapper's
+				// detailed diagnostic. Do not require those internals to leak.
+				want := fmt.Sprintf("solution %q stopped serving: %s", testSolutionID, workcontext.ErrMintRefused)
+				if err.Error() != want {
+					t.Errorf("serve ended with %q, want the redacted terminal refusal %q", err, want)
+				}
+			}
+			// The renewal landed exactly once and remains terminal after the
+			// listener stopped; a later caller cannot trigger another mint.
+			for range 2 {
+				if _, err := solution.server.acquireCredential(context.Background()); !errors.Is(err, workcontext.ErrMintRefused) {
+					t.Errorf("the terminal execution refusal was not retained: %v", err)
+				}
+			}
+			if got := mint.count(); got != 2 {
+				t.Errorf("the host saw %d mints, want the boot and one refused renewal", got)
 			}
 		})
 	}

@@ -85,8 +85,8 @@ func TestPassthroughRefusesOnlyTheMethodWhoseAuthorityTheViewerLacks(t *testing.
 	if status != http.StatusForbidden || body["code"] != "permission_denied" {
 		t.Fatalf("get without inspect: status %d, body %v; want 403 permission_denied", status, body)
 	}
-	if msg, _ := body["message"].(string); !strings.Contains(msg, "things:inspect") {
-		t.Fatalf("message %q does not name the missing permission", msg)
+	if msg, _ := body["message"].(string); msg != "the viewer's authority for this module was refused" {
+		t.Fatalf("message %q disclosed broker diagnostics or lost the fixed refusal", msg)
 	}
 	if len(gw.calls) != 0 {
 		t.Fatalf("the module was called without a capability: %v", gw.calls)

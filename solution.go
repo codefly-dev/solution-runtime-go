@@ -303,10 +303,11 @@ type Server struct {
 	// source: one resolution serving the listener and the outbound client, so
 	// the two cannot be different identities.
 	identityConfig *tls.Config
-	// credential is where this execution's credential comes from. Nil until
-	// the boot opens the platform's mint endpoint; a test or a consumer on
-	// another issuer supplies its own with Credential.
-	credential CredentialSource
+	// credential is the optional consumer-supplied SDK source. The native
+	// broker is opened at boot when no consumer source was supplied. Both
+	// feed the same controller through nextCredential.
+	credential       CredentialSource
+	brokerCredential *brokerCredentialSource
 	// authority is the frozen set of authority-bearing values this process runs
 	// under, read once at boot and rechecked before every credential renewal.
 	authority *codefly.Authority
@@ -323,7 +324,7 @@ type Server struct {
 	credentialMu         sync.Mutex
 	credentialAsk        *credentialFlight
 	credentialAskErr     error
-	credentialHeld       workcontext.Credential
+	credentialHeld       executionCredential
 	credentialQuietUntil time.Time
 	// credentialAskFailures counts consecutive failed acquisitions, which is
 	// what the backoff grows on and a success resets.
@@ -374,13 +375,10 @@ type config struct {
 	// telling an MCP client an address this runtime dialled.
 	dialled   []string
 	assetsDir string
-	// mintURL is the host endpoint that mints this execution's credential. The
-	// audience the projected token must be bound to is read through the SDK's
-	// authority reader and frozen (see openAuthority), not carried here: there
-	// used to be a mintAudience field beside this one, unread by anything, and
-	// its comment claimed both were "resolved, never defaulted" while mintURL
-	// does carry a default path.
-	mintURL string
+	// mintURL is the explicitly configured module broker endpoint. The prefix
+	// comes from Manifest.ID; authority audiences remain frozen separately.
+	mintURL             string
+	brokerInternalToken string
 	// projectedTokenPath is the file the platform projects this workload's
 	// service-account token into. It is re-read before every renewal, because
 	// the projection is rotated under the running process and a token read once
@@ -693,24 +691,21 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 	// resolve it are gone.
 	frontendURL := strings.TrimRight(resolveFrontend(ctx, hostModule, hostFrontend), "/")
 
+	projectedTokenPath := workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey)
+	if projectedTokenPath == "" {
+		projectedTokenPath = "/var/run/secrets/codefly/token"
+	}
+
+	internalToken, _ := codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")
 	cfg := config{
-		port:       port,
-		gatewayURL: gatewayURL,
-		assetsDir:  env("ASSETS_DIR", "../fe-remote/dist"),
-		// No default, because there is nothing to default to. Whether the mint
-		// stays brokered through the gateway is not settled — the host prefers
-		// the workload to post directly to the issuer with its projected token
-		// bound to the issuer's own audience, and neither endpoint exists yet.
-		// Deriving a path on the resolved gateway and labelling it a guess is
-		// not an answer: this is the address
-		// this runtime POSTs the projected service-account token to, the
-		// strongest statement it can make about which workload it is, and a
-		// guessed address for that is the one thing fail-closed does not
-		// permit. It is refused at boot until something resolves it, which is
-		// how this package already treats a token-exchange URL it cannot pair.
+		brokerInternalToken: strings.TrimSpace(internalToken),
+		port:                port,
+		gatewayURL:          gatewayURL,
+		assetsDir:           env("ASSETS_DIR", "../fe-remote/dist"),
+		// The broker path is published, but its origin remains explicit.
 		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
 		dialled:            dialledAddresses(gatewayURL, strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, ""))),
-		projectedTokenPath: workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey),
+		projectedTokenPath: projectedTokenPath,
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
 		trustBundleFile:    workloadPath(ctx, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey),
@@ -895,12 +890,9 @@ const CredentialMintURLEnvironmentVariable = "CODEFLY__CREDENTIAL_MINT_URL"
 // machine's — the gap codefly-dev/core#687 named and core v0.7.1 closed.
 const ContractProfileEnvironmentVariable = "CODEFLY__CONTRACT_PROFILE"
 
-// credentialMintPath is the path this package's own tests mount their fake mint
-// on. It is NOT a default: nothing in loadConfig derives an address from it,
-// because the host has not settled brokered-versus-direct and a guessed mint
-// address is refused rather than assumed. It exists so the suite's fixtures
-// agree with each other.
-const credentialMintPath = "/platform/_credential"
+// credentialMintPath is the host's published module-broker execution endpoint.
+// The origin remains explicitly resolved, never inferred from a solution name.
+const credentialMintPath = "/modules/_work-context"
 
 // workloadPath resolves one of the identity paths above: an explicit
 // environment override first, then the workspace configuration group the
@@ -1004,6 +996,12 @@ func (c config) validate() error {
 			return fmt.Errorf("%s carries a fragment: a fragment is never sent, so this is not the destination it appears to be. Set %s to the address the host actually serves",
 				required.name, required.override)
 		}
+	}
+	if u, _ := url.Parse(c.mintURL); u.Path != credentialMintPath || u.RawPath != "" {
+		return fmt.Errorf("%s must name the broker endpoint /modules/_work-context", CredentialMintURLEnvironmentVariable)
+	}
+	if c.brokerInternalToken == "" {
+		return fmt.Errorf("missing module-authority/INTERNAL_TOKEN: provision the broker perimeter credential as a workspace secret")
 	}
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
@@ -1653,7 +1651,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// and hands the same one back until its renewal point, so this is a
 	// mutex and a comparison except at the renewal the credential's own expiry
 	// dictates. Nothing here runs on a timer this runtime chose.
-	if s.credential != nil {
+	if s.credential != nil || s.brokerCredential != nil {
 		// Through credentialWithin, so the deadline is real: passing a context
 		// to the SDK's client does not bound it, because what blocks is a
 		// mutex held across the mint.
@@ -1703,7 +1701,7 @@ func (s *Server) actingForAViewer(ctx context.Context) error {
 	if err := s.terminalErr.Load(); err != nil {
 		return fmt.Errorf("%w: %w", ErrCredentialRefused, *err)
 	}
-	if s.credential == nil {
+	if s.credential == nil && s.brokerCredential == nil {
 		return nil
 	}
 	_, err := s.credentialWithin(ctx, routeCredentialTimeout)
@@ -1731,7 +1729,7 @@ func (s *Server) actingForAViewer(ctx context.Context) error {
 // outright would turn a slow renewal — which happens while a perfectly valid
 // credential is still in hand, since renewal starts inside a lead before expiry
 // — into a 503 for every viewer.
-func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (workcontext.Credential, error) {
+func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (executionCredential, error) {
 	// Held and unexpired is the answer whenever the issuer is not answering,
 	// and this is the branch that was missing.
 	//
@@ -1786,7 +1784,7 @@ func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (workcon
 
 // holdCredential records a credential the controller did not itself acquire —
 // the boot's — so the first caller after boot sees a process that holds one.
-func (s *Server) holdCredential(credential workcontext.Credential) {
+func (s *Server) holdCredential(credential executionCredential) {
 	s.credentialMu.Lock()
 	s.credentialHeld = credential
 	s.credentialQuietUntil = time.Time{}
@@ -1797,10 +1795,10 @@ func (s *Server) holdCredential(credential workcontext.Credential) {
 // expired. The zero credential never counts as held: a source that hands back
 // nothing has given this process no authority, which is the case a wrapper
 // keyed on the token's *value* could not see.
-func (s *Server) heldCredential() (workcontext.Credential, bool) {
+func (s *Server) heldCredential() (executionCredential, bool) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
-	if s.credentialHeld.Token() == "" {
+	if s.credentialHeld == nil || s.credentialHeld.Token() == "" {
 		return workcontext.Credential{}, false
 	}
 	if !time.Now().Before(s.credentialHeld.ExpiresAt()) {
@@ -1814,11 +1812,11 @@ func (s *Server) heldCredential() (workcontext.Credential, bool) {
 //
 // All three under one lock, because a caller that reads them separately can act
 // on a mixture of two different moments.
-func (s *Server) credentialState() (held workcontext.Credential, quiet bool, last error) {
+func (s *Server) credentialState() (held executionCredential, quiet bool, last error) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
 	held = s.credentialHeld
-	if held.Token() == "" || !time.Now().Before(held.ExpiresAt()) {
+	if held == nil || held.Token() == "" || !time.Now().Before(held.ExpiresAt()) {
 		held = workcontext.Credential{}
 	}
 	last = s.credentialAskErr
@@ -1837,7 +1835,7 @@ func (s *Server) credentialState() (held workcontext.Credential, quiet bool, las
 // SDK's client holds a sync.Mutex across the network mint and sync.Mutex.Lock
 // ignores contexts (see the drafted sdk-go issue, which is the durable half of
 // this).
-func (s *Server) askOnce(ctx context.Context, d time.Duration) (workcontext.Credential, error) {
+func (s *Server) askOnce(ctx context.Context, d time.Duration) (executionCredential, error) {
 	s.credentialMu.Lock()
 	inflight := s.credentialAsk
 	if inflight == nil {
@@ -1883,7 +1881,7 @@ func (s *Server) askOnce(ctx context.Context, d time.Duration) (workcontext.Cred
 func (s *Server) resolveCredential(ctx context.Context, flight *credentialFlight) {
 	asked, cancel := context.WithTimeout(context.WithoutCancel(ctx), platformRequestTimeout)
 	defer cancel()
-	credential, err := s.credential.Credential(asked)
+	credential, err := s.nextCredential(asked)
 	if err == nil {
 		err = usableCredential(credential)
 	}
@@ -1925,7 +1923,7 @@ func (s *Server) resolveCredential(ctx context.Context, flight *credentialFlight
 // credentialFlight is one acquisition and the answer it produced.
 type credentialFlight struct {
 	done       chan struct{}
-	credential workcontext.Credential
+	credential executionCredential
 	err        error
 }
 
@@ -1988,8 +1986,8 @@ func credentialAskQuiet(failures int) time.Duration {
 //
 // The authority wrapper could not see either: it keys on the token *changing*,
 // and a token that is always "" never changes.
-func usableCredential(credential workcontext.Credential) error {
-	if credential.Token() == "" {
+func usableCredential(credential executionCredential) error {
+	if credential == nil || credential.Token() == "" {
 		return fmt.Errorf("%w: the credential source returned no credential at all (empty token), so this process holds nothing that attests which workload it is",
 			workcontext.ErrMintRefused)
 	}
@@ -2053,7 +2051,7 @@ func usableCredential(credential workcontext.Credential) error {
 //
 // Nil when no source was supplied, so attestWorkloadReporting still refuses a
 // mint rather than treating an absent source as nothing to attest with.
-func (s *Server) acquireCredential(ctx context.Context) (workcontext.Credential, error) {
+func (s *Server) acquireCredential(ctx context.Context) (executionCredential, error) {
 	return s.credentialWithin(ctx, routeCredentialTimeout)
 }
 
@@ -2411,7 +2409,7 @@ func (s *Server) gatewayFor(header http.Header) *Gateway {
 	gw.id, gw.report = s.manifest.ID, &s.attestation
 	// Left nil when no source was supplied, so a mint is refused for want of
 	// one rather than panicking inside the controller.
-	if s.credential != nil {
+	if s.credential != nil || s.brokerCredential != nil {
 		gw.workload = s.acquireCredential
 	}
 	gw.terminal = s.credentialRefused
@@ -3304,21 +3302,23 @@ func (g *Gateway) workContext(ctx context.Context) (string, error) {
 	})
 }
 
-// WorkContextRefusal is the issuer's refusal to mint a Work Context: most
-// often an authority the viewer does not hold ("owner is not allowed
-// kind:action at requested scope"). It keeps the issuer's Connect code and
-// message, so a caller can tell "you lack this permission" from "the gateway
-// never routed the mint", and unwraps to the GatewayError it has always been.
+// WorkContextRefusal carries only the HTTP status and the locally requested
+// audience. Broker response diagnostics are never retained or returned.
+// Code and Message were removed; consumers should inspect StatusCode.
 type WorkContextRefusal struct {
 	Audience   string
 	StatusCode int
-	// Code is the issuer's Connect code ("permission_denied"), when it sent one.
-	Code    string
-	Message string
 }
 
 func (e *WorkContextRefusal) Error() string {
-	return fmt.Sprintf("work context mint for %q rejected (status %d, %q): %s", e.Audience, e.StatusCode, e.Code, e.Message)
+	message := "request failed"
+	switch e.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		message = "request refused"
+	case http.StatusServiceUnavailable:
+		message = "execution not established"
+	}
+	return fmt.Sprintf("work context mint: HTTP %d: %s", e.StatusCode, message)
 }
 
 func (e *WorkContextRefusal) Unwrap() error { return &GatewayError{StatusCode: e.StatusCode} }
@@ -3364,7 +3364,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	defer cancel()
 	post, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+workContextStartTaskProcedure, bytes.NewReader(body))
 	if err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, errors.New("work context mint: request could not be constructed")
 	}
 	post.Header.Set("content-type", "application/json")
 	// The viewer's bearer says on whose behalf; this execution's credential
@@ -3377,30 +3377,19 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	}
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
+		return "", time.Time{}, errors.New("work context mint: transport failed")
 	}
 	defer drainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
-		// Connect reports a refusal as a code and message under a mapped HTTP
-		// status. Carry it through: an authority the viewer does not hold reads
-		// nothing like a gateway that never routed the mint, and the status
-		// alone cannot tell them apart.
-		var refusal struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
-		return "", time.Time{}, &WorkContextRefusal{
-			Audience: ask.Audience, StatusCode: resp.StatusCode, Code: refusal.Code, Message: refusal.Message,
-		}
+		return "", time.Time{}, &WorkContextRefusal{Audience: ask.Audience, StatusCode: resp.StatusCode}
 	}
 	var issued struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expiresAt"`
 		WorkContextPrincipals
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
-		return "", time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&issued); err != nil {
+		return "", time.Time{}, errors.New("work context mint: invalid response")
 	}
 	// The capability travels as a string and is not parsed here. There is one
 	// implementation of a Work Context — core's — and this runtime is not it:
@@ -3429,8 +3418,8 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 			ask.Audience)
 	case lifetime < workContextMinimumLifetime:
 		return "", time.Time{}, fmt.Errorf(
-			"work context mint for %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
-			ask.Audience, issued.ExpiresAt.UTC().Format(time.RFC3339), workContextMinimumLifetime)
+			"work context mint for %q returned an expiry already past or less than %s away (check this host's clock against the issuer's)",
+			ask.Audience, workContextMinimumLifetime)
 	}
 	// Renew ahead of expiry, but never by more than half the capability's own
 	// life: a lead longer than the lifetime would make every capability
@@ -3443,8 +3432,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 			// Honoured, but say so once: at this lifetime a capability cannot be
 			// held across a whole request, so the mint rate is the issuer's
 			// setting and not a defect here.
-			log.Printf("work contexts are issued with a %s lifetime, shorter than the %s renewal lead: one will be re-minted roughly every %s",
-				lifetime.Round(time.Second), workContextRenewal, lead.Round(time.Second))
+			log.Print("work context mint: issued lifetime requires an earlier renewal")
 		})
 	}
 	g.contexts.remember(token, issued.WorkContextPrincipals)
@@ -3501,6 +3489,8 @@ type workContextCache struct {
 	// fans out would otherwise spend one audited mint per goroutine for a
 	// capability they all share.
 	minting map[string]*pendingMint
+	// Refusals persist for this viewer request; another caller must not re-mint.
+	refused map[string]error
 	// issuedFor holds, per issued capability, whom accounts said it acts for.
 	issuedFor map[string]WorkContextPrincipals
 }
@@ -3522,6 +3512,7 @@ func newWorkContextCache() *workContextCache {
 	return &workContextCache{
 		minted:    map[string]cachedCapability{},
 		minting:   map[string]*pendingMint{},
+		refused:   map[string]error{},
 		issuedFor: map[string]WorkContextPrincipals{},
 	}
 }
@@ -3555,6 +3546,10 @@ func (c *workContextCache) resolve(
 	mint func(context.Context) (string, time.Time, error),
 ) (string, error) {
 	c.mu.Lock()
+	if err := c.refused[key]; err != nil {
+		c.mu.Unlock()
+		return "", err
+	}
 	if issued, ok := c.minted[key]; ok && time.Now().Before(issued.reuseUntil) {
 		c.mu.Unlock()
 		return issued.token, nil
@@ -3579,6 +3574,10 @@ func (c *workContextCache) resolve(
 
 	c.mu.Lock()
 	delete(c.minting, key)
+	var refusal *WorkContextRefusal
+	if errors.As(err, &refusal) && (refusal.StatusCode == http.StatusUnauthorized || refusal.StatusCode == http.StatusForbidden) {
+		c.refused[key] = err
+	}
 	if err == nil {
 		c.minted[key] = cachedCapability{token: token, reuseUntil: reuseUntil}
 	}

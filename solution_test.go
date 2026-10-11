@@ -755,7 +755,7 @@ func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Se
 func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, handler Handler) *httptest.Server {
 	t.Helper()
 	s := New(Manifest{ID: "notes", Title: "Notes"}).Credential(source)
-	s.cfg = config{gatewayURL: gatewayURL}
+	s.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gatewayURL}
 	server := httptest.NewServer(s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
 		return handler(r.Context(), gw)
 	}))
@@ -1169,7 +1169,7 @@ func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
 
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
 		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
 		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
 		// This test inspects the transport rather than dialling, so any
@@ -1231,7 +1231,7 @@ func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T
 	host := newPlatformHost(t, c, testGatewayPrincipal)
 
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
 		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
 		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal), gatewayURL: host.URL}
 	server.principal = testPrincipal
@@ -1257,8 +1257,8 @@ func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T
 	}
 }
 
-// A refused mint retains diagnostics for the handler but returns an actionable
-// status, without disclosing upstream details, to the browser.
+// A refused mint exposes its status, with no upstream diagnostics in either
+// the handler error or the browser response.
 func TestForModuleSurfacesARefusedMint(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{mintStatus: http.StatusForbidden})
 	var mintErr error
@@ -1275,9 +1275,14 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 	if mintErr == nil {
 		t.Fatal("ForModule succeeded against a refusing authority")
 	}
-	for _, want := range []string{"documents", "403", "permission_denied", "caller holds no such authority"} {
+	for _, want := range []string{"403", "request refused"} {
 		if !strings.Contains(mintErr.Error(), want) {
 			t.Errorf("mint error %q does not mention %q", mintErr, want)
+		}
+	}
+	for _, forbidden := range []string{"permission_denied", "caller holds no such authority"} {
+		if strings.Contains(mintErr.Error(), forbidden) {
+			t.Errorf("mint error disclosed broker text: %v", mintErr)
 		}
 	}
 	body, err := io.ReadAll(resp.Body)
@@ -1570,7 +1575,7 @@ func optionalIdentitiesFile(t *testing.T, identities string) string {
 // guessed address for that is what fail-closed forbids, and this package
 // already refuses rather than guesses when it cannot pair a token-exchange URL.
 func TestABootWithoutAResolvedMintURLIsRefused(t *testing.T) {
-	cfg := config{port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile}
+	cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile}
 	err := cfg.validate()
 	if err == nil {
 		t.Fatal("the boot accepted a configuration with no mint URL, so this runtime would POST its projected token to an address nobody resolved")
@@ -1618,7 +1623,7 @@ func TestNoProductionCodeDerivesTheMintAddress(t *testing.T) {
 func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
 	base := func(t *testing.T) config {
 		t.Helper()
-		return config{
+		return config{brokerInternalToken: "broker-perimeter-token",
 			port: "8080", gatewayURL: "https://gateway:42152",
 			mintURL: "https://gateway:42152" + credentialMintPath,
 			profile: localProfile,
@@ -1787,12 +1792,12 @@ func TestAnAdmissionFileIsReadWholeOrRefused(t *testing.T) {
 // sent, so it is never used for anything except being logged.
 func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
 	for _, tc := range []struct{ name, mint, names string }{
-		{"userinfo", "https://ops:s3cr3t@mint.cell/platform/_credential", "userinfo"},
-		{"a query", "https://mint.cell/platform/_credential?token=s3cr3t", "query"},
-		{"a fragment", "https://mint.cell/platform/_credential#part", "fragment"},
+		{"userinfo", "https://ops:s3cr3t@mint.cell/modules/_work-context", "userinfo"},
+		{"a query", "https://mint.cell/modules/_work-context?token=s3cr3t", "query"},
+		{"a fragment", "https://mint.cell/modules/_work-context#part", "fragment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := config{port: "8080", gatewayURL: "https://gateway:42152", mintURL: tc.mint, profile: localProfile}
+			cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: "https://gateway:42152", mintURL: tc.mint, profile: localProfile}
 			err := cfg.validate()
 			if err == nil {
 				t.Fatalf("a credential mint URL carrying %s was accepted", tc.names)
@@ -1820,17 +1825,17 @@ func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
 		log.SetOutput(&captured)
 		t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
-		cfg := config{port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile,
-			mintURL: "https://ops:s3cr3t-password@mint.cell/platform/_credential"}
+		cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile,
+			mintURL: "https://ops:s3cr3t-password@mint.cell/modules/_work-context"}
 		// validate() refuses this URL, and the log line still must not carry
 		// the secret: the refusal and the logging are independent, which is
 		// the whole reason the log redacts regardless.
 		_ = cfg.validate()
-		cfg.mintURL = "https://mint.cell/platform/_credential"
+		cfg.mintURL = "https://mint.cell/modules/_work-context"
 		if err := cfg.validate(); err != nil {
 			t.Fatalf("a conforming configuration was refused: %v", err)
 		}
-		cfg.mintURL = "https://ops:s3cr3t-password@mint.cell/platform/_credential"
+		cfg.mintURL = "https://ops:s3cr3t-password@mint.cell/modules/_work-context"
 		cfg.logResolved()
 		if got := captured.String(); strings.Contains(got, "s3cr3t-password") {
 			t.Errorf("the boot log carries the secret from the mint URL:\n%s", got)
@@ -1857,7 +1862,7 @@ func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
 	})
 
 	t.Run("an unresolved destination says which it is", func(t *testing.T) {
-		cfg := config{port: "8080", profile: localProfile, environmentLoadErr: loadErr}
+		cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", profile: localProfile, environmentLoadErr: loadErr}
 		err := cfg.validate()
 		if err == nil {
 			t.Fatal("a configuration with no gateway was accepted")
@@ -1868,7 +1873,7 @@ func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
 	})
 
 	t.Run("a missing path says which it is", func(t *testing.T) {
-		cfg := config{environmentLoadErr: loadErr}
+		cfg := config{brokerInternalToken: "broker-perimeter-token", environmentLoadErr: loadErr}
 		err := cfg.requirePath("workload identity certificate", "", "OVERRIDE", "CERT_FILE")
 		if err == nil {
 			t.Fatal("an unresolved path was accepted")
@@ -1884,9 +1889,9 @@ func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
 // many of them are carried — came through the redaction intact.
 func TestAUsernameCredentialIsNotLogged(t *testing.T) {
 	for _, raw := range []string{
-		"https://s3cr3t-token@mint.cell/platform/_credential",
-		"https://s3cr3t-token:@mint.cell/platform/_credential",
-		"https://user:s3cr3t-token@mint.cell/platform/_credential",
+		"https://s3cr3t-token@mint.cell/modules/_work-context",
+		"https://s3cr3t-token:@mint.cell/modules/_work-context",
+		"https://user:s3cr3t-token@mint.cell/modules/_work-context",
 	} {
 		if got := redactedURL(raw); strings.Contains(got, "s3cr3t-token") {
 			t.Errorf("redactedURL(%q) = %q, which still carries the secret: Redacted() only masks the password", raw, got)
@@ -1953,7 +1958,7 @@ func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		}})
-	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
 	server.principal = testPrincipal
 	contract, err := server.resolveContract()
 	if err != nil {
