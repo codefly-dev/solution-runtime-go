@@ -35,9 +35,14 @@ type CredentialSource interface {
 
 // Credential sets where this execution's credential comes from, replacing the
 // platform's mint endpoint. A test, or a consumer whose issuer is reached
-// another way, supplies its own. Chainable.
+// another way, supplies its own. Source errors retain only ErrMintRefused or
+// ErrMintUnavailable classification; their text and causes are discarded.
+// Chainable.
 func (s *Server) Credential(source CredentialSource) *Server {
 	s.credential = source
+	if source != nil {
+		s.credential = &redactedMintSource{client: source}
+	}
 	return s
 }
 
@@ -146,7 +151,7 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
 	}
-	return client, nil
+	return &redactedMintSource{client: client}, nil
 }
 
 // heldToTheFrozenAuthority rechecks the authority whenever a source hands back
@@ -306,7 +311,7 @@ func (s *Server) mintOptions(
 		// passed alongside the pin meant the drift check guarded a value the
 		// mint did not use.
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
-		ProjectedToken:     workcontext.ProjectedTokenFile(s.cfg.projectedTokenPath),
+		ProjectedToken:     projectedTokenFile(s.cfg.projectedTokenPath),
 		ProjectionAudience: projectionAudience,
 		// The frozen reader, not a value read again here: it is what rechecks
 		// the authority-bearing values before each mint, including the first.

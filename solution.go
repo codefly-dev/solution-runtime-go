@@ -693,6 +693,11 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 	// resolve it are gone.
 	frontendURL := strings.TrimRight(resolveFrontend(ctx, hostModule, hostFrontend), "/")
 
+	projectedTokenPath := workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey)
+	if projectedTokenPath == "" {
+		projectedTokenPath = "/var/run/secrets/codefly/token"
+	}
+
 	cfg := config{
 		port:       port,
 		gatewayURL: gatewayURL,
@@ -710,7 +715,7 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 		// how this package already treats a token-exchange URL it cannot pair.
 		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
 		dialled:            dialledAddresses(gatewayURL, strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, ""))),
-		projectedTokenPath: workloadPath(ctx, ProjectedTokenFileEnvironmentVariable, WorkloadIdentityTokenFileKey),
+		projectedTokenPath: projectedTokenPath,
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
 		identityKeyFile:    workloadPath(ctx, IdentityKeyFileEnvironmentVariable, WorkloadIdentityKeyFileKey),
 		trustBundleFile:    workloadPath(ctx, IdentityTrustBundleFileEnvironmentVariable, WorkloadIdentityTrustBundleFileKey),
@@ -3304,21 +3309,23 @@ func (g *Gateway) workContext(ctx context.Context) (string, error) {
 	})
 }
 
-// WorkContextRefusal is the issuer's refusal to mint a Work Context: most
-// often an authority the viewer does not hold ("owner is not allowed
-// kind:action at requested scope"). It keeps the issuer's Connect code and
-// message, so a caller can tell "you lack this permission" from "the gateway
-// never routed the mint", and unwraps to the GatewayError it has always been.
+// WorkContextRefusal carries only the HTTP status and the locally requested
+// audience. Broker response diagnostics are never retained or returned.
+// Code and Message were removed; consumers should inspect StatusCode.
 type WorkContextRefusal struct {
 	Audience   string
 	StatusCode int
-	// Code is the issuer's Connect code ("permission_denied"), when it sent one.
-	Code    string
-	Message string
 }
 
 func (e *WorkContextRefusal) Error() string {
-	return fmt.Sprintf("work context mint for %q rejected (status %d, %q): %s", e.Audience, e.StatusCode, e.Code, e.Message)
+	message := "request failed"
+	switch e.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		message = "request refused"
+	case http.StatusServiceUnavailable:
+		message = "execution not established"
+	}
+	return fmt.Sprintf("work context mint: HTTP %d: %s", e.StatusCode, message)
 }
 
 func (e *WorkContextRefusal) Unwrap() error { return &GatewayError{StatusCode: e.StatusCode} }
@@ -3364,7 +3371,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	defer cancel()
 	post, err := http.NewRequestWithContext(ctx, http.MethodPost, g.baseURL+workContextStartTaskProcedure, bytes.NewReader(body))
 	if err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, errors.New("work context mint: request could not be constructed")
 	}
 	post.Header.Set("content-type", "application/json")
 	// The viewer's bearer says on whose behalf; this execution's credential
@@ -3377,30 +3384,19 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	}
 	resp, err := g.bearerClient().Do(post)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("work context mint for %q: %w", ask.Audience, err)
+		return "", time.Time{}, errors.New("work context mint: transport failed")
 	}
 	defer drainAndClose(resp)
 	if resp.StatusCode != http.StatusOK {
-		// Connect reports a refusal as a code and message under a mapped HTTP
-		// status. Carry it through: an authority the viewer does not hold reads
-		// nothing like a gateway that never routed the mint, and the status
-		// alone cannot tell them apart.
-		var refusal struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&refusal)
-		return "", time.Time{}, &WorkContextRefusal{
-			Audience: ask.Audience, StatusCode: resp.StatusCode, Code: refusal.Code, Message: refusal.Message,
-		}
+		return "", time.Time{}, &WorkContextRefusal{Audience: ask.Audience, StatusCode: resp.StatusCode}
 	}
 	var issued struct {
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expiresAt"`
 		WorkContextPrincipals
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&issued); err != nil {
-		return "", time.Time{}, fmt.Errorf("work context mint for %q returned invalid json: %w", ask.Audience, err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&issued); err != nil {
+		return "", time.Time{}, errors.New("work context mint: invalid response")
 	}
 	// The capability travels as a string and is not parsed here. There is one
 	// implementation of a Work Context — core's — and this runtime is not it:
@@ -3429,8 +3425,8 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 			ask.Audience)
 	case lifetime < workContextMinimumLifetime:
 		return "", time.Time{}, fmt.Errorf(
-			"work context mint for %q returned the expiry %s, already past or less than %s away (check this host's clock against the issuer's)",
-			ask.Audience, issued.ExpiresAt.UTC().Format(time.RFC3339), workContextMinimumLifetime)
+			"work context mint for %q returned an expiry already past or less than %s away (check this host's clock against the issuer's)",
+			ask.Audience, workContextMinimumLifetime)
 	}
 	// Renew ahead of expiry, but never by more than half the capability's own
 	// life: a lead longer than the lifetime would make every capability
@@ -3443,8 +3439,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 			// Honoured, but say so once: at this lifetime a capability cannot be
 			// held across a whole request, so the mint rate is the issuer's
 			// setting and not a defect here.
-			log.Printf("work contexts are issued with a %s lifetime, shorter than the %s renewal lead: one will be re-minted roughly every %s",
-				lifetime.Round(time.Second), workContextRenewal, lead.Round(time.Second))
+			log.Print("work context mint: issued lifetime requires an earlier renewal")
 		})
 	}
 	g.contexts.remember(token, issued.WorkContextPrincipals)
@@ -3501,6 +3496,8 @@ type workContextCache struct {
 	// fans out would otherwise spend one audited mint per goroutine for a
 	// capability they all share.
 	minting map[string]*pendingMint
+	// Refusals persist for this viewer request; another caller must not re-mint.
+	refused map[string]error
 	// issuedFor holds, per issued capability, whom accounts said it acts for.
 	issuedFor map[string]WorkContextPrincipals
 }
@@ -3522,6 +3519,7 @@ func newWorkContextCache() *workContextCache {
 	return &workContextCache{
 		minted:    map[string]cachedCapability{},
 		minting:   map[string]*pendingMint{},
+		refused:   map[string]error{},
 		issuedFor: map[string]WorkContextPrincipals{},
 	}
 }
@@ -3555,6 +3553,10 @@ func (c *workContextCache) resolve(
 	mint func(context.Context) (string, time.Time, error),
 ) (string, error) {
 	c.mu.Lock()
+	if err := c.refused[key]; err != nil {
+		c.mu.Unlock()
+		return "", err
+	}
 	if issued, ok := c.minted[key]; ok && time.Now().Before(issued.reuseUntil) {
 		c.mu.Unlock()
 		return issued.token, nil
@@ -3579,6 +3581,10 @@ func (c *workContextCache) resolve(
 
 	c.mu.Lock()
 	delete(c.minting, key)
+	var refusal *WorkContextRefusal
+	if errors.As(err, &refusal) && (refusal.StatusCode == http.StatusUnauthorized || refusal.StatusCode == http.StatusForbidden) {
+		c.refused[key] = err
+	}
 	if err == nil {
 		c.minted[key] = cachedCapability{token: token, reuseUntil: reuseUntil}
 	}

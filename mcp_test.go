@@ -900,9 +900,8 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 
 // mcpConfigurationCarrier is the environment variable Codefly's render projects
 // one value of the `mcp` workspace-configuration group into. The runtime never
-// reads it: it resolves the value through the SDK, exactly as it resolves the
-// registration secret. The tests below write the carrier so the SDK's real
-// accessor is what answers — a fake in its place would prove the runtime agrees
+// reads it: it resolves the value through the SDK. The tests write the carrier
+// so the SDK's real accessor answers — a fake would prove the runtime agrees
 // with the fake about an encoding that is the SDK's to own.
 func mcpConfigurationCarrier(key string) string {
 	return resources.WorkspaceConfigurationPrefix + "__" +

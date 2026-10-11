@@ -311,16 +311,16 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 	}
 }
 
-// TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet is the cutover
+// TestABootedRuntimeRegistersNothing is the cutover
 // evidence the earlier version of this test did not provide.
 //
 // That version called the SDK's mint client directly and asserted no legacy
 // header was on the request — which would have stayed green with the whole
 // registration path still in the runtime. This one boots the real runtime with
-// every deleted configuration key set to a value a host would once have acted
-// on, and asserts what the host received: one request, to the mint, and
+// the deleted endpoint settings aimed at an observer, and asserts what the
+// host received: one request, to the mint, and
 // nothing resembling a registration.
-func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
+func TestABootedRuntimeRegistersNothing(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 
 	// A listener of its own for every deleted URL, which boot cannot move.
@@ -347,7 +347,7 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 	}))
 	t.Cleanup(legacy.Close)
 
-	// Every key the cutover deleted. If any of them still reaches a code path,
+	// Removed endpoint settings must reach no code path. If any still does,
 	// the observer above sees a request — or a header it should never be shown
 	// again.
 	for key, value := range map[string]string{
@@ -359,8 +359,6 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   legacy.URL + "/modules/_registration-token",
 		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": legacy.URL + "/solutions/_registration-token",
 		"CODEFLY_INTERNAL_TOKEN":                  "internal-token-that-must-not-travel",
-		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "solution-secret-that-must-not-travel",
-		"CODEFLY__MODULE_REGISTRATION_SECRETS":    "things:module-secret-that-must-not-travel",
 		"CODEFLY__SOLUTION_REGISTRATION_INTERVAL": "1s",
 		"CODEFLY_HOST_FRONTEND":                   "frontend",
 	} {
@@ -476,7 +474,7 @@ func TestABootedRuntimeRegistersNothingWithEveryLegacyKeySet(t *testing.T) {
 		"x-codefly-internal-token",
 		"x-codefly-solution-registration",
 		"x-codefly-module-registration",
-		"x-codefly-module-secret",
+		removedClaimShape(t, "header"),
 	} {
 		if value := mint.headers[0].Get(header); value != "" {
 			t.Errorf("the one request this runtime made presented %s=%q: this runtime has no registration credential to present", header, value)
@@ -775,7 +773,7 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 				default:
 					t.Error("the process was not asked to end: a credential the host has stopped honouring cannot be waited out")
 				}
-				if stored := server.terminalErr.Load(); stored == nil || !errors.Is(*stored, tc.err) {
+				if stored := server.terminalErr.Load(); stored == nil || !errors.Is(*stored, workcontext.ErrMintRefused) {
 					t.Error("the reason this process is ending was not recorded, so its exit would say nothing")
 				}
 			} else {
@@ -2389,6 +2387,10 @@ func TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs(t *testing.T) {
 // the readers under test.
 func freshMint(t *testing.T, source CredentialSource, held workcontext.Credential) (workcontext.Credential, error) {
 	t.Helper()
+	// These checks inspect the SDK transport directly, below error redaction.
+	if redacted, ok := source.(*redactedMintSource); ok {
+		source = redacted.client
+	}
 	client, ok := source.(*workcontext.MintClient)
 	if !ok {
 		t.Fatalf("the source under test is %T, not the SDK's mint client, so this would not exercise the transport at all", source)

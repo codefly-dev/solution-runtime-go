@@ -1257,8 +1257,8 @@ func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T
 	}
 }
 
-// A refused mint retains diagnostics for the handler but returns an actionable
-// status, without disclosing upstream details, to the browser.
+// A refused mint exposes its status, with no upstream diagnostics in either
+// the handler error or the browser response.
 func TestForModuleSurfacesARefusedMint(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{mintStatus: http.StatusForbidden})
 	var mintErr error
@@ -1275,9 +1275,14 @@ func TestForModuleSurfacesARefusedMint(t *testing.T) {
 	if mintErr == nil {
 		t.Fatal("ForModule succeeded against a refusing authority")
 	}
-	for _, want := range []string{"documents", "403", "permission_denied", "caller holds no such authority"} {
+	for _, want := range []string{"403", "request refused"} {
 		if !strings.Contains(mintErr.Error(), want) {
 			t.Errorf("mint error %q does not mention %q", mintErr, want)
+		}
+	}
+	for _, forbidden := range []string{"permission_denied", "caller holds no such authority"} {
+		if strings.Contains(mintErr.Error(), forbidden) {
+			t.Errorf("mint error disclosed broker text: %v", mintErr)
 		}
 	}
 	body, err := io.ReadAll(resp.Body)

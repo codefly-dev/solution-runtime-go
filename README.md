@@ -62,14 +62,32 @@ Four things follow, and each is a boot failure rather than a degraded run:
 | The authority-bearing values are read once and frozen | the credential is sealed to the values it was minted under, so a value that drifts is an error, never a reload |
 | The contract is published, and the declaration is held to it | an ask outside its declared ceiling fails the boot — see [The published contract](#the-published-contract) |
 
+The remaining migration to the platform's module broker is **blocked by SDK
+compatibility**: `saas-sdk-go` at `217bf9fe3f10` references a capability API
+removed from this runtime's `sdk-go/workcontext`, and requires an internal-token
+seam this runtime no longer has. The existing execution SDK remains in use;
+its broader retry policy below still needs an upstream change. See
+[the migration record](CHANGELOG.md) for the exact blocker.
+
+`WorkContextRefusal.Code` and `.Message` have been removed (breaking API change).
+Consumers should inspect `.StatusCode` or unwrap to `GatewayError`. Broker bodies,
+headers, redirect locations and raw transport diagnostics are not returned.
+A viewer request retains a 401/403 for the same mint ask and never re-mints it.
+
+The CLI projects the service-account token read-only at
+`/var/run/secrets/codefly/token`, for audience `accounts`, with lifetime at most
+600 seconds. That path is the boot default; the existing path configuration is
+still available. Token reads are bounded to 64 KiB and repeated for every mint;
+missing, empty, unreadable or oversized files fail closed before a request.
+
 ## Handler errors
 
 Return `ClientError` for an explicitly public validation message. Connect errors
 returned by `Unary` retain actionable statuses: authentication 401, permission
 403, missing resource 404, invalid input 400, conflict 409, precondition 412,
 quota 429, unavailable 503 and deadline 504. Other RPC failures return 502.
-Only generic status text reaches the browser; wrapped/upstream details remain
-available to the handler. No request is retried or replayed.
+Only generic status text reaches the browser. Mint failures also discard upstream
+diagnostics before reaching handlers or logs. No request is retried or replayed.
 
 REST adapters can return `&solution.GatewayError{StatusCode: resp.StatusCode}`
 after a non-success response through the gateway. The runtime preserves 4xx,
@@ -81,7 +99,7 @@ or flattening failures into strings must adopt these typed errors to benefit.
 
 ## Configuration
 
-The runtime hardcodes nothing. On boot `Serve` calls
+On boot `Serve` calls
 `codefly.LoadEnvironmentVariables()` to load Codefly's injected carriers, then
 `loadConfig` resolves every address, port, and path through the codefly Go SDK
 (`github.com/codefly-dev/sdk-go`), falling back to the local native workspace
@@ -93,7 +111,7 @@ The two MCP values have none, because a Codefly composition cannot set a bare
 environment variable on a service: every value a service receives is either an
 endpoint the SDK resolves or a **declared configuration** the render projects.
 Their override is therefore a value in the `mcp` workspace-configuration group,
-resolved through the SDK the way the registration secret is — see [The resource
+resolved through the SDK — see [The resource
 identifier and the issuer](#the-resource-identifier-and-the-issuer).
 
 | What | SDK resolution | Env override (default) |
@@ -101,7 +119,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
 | Credential mint URL | **not resolved — required explicitly.** Must be `https`. Nothing derives it: whether the host mints through the gateway or the workload posts straight to the issuer is unsettled and neither endpoint is deployed, and this is the address the projected service-account token goes to, so an assumed one is refused at boot. Every boot logs where it will mint, and a 404 there means that endpoint does not exist on that host — not that this build was refused | `CODEFLY__CREDENTIAL_MINT_URL` (**required**) |
-| Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint | `CODEFLY__WORKLOAD_TOKEN_FILE` |
+| Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint; defaults to `/var/run/secrets/codefly/token`, the CLI projection | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
@@ -164,7 +182,6 @@ even for that is an open follow-up.
 **Removed in this cutover, with the registrations they fed**: `SELF_UPSTREAM`, `HOST_REGISTER_URL`, `GATEWAY_REGISTER_URL`,
 `GATEWAY_MODULE_REGISTER_URL`, `GATEWAY_MODULE_REGISTRATION_TOKEN_URL`,
 `GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, `CODEFLY_INTERNAL_TOKEN`,
-`CODEFLY__SOLUTION_REGISTRATION_SECRET`, `CODEFLY__MODULE_REGISTRATION_SECRETS`,
 and `CODEFLY__SOLUTION_REGISTRATION_INTERVAL`. Setting any of them now does
 nothing.
 
@@ -467,7 +484,7 @@ is waited for, within a bound.** The two are different answers:
   statuses, `401` and `403`) is the issuer judging this workload: this build is not the one
   its presence document approved, the pod's identity does not match, the token
   attests to another subject. No number of attempts changes any of those
-  answers, so the boot reports what the issuer said and exits non-zero. A loop
+  answers, so the boot reports the refusal class and exits non-zero. A loop
   around it is what this change exists to delete: the old runtime answered every
   refusal by beating again, minting a fresh single-use token each time, so one
   undeployable solution produced an audited mint every 15 seconds for as long as
@@ -537,6 +554,10 @@ A consumer whose issuer is reached another way supplies its own source:
 ```go
 solution.New(manifest).Credential(mySource).Serve() // Credential(ctx) (workcontext.Credential, error)
 ```
+
+Source errors preserve only the `ErrMintRefused` and `ErrMintUnavailable`
+classifications; text and underlying causes are discarded before callers or
+logs can receive them. Other source failures get a fixed failure message.
 
 ### This runtime neither signs, parses nor verifies a capability
 
@@ -742,8 +763,7 @@ else: the gateway holds them in its durable registry, from the presence
 documents, and this runtime registers no upstream for them. The three
 heartbeats that used to — one per consumed module, each brokering a signed
 prefix-bound token through the gateway, plus the two self-registrations — are
-deleted, along with `CODEFLY__MODULE_REGISTRATION_SECRETS` and the per-module
-secrets it carried.
+deleted, along with the credentials they carried.
 
 Codefly still projects the targets into `CODEFLY__API_CONSUMES`, and that
 projection is still what the passthrough declaration is checked against — at
@@ -1015,7 +1035,7 @@ solution.ConsumedModule{
 
 Each call mints only its own method's authority. A viewer who lacks one
 method's authority is refused that method as `permission_denied`, with the
-issuer's reason (which names the missing permission), and is still served
+fixed refusal message, and is still served
 every other method; the mint is never widened or retried with less. Every
 method of a module that is not `ViewerBearer` needs scopes, its own or the
 module's, and `ViewerBearer` takes none at either level.
@@ -1102,7 +1122,7 @@ client := widgetsv1connect.NewWidgetsClient(page.Client(), page.BaseURL("widgets
 | --- | --- |
 | `NewHost(t)` | The fake host gateway: it mints the viewer's Work Context (the accounts `StartTask` procedure) and forwards `/v1/<as>/*` to each routed module, streams included, flushed as they arrive. |
 | `Host.Module(as, upstream)` | Routes a consumed module to the test's own server, path unchanged. Every routed module is also in the solution's api.consumes; one the declaration names but the host does not route is refused as `Serve` refuses it. |
-| `Host.RefuseMints(func(Mint) *Refusal)` | Decides each mint: a non-nil `Refusal` refuses it as accounts would (default status 403), so the page sees `permission_denied` with its message. |
+| `Host.RefuseMints(func(Mint) *Refusal)` | Decides each mint: a non-nil `Refusal` refuses it as accounts would (default status 403), so the page sees `permission_denied` with a fixed refusal message. |
 | `Host.Mints()`, `Host.Calls()` | Every mint asked for (audience, scopes, org, session, bearer, the token answered), and every call forwarded to a module, each with the `Mint` whose capability it presented — how a test asserts the authority each method was called under. |
 | `Start(t, host, consumes...)` / `Handler(host, consumes...)` | The passthrough served for the declaration, or the bare handler and the error `Serve` would refuse the declaration with. |
 | `Solution.Client()`, `ClientAs(Viewer)`, `BaseURL(as)` | A client that calls as `DefaultViewer` (or the viewer given), setting the bearer and the `x-org-id` / `x-session-id` headers the gateway stamps; and the base URL a module's generated client takes. |

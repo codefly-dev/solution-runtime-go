@@ -350,8 +350,8 @@ func TestARefusedMintRefusesOnlyThatMethod(t *testing.T) {
 		err = stream.Err()
 		_ = stream.Close()
 	}
-	if connect.CodeOf(err) != connect.CodePermissionDenied || !strings.Contains(err.Error(), "widgets:watch") {
-		t.Fatalf("watch = %v, want permission_denied naming the missing permission", err)
+	if connect.CodeOf(err) != connect.CodePermissionDenied || !strings.Contains(err.Error(), "the viewer's authority for this module was refused") || strings.Contains(err.Error(), "widgets:watch") {
+		t.Fatalf("watch = %v, want permission_denied with a fixed refusal and no broker diagnostics", err)
 	}
 	if _, err := search.CallUnary(context.Background(), request("w1")); err != nil {
 		t.Fatalf("search, whose authority the viewer holds, was refused: %v", err)
