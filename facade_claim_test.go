@@ -5,7 +5,6 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -40,35 +39,28 @@ import (
 // implement. There is no list of expression forms to finish here: the compiler
 // has already folded every constant, conversions and concatenation alike, so
 // the value is taken from it. That fixture is a compiled negative case below.
-// The removed vocabulary is archived in CHANGELOG.md. Keeping the gate's
-// inputs there lets configuration and source trees stay free of those names
-// without weakening the compiled regression fixtures.
+// Pin canonical wire spellings independently of documentation and fixture
+// generation. Archive edits must never redefine the boundary.
 func removedClaimShape(t *testing.T, kind string) string {
 	t.Helper()
-	raw, err := os.ReadFile("CHANGELOG.md")
-	if err != nil {
-		t.Fatal(err)
+	switch kind {
+	case "header":
+		return "X-Codefly-Module-Secret"
+	case "carrier":
+		return "CODEFLY__MODULE_REGISTRATION_SECRETS"
 	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		parts := strings.Split(line, "|")
-		if len(parts) == 4 && strings.TrimSpace(parts[1]) == kind {
-			value := strings.Trim(strings.TrimSpace(parts[2]), "`")
-			if value != "" {
-				return value
-			}
-		}
-	}
-	t.Fatalf("missing removed claim %q in the migration archive", kind)
+	t.Fatalf("unknown removed claim kind %q", kind)
 	return ""
 }
 
 func claimShapes(t *testing.T) map[string]string {
 	return map[string]string{
-		"/modules/_register":            "the gateway's module route-claim path",
-		"/modules/_registration-token":  "the exchange that credentials a module route claim",
-		"X-Codefly-Module-Registration": "the header carrying a module route-claim credential",
-		removedClaimShape(t, "header"):  "the removed module credential header",
-		removedClaimShape(t, "carrier"): "the removed module credential carrier",
+		"CODEFLY__SOLUTION_REGISTRATION_SECRET": "the removed solution credential carrier",
+		"/modules/_register":                    "the gateway's module route-claim path",
+		"/modules/_registration-token":          "the exchange that credentials a module route claim",
+		"X-Codefly-Module-Registration":         "the header carrying a module route-claim credential",
+		removedClaimShape(t, "header"):          "the removed module credential header",
+		removedClaimShape(t, "carrier"):         "the removed module credential carrier",
 	}
 }
 
@@ -226,6 +218,10 @@ func TestTheFacadeGatesCatchTheEscapingFixture(t *testing.T) {
 
 import "os"
 
+func LegacySolutionCredential() string {
+ return os.Getenv("CODEFLY__SOLUTION_REGISTRATION_SECRET")
+}
+
 // A constant conversion splicing the carrier's name.
 func FacadeCredentialViaConversion() string {
 	const key = __CARRIER_CONVERSION__
@@ -324,7 +320,9 @@ func joinedKey(parts []string) string {
 }
 `
 
-	carrier, header := removedClaimShape(t, "carrier"), removedClaimShape(t, "header")
+	// Independent of claimShapes: changing the gate's vocabulary must fail
+	// against these canonical wire inputs, even if the archive changes too.
+	carrier, header := "CODEFLY__MODULE_REGISTRATION_SECRETS", "X-Codefly-Module-Secret"
 	conversion := func(value string) string {
 		return strconv.Quote(value[:1]) + " + string(rune(" + strconv.Itoa(int(value[1])) + ")) + " + strconv.Quote(value[2:])
 	}
@@ -345,6 +343,7 @@ func joinedKey(parts []string) string {
 		keys = strings.Join(unresolvedKeyFindings(t, pkg), "\n")
 	}
 	for _, want := range []string{
+		"CODEFLY__SOLUTION_REGISTRATION_SECRET",
 		carrier,
 		"/modules/_register",
 		header,

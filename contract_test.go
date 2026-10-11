@@ -21,7 +21,7 @@ func contractServer(t *testing.T, profile string, contract ModuleContract, modul
 		modules = []ConsumedModule{passthroughModule()}
 	}
 	server := New(Manifest{ID: testSolutionID}).Consumes(modules...).Contract(contract)
-	server.cfg = config{profile: profile, consumes: newProjection(consumesThings)}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", profile: profile, consumes: newProjection(consumesThings)}
 	server.principal = testPrincipal
 	return server
 }
@@ -276,7 +276,7 @@ func TestAnUnusableProfileNameIsRefused(t *testing.T) {
 	}}, passthroughModule()); err == nil {
 		t.Error("a traversing profile name was rendered")
 	}
-	cfg := config{
+	cfg := config{brokerInternalToken: "broker-perimeter-token",
 		port: "8080", gatewayURL: "https://gateway:42152", mintURL: "https://gateway:42152" + credentialMintPath,
 		identityCertFile: "c", identityKeyFile: "k", projectedTokenPath: "t", trustBundleFile: "b", profile: "../local",
 	}
@@ -706,7 +706,7 @@ func TestTheDeclaredCeilingIsFrozenAtDeclaration(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: ceilingActions}}},
 		}})
-	server.cfg = config{gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
 	server.principal = testPrincipal
 	contract, err := server.resolveContract()
 	if err != nil {

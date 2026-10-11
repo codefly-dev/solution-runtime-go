@@ -56,16 +56,17 @@ func TestRuntimeProjectedTokenReaderReadsFreshAndFailsClosed(t *testing.T) {
 }
 
 // Exercise the production source, including its TLS readers and error boundary.
-func productionMintSource(t *testing.T, mint *hostMint, tokenFile string) CredentialSource {
+func productionMintSource(t *testing.T, mint *hostMint, tokenFile string) *brokerCredentialSource {
 	t.Helper()
 	cert, key, bundle, _, _, _ := bootIdentityIn(t, mint, testPrincipal)
 	s := New(Manifest{ID: testSolutionID})
 	s.cfg = config{
 		identityCertFile: cert, identityKeyFile: key, trustBundleFile: bundle,
-		allowedCallersFile: identitiesFile(t, testGatewayPrincipal),
-		mintPeersFile:      identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile:   identitiesFile(t, testGatewayPrincipal),
-		mintURL:            mint.URL + credentialMintPath, projectedTokenPath: tokenFile,
+		allowedCallersFile:  identitiesFile(t, testGatewayPrincipal),
+		mintPeersFile:       identitiesFile(t, testGatewayPrincipal),
+		gatewayPeersFile:    identitiesFile(t, testGatewayPrincipal),
+		brokerInternalToken: "broker-perimeter-token",
+		mintURL:             mint.URL + credentialMintPath, projectedTokenPath: tokenFile,
 	}
 	s.principal = testPrincipal
 	s.authority = authorityFor(t, context.Background())
@@ -94,7 +95,7 @@ func TestUnusableProjectedTokenNeverReachesTheMint(t *testing.T) {
 			mint := newHostMint(t, &hostMint{})
 			source := productionMintSource(t, mint, path)
 			credential, err := source.Credential(context.Background())
-			if credential.Token() != "" || !errors.Is(err, workcontext.ErrMintUnavailable) {
+			if credential.Token() != "" || !terminalCredentialFailure(err) {
 				t.Fatalf("unusable projection did not fail closed: %v", err)
 			}
 			if !strings.Contains(err.Error(), "projected service-account token") || strings.Contains(err.Error(), path) {
@@ -161,7 +162,8 @@ func TestViewerMintDiscardsResponseAndTransportDiagnostics(t *testing.T) {
 	for _, kind := range []string{"401", "403", "503", "redirect", "malformed-json", "transport"} {
 		t.Run(kind, func(t *testing.T) {
 			gw := newGateway("https://gateway.example", "viewer", "org", "session")
-			gw.workload = attestingSource(t).Credential
+			source := attestingSource(t)
+			gw.workload = func(ctx context.Context) (executionCredential, error) { return source.Credential(ctx) }
 			calls := 0
 			gw.transport = mintRoundTrip(func(r *http.Request) (*http.Response, error) {
 				calls++

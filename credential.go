@@ -15,20 +15,9 @@ import (
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
-// CredentialSource is where this execution's credential comes from.
-//
-// It is the SDK mint client's own method, so *workcontext.MintClient satisfies
-// it directly and this runtime holds no mint of its own: obtaining a credential
-// from a projected service-account token, sealing it to a build incarnation and
-// an installation, re-reading the rotated projection and rechecking the
-// boot-read authority before each renewal are all the SDK's, and this runtime
-// decides only when a credential is needed and what happens when there is none.
-//
-// Every use calls it. The client mints the first credential, hands back the one
-// it holds while that one is current, and renews it once it has entered its
-// renewal lead — so there is no path through this runtime on which a lapsed
-// credential is presented, and no timer here that is not the credential's own
-// expiry.
+// CredentialSource supplies an execution credential from a consumer's issuer.
+// The platform broker uses an internal source; this SDK-compatible hook remains
+// available to existing consumers without changing their return type.
 type CredentialSource interface {
 	Credential(ctx context.Context) (workcontext.Credential, error)
 }
@@ -71,9 +60,8 @@ const (
 	// against, as the host names it.
 	AuthorityAudienceKey = "AUDIENCE"
 	// AuthorityProjectionAudienceKey is the audience the projected
-	// service-account token was itself minted for. It is sent with the mint so
-	// the host can refuse a projection aimed at something else, rather than
-	// reviewing whatever it is handed.
+	// service-account token was itself minted for. The broker requires accounts;
+	// this value is checked locally and is not a broker request field.
 	AuthorityProjectionAudienceKey = "PROJECTION_AUDIENCE"
 )
 
@@ -94,7 +82,7 @@ func readAuthority(ctx context.Context) (*codefly.Authority, error) {
 	return authority, nil
 }
 
-// platformCredentialSource is the default source: the SDK's mint client,
+// platformCredentialSource is the native module broker client,
 // pointed at the host's mint endpoint, presenting the service-account token the
 // platform projects for this workload.
 //
@@ -103,7 +91,7 @@ func readAuthority(ctx context.Context) (*codefly.Authority, error) {
 // projected, is not proxied, and does not follow redirects: the request carries
 // the projected token that attests which workload this process is, and a
 // Location would hand that to whatever answered at the mint URL.
-func (s *Server) platformCredentialSource() (CredentialSource, error) {
+func (s *Server) platformCredentialSource() (*brokerCredentialSource, error) {
 	projectionAudience, err := s.authority.Value(AuthorityGroup, AuthorityProjectionAudienceKey)
 	if err != nil {
 		return nil, err
@@ -147,11 +135,11 @@ func (s *Server) platformCredentialSource() (CredentialSource, error) {
 			return nil, fmt.Errorf("this workload would present a certificate the host has not approved it under to the credential mint: %w", err)
 		}
 	}
-	client, err := workcontext.NewMintClient(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), held))
+	client, err := newBrokerCredentialSource(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), held))
 	if err != nil {
 		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
 	}
-	return &redactedMintSource{client: client}, nil
+	return client, nil
 }
 
 // heldToTheFrozenAuthority rechecks the authority whenever a source hands back
@@ -290,63 +278,24 @@ type sealedIdentity struct {
 	incarnation  uint64
 }
 
-// mintOptions is how this runtime asks the SDK's mint client for a credential.
-//
-// A function of its own so it can be read in a test. Every field here is a
-// decision, and the one most easily lost is Authority: the SDK rechecks it
-// before every renewal, which is the single moment a drifted authority value
-// would otherwise be laundered into a credential nobody approved. Dropping it
-// leaves the boot and the first mint working perfectly and only renewals wrong,
-// which is not a shape a test over the happy path can see.
+// mintOptions binds the declared prefix and perimeter credential to the frozen
+// authority and live TLS readers. No environment is read after loadConfig.
 func (s *Server) mintOptions(
 	projectionAudience string,
 	anchor func() (*x509.CertPool, error),
 	leaf func(*tls.CertificateRequestInfo) (*tls.Certificate, error),
-) workcontext.MintOptions {
-	return workcontext.MintOptions{
-		URL: s.cfg.mintURL,
-		// The pinned value the audience is READ from, not an audience this
-		// runtime resolved and passed beside the pin. The SDK made that a
-		// typed reference for a reason worth keeping in mind here: a string
-		// passed alongside the pin meant the drift check guarded a value the
-		// mint did not use.
+) brokerMintOptions {
+	return brokerMintOptions{
+		URL:                s.cfg.mintURL,
+		Prefix:             s.manifest.ID,
+		InternalToken:      s.cfg.brokerInternalToken,
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
 		ProjectedToken:     projectedTokenFile(s.cfg.projectedTokenPath),
 		ProjectionAudience: projectionAudience,
-		// The frozen reader, not a value read again here: it is what rechecks
-		// the authority-bearing values before each mint, including the first.
-		Authority: s.authority,
-		// The transport's three judgements, as READERS rather than values.
-		//
-		// This is sdk-go#51, and it is the shape this runtime argued for from
-		// both ends. The SDK still builds and owns the transport — a supplied
-		// *http.Client is a hole it cannot inspect, since a nil Transport
-		// means the global mutable default, a DialTLSContext bypasses
-		// TLSClientConfig entirely, and a caller holding the same transport
-		// can turn verification off after construction — but it no longer
-		// takes a pool by value and fixes it for the client's lifetime.
-		//
-		// Every one of these is called DURING the handshake, so withdrawal
-		// takes effect on the next handshake rather than on the next process:
-		//
-		//   - TrustAnchor is the same reader the listener and the gateway dial
-		//     use, read before and after each handshake and never cached, so a
-		//     removed root stops this process dialling the mint.
-		//   - ClientCertificate makes the mint request present this workload's
-		//     X.509-SVID again. The projected service-account token is no
-		//     longer the whole of what attests who is asking.
-		//   - AdmittedPeers is MINT_PEERS_FILE, read per handshake, so the
-		//     mint endpoint is held to WHICH party it is and not merely to a
-		//     certificate from the right CA. Every workload in the trust
-		//     domain holds one of those, which is why authentication was never
-		//     authorisation here.
-		TrustAnchor: anchor,
-		// Asked with an empty request rather than nil: a consumer's own
-		// GetClientCertificate may read the acceptable CAs off it, and handing
-		// it nil would be this runtime choosing a dereference on somebody
-		// else's code path.
-		ClientCertificate: func() (*tls.Certificate, error) { return leaf(&tls.CertificateRequestInfo{}) },
-		AdmittedPeers:     s.admittedMint(),
+		Authority:          s.authority,
+		TrustAnchor:        anchor,
+		ClientCertificate:  func() (*tls.Certificate, error) { return leaf(&tls.CertificateRequestInfo{}) },
+		AdmittedPeers:      s.admittedMint(),
 	}
 }
 
@@ -382,25 +331,17 @@ func (s *Server) mintOptions(
 // orchestrator whose job is to restart it, and a restart is cheaper to read
 // than a solution that serves nothing while logging forever.
 func (s *Server) openCredential(ctx context.Context) error {
-	if s.credential == nil {
+	if s.credential == nil && s.brokerCredential == nil {
 		source, err := s.platformCredentialSource()
 		if err != nil {
 			return err
 		}
-		s.credential = source
+		s.brokerCredential = source
 	}
-	// Whatever the source is, the authority recheck is this runtime's promise
-	// and not the source's.
-	//
-	// A supplied source replaces the mint client, and with it every option
-	// mintOptions carries — including Authority, which the SDK rechecks before
-	// each renewal. So the one guarantee that exists to stop a drifted
-	// authority value being laundered into a differently-sealed credential
-	// applied to the platform path only, while this package's own
-	// documentation promises it of the process. Wrapping here makes the promise
-	// true of every source, and it costs the platform source nothing: the SDK
-	// does it too, and a recheck of three frozen values is a comparison.
-	s.credential = heldToTheFrozenAuthority(s.credential, s.authority)
+	// Consumer sources receive the same authority hold as the native broker.
+	if s.credential != nil {
+		s.credential = heldToTheFrozenAuthority(s.credential, s.authority)
+	}
 	window := s.firstMintWindow
 	if window == 0 {
 		window = firstMintWait
@@ -423,7 +364,7 @@ func (s *Server) openCredential(ctx context.Context) error {
 		wait = quarter
 	}
 	for attempt := 1; ; attempt++ {
-		credential, err := s.credential.Credential(deadline)
+		credential, err := s.nextCredential(deadline)
 		switch {
 		case err == nil && usableCredential(credential) != nil:
 			// A source may hand back the zero credential or an expired one,
@@ -475,7 +416,11 @@ func (s *Server) openCredential(ctx context.Context) error {
 			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s and %d attempt(s): %w — the issuer answers this way while a presence generation has not been applied yet, or while it cannot reach the Kubernetes API or its policy log; all three are transient, so this is an exit for the orchestrator to retry rather than a judgement on this build",
 				s.cfg.mintURL, window, attempt, err)
 		}
-		if remaining := time.Until(mustDeadline(deadline)); wait > remaining {
+		remaining := time.Until(mustDeadline(deadline))
+		if remaining <= 0 {
+			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s (transient): %w", s.cfg.mintURL, window, err)
+		}
+		if wait > remaining {
 			wait = remaining
 		}
 		log.Printf("solution %q: this execution's credential is not available yet (attempt %d, retrying in %s): %v",
@@ -575,7 +520,7 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // the held-credential fallback that every other caller goes through did not
 // apply to the viewer's mint, which is the hottest path there is. One
 // controller means one controller.
-type credentialAcquirer func(context.Context) (workcontext.Credential, error)
+type credentialAcquirer func(context.Context) (executionCredential, error)
 
 // attestWorkloadReporting is attestWorkload with somewhere to report a
 // *terminal* failure, which is the half that is easy to get backwards.
@@ -676,31 +621,22 @@ func (r *attestationReport) recovered(id string) {
 	}
 }
 
-// terminalCredentialFailure reports whether the issuer's answer is a judgement
-// no retry can change.
-//
-// ErrMintRefused only, and the correction is worth recording because the
-// it is easy to get from the wrong direction. It also treated ErrRevoked
-// as terminal here, on the reasoning that live state moving under a sound
-// credential is as final as a refused build. Two things are wrong with that:
-// the mint client does not return ErrRevoked at all (it comes back from a
-// *callee* that was shown a capability sealed to state that has moved), and the
-// SDK's own contract for it is a refresh and one retry — so treating it as
-// terminal would have ended the process on a condition the client is built to
-// recover from, if the path had ever been reachable. It was not, which is why
-// no test noticed; a dead branch that would do the wrong thing if it ever woke
-// up is worse than no branch.
-//
-// A callee's ErrRevoked arrives on a viewer's own request and is answered
-// there, as a 409 to that viewer. Nothing is inferred from it about the
-// capability or about this execution's credential: a 409 means "the state you
-// were sealed to has moved" and it means "that page already exists", and
-// nothing on the wire says which (see the RoundTrip comment in solution.go).
-//
-// Everything else, ErrMintUnavailable above all, is transient by construction
-// and must not end the process: an issuer that cannot reach its own policy log
-// is an issuer behaving correctly, and exiting on it would turn a dependency
-// blip into a crash loop.
+// terminalCredentialFailure preserves refusals separately from terminal broker
+// protocol/configuration errors. Neither may cause another execution mint.
 func terminalCredentialFailure(err error) bool {
-	return errors.Is(err, workcontext.ErrMintRefused)
+	var broker *brokerMintError
+	return errors.Is(err, workcontext.ErrMintRefused) ||
+		(errors.As(err, &broker) && !broker.retryable())
+}
+
+// Both sources enter the same acquisition controller; the public SDK source
+// keeps its original signature while the broker carries Core's inspected value.
+func (s *Server) nextCredential(ctx context.Context) (executionCredential, error) {
+	if s.credential != nil {
+		return s.credential.Credential(ctx)
+	}
+	if s.brokerCredential != nil {
+		return s.brokerCredential.Credential(ctx)
+	}
+	return workcontext.Credential{}, errors.New("no credential source")
 }

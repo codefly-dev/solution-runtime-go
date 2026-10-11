@@ -625,7 +625,7 @@ func TestTheMCPSeamRefusesWithoutAServeMCPDeclaration(t *testing.T) {
 // the host's issuer and must not start failing to boot because this runtime now
 // resolves one.
 func TestValidateRefusesAnUnresolvedIssuerOnlyWhenMCPIsServed(t *testing.T) {
-	cfg := config{mcp: true}
+	cfg := config{brokerInternalToken: "broker-perimeter-token", mcp: true}
 	err := cfg.validateMCP()
 	if err == nil {
 		t.Fatal("an unresolved issuer was accepted while serving MCP")
@@ -633,7 +633,7 @@ func TestValidateRefusesAnUnresolvedIssuerOnlyWhenMCPIsServed(t *testing.T) {
 	if !strings.Contains(err.Error(), mcpConfigurationValue(MCPIssuerURLKey)) {
 		t.Errorf("refusal %q does not name %s, the configuration that fixes it", err, mcpConfigurationValue(MCPIssuerURLKey))
 	}
-	if err := (config{}).validateMCP(); err != nil {
+	if err := (config{brokerInternalToken: "broker-perimeter-token"}).validateMCP(); err != nil {
 		t.Errorf("a solution serving no MCP was refused: %v", err)
 	}
 }
@@ -649,7 +649,7 @@ func TestValidateRefusesAnUnresolvedIssuerOnlyWhenMCPIsServed(t *testing.T) {
 // derived identifier is unusable only because PUBLIC_URL is.
 func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
 	for _, public := range []string{"https://host.test/solutions/wiki", "https://host.test/mcp/", "/solutions/wiki/mcp"} {
-		cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: public, mcpPublicExplicit: true}
+		cfg := config{brokerInternalToken: "broker-perimeter-token", mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: public, mcpPublicExplicit: true}
 		err := cfg.validateMCP()
 		if err == nil {
 			t.Errorf("%s %q was accepted, want a refusal", mcpConfigurationValue(MCPPublicURLKey), public)
@@ -669,7 +669,7 @@ func TestValidateRefusesAnUnpairablePublicURL(t *testing.T) {
 			t.Errorf("refusal %q for a derived identifier does not send the operator to PUBLIC_URL", err)
 		}
 	}
-	cfg := config{mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: "https://host.test/solutions/wiki" + MCPPath}
+	cfg := config{brokerInternalToken: "broker-perimeter-token", mcp: true, mcpIssuerURL: testIssuer, mcpPublicURL: "https://host.test/solutions/wiki" + MCPPath}
 	if err := cfg.validateMCP(); err != nil {
 		t.Errorf("a pairable public URL was refused: %v", err)
 	}
@@ -732,7 +732,7 @@ func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
 	const inCluster = "http://frontend.saas.svc.cluster.local:3000"
 	const public = "https://app.example.com/solutions/wiki" + MCPPath
 
-	deployed := config{mcp: true, runtimeContext: "kubernetes", mcpIssuerURL: inCluster}
+	deployed := config{brokerInternalToken: "broker-perimeter-token", mcp: true, runtimeContext: "kubernetes", mcpIssuerURL: inCluster}
 	err := deployed.validateMCP()
 	if err == nil {
 		t.Fatal("a deployed MCP surface with no public URL was accepted")
@@ -781,7 +781,7 @@ func TestValidateRefusesADeployedMCPThatNobodyAddressed(t *testing.T) {
 	// A local run resolves a host it can actually reach and is unaffected: the
 	// refusal is about a deployment, never about the environment's name.
 	for _, local := range []string{"", "native", "nix", "container", "free"} {
-		cfg := config{mcp: true, runtimeContext: local, mcpIssuerURL: "http://localhost:3000"}
+		cfg := config{brokerInternalToken: "broker-perimeter-token", mcp: true, runtimeContext: local, mcpIssuerURL: "http://localhost:3000"}
 		if err := cfg.validateMCP(); err != nil {
 			t.Errorf("runtime context %q was refused: %v", local, err)
 		}
@@ -1183,7 +1183,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 			}
 			server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
 				ServeMCP(mcpServerName, "v1.2.3", register).
-				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/platform/_credential (dial tcp 10.4.1.9:8443: connection refused)", tc.err)})
+				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/modules/_work-context (dial tcp 10.4.1.9:8443: connection refused)", tc.err)})
 
 			handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
 			if err != nil {
@@ -1375,7 +1375,7 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
 	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
 		ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
-		Credential(refusingSource{err: fmt.Errorf("%w: at https://mint.internal.example/platform/_credential", workcontext.ErrMintUnavailable)})
+		Credential(refusingSource{err: fmt.Errorf("%w: at https://mint.internal.example/modules/_work-context", workcontext.ErrMintUnavailable)})
 
 	var reached atomic.Bool
 	next := func(context.Context, string, mcp.Request) (mcp.Result, error) {
@@ -1455,7 +1455,7 @@ func TestNoMCPRefusalEverPrintsASecret(t *testing.T) {
 	for _, runtimeContext := range []string{"", "kubernetes"} {
 		for _, value := range withSecret {
 			for _, which := range []string{"issuer", "public"} {
-				cfg := config{mcp: true, runtimeContext: runtimeContext,
+				cfg := config{brokerInternalToken: "broker-perimeter-token", mcp: true, runtimeContext: runtimeContext,
 					mcpIssuerURL: "https://login.example.com", mcpIssuerExplicit: true,
 					mcpPublicURL: "https://app.example.com/wiki" + MCPPath, mcpPublicExplicit: true}
 				switch which {
@@ -1504,7 +1504,7 @@ func TestNoMCPRefusalEverPrintsASecret(t *testing.T) {
 func TestNoExportedGatewayMethodRelaysTheRuntimesError(t *testing.T) {
 	gw := newWorkContextGateway(t, &workContextGateway{})
 	server := New(Manifest{ID: testSolutionID}).Credential(attestingSource(t))
-	server.cfg = config{gatewayURL: gw.URL}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gw.URL}
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
@@ -1696,9 +1696,9 @@ func TestAToolsOwnRefusalIsLeftAlone(t *testing.T) {
 // was looking in one of the two places the SDK sends.
 func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token",
 		gatewayURL: "https://gateway.internal.test",
-		mintURL:    "https://mint.internal.test/platform/_credential",
+		mintURL:    "https://mint.internal.test/modules/_work-context",
 	}
 	server.cfg.dialled = dialledAddresses(server.cfg.gatewayURL, server.cfg.mintURL)
 
@@ -1707,7 +1707,7 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 			IsError: true,
 			Content: []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
 			StructuredContent: map[string]any{
-				"error": `Post "https://mint.internal.test/platform/_credential": dial tcp 127.0.0.1:1 connect: connection refused`,
+				"error": `Post "https://mint.internal.test/modules/_work-context": dial tcp 127.0.0.1:1 connect: connection refused`,
 			},
 		}, "tools/call")
 		call, ok := result.(*mcp.CallToolResult)
@@ -1767,7 +1767,9 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		// through Marshal, so a search over the serialized bytes for
 		// "https://host" misses — and the client decodes the address straight
 		// back out. The decoded strings are what get checked now.
-		escaped := json.RawMessage(`{"error":"https:\/\/mint.internal.test\/platform\/_credential failed"}`)
+		// Escape the configured endpoint so a protocol migration cannot leave
+		// this probe testing a URL the runtime no longer dials.
+		escaped := json.RawMessage(`{"error":"` + strings.ReplaceAll(server.cfg.mintURL, "/", `\/`) + ` failed"}`)
 		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
 			IsError:           true,
 			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
@@ -1799,7 +1801,7 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
 			IsError:           true,
 			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
-			StructuredContent: map[string]any{"https://mint.internal.test/platform/_credential": "refused"},
+			StructuredContent: map[string]any{"https://mint.internal.test/modules/_work-context": "refused"},
 		}, "tools/call")
 		if call, ok := result.(*mcp.CallToolResult); !ok || call.StructuredContent != nil {
 			t.Errorf("an address in a structured KEY survived the filter: %+v", result)
@@ -1813,7 +1815,7 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		// mint's address afterwards passed the check and disclosed on the
 		// second call. No concurrency needed — marshalling is not a pure
 		// function of a value this runtime did not write.
-		shifty := &shiftingMarshaler{later: `{"error":"https://mint.internal.test/platform/_credential"}`}
+		shifty := &shiftingMarshaler{later: `{"error":"https://mint.internal.test/modules/_work-context"}`}
 		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
 			IsError:           true,
 			Content:           []mcp.Content{&mcp.TextContent{Text: "the call did not complete"}},
@@ -1843,7 +1845,7 @@ func TestAStructuredToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 		result := server.withoutRuntimeAddresses(&mcp.CallToolResult{
 			IsError:           true,
 			Content:           []mcp.Content{text},
-			StructuredContent: sabotagingMarshaler{text: text, to: "https://mint.internal.test/platform/_credential"},
+			StructuredContent: sabotagingMarshaler{text: text, to: "https://mint.internal.test/modules/_work-context"},
 		}, "tools/call")
 		published, err := json.Marshal(result)
 		if err != nil {

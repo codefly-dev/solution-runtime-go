@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — partial mint-once migration
+## Unreleased — native module-broker execution mint
 
 Breaking API change: `WorkContextRefusal.Code` and `WorkContextRefusal.Message`
 are removed. Use `StatusCode` (or unwrap to `GatewayError`) to classify failures.
@@ -12,21 +12,28 @@ mounts it read-only for audience `accounts` with a lifetime of at most 600 secon
 The runtime reads the bounded file again before each mint. Missing, empty,
 unreadable and oversized projections fail closed.
 
-The requested `saas-sdk-go` revision
-`v0.0.3-0.20261011091114-217bf9fe3f10` cannot build alongside the current
-`sdk-go/workcontext`: its `moduleauthority` package requires the removed
-`WorkContextToken` and `ParseWorkContextToken` API. Its `Seams` also requires an
-internal perimeter token that this runtime no longer provisions. Switching the
-broker and supplying the solution's declared name as its prefix remain blocked
-on a compatible SDK. The offline `go get` succeeded, but the subsequent
-`moduleauthority` build failed on those symbols. The unusable dependency change
-was reverted and `go mod tidy` left the original pins unchanged. No SDK source
-was copied or modified locally.
+Execution minting now implements the published `saas-sdk-go/moduleauthority`
+contract at `217bf9fe3f10` natively: `POST /modules/_work-context`, the declared
+`Manifest.ID` as `prefix`, the fresh projected bearer, and the perimeter token
+from the declared workspace secret `module-authority/INTERNAL_TOKEN`. The legacy
+internal-token variable remains ignored. This is a runtime protocol fix; no SDK
+package is vendored or copied and dependency pins are unchanged.
 
-The retained execution SDK marks every non-401/403 HTTP status unavailable and
-exposes no typed status for narrowing retries. Therefore the requested retry
-policy (only 503 and transient transport failures) is not complete. Execution
-refusals still latch; errors from default and consumer-supplied credential sources are now redacted.
+The broker client accepts the camel-case response and delegates structural
+capability inspection to Core. The public `CredentialSource` signature is
+unchanged. TLS identity, fresh trust/admission checks, frozen authority,
+installation/build holds, single-flight acquisition and expiry-driven renewal
+remain enforced.
+
+Only 503 and typed timeout/connection-refused/connection-reset failures retry.
+401/403 remain terminal refusals; every other status and permanent transport or
+response error is terminal. Errors retain safe classification and discard raw
+diagnostics. Conformance tests exercise the actual request and response using
+an in-memory fake broker, including boot and renewal retry decisions.
+
+The legacy-secret regression again sets nonempty deleted secret variables.
+Compiler gates pin the canonical forbidden spellings independently of this
+archive; compiled fixtures prove that reintroduced readers are rejected.
 
 ### Removed authentication configuration (archive)
 
@@ -36,9 +43,8 @@ These identifiers are deleted, not compatibility inputs:
 `CODEFLY__SOLUTION_REGISTRATION_SECRET`, `MintModuleRegistration`, and
 `MintSolutionRegistration`.
 
-The compiler-based facade gate reads the two wire spellings below from this
-archive and still checks constants, conversions, aliases and compiled fixtures.
-Tests never provision a removed identity secret.
+These archived spellings are also independently pinned by the compiler-based
+facade gate. Adversarial tests deliberately provision removed secrets.
 
 | Kind | Removed wire spelling |
 | --- | --- |

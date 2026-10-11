@@ -30,9 +30,12 @@ func bootableEnvironment(t *testing.T) {
 	t.Helper()
 	t.Setenv("PORT", "8090")
 	t.Setenv("GATEWAY_URL", "https://gateway.cell.test:42152")
-	t.Setenv(CredentialMintURLEnvironmentVariable, "https://mint.cell.test/mint")
+	t.Setenv(CredentialMintURLEnvironmentVariable, "https://mint.cell.test/modules/_work-context")
 	t.Setenv(ContractProfileEnvironmentVariable, "test")
 	t.Setenv("CODEFLY__RUNTIME_CONTEXT", "")
+	// The broker requires its declared workspace secret even when nothing is
+	// consumed. Resolve it through the SDK just as the real boot does.
+	authorityValues(t)
 }
 
 // bootConfig is the config a boot resolves in that environment, asserted to be
@@ -278,6 +281,8 @@ func TestTheProjectionCannotBeHalfConstructed(t *testing.T) {
 	refused.consumes = malformed
 	if err := refused.validate(); err == nil {
 		t.Error("a config holding a malformed projection passed validate()")
+	} else if !strings.Contains(err.Error(), manifest.APIConsumesEnvironmentVariable) {
+		t.Errorf("the malformed projection was refused for another reason: %v", err)
 	}
 	accepted := loadConfig(context.Background(), "solution-under-test", nil)
 	accepted.consumes = empty

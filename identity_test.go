@@ -56,7 +56,7 @@ func TestABootWithoutAWorkloadIdentityIsRefusedByName(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID})
-			server.cfg = config{
+			server.cfg = config{brokerInternalToken: "broker-perimeter-token",
 				port:               "8080",
 				gatewayURL:         "https://gateway:42152",
 				mintURL:            "https://gateway:42152" + credentialMintPath,
@@ -105,7 +105,7 @@ func TestACredentialBearingDestinationMustBeHTTPS(t *testing.T) {
 		{"a plaintext mint", "https://gateway:42152", "http://gateway:42152" + credentialMintPath, "service-account token", CredentialMintURLEnvironmentVariable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := config{port: "8080", gatewayURL: tc.gateway, mintURL: tc.mint, profile: localProfile}
+			cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: tc.gateway, mintURL: tc.mint, profile: localProfile}
 			err := cfg.validate()
 			if err == nil {
 				t.Fatal("validate accepted a plaintext credential-bearing destination")
@@ -125,7 +125,7 @@ func TestACredentialBearingDestinationMustBeHTTPS(t *testing.T) {
 // projected file paths as well would be requiring provisioning nothing reads.
 // What no source changes is the authority identity.
 func TestASuppliedSourceNeedsNoProvisioningItDoesNotRead(t *testing.T) {
-	base := config{
+	base := config{brokerInternalToken: "broker-perimeter-token",
 		port:       "8080",
 		gatewayURL: "https://gateway:42152",
 		mintURL:    "https://gateway:42152" + credentialMintPath,
@@ -187,7 +187,7 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: tc.config})
-			server.cfg = config{port: listenOn(t, server)}
+			server.cfg = config{brokerInternalToken: "broker-perimeter-token", port: listenOn(t, server)}
 			server.principal = testPrincipal
 			ln, err := server.listen()
 			if ln != nil {
@@ -204,7 +204,7 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 
 	t.Run("a source that reaches the posture is accepted", func(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: usable})
-		server.cfg = config{port: listenOn(t, server)}
+		server.cfg = config{brokerInternalToken: "broker-perimeter-token", port: listenOn(t, server)}
 		server.principal = testPrincipal
 		ln, err := server.listen()
 		if err != nil {
@@ -222,7 +222,7 @@ func TestAnIdentitySourceReachesTheSamePostureAsTheProjectedOne(t *testing.T) {
 func TestAListenerIsHeldToItsOwnFrozenPrincipal(t *testing.T) {
 	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile}
 	server.principal = testPrincipal
 	ln, err := server.listen()
 	if ln != nil {
@@ -549,7 +549,7 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: downgrading(tc.change)})
-			server.cfg = config{port: listenOn(t, server), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+			server.cfg = config{brokerInternalToken: "broker-perimeter-token", port: listenOn(t, server), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 			server.principal = testPrincipal
 			// The two failures listen() returns as one are separated here.
 			// Refusing the *identity* at boot is an acceptable answer — what
@@ -615,7 +615,7 @@ func TestASourcesPerConnectionCallbackCannotLowerThePosture(t *testing.T) {
 		// and read as a success anyway: in TLS 1.3 the client finishes before
 		// it learns whether the server accepted its certificate, so a
 		// server-side refusal is invisible to tls.Dial.
-		server.cfg = config{port: listenOn(t, server), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+		server.cfg = config{brokerInternalToken: "broker-perimeter-token", port: listenOn(t, server), allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 		server.principal = testPrincipal
 		ln, err := server.listen()
 		if err != nil {
@@ -943,7 +943,7 @@ func TestARotatedLeafIsStillHeldToTheFrozenPrincipal(t *testing.T) {
 	c := newCell(t)
 	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile,
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", port: listenOn(t, server), identityCertFile: certFile, identityKeyFile: keyFile,
 		trustBundleFile: bundleFile, allowedCallersFile: identitiesFile(t, testGatewayPrincipal), mintPeersFile: identitiesFile(t, testGatewayPrincipal),
 		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
@@ -1201,7 +1201,7 @@ func TestASourcesConfigurationIsNotMutated(t *testing.T) {
 	}
 
 	server := New(Manifest{ID: testSolutionID}).Identity(staticIdentity{config: shared})
-	server.cfg = config{allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", allowedCallersFile: identitiesFile(t, testGatewayPrincipal)}
 	server.principal = testPrincipal
 	config, err := server.serverIdentity()
 	if err != nil {

@@ -62,12 +62,15 @@ Four things follow, and each is a boot failure rather than a degraded run:
 | The authority-bearing values are read once and frozen | the credential is sealed to the values it was minted under, so a value that drifts is an error, never a reload |
 | The contract is published, and the declaration is held to it | an ask outside its declared ceiling fails the boot — see [The published contract](#the-published-contract) |
 
-The remaining migration to the platform's module broker is **blocked by SDK
-compatibility**: `saas-sdk-go` at `217bf9fe3f10` references a capability API
-removed from this runtime's `sdk-go/workcontext`, and requires an internal-token
-seam this runtime no longer has. The existing execution SDK remains in use;
-its broader retry policy below still needs an upstream change. See
-[the migration record](CHANGELOG.md) for the exact blocker.
+Execution minting uses the host's module broker protocol natively. The reference
+is `saas-sdk-go/moduleauthority` at `217bf9fe3f10`; importing that package is
+incompatible with this runtime's SDK capability API, so no dependency was added.
+The request is `POST /modules/_work-context`, with exactly
+`{"prefix":"<Manifest.ID>"}`, `Authorization: Bearer <projected token>`, and
+`X-Codefly-Internal-Token`. The prefix is the declared solution ID, separate from
+the frozen SPIFFE principal. The answer carries `token`, `expiresAt`,
+`principalId`, and `tenant`. Core alone inspects the returned capability; the
+runtime does not implement a signed encoding or verify an issuer's authority.
 
 `WorkContextRefusal.Code` and `.Message` have been removed (breaking API change).
 Consumers should inspect `.StatusCode` or unwrap to `GatewayError`. Broker bodies,
@@ -118,17 +121,18 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
 | Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
-| Credential mint URL | **not resolved — required explicitly.** Must be `https`. Nothing derives it: whether the host mints through the gateway or the workload posts straight to the issuer is unsettled and neither endpoint is deployed, and this is the address the projected service-account token goes to, so an assumed one is refused at boot. Every boot logs where it will mint, and a 404 there means that endpoint does not exist on that host — not that this build was refused | `CODEFLY__CREDENTIAL_MINT_URL` (**required**) |
+| Credential mint URL | Explicit HTTPS endpoint ending in `/modules/_work-context`. The host's broker path is published; its origin must still be supplied. A 404 is a terminal endpoint/configuration error | `CODEFLY__CREDENTIAL_MINT_URL` (**required**) |
+| Broker perimeter credential | `codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")`, required at boot. Sent only to the execution broker as `X-Codefly-Internal-Token`; it does not replace the projected token or workload identity | — (declared workspace secret, no legacy env fallback) |
 | Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint; defaults to `/var/run/secrets/codefly/token`, the CLI projection | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
 | Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
 | Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
 | Allowed callers | `workload-identity`/`ALLOWED_CALLERS_FILE` — **required**, a **path** to a file of identities, one per line (normally the gateway's); re-read per handshake. Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE` |
-| Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per handshake. This is the set the credential mint endpoint is admitted by: the SDK's mint client reads it during the handshake and refuses a peer whose single URI SAN is not in it, even when the certificate was signed by the accepted anchor. It also narrows the shared-address case, where the mint and the gateway answer at one address and a dial cannot be attributed: what is admitted there is the intersection of this set and the gateway's | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
+| Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per handshake. This is the set the credential mint endpoint is admitted by: the native broker client reads it during the handshake and refuses a peer whose single URI SAN is not in it, even when the certificate was signed by the accepted anchor. It also narrows the shared-address case, where the mint and the gateway answer at one address and a dial cannot be attributed: what is admitted there is the intersection of this set and the gateway's | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
 | Gateway peer | `workload-identity`/`GATEWAY_PEERS_FILE` — **required**, same shape. One set **per destination**: the mint and the gateway are two parties, and a single set spanning both authorises each to stand in for the other at the other's address — and the mint is the destination that receives the projected service-account token. A dial to an address that is neither has no set and is refused. When the two are at the **same** host and port — the brokered shape — a dial there cannot be attributed to one of them, so it is held to the **intersection** of both sets, and an empty intersection is refused at boot | `CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
-| Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
+| Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, required to be `accounts`, read once and frozen | — |
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
 | Host issuer (MCP) | `codefly.For(ctx).WorkspaceConfiguration("mcp", "issuer-url")` — the declared value the composition supplies; without one, the resolved host frontend origin (see [Exposing an MCP server](#exposing-an-mcp-server)). Checked at boot only when `ServeMCP` is declared | — (declared configuration, no env override) |
@@ -190,8 +194,8 @@ with the registrations and then came back for one consumer, the same way
 `PUBLIC_URL` did: it names the host's frontend service, whose resolved URL is
 the fallback the MCP issuer identifier is derived from when no `mcp/issuer-url`
 is declared (`resolveMCPIssuer`). It is read in `loadConfig` like every other
-value here. Nothing reads the shared cluster-internal token or
-a per-solution registration secret any more: the credential this runtime
+value here. Nothing reads the legacy `CODEFLY_INTERNAL_TOKEN` or a per-solution registration
+secret. The broker perimeter token comes only from its declared workspace secret; the credential this runtime
 presents attests which workload it is, and there is no fallback to one that
 attests nothing.
 
@@ -451,14 +455,13 @@ admitted.
 ## One credential per execution
 
 `Serve` obtains this execution's credential once, before the listener exists,
-through the SDK's mint client (`sdk-go/workcontext`): the projected
+through the native module broker client: the projected
 service-account token is presented to the host's mint endpoint, and the host —
 which establishes the principal, the installation and the build from that token
 and its own records, never from anything this process reports — answers with a
 credential sealed to this build incarnation and this installation.
 
-The runtime holds no mint of its own, and it runs **no registration
-heartbeat** — which is the claim this cutover is about. It does run other
+The runtime runs **no registration heartbeat** — which is the claim this cutover is about. It does run other
 timers, and saying otherwise here was wrong twice: the inbound and outbound
 trust watchers re-verify an established peer once a second, the credential
 acquisition holds off after a failure (capped, jittered), and the listener has
@@ -480,32 +483,24 @@ runtime replaced, because the heartbeat at least minted on a timer.
 **A refused first mint fails the boot and is never retried. An unavailable one
 is waited for, within a bound.** The two are different answers:
 
-- a **refusal** (`ErrMintRefused`, which the SDK latches for exactly two
-  statuses, `401` and `403`) is the issuer judging this workload: this build is not the one
-  its presence document approved, the pod's identity does not match, the token
-  attests to another subject. No number of attempts changes any of those
-  answers, so the boot reports the refusal class and exits non-zero. A loop
-  around it is what this change exists to delete: the old runtime answered every
-  refusal by beating again, minting a fresh single-use token each time, so one
-  undeployable solution produced an audited mint every 15 seconds for as long as
-  it ran.
-- an **unavailable** mint (`ErrMintUnavailable`: the host's `503`, `429`, any
-  other `5xx`, **and a `404`**) is not a judgement. A workload may legitimately start before its
-  presence generation has been applied, and then there is no incarnation to mint
-  against yet; the issuer may also be unable to reach the Kubernetes API or its
-  own policy log, and a host that issues nothing in those cases is behaving
-  correctly. So the boot asks again, backing off, for up to **two minutes**, and
-  then exits non-zero.
+- A **refusal** (`401` or `403`, wrapping `ErrMintRefused`) is terminal and
+  retained. It is never retried.
+- An **unavailable** mint (`503`, timeout, connection refused or connection
+  reset, wrapping `ErrMintUnavailable`) is retried with backoff inside the
+  **two-minute** boot deadline. Renewal uses the same classification and keeps
+  an unexpired held credential available during transient failures.
+- Every other HTTP status, including `400`, `404`, `429`, `500`, and redirects,
+  is a **terminal error**. TLS, permanent DNS, cancellation, unclassified
+  transport failures, invalid responses and unusable projections are terminal
+  too. They stop renewal and fail health. Status, status class and transport
+  category survive; raw body, headers, parser diagnostics and causes do not.
 
-  A `404` is in this set, and that is a deliberate change rather than an
-  oversight: the rule here was "`429` and `5xx` retry, everything else is
-  terminal", and sdk-go v0.3.0 inverted it after measuring the cost — a `408`
-  from a proxy, with a valid credential in hand, latched for the life of the
-  process, and a `404` from an ingress mid-rollout would do the same. `401` and
-  `403` are the two statuses the host signs. So **an old runtime against a host
-  of this generation waits out its bounded window and exits non-zero for the
-  orchestrator rather than failing on the first answer.** It still does not
-  recover; what changed is the shape, not the outcome.
+Every mint makes a fresh TLS 1.3 handshake, presents this workload's identity,
+checks `MINT_PEERS_FILE` and the trust anchor before and after the handshake,
+and refuses a server that did not request a client certificate. Redirects,
+proxies and connection reuse are disabled. The SDK still owns certificate
+reloading and authority resolution. `CredentialSource` remains SDK-compatible
+for consumers supplying their own issuer.
 
 The bound is what keeps the second case from being the heartbeat again: it is a
 boot waiting for a dependency, with no steady state, nothing minted on success
@@ -563,7 +558,7 @@ logs can receive them. Other source failures get a fixed failure message.
 
 There is **one** implementation of a Work Context — Core's (`core/workcontext`:
 deterministic proto, Ed25519) — and this runtime is not it. It obtains a
-credential through the SDK's client, carries it as the string it travels as,
+credential through the module broker client, carries it as the string it travels as,
 and lets whoever consumes it decide. It declares none of a capability's fields
 and reads none of them: the capability a handler's gateway presents to a module
 is a string this package never decoded, and the one check that must happen
@@ -873,7 +868,7 @@ request, and `ForModule` refuses one without an organization and a session.
 
 This execution's own credential is sealed to an installation by the host, from
 the projected service-account token; the runtime names none on that mint and
-cannot, since the SDK's `MintOptions` carries no such field. What it does is
+cannot: the broker request contains only the declared prefix. What it does is
 refuse a credential sealed to no installation at all, and refuse a *renewal*
 sealed to a different one than the credential this process has been acting
 under: that is a different identity arriving through the renewal path, not a

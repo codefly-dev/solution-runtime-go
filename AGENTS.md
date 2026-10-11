@@ -23,8 +23,8 @@ runtime removed.
 
 It owns none of the counterparts it talks to. The mint endpoint and the
 admission rules belong to the host (the composition's own host module) and the
-gateway; the mint-once client, the authority reader and the TLS reloader to
-`codefly-dev/sdk-go`; endpoint, port and secret resolution to `sdk-go` as well;
+gateway; the authority reader and the TLS reloader to `codefly-dev/sdk-go`; the broker
+wire contract to the host, implemented natively here; endpoint, port and secret resolution to `sdk-go` as well;
 workspace, manifest and presence/authority document types to `codefly-dev/core`;
 running a composition, provisioning its secrets and rendering the authority
 document to `codefly-dev/cli`. Everything here is a library — one Go package at
@@ -205,8 +205,8 @@ embedding it.
   wire shapes — folded, so a shape split across a concatenation, parenthesised,
   built from named constants or cased differently is the same shape to it.
 - **Never sign, parse or verify a Work Context here.** There is one
-  implementation, Core's; this runtime obtains a credential through the SDK's
-  mint client, carries it as the string it travels as, and lets the far end
+  implementation, Core's; this runtime obtains a credential through the native broker
+  client and delegates structural inspection to Core, carries it as the string it travels as, and lets the far end
   decide. It declares none of a capability's fields and holds no verifier —
   core's needs the issuer's live revision, replay, grant and seal sources, which
   a solution does not have. `work_context_boundary_test.go` fails on a signing
@@ -333,7 +333,7 @@ embedding it.
   set spanning both authorises each to stand in for the other at the other's
   address — the mint being the one that receives the projected token.
   `MINT_PEERS_FILE` governs the mint hop again, per handshake, through the
-  SDK's `AdmittedPeers` reader (sdk-go#51) — so the question it was kept open
+  native broker's live admitted-peer reader — so the question it was kept open
   for is settled: it is the authorization set for the destination that receives
   the projected service-account token. It also still narrows the shared-address
   case, where the mint and the gateway answer at one address and a dial cannot
@@ -383,8 +383,7 @@ embedding it.
   every mint is viewer-driven and `ForModule` refuses a caller without an org
   and a session.
 - **This execution's own credential is held to what it was FIRST sealed to.**
-  The host seals it from the projected token — `MintOptions` carries no
-  installation field — so what this runtime owns is refusing one sealed to no
+  The host seals it from the projected token — the broker request carries no installation field — so what this runtime owns is refusing one sealed to no
   installation, refusing one sealed to no **execution** (image digest and build
   incarnation, which core seals as a pair), and refusing a renewal sealed to a
   *different* installation, digest or incarnation. The last is one value, not
@@ -438,61 +437,30 @@ embedding it.
   answer is recorded **where the answer lands** rather than by whichever caller
   was still waiting — the ask is detached, so it can finish with nobody
   listening.
-- **The mint hop is held to the same three things the gateway hop is, and the
-  SDK owns the transport that holds it.** `MintOptions` takes no pool, no
-  client and no dialler: it takes `TrustAnchor`, `ClientCertificate` and
-  `AdmittedPeers` as **readers**, each consulted during the handshake
-  (sdk-go#51). So the mint request presents this workload's X.509-SVID, the
-  endpoint is admitted by the SPIFFE ID in its single URI SAN against
-  `MINT_PEERS_FILE`, and the anchor is re-read before and after every
-  handshake and never cached. Withdrawal of a root or of a peer takes effect on
-  the next handshake rather than on the next process.
-  The SDK still refuses a caller-supplied `*http.Client`, and that reasoning is
-  sound and worth keeping in mind: a supplied client is a hole it cannot
-  inspect — a nil `Transport` means the global mutable default, a
-  `DialTLSContext` bypasses `TLSClientConfig` entirely, and a caller holding
-  the same `*http.Transport` can turn verification off after construction. The
-  answer was never for this runtime to take the transport back; it was for the
-  transport to take readers instead of values, which is what it now does.
-  **This paragraph said the opposite, and said it was unreachable.** It
-  recorded that the mint presented no certificate, that `MINT_PEERS_FILE` did
-  not govern that hop, and that the rest of the posture could not be restored
-  from outside the SDK — accurate at `v0.3.0`, and the reason it was an sdk-go
-  issue rather than a local workaround. What was wrong was not the diagnosis
-  but treating the resulting gap as a property of this runtime: a reviewer
-  pointed out that the fixtures had been weakened to accommodate it
-  (`VerifyClientCertIfGiven`, the mint caller's identity expected to be empty),
-  which establishes a changed behaviour rather than closing a finding. The
-  fixtures demand the certificate again, and
-  `TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs` drives the negative
-  controls through a real handshake: a peer the anchor signed but the set does
-  not name, peer withdrawal with the anchor unchanged, an unreadable anchor,
-  and a certificate reader that cannot answer.
-  **There is no established mint connection to bound, and this file said there
-  was.** It recorded a residual — "the client keeps idle connections, so a
-  withdrawal takes effect on the next handshake and not on a connection already
-  open" — which was true of `v0.3.0` and is not true of the pinned leaf. That
-  transport sets `DisableKeepAlives`, `MaxIdleConnsPerHost: 0` and
-  `ForceAttemptHTTP2: false`, so **every mint is a fresh handshake**; and after
-  the handshake completes it re-reads the anchor and the peer set and verifies
-  the peer again, because `GetClientCertificate` and the server's own
-  processing run *after* the first admission decision and a withdrawal landing
-  in that window must not authorize the HTTP write. It also refuses an endpoint
-  that did not request a client certificate, so this hop cannot silently become
-  anonymous. The residual to carry is narrower and belongs to the SDK: the
-  interval between that post-handshake recheck and the write itself.
-- **Only 401 and 403 latch a credential refusal.** The rule was "429 and 5xx
-  retry, everything else is terminal", and sdk-go v0.3.0 inverted it after
-  measuring the cost: a 408 from a proxy, with a valid credential in hand,
-  refused and latched for the life of the process, and a 404 from an ingress
-  mid-rollout would do the same. Those two are the statuses the host signs —
-  the projected token is not acceptable, or the build is not approved. **A 404
-  on the mint is now an outage**, so an old runtime against a host of this
-  generation waits out its bounded window and exits non-zero for the
-  orchestrator rather than failing on the first answer. It still does not
-  recover; what changed is the shape, not the outcome.
+- **The execution mint follows the host's module broker contract natively.**
+  `saas-sdk-go/moduleauthority` at `217bf9fe3f10` is the wire reference; its
+  capability dependency is incompatible with this runtime. Send exactly
+  `prefix: Manifest.ID` to `/modules/_work-context`, with the projected token
+  as bearer and `X-Codefly-Internal-Token` from the declared workspace secret
+  `module-authority/INTERNAL_TOKEN`. Resolve it in `loadConfig`, refuse absence
+  in `validate()`, and never resurrect a legacy secret reader. The projection
+  audience is `accounts`; the prefix never replaces the frozen SPIFFE principal.
+  The native transport owns a fresh mutually authenticated TLS handshake for
+  every mint, checks live trust and admission before and after it, disables
+  redirects/proxies/reuse, and holds the presented leaf to the frozen principal.
+  The SDK still owns the certificate reloader and authority reader. Core's
+  `Inspect` is the only structural reader of the returned token; no signed
+  message is constructed or decoded here, and inspection verifies no signature.
+  A private credential view keeps the public SDK `CredentialSource` compatible.
+- **Only 503 and transient transport failures retry.** Timeout, connection
+  refused and connection reset are identified by error types/identities, never
+  text. 401/403 are terminal refusals. Every other HTTP status, TLS failure,
+  permanent DNS failure, cancellation, unclassified transport failure and
+  invalid broker response is a terminal error. Retain safe status/class/category
+  only, with no raw diagnostic cause. Boot and renewal use the same decision;
+  terminal answers are retained where they land, even after waiters leave.
 - **A terminal credential refusal ends the process; a transient one does not.**
-  `ErrMintRefused` at renewal fails `/health` and ends `serve` with the reason.
+  `ErrMintRefused` or a terminal broker error at renewal fails `/health` and ends `serve` with the reason.
   `ErrMintUnavailable` must not: it is transient by construction and exiting on
   it is a crash loop. `ErrRevoked` is not in either set, and three review rounds
   found this file still saying it was: the mint client does not return it at all
