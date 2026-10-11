@@ -52,10 +52,12 @@ type installRefusal struct{ reason string }
 func (e *installRefusal) Error() string { return e.reason }
 func (*installRefusal) Unwrap() error   { return ErrInstallRefused }
 
-// OnInstall registers the install step, before Serve. The host may call again
-// after a restart, so the step must converge. Within this Server, every
-// completed outcome is retained per installation ID and revision, and a
-// concurrent duplicate waits for the first call. ViewerFromContext returns
+// OnInstall registers the install step, before Serve. The step must converge:
+// the host calls again after a transient failure or a restart, and the step may
+// run again for an installation it has already set up. Within this Server a
+// concurrent duplicate waits for the first call; a terminal outcome
+// (acknowledged or refused) is answered from memory for the most recent 1024
+// installation revisions, and a transient failure is not remembered. ViewerFromContext returns
 // the gateway carrying the install call's Work Context for the step's outgoing
 // calls; the host verifies that bearer on every call. Chainable.
 func (s *Server) OnInstall(step func(context.Context, Installation) error) *Server {

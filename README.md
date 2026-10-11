@@ -128,9 +128,12 @@ diagnostics are never included in the public reason. Refusals return 409 with
 A bare or wrapped `ErrInstallRefused` without a
 `RefuseInstall` reason receives `installation refused`.
 
-Completed outcomes are retained in memory per installation ID and revision,
-including refusals and failures; concurrent duplicates wait for the first.
-After a process restart the host must call again, and the step must converge.
+Concurrent duplicates wait for the first call. A terminal outcome (204 or
+409) is answered from memory for the most recent 1024 installation revisions;
+a 503 is not remembered, so the host's retry runs the step again, and at most
+64 steps run at once (past that the call is 503 and the host retries). The step
+must therefore converge: it may run again for an installation it already set
+up, after a retry, an eviction or a restart.
 
 ## Configuration
 
