@@ -55,9 +55,9 @@ func (*installRefusal) Unwrap() error   { return ErrInstallRefused }
 // OnInstall registers the install step, before Serve. The step must converge:
 // the host calls again after a transient failure or a restart, and the step may
 // run again for an installation it has already set up. Within this Server a
-// concurrent duplicate waits for the first call; a terminal outcome
-// (acknowledged or refused) is answered from memory for the most recent 1024
-// installation revisions, and a transient failure is not remembered. ViewerFromContext returns
+// concurrent duplicate waits for the first call; an acknowledgement is answered
+// from memory for the most recent 1024 installation revisions, and a refusal or
+// a transient failure is not remembered, so a retry runs the step again. ViewerFromContext returns
 // the gateway carrying the install call's Work Context for the step's outgoing
 // calls; the host verifies that bearer on every call. Chainable.
 func (s *Server) OnInstall(step func(context.Context, Installation) error) *Server {
@@ -143,9 +143,10 @@ type installationResult struct {
 	installationOutcome
 }
 
-// The outcome cache is bounded. Only terminal outcomes are kept — an
-// acknowledgement or a refusal — so a transient failure is forgotten once its
-// waiters have it, and the host's retry runs the step again. Completed outcomes
+// The outcome cache is bounded. Only an acknowledgement is kept: a refusal or a
+// transient failure is forgotten once its waiters have it, so the host's retry
+// — including an administrator's Retry after fixing the cause — runs the step
+// again. Completed outcomes
 // are evicted oldest first past maxInstallOutcomes: the step must converge, so a
 // repeat after eviction runs it again rather than answering from memory.
 // Steps in flight are never evicted; past maxInstallsInFlight a new one is
@@ -184,7 +185,7 @@ func (s *Server) installOnce(ctx context.Context, installation Installation) ins
 	// step is recorded as a failure too, so no duplicate waits forever.
 	result.installationOutcome = s.runInstall(ctx, installation)
 	s.installMu.Lock()
-	if result.status == http.StatusServiceUnavailable {
+	if result.status != http.StatusNoContent {
 		delete(s.installations, key)
 	} else {
 		s.installCompleted = append(s.installCompleted, key)

@@ -130,10 +130,10 @@ func TestInstallOutcomesAndRepeats(t *testing.T) {
 					t.Fatal("refusal is not JSON")
 				}
 			}
-			// A terminal outcome is answered from memory; a transient failure is
-			// forgotten, so the host's retry runs the step again.
+			// An acknowledgement is answered from memory; a refusal or a
+			// transient failure is forgotten, so the host's retry runs the step again.
 			want := 1
-			if tc.status == http.StatusServiceUnavailable {
+			if tc.status != http.StatusNoContent {
 				want = 2
 			}
 			if tc.step != nil && calls != want {
@@ -270,9 +270,12 @@ func TestInstallWorkloadIdentityListener(t *testing.T) {
 			t.Fatalf("refusal = %d %q", resp.StatusCode, body)
 		}
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("step ran %d times, want 2", calls.Load())
+	// Revision 7 is acknowledged once and then answered from memory; revision 8
+	// is refused and not remembered, so its repeat runs the step again.
+	if calls.Load() != 3 {
+		t.Fatalf("step ran %d times, want 3", calls.Load())
 	}
+	admitted := calls.Load()
 	for _, tc := range []struct {
 		name   string
 		scheme string
@@ -299,7 +302,7 @@ func TestInstallWorkloadIdentityListener(t *testing.T) {
 					t.Fatalf("unadmitted caller received HTTP %d", resp.StatusCode)
 				}
 			}
-			if calls.Load() != 2 {
+			if calls.Load() != admitted {
 				t.Fatal("unadmitted caller ran the step")
 			}
 		})
@@ -402,9 +405,9 @@ func TestInstallConcurrentDuplicateWaits(t *testing.T) {
 				}
 			}
 			// Concurrent duplicates share one run. A later repeat is answered from
-			// memory only for a terminal outcome; a transient failure runs again.
+			// memory only for an acknowledgement; a refusal or failure runs again.
 			wantCalls := int32(1)
-			if first.status == http.StatusServiceUnavailable {
+			if first.status != http.StatusNoContent {
 				wantCalls = 2
 			}
 			if got := s.installOnce(t.Context(), installFixture()); got != first || calls.Load() != wantCalls {
