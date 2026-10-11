@@ -130,8 +130,14 @@ func TestInstallOutcomesAndRepeats(t *testing.T) {
 					t.Fatal("refusal is not JSON")
 				}
 			}
-			if tc.step != nil && calls != 1 {
-				t.Fatalf("step ran %d times, want 1", calls)
+			// A terminal outcome is answered from memory; a transient failure is
+			// forgotten, so the host's retry runs the step again.
+			want := 1
+			if tc.status == http.StatusServiceUnavailable {
+				want = 2
+			}
+			if tc.step != nil && calls != want {
+				t.Fatalf("step ran %d times, want %d", calls, want)
 			}
 		})
 	}
@@ -395,8 +401,14 @@ func TestInstallConcurrentDuplicateWaits(t *testing.T) {
 					t.Fatalf("duplicate = %+v; first = %+v", got, first)
 				}
 			}
-			if got := s.installOnce(t.Context(), installFixture()); got != first || calls.Load() != 1 {
-				t.Fatalf("repeat = %+v, calls = %d", got, calls.Load())
+			// Concurrent duplicates share one run. A later repeat is answered from
+			// memory only for a terminal outcome; a transient failure runs again.
+			wantCalls := int32(1)
+			if first.status == http.StatusServiceUnavailable {
+				wantCalls = 2
+			}
+			if got := s.installOnce(t.Context(), installFixture()); got != first || calls.Load() != wantCalls {
+				t.Fatalf("repeat = %+v, calls = %d, want %d", got, calls.Load(), wantCalls)
 			}
 		})
 	}
@@ -433,4 +445,67 @@ func TestInstallWaitingCancellationDoesNotCancelStep(t *testing.T) {
 			t.Fatalf("repeat inherited a waiter's cancellation: %+v", got)
 		}
 	})
+}
+
+func TestInstallOutcomesAreBounded(t *testing.T) {
+	s := New(Manifest{ID: testSolutionID})
+	calls := map[string]int{}
+	s.OnInstall(func(_ context.Context, installation Installation) error {
+		calls[installation.ID]++
+		return nil
+	})
+	install := func(id string) {
+		t.Helper()
+		if got := s.installOnce(context.Background(), Installation{ID: id, OrganizationID: "org", Revision: 1}); got.status != http.StatusNoContent {
+			t.Fatalf("install %s = %d", id, got.status)
+		}
+	}
+	for i := range maxInstallOutcomes + 1 {
+		install(fmt.Sprintf("installation-%d", i))
+	}
+	if len(s.installations) != maxInstallOutcomes || len(s.installCompleted) != maxInstallOutcomes {
+		t.Fatalf("kept %d outcomes (%d ordered), want %d", len(s.installations), len(s.installCompleted), maxInstallOutcomes)
+	}
+	// The oldest was evicted: a repeat runs the step again, which converges.
+	install("installation-0")
+	if calls["installation-0"] != 2 {
+		t.Fatalf("evicted installation ran %d times, want 2", calls["installation-0"])
+	}
+	// The newest is still answered from memory.
+	install(fmt.Sprintf("installation-%d", maxInstallOutcomes))
+	if calls[fmt.Sprintf("installation-%d", maxInstallOutcomes)] != 1 {
+		t.Fatal("a kept outcome ran its step again")
+	}
+}
+
+func TestInstallsInFlightAreBounded(t *testing.T) {
+	s := New(Manifest{ID: testSolutionID})
+	release := make(chan struct{})
+	started := make(chan struct{}, maxInstallsInFlight)
+	s.OnInstall(func(context.Context, Installation) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	})
+	done := make(chan installationOutcome, maxInstallsInFlight)
+	for i := range maxInstallsInFlight {
+		go func() {
+			done <- s.installOnce(context.Background(), Installation{ID: fmt.Sprintf("flight-%d", i), OrganizationID: "org", Revision: 1})
+		}()
+	}
+	for range maxInstallsInFlight {
+		<-started
+	}
+	if got := s.installOnce(context.Background(), Installation{ID: "one-too-many", OrganizationID: "org", Revision: 1}); got.status != http.StatusServiceUnavailable {
+		t.Fatalf("a step past the in-flight bound = %d, want 503", got.status)
+	}
+	close(release)
+	for range maxInstallsInFlight {
+		if got := <-done; got.status != http.StatusNoContent {
+			t.Fatalf("an in-flight step = %d", got.status)
+		}
+	}
+	if got := s.installOnce(context.Background(), Installation{ID: "one-too-many", OrganizationID: "org", Revision: 1}); got.status != http.StatusNoContent {
+		t.Fatalf("once the flights finished, the refused step = %d, want 204", got.status)
+	}
 }

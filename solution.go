@@ -273,6 +273,8 @@ type Server struct {
 	installStep   func(context.Context, Installation) error
 	installMu     sync.Mutex
 	installations map[installationKey]*installationResult
+	// installCompleted orders the terminal outcomes kept, oldest first.
+	installCompleted []installationKey
 	// consumed is the passthrough declaration (Consumes); passthrough is its
 	// resolved routes, checked by Serve before it listens.
 	consumed    []ConsumedModule

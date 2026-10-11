@@ -141,6 +141,18 @@ type installationResult struct {
 	installationOutcome
 }
 
+// The outcome cache is bounded. Only terminal outcomes are kept — an
+// acknowledgement or a refusal — so a transient failure is forgotten once its
+// waiters have it, and the host's retry runs the step again. Completed outcomes
+// are evicted oldest first past maxInstallOutcomes: the step must converge, so a
+// repeat after eviction runs it again rather than answering from memory.
+// Steps in flight are never evicted; past maxInstallsInFlight a new one is
+// refused as unavailable, which the host retries.
+const (
+	maxInstallOutcomes  = 1024
+	maxInstallsInFlight = 64
+)
+
 // installOnce is entered only after caller admission and carrier validation.
 // A cached success must never let a repeat bypass that boundary.
 func (s *Server) installOnce(ctx context.Context, installation Installation) installationOutcome {
@@ -158,14 +170,28 @@ func (s *Server) installOnce(ctx context.Context, installation Installation) ins
 	if s.installations == nil {
 		s.installations = make(map[installationKey]*installationResult)
 	}
+	if len(s.installations)-len(s.installCompleted) >= maxInstallsInFlight {
+		s.installMu.Unlock()
+		return installationOutcome{status: http.StatusServiceUnavailable}
+	}
 	result := &installationResult{done: make(chan struct{})}
 	s.installations[key] = result
 	s.installMu.Unlock()
 
 	// The channel publishes the immutable outcome to all waiters. A panicking
-	// step is recorded as a failure too, so no duplicate waits forever or runs
-	// the partially completed step again in this process.
+	// step is recorded as a failure too, so no duplicate waits forever.
 	result.installationOutcome = s.runInstall(ctx, installation)
+	s.installMu.Lock()
+	if result.status == http.StatusServiceUnavailable {
+		delete(s.installations, key)
+	} else {
+		s.installCompleted = append(s.installCompleted, key)
+		for len(s.installCompleted) > maxInstallOutcomes {
+			delete(s.installations, s.installCompleted[0])
+			s.installCompleted = s.installCompleted[1:]
+		}
+	}
+	s.installMu.Unlock()
 	close(result.done)
 	return result.installationOutcome
 }
