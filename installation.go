@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -78,6 +79,10 @@ const (
 func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 	token, err := workcontext.FromHeaders(r.Header)
 	if err != nil {
+		// Named in this process's log, never in the answer: the host's job
+		// retries and dead-letters on a bare 401, and the operator reading
+		// the installation needs to know what the carrier got wrong.
+		log.Printf("solution %q: install step refused: %v", s.manifest.ID, err)
 		http.Error(w, "invalid work context", http.StatusUnauthorized)
 		return
 	}

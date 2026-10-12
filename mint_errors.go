@@ -68,6 +68,10 @@ const (
 	brokerTransport
 	brokerInvalidAnswer
 	brokerProjection
+	// brokerAwaitingInstallation: the host admits this workload and has not
+	// been asked to install it anywhere yet. The install step arrives on this
+	// runtime's own listener; until then there is nothing to mint for.
+	brokerAwaitingInstallation
 )
 
 type brokerTransportCategory uint8
@@ -92,6 +96,8 @@ func (e *brokerMintError) Error() string {
 		return fmt.Sprintf("module broker: HTTP %d: request refused", e.status)
 	case brokerNotEstablished:
 		return "module broker: HTTP 503: execution not established"
+	case brokerAwaitingInstallation:
+		return "module broker: HTTP 412: no organization has installed this solution yet"
 	case brokerOtherStatus:
 		return fmt.Sprintf("module broker: HTTP %d: request failed", e.status)
 	case brokerInvalidAnswer:
@@ -113,7 +119,7 @@ func (e *brokerMintError) Error() string {
 	}
 }
 func (e *brokerMintError) retryable() bool {
-	return e.class == brokerNotEstablished || e.class == brokerTransport &&
+	return e.class == brokerNotEstablished || e.class == brokerAwaitingInstallation || e.class == brokerTransport &&
 		(e.transport == brokerTransportTimeout || e.transport == brokerTransportRefused || e.transport == brokerTransportReset)
 }
 func (e *brokerMintError) Unwrap() error {
@@ -132,6 +138,8 @@ func brokerStatusError(status int) *brokerMintError {
 		e.class = brokerRefused
 	case http.StatusServiceUnavailable:
 		e.class = brokerNotEstablished
+	case http.StatusPreconditionFailed:
+		e.class = brokerAwaitingInstallation
 	}
 	return e
 }

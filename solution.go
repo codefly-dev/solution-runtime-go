@@ -384,7 +384,10 @@ type config struct {
 	assetsDir string
 	// mintURL is the explicitly configured module broker endpoint. The prefix
 	// comes from Manifest.ID; authority audiences remain frozen separately.
-	mintURL             string
+	mintURL string
+	// upstream is the https origin this runtime serves at, as the SDK resolves
+	// its own endpoint; reported at mint (see brokerMintOptions.Upstream).
+	upstream            string
 	brokerInternalToken string
 	// projectedTokenPath is the file the platform projects this workload's
 	// service-account token into. It is re-read before every renewal, because
@@ -520,6 +523,20 @@ func env(key, fallback string) string {
 // "localhost:8080"), and other endpoints as URLs; url.Parse reads the bare form
 // as scheme "localhost" with no port, which left every rendered solution
 // refusing to boot with an empty listen port. Both forms resolve here.
+// hostPortOf is the host:port of a resolved address, with or without a scheme.
+func hostPortOf(self string) string {
+	if strings.Contains(self, "://") {
+		if u, err := url.Parse(self); err == nil && u.Host != "" && u.Port() != "" {
+			return u.Host
+		}
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(self); err == nil {
+		return self
+	}
+	return ""
+}
+
 func listenPort(self string) string {
 	if strings.Contains(self, "://") {
 		if u, err := url.Parse(self); err == nil {
@@ -700,11 +717,18 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 	public := strings.TrimRight(env("PUBLIC_URL", ""), "/")
 
 	// Own endpoint: the port Codefly assigned this service, not a fixed default.
+	self := address(ctx, "", "", "http", "http")
 	port := env("PORT", "")
-	if port == "" {
-		if self := address(ctx, "", "", "http", "http"); self != "" {
-			port = listenPort(self)
-		}
+	if port == "" && self != "" {
+		port = listenPort(self)
+	}
+	// Where peers reach this runtime: the SDK's answer for its own endpoint,
+	// which a composition resolves to the address the gateway can dial (a
+	// loopback port on a laptop, a cluster-local name in a cell), served over
+	// this runtime's TLS listener.
+	upstream := ""
+	if hostport := hostPortOf(self); hostport != "" {
+		upstream = "https://" + hostport
 	}
 
 	// Host endpoints, resolved via the SDK (no localhost:port literals).
@@ -727,6 +751,7 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 		assetsDir:           env("ASSETS_DIR", "../fe-remote/dist"),
 		// The broker path is published, but its origin remains explicit.
 		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
+		upstream:           upstream,
 		dialled:            dialledAddresses(gatewayURL, strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, ""))),
 		projectedTokenPath: projectedTokenPath,
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),

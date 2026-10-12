@@ -45,12 +45,20 @@ func (c brokerCredential) Attach(r *http.Request) error    { return workcontext.
 
 type brokerMintOptions struct {
 	URL, Prefix, InternalToken, ProjectionAudience string
-	Audience                                       workcontext.AuthorityValue
-	Authority                                      workcontext.AuthorityPin
-	ProjectedToken                                 workcontext.ProjectedTokenSource
-	TrustAnchor                                    func() (*x509.CertPool, error)
-	ClientCertificate                              func() (*tls.Certificate, error)
-	AdmittedPeers                                  func() ([]string, error)
+	// Upstream is the origin this runtime serves its backend at, reported with
+	// the mint as the dynamic half of its registration: the host records it
+	// only for the workload the projected token proves, and reaches it only
+	// under this workload's SVID. Empty reports nothing.
+	Upstream string
+	// Manifest is the solution's frontend manifest, as this runtime serves it:
+	// the other dynamic half of a solution's registration. Empty for a module.
+	Manifest          string
+	Audience          workcontext.AuthorityValue
+	Authority         workcontext.AuthorityPin
+	ProjectedToken    workcontext.ProjectedTokenSource
+	TrustAnchor       func() (*x509.CertPool, error)
+	ClientCertificate func() (*tls.Certificate, error)
+	AdmittedPeers     func() ([]string, error)
 }
 
 type brokerCredentialSource struct {
@@ -117,7 +125,14 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	if strings.TrimSpace(projected) == "" {
 		return workcontext.Credential{}, &brokerMintError{class: brokerProjection}
 	}
-	payload, _ := json.Marshal(map[string]string{"prefix": c.options.Prefix})
+	body := map[string]string{"prefix": c.options.Prefix}
+	if c.options.Upstream != "" {
+		body["upstream"] = c.options.Upstream
+	}
+	if c.options.Manifest != "" {
+		body["manifest"] = c.options.Manifest
+	}
+	payload, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.options.URL, bytes.NewReader(payload))
 	if err != nil {
 		return workcontext.Credential{}, classifyBrokerTransport(err)

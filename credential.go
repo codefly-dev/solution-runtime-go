@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -287,6 +288,8 @@ func (s *Server) mintOptions(
 ) brokerMintOptions {
 	return brokerMintOptions{
 		URL:                s.cfg.mintURL,
+		Upstream:           s.cfg.upstream,
+		Manifest:           s.manifestJSON(),
 		Prefix:             s.manifest.ID,
 		InternalToken:      s.cfg.brokerInternalToken,
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
@@ -409,6 +412,19 @@ func (s *Server) openCredential(ctx context.Context) error {
 			// wait, and accepting a late success would make it advisory.
 			return fmt.Errorf("obtain this execution's credential from %s: a credential arrived after the %s window closed, so this boot does not hold one",
 				s.cfg.mintURL, window)
+		case awaitingInstallation(err):
+			// Admitted by the host, installed nowhere yet. The install step is
+			// delivered to this runtime's own listener, so this boot serves —
+			// the install endpoint and health — holding no credential, and
+			// mints the first time a viewer's call needs one.
+			log.Printf("solution %q: no organization has installed this solution yet; serving its install endpoint, a credential is minted once one has", s.manifest.ID)
+			go s.awaitInstallation(ctx)
+			return nil
+		case errors.Is(err, workcontext.ErrMintRefused) && deadline.Err() == nil:
+			// Inside the window a refusal may come from the registry the host
+			// held before this workload's presence, authority and envelope
+			// were applied — the not-yet state the window exists for — so it
+			// is retried until the window ends, below.
 		case !errors.Is(err, workcontext.ErrMintUnavailable):
 			// A judgement, or a configuration this client will not even send.
 			return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
@@ -439,6 +455,57 @@ func (s *Server) openCredential(ctx context.Context) error {
 
 // mustDeadline is the deadline of a context that has one. openCredential sets
 // it, so the fallback is only there to keep the arithmetic total.
+// manifestJSON is the frontend manifest this runtime serves, reported with
+// the mint so the host's registration carries it without a self-registration.
+func (s *Server) manifestJSON() string {
+	if s.manifest.ID == "" {
+		return ""
+	}
+	encoded, err := json.Marshal(s.manifestMap())
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// awaitInstallation keeps asking the host for this execution's credential
+// while no organization has installed the solution, at a slow cadence, and
+// holds the first one issued: the install step reaches this runtime without
+// a credential, and the next ask after it succeeds. It stops with the server.
+func (s *Server) awaitInstallation(ctx context.Context) {
+	ticker := time.NewTicker(awaitInstallationEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		credential, err := s.nextCredential(ctx)
+		switch {
+		case err == nil && usableCredential(credential) == nil:
+			s.holdCredential(credential)
+			seal := credential.Seal()
+			log.Printf("solution %q: installed; holding one execution credential, sealed to installation %s revision %d and build incarnation %d",
+				s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation())
+			return
+		case err != nil && !awaitingInstallation(err) && !errors.Is(err, workcontext.ErrMintUnavailable):
+			log.Printf("solution %q: this execution's credential was refused while awaiting installation: %v", s.manifest.ID, err)
+			return
+		}
+	}
+}
+
+// awaitInstallationEvery is how often an uninstalled solution asks again.
+const awaitInstallationEvery = 20 * time.Second
+
+// awaitingInstallation reports the host's answer that nobody has installed
+// this solution yet.
+func awaitingInstallation(err error) bool {
+	var broker *brokerMintError
+	return errors.As(err, &broker) && broker.class == brokerAwaitingInstallation
+}
+
 func mustDeadline(ctx context.Context) time.Time {
 	if at, ok := ctx.Deadline(); ok {
 		return at
