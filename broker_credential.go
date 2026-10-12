@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -84,9 +85,35 @@ func newBrokerCredentialSource(options brokerMintOptions) (*brokerCredentialSour
 	if options.ProjectionAudience != "accounts" {
 		return nil, errors.New("module-authority/PROJECTION_AUDIENCE must be accounts for the module broker")
 	}
+	// At boot, where it names the cause. The host bounds what it reads, and an
+	// oversize body is answered there as a malformed request — which this
+	// client can only classify as a refusal, at boot and again at every
+	// renewal: a crash loop that says "request failed" about a manifest.
+	if size := len(options.body()); size > brokerMintBodyMaxBytes {
+		return nil, fmt.Errorf("the mint request is %d bytes and the module broker reads at most %d: the frontend manifest this solution reports with it is too large", size, brokerMintBodyMaxBytes)
+	}
 	c := &brokerCredentialSource{options: options}
 	c.client = c.httpClient(u)
 	return c, nil
+}
+
+// brokerMintBodyMaxBytes bounds the mint request this client will send. It is
+// under what the host reads, so the bound that fires is the one that can say
+// why.
+const brokerMintBodyMaxBytes = 64 << 10
+
+// body is the mint request: the declared prefix, and the dynamic half of this
+// runtime's registration when it has one to report.
+func (o brokerMintOptions) body() []byte {
+	body := map[string]string{"prefix": o.Prefix}
+	if o.Upstream != "" {
+		body["upstream"] = o.Upstream
+	}
+	if o.Manifest != "" {
+		body["manifest"] = o.Manifest
+	}
+	payload, _ := json.Marshal(body)
+	return payload
 }
 
 func (c *brokerCredentialSource) Credential(ctx context.Context) (executionCredential, error) {
@@ -125,14 +152,7 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	if strings.TrimSpace(projected) == "" {
 		return workcontext.Credential{}, &brokerMintError{class: brokerProjection}
 	}
-	body := map[string]string{"prefix": c.options.Prefix}
-	if c.options.Upstream != "" {
-		body["upstream"] = c.options.Upstream
-	}
-	if c.options.Manifest != "" {
-		body["manifest"] = c.options.Manifest
-	}
-	payload, _ := json.Marshal(body)
+	payload := c.options.body()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.options.URL, bytes.NewReader(payload))
 	if err != nil {
 		return workcontext.Credential{}, classifyBrokerTransport(err)
