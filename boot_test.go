@@ -360,7 +360,7 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/modules/_work-context" {
 		var body map[string]string
-		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 1 || body["prefix"] != testSolutionID {
+		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || body["prefix"] != testSolutionID || !onlyBrokerBodyKeys(body) {
 			http.Error(w, "invalid broker request", http.StatusBadRequest)
 			return
 		}

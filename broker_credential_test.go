@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -72,10 +70,7 @@ func TestBrokerExecutionProtocolConformance(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var body map[string]any
-		if json.Unmarshal(raw, &body) != nil || !reflect.DeepEqual(body, map[string]any{"prefix": "widgets-go"}) {
-			t.Fatalf("broker body must contain exactly the declared prefix: %s", raw)
-		}
+		requireBrokerBody(t, raw, "widgets-go")
 		r.Body = io.NopCloser(strings.NewReader(string(raw)))
 		return wire.RoundTrip(r)
 	})

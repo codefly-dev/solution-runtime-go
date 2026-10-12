@@ -420,11 +420,6 @@ func (s *Server) openCredential(ctx context.Context) error {
 			log.Printf("solution %q: no organization has installed this solution yet; serving its install endpoint, a credential is minted once one has", s.manifest.ID)
 			go s.awaitInstallation(ctx)
 			return nil
-		case errors.Is(err, workcontext.ErrMintRefused) && deadline.Err() == nil:
-			// Inside the window a refusal may come from the registry the host
-			// held before this workload's presence, authority and envelope
-			// were applied — the not-yet state the window exists for — so it
-			// is retried until the window ends, below.
 		case !errors.Is(err, workcontext.ErrMintUnavailable):
 			// A judgement, or a configuration this client will not even send.
 			return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
