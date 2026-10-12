@@ -85,7 +85,8 @@ func (g *Gateway) Transcoded(ctx context.Context, prefix, method string, req, re
 	if call.body != nil {
 		httpReq.Header.Set("content-type", "application/json")
 	}
-	httpResp, err := g.HTTPClient().Do(httpReq)
+	injectTraceContext(ctx, httpReq.Header)
+	httpResp, err := g.moduleClient().Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", call.verb, call.template, err)
 	}
