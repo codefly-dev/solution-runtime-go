@@ -210,7 +210,7 @@ func (g *Gateway) TranscodedStream(ctx context.Context, prefix, method string, r
 		// itself, once started, is bounded only by ctx.
 		timer := time.AfterFunc(options.firstAnswer, func() { late.Store(true); cancelReq() })
 		defer timer.Stop()
-		httpResp, err := g.HTTPClient().Do(httpReq)
+		httpResp, err := g.moduleClient().Do(httpReq)
 		timer.Stop()
 		if err != nil {
 			if late.Load() && ctx.Err() == nil {
@@ -220,7 +220,7 @@ func (g *Gateway) TranscodedStream(ctx context.Context, prefix, method string, r
 		}
 		return readStream(ctx, call, httpResp, options, newMsg, each)
 	}
-	httpResp, err := g.HTTPClient().Do(httpReq)
+	httpResp, err := g.moduleClient().Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", call.verb, call.template, err)
 	}
