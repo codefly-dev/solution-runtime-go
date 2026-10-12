@@ -831,8 +831,10 @@ func readsEnvironment(call *ast.CallExpr) bool {
 	case "WorkspaceConfiguration", "Environment", "Endpoint", "Secret":
 		return true
 	}
-	// Not LoadEnvironmentVariables: that is the loader, and start() calling it
-	// before loadConfig is the documented shape rather than a read to govern.
+	// Not Init, nor the LoadEnvironmentVariables it begins with: that is the
+	// loader, and start() calling it before loadConfig is the documented shape
+	// rather than a read to govern. What it fails with is handed to loadConfig
+	// and refused by validate(), like every other boot value.
 	// Not For() either — it returns the query; the read is the accessor called
 	// on it, which the names above cover.
 	return false

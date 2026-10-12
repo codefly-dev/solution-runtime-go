@@ -525,7 +525,15 @@ agent:
   publisher: codefly.dev
 endpoints:
   - name: rest
+    visibility: public
+    exposure: public
 `)
+	// Declared public because this solution runs as another module
+	// (testModule), and a host's gateway has to be reachable from one for a
+	// solution to resolve it at all. At core v0.19.1 an endpoint declaring no
+	// visibility is private to its own module, and the SDK refuses the
+	// reference rather than resolving an address the consumer may not reach.
+	//
 	// Force the SDK's local-native resolution (no injected carriers), and restore
 	// the shared env snapshot afterwards so later tests see a clean state.
 	t.Setenv("CODEFLY__ENVIRONMENT", "")

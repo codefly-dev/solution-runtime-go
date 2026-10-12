@@ -171,6 +171,13 @@ embedding it.
   suite until this file describes the exception — and so does a read reachable
   from the serving surface, because a helper boot shares with serving code sits
   in that tree while running long after `validate()`.
+  What precedes `loadConfig` is `codefly.Init`, not a bare
+  `LoadEnvironmentVariables`: since sdk-go v0.3.1 the SDK resolves no endpoint
+  until `Init` has pinned the consumer module from `CODEFLY__MODULE`, so a boot
+  that only loaded the carriers resolved nothing and blamed provisioning.
+  `loadConfig` separates `Init`'s two failures and `validate()` refuses an
+  unidentified module by name, overrides or not — the SDK's contract is that a
+  process failing `Init` does not serve.
 - Those gates ask the compiler, not the source text, and that is not a style
   choice: four review rounds each found one more spelling a syntactic rule
   lost. Constants come from `types.Info` (a conversion, a chain, a local
@@ -206,7 +213,7 @@ embedding it.
   built from named constants or cased differently is the same shape to it.
 - **Never sign, parse or verify a Work Context here.** There is one
   implementation, Core's; this runtime obtains a credential through the native broker
-  client and delegates structural inspection to Core, carries it as the string it travels as, and lets the far end
+  client and delegates its structural read to Core, carries it as the string it travels as, and lets the far end
   decide. It declares none of a capability's fields and holds no verifier —
   core's needs the issuer's live revision, replay, grant and seal sources, which
   a solution does not have. `work_context_boundary_test.go` fails on a signing
@@ -449,8 +456,11 @@ embedding it.
   every mint, checks live trust and admission before and after it, disables
   redirects/proxies/reuse, and holds the presented leaf to the frozen principal.
   The SDK still owns the certificate reloader and authority reader. Core's
-  `Inspect` is the only structural reader of the returned token; no signed
-  message is constructed or decoded here, and inspection verifies no signature.
+  `Decode` is the only structural reader of the returned token; no signed
+  message is constructed or decoded here, and that read verifies no signature.
+  It was `Inspect` until core v0.15, and the old name is now core's
+  `Inspector` — a forwarding hop's **signature check** — so it is a verifier to
+  this package and the verifier gate refuses it, with `Authenticator`, by name.
   A private credential view keeps the public SDK `CredentialSource` compatible.
 - **Only 503 and transient transport failures retry.** Timeout, connection
   refused and connection reset are identified by error types/identities, never

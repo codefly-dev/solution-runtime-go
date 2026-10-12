@@ -201,8 +201,21 @@ func verifiersReachedBy(file *ast.File) []string {
 			// rule misses NewVerifier, which is the most ordinary name a
 			// verifier constructor can have. Nothing this package legitimately
 			// names through these imports contains it.
-			if strings.Contains(selector.Sel.Name, "Verif") {
-				reached = append(reached, pkg.Name+"."+selector.Sel.Name)
+			//
+			// And not "Verif" alone. Core v0.19 has two more entrypoints that
+			// check a signature against an issuer's keys, and neither is
+			// spelled that way: Inspector, a forwarding hop's check, and
+			// Authenticator, a callee's check against caller-supplied state.
+			// Inspector is the sharper of the two, because this runtime used
+			// to call core's STRUCTURAL read Inspect — renamed Decode in core
+			// v0.15 precisely so a structural read and a signature check would
+			// stop sharing a name — and the old spelling is now the one that
+			// verifies.
+			for _, verifies := range []string{"Verif", "Inspect", "Authenticat"} {
+				if strings.Contains(selector.Sel.Name, verifies) {
+					reached = append(reached, pkg.Name+"."+selector.Sel.Name)
+					break
+				}
 			}
 			return true
 		})
@@ -259,6 +272,18 @@ func f() { _ = next.NewVerifier() }`,
 import "github.com/codefly-dev/core/workcontext"
 func f() { _ = workcontext.Verifier() }`,
 		},
+		{
+			"a forwarding hop's signature check, which names no Verif",
+			`package solution
+import corework "github.com/codefly-dev/core/workcontext"
+func f(token string) { _, _ = (&corework.Inspector{}).Inspect(token, "route") }`,
+		},
+		{
+			"a callee's check against supplied state, which names no Verif either",
+			`package solution
+import corework "github.com/codefly-dev/core/workcontext"
+var a corework.Authenticator`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			file, err := parser.ParseFile(token.NewFileSet(), "escape.go", tc.source, 0)
@@ -283,6 +308,20 @@ func f() { _ = conformance.Fixtures() }`, 0)
 	}
 	if reached := verifiersReachedBy(file); len(reached) != 0 {
 		t.Errorf("the gate flagged %v in a file that reaches no verifier: reading core's published fixtures is how this suite gets a capability it did not sign itself", reached)
+	}
+
+	// And core's structural read, which is how this runtime reads the
+	// credential it was issued. It checks no signature, so it is not a
+	// verifier, and refusing it would push this package back to a hand-written
+	// parser of its own.
+	file, err = parser.ParseFile(token.NewFileSet(), "decode.go", `package solution
+import corework "github.com/codefly-dev/core/workcontext"
+func f(token string) { decoded, _ := corework.Decode(token); var _ *corework.Decoded = decoded }`, 0)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	if reached := verifiersReachedBy(file); len(reached) != 0 {
+		t.Errorf("the gate flagged %v in a file that only decodes: core's Decode checks no signature, and it is the one structural reader this runtime is allowed", reached)
 	}
 }
 

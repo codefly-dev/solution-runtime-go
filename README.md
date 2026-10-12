@@ -69,8 +69,10 @@ The request is `POST /modules/_work-context`, with exactly
 `{"prefix":"<Manifest.ID>"}`, `Authorization: Bearer <projected token>`, and
 `X-Codefly-Internal-Token`. The prefix is the declared solution ID, separate from
 the frozen SPIFFE principal. The answer carries `token`, `expiresAt`,
-`principalId`, and `tenant`. Core alone inspects the returned capability; the
-runtime does not implement a signed encoding or verify an issuer's authority.
+`principalId`, and `tenant`. Core alone reads the returned capability, through
+its structural `Decode` (named `Inspect` before core v0.15); the runtime does not
+implement a signed encoding or verify an issuer's authority, and that read
+checks no signature.
 
 `WorkContextRefusal.Code` and `.Message` have been removed (breaking API change).
 Consumers should inspect `.StatusCode` or unwrap to `GatewayError`. Broker bodies,
@@ -138,9 +140,13 @@ up, after a retry, an eviction or a restart.
 
 ## Configuration
 
-On boot `Serve` calls
-`codefly.LoadEnvironmentVariables()` to load Codefly's injected carriers, then
-`loadConfig` resolves every address, port, and path through the codefly Go SDK
+On boot `Serve` calls `codefly.Init(ctx)`, which loads Codefly's injected
+carriers and pins the module this process belongs to from `CODEFLY__MODULE`.
+Every Codefly-managed flow sets that variable; the SDK (v0.3.1 and later)
+resolves no endpoint for a process it has not pinned, so a boot that names no
+module — or a different one from the module the process was first pinned to —
+is refused naming `CODEFLY__MODULE`, whether or not every address below was
+overridden. Then `loadConfig` resolves every address, port, and path through the codefly Go SDK
 (`github.com/codefly-dev/sdk-go`), falling back to the local native workspace
 map when not running under the runtime. Most values have an explicit env
 override for an operator with a deployment the resolver cannot see; the
@@ -156,7 +162,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | What | SDK resolution | Env override (default) |
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
-| Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
+| Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally, where core's endpoint visibility applies: an endpoint private to the host's module is refused, not resolved, for a solution in another module). Must be `https` | `GATEWAY_URL` |
 | Credential mint URL | Explicit HTTPS endpoint ending in `/modules/_work-context`. The host's broker path is published; its origin must still be supplied. A 404 is a terminal endpoint/configuration error | `CODEFLY__CREDENTIAL_MINT_URL` (**required**) |
 | Broker perimeter credential | `codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")`, required at boot. Sent only to the execution broker as `X-Codefly-Internal-Token`; it does not replace the projected token or workload identity | — (declared workspace secret, no legacy env fallback) |
 | Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint; defaults to `/var/run/secrets/codefly/token`, the CLI projection | `CODEFLY__WORKLOAD_TOKEN_FILE` |
@@ -1447,12 +1453,11 @@ descriptor, with protobuf JSON names.
 > configuration-profile rule and `core/workcontext` come from core; and the
 > certificate reloader, the authority reader and the mint client come from
 > sdk-go. The `core` and `sdk-go` pins in `go.mod` carry all of it, and there is
-> **no `replace` directive** — both are ordinary pseudo-version `require`s, so
-> this module builds from its own tag for anyone.
+> **no `replace` directive** — every one is an ordinary `require` of a released
+> tag, so this module builds from its own tag for anyone.
 >
-> Both pins are **released** now: `core v0.9.0` and `sdk-go v0.3.0`, with the
-> `sdk-go/workcontext` leaf at a `main` pseudo-version because that leaf module
-> has no tag by design. This said they were unreleased branches that "must move
-> to the releases at merge"; they moved. Every capability's format changed in
-> that cutover, so verifiers upgrade before minters or calls fail closed in the
+> The pins are `core v0.19.1`, `sdk-go v0.3.2` and the `sdk-go/workcontext` leaf
+> at its first tag, `workcontext/v0.1.0` (it was a `main` pseudo-version until
+> that leaf was tagged). Every capability's format changed in the v0.9.0
+> cutover, so verifiers upgrade before minters or calls fail closed in the
 > window — which is a statement about the rollout order, not about these pins.
