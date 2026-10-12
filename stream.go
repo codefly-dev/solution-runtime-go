@@ -203,6 +203,7 @@ func (g *Gateway) TranscodedStream(ctx context.Context, prefix, method string, r
 	if call.body != nil {
 		httpReq.Header.Set("content-type", "application/json")
 	}
+	injectTraceContext(ctx, httpReq.Header)
 	var late atomic.Bool
 	if options.firstAnswer > 0 {
 		// A module that never starts its stream is abandoned; the stream

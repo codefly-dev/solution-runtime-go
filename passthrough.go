@@ -400,7 +400,9 @@ func (s *Server) passthroughHandler(routes map[string]passthroughRoute) http.Han
 			http.NotFound(w, r)
 			return
 		}
-		mux.ServeHTTP(w, r)
+		// The caller's W3C trace context, and only it, rides to the module
+		// call: see withInboundTraceContext.
+		mux.ServeHTTP(w, withInboundTraceContext(r))
 	}))
 }
 
