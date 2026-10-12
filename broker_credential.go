@@ -21,8 +21,10 @@ import (
 )
 
 // executionCredential is private so the public SDK-based CredentialSource
-// remains source compatible. Core alone inspects capability bytes; this runtime
-// never decodes a signed message or treats inspection as verification.
+// remains source compatible. Core alone reads capability bytes, through its
+// structural Decode; this runtime never decodes a signed message itself and
+// never treats that read as verification — core's Inspector, which does check
+// a signature, is a verifier and is not reachable here.
 type executionCredential interface {
 	Token() string
 	Seal() *workcontext.SealedValues
@@ -31,13 +33,13 @@ type executionCredential interface {
 }
 
 type brokerCredential struct {
-	token     string
-	inspected *corework.Inspected
-	expires   time.Time
+	token   string
+	decoded *corework.Decoded
+	expires time.Time
 }
 
 func (c brokerCredential) Token() string                   { return c.token }
-func (c brokerCredential) Seal() *workcontext.SealedValues { return c.inspected.Seal() }
+func (c brokerCredential) Seal() *workcontext.SealedValues { return c.decoded.Seal() }
 func (c brokerCredential) ExpiresAt() time.Time            { return c.expires }
 func (c brokerCredential) Attach(r *http.Request) error    { return workcontext.Attach(r, c.token) }
 
@@ -155,22 +157,22 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	if err != nil || !expiry.After(time.Now()) {
 		return fail()
 	}
-	inspected, err := corework.Inspect(issued.Token)
+	decoded, err := corework.Decode(issued.Token)
 	if err != nil {
 		return fail()
 	}
 	audience, err := c.options.Authority.Value(c.options.Audience.Name, c.options.Audience.Key)
-	if err != nil || inspected.Context().GetAudience() != audience {
+	if err != nil || decoded.Context().GetAudience() != audience {
 		return fail()
 	}
-	if time.Now().Before(inspected.NotBefore().Add(-corework.DefaultSkew)) {
+	if time.Now().Before(decoded.NotBefore().Add(-corework.DefaultSkew)) {
 		return fail()
 	}
 	// The broker's expiry may shorten, never extend, the signed lifetime.
-	if inspected.ExpiresAt().Before(expiry) {
-		expiry = inspected.ExpiresAt()
+	if decoded.ExpiresAt().Before(expiry) {
+		expiry = decoded.ExpiresAt()
 	}
-	credential := brokerCredential{token: issued.Token, inspected: inspected, expires: expiry}
+	credential := brokerCredential{token: issued.Token, decoded: decoded, expires: expiry}
 	if err := usableCredential(credential); err != nil {
 		if errors.Is(err, workcontext.ErrMintRefused) {
 			return workcontext.Credential{}, err
@@ -183,7 +185,7 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	if err := c.identity.holdSealedIdentity(credential.Seal()); err != nil {
 		return workcontext.Credential{}, workcontext.ErrMintRefused
 	}
-	lead := min(30*time.Second, expiry.Sub(inspected.NotBefore())/5)
+	lead := min(30*time.Second, expiry.Sub(decoded.NotBefore())/5)
 	c.renewAt = expiry.Add(-lead)
 	if !time.Now().Before(c.renewAt) {
 		return fail()

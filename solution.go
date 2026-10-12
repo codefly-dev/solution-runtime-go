@@ -467,6 +467,12 @@ type config struct {
 	// so validate() must say so rather than report each empty value as
 	// something the composition forgot to provision.
 	environmentLoadErr error
+	// consumerIdentityErr is Init's refusal to pin this process's module:
+	// CODEFLY__MODULE unset, or naming a different module from the one the
+	// process was first pinned to. The SDK resolves no endpoint without that
+	// pin, so validate() refuses it whether or not anything below came from an
+	// override.
+	consumerIdentityErr error
 	// consumes is the api.consumes projection Codefly injected, decoded once at
 	// the boundary it enters by. There is no raw string beside it: the two were
 	// separate fields, and a config could then be built with only the raw one —
@@ -668,7 +674,17 @@ func newProjection(raw string) projection {
 // credential.go); the shared cluster-internal token and the per-solution
 // registration secret that preceded it are gone, along with the surfaces that
 // accepted them.
-func loadConfig(ctx context.Context, id string, environmentLoadErr error) config {
+func loadConfig(ctx context.Context, id string, initErr error) config {
+	// Init fails for one of two reasons, and they are fixed in different
+	// places: the carriers did not load, or the process named no module (or a
+	// different one from the module it was first pinned to). Only the first
+	// means every SDK-resolved value below is suspect; the second is refused
+	// outright, because the SDK resolves no endpoint for a consumer it cannot
+	// identify and its contract is that such a process does not serve.
+	environmentLoadErr, consumerIdentityErr := initErr, error(nil)
+	if errors.Is(initErr, resources.ErrConsumerNotIdentified) || errors.Is(initErr, codefly.ErrAuthorityValueChanged) {
+		environmentLoadErr, consumerIdentityErr = nil, initErr
+	}
 	// Empty by default: the host is resolved by service+endpoint role, not by its
 	// workspace module name (see resolveGateway). An explicit CODEFLY_HOST_MODULE
 	// scopes the lookup only when a composition is genuinely ambiguous.
@@ -728,7 +744,8 @@ func loadConfig(ctx context.Context, id string, environmentLoadErr error) config
 		// the former. Sending someone to inspect provisioning over a variable
 		// they broke themselves is the specific mistake validate() was written
 		// to stop making.
-		environmentLoadErr: environmentLoadErr,
+		environmentLoadErr:  environmentLoadErr,
+		consumerIdentityErr: consumerIdentityErr,
 	}
 	// Two sources for one authorization fact are refused, not ranked.
 	//
@@ -940,6 +957,12 @@ func (c config) validate() error {
 	// ordinary provisioning advice next to it.
 	if c.admissionConflict != nil {
 		return c.admissionConflict
+	}
+	// Before any endpoint: with no consumer pinned, every one of them is empty
+	// for that reason and not for the one its own refusal would name.
+	if c.consumerIdentityErr != nil {
+		return fmt.Errorf("the Codefly SDK could not identify the module this process belongs to: %w — %s names it, every Codefly-managed flow sets it, and the SDK resolves no endpoint for a process it has not pinned, so this one does not serve",
+			c.consumerIdentityErr, resources.ModulePrefix)
 	}
 	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
@@ -1483,17 +1506,21 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if err := s.validateMCPDeclaration(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
-	// The SDK owns environment resolution: load Codefly's injected carriers so
-	// endpoint and workspace-configuration lookups resolve from them (falling
-	// back to the local native workspace map when not running under the
-	// runtime). Kept, not swallowed: when this fails every SDK-resolved value
-	// below comes back empty, and validate() would otherwise report each one as
-	// something the composition forgot to provision.
-	environmentLoadErr := codefly.LoadEnvironmentVariables()
-	if environmentLoadErr != nil {
-		log.Printf("codefly: load environment: %v", environmentLoadErr)
+	// The SDK owns environment resolution, and since sdk-go v0.3.1 that begins
+	// with Init: it loads Codefly's injected carriers so endpoint and
+	// workspace-configuration lookups resolve from them (falling back to the
+	// local native workspace map when not running under the runtime), and it
+	// pins the module this process belongs to from CODEFLY__MODULE. The SDK
+	// refuses every endpoint query before that pin, so a boot that only loaded
+	// the carriers — which this one did — resolved no gateway, no frontend and
+	// no port, and reported each as something the composition forgot to
+	// provision. Kept, not swallowed: loadConfig separates the two failures and
+	// validate() refuses each by its own cause.
+	_, initErr := codefly.Init(ctx)
+	if initErr != nil {
+		log.Printf("codefly: init: %v", initErr)
 	}
-	s.cfg = loadConfig(ctx, s.manifest.ID, environmentLoadErr)
+	s.cfg = loadConfig(ctx, s.manifest.ID, initErr)
 	// Whether an MCP surface was declared, which is what makes the MCP
 	// configuration load-bearing: validate() checks it only then, so a
 	// solution serving no MCP is unaffected by a host whose issuer does not

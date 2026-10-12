@@ -49,8 +49,8 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("core conformance fixtures: %v", err)
 	}
-	if len(fixtures) < 39 {
-		t.Fatalf("core published %d fixtures; the kit is 39 at core v0.9.0, so this test is reading a trimmed set", len(fixtures))
+	if len(fixtures) < 40 {
+		t.Fatalf("core published %d fixtures; the kit is 40 at core v0.19.1, so this test is reading a trimmed set", len(fixtures))
 	}
 
 	var carriedCount, refusedCount int
@@ -216,6 +216,12 @@ var boundary = map[string]carriage{
 	"partial-operation-binding":  refusedHere,
 	"actor-without-epoch":        refusedHere,
 	"unknown-field":              refusedHere,
+	// Added after core v0.9.0 (present at v0.19.1): a capability addressed to
+	// no audience. Core's schema refuses it inside the decode, before anything
+	// compares it to a route, so like the rest of this group it is a property
+	// of the bytes in hand — distinct from "another-audience", which names one
+	// and needs the far end to say it is not theirs.
+	"empty-audience": refusedHere,
 
 	// Judgements this runtime cannot make. The issuer's identity is a claim
 	// and the key is not the trust decision; a validity window needs a clock
