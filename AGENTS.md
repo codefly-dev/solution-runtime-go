@@ -672,3 +672,7 @@ Keep this file short; add depth to the file that owns the subject.
 - `.claude/skills/` — procedures an agent repeats, loaded only when relevant.
   None exist yet, because nothing here repeats beyond the four commands above.
   Add one instead of growing this file.
+
+The optional frontend declaration uses Core's `solutionhost.ParseFrontend` and
+its types directly. Nil is headless; a present malformed file refuses boot.
+Do not introduce a second parser, size limits or a fixed client-kind inventory.

@@ -418,10 +418,19 @@ func bootEnvironment(t *testing.T, mint *hostMint) {
 // contract, the one mint, the TLS listener — on an ephemeral port.
 func boot(t *testing.T, server *Server, mint *hostMint) *booted {
 	t.Helper()
+	return bootComponent(t, server, mint, false)
+}
+
+func bootComponent(t *testing.T, server *Server, mint *hostMint, headless bool) *booted {
+	t.Helper()
 	bootEnvironment(t, mint)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	ln, err := takeListener(server).start(ctx)
+	takeListener(server)
+	if headless {
+		server.manifest.Frontend = nil
+	}
+	ln, err := server.start(ctx)
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -953,8 +962,8 @@ func provideListener(t *testing.T, ln net.Listener) {
 // the boot binds for itself.
 //
 // It also embeds the fixture's declared frontend into a server that declared
-// none, the way a solution's go:embed does: every boot requires the file, and
-// a test about anything else should not have to spell it out.
+// none, the way a solution's go:embed does. Existing fixtures include a page;
+// bootComponent explicitly opts out when exercising a headless component.
 func takeListener(server *Server) *Server {
 	if parkedListener != nil {
 		server.boundListener = parkedListener
@@ -1123,3 +1132,14 @@ type localRun struct{}
 
 func (localRun) WorkspaceValueIfSet(string, string) (string, bool, error) { return "", false, nil }
 func (localRun) IsLocalRun() bool                                         { return true }
+
+func TestHeadlessComponentBootsWithoutAdvertisingAFrontend(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	running := bootComponent(t, New(Manifest{ID: testSolutionID}), mint, true)
+	if status := getStatus(t, running.client, running.base+HealthPath); status != http.StatusOK {
+		t.Fatalf("headless health: %d", status)
+	}
+	if status := getStatus(t, running.client, running.base+"/.well-known/solution.json"); status != http.StatusNotFound {
+		t.Fatalf("headless component advertised a page: %d", status)
+	}
+}

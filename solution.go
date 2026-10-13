@@ -80,9 +80,9 @@ type Manifest struct {
 	Contract     string   // capability contract id (default: ID)
 	Capabilities []string // capability feature ids
 	// Frontend is the declared frontend file, FrontendFileName, embedded with
-	// go:embed from beside the backend's service.codefly.yaml. Required: the
-	// manifest route serves from it, and a boot without one is refused naming
-	// the file. Contract and Capabilities stay Go fields because the
+	// go:embed from beside the backend's service.codefly.yaml. Nil means a
+	// headless component. A present file is validated even when empty, and
+	// the manifest route serves only when a frontend is declared. Contract and Capabilities stay Go fields because the
 	// capability handshake (/.well-known/capabilities) is the backend's own
 	// and the frontend block does not carry them.
 	Frontend []byte
@@ -875,11 +875,13 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	if err := s.manifest.validateID(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
-	frontend, err := parseFrontend(s.manifest.Frontend)
-	if err != nil {
-		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	if s.manifest.Frontend != nil {
+		frontend, err := parseFrontend(s.manifest.Frontend)
+		if err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+		}
+		s.frontend = frontend
 	}
-	s.frontend = frontend
 	if err := s.validateMCPDeclaration(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -1607,7 +1609,11 @@ func (s *Server) frontendManifestURL() string {
 	return federationManifestPath
 }
 
-func (s *Server) handleManifest(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	if s.manifest.Frontend == nil {
+		http.NotFound(w, r)
+		return
+	}
 	writeJSON(w, http.StatusOK, s.manifestMap())
 }
 

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codefly-dev/core/solutionhost"
 	corework "github.com/codefly-dev/core/workcontext"
 	"gopkg.in/yaml.v3"
 
@@ -256,8 +257,8 @@ func TestManifestOmitsAbsentSurfacesAndTheirEmptySlots(t *testing.T) {
 	minimal := "surfaces:\n  - id: footnote\n    client: word\n    title: Footnote\n    module: /surfaces/word/footnote.js\n    contract: 1\n    applies: always\n"
 	s := &Server{manifest: Manifest{ID: "notes"}, frontend: declaredFrontend(t, minimal)}
 	entry := s.manifestMap()["surfaces"].([]any)[0].(map[string]any)
-	if got := entry["applies"]; got != surfaceAppliesAlways {
-		t.Errorf("applies = %#v, want %q as declared", got, surfaceAppliesAlways)
+	if got := entry["applies"]; got != "always" {
+		t.Errorf("applies = %#v, want %q as declared", got, "always")
 	}
 	if _, ok := entry["description"]; ok {
 		t.Errorf("emitted a description key with no description declared")
@@ -302,10 +303,9 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 		{"id of one dash", with(func(s *frontendSurface) { s.ID = "-" }), "id must be"},
 		{"duplicate id in one client", []frontendSurface{wordFootnote(), wordFootnote()}, "declared twice"},
 		{"no title", with(func(s *frontendSurface) { s.Title = "" }), "no title"},
-		{"unknown client", with(func(s *frontendSurface) { s.Client = "notion" }), "unknown client kind"},
+		{"invalid client", with(func(s *frontendSurface) { s.Client = "bad/client" }), "client"},
 		{"no client", with(func(s *frontendSurface) { s.Client = "" }), "unknown client kind"},
 		{"undeclared contract", with(func(s *frontendSurface) { s.Contract = 0 }), "contract"},
-		{"negative contract", with(func(s *frontendSurface) { s.Contract = -1 }), "contract"},
 		// The selector is declared, in one of the two shapes the host client
 		// reads; core signs no default and refuses every other shape.
 		{"no applies", with(func(s *frontendSurface) { s.Applies = nil }), "no applies"},
@@ -336,8 +336,8 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 			if err == nil {
 				t.Fatalf("validateSurfaces accepted %s", tc.name)
 			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("error %q does not say %q", err, tc.want)
+			if !errors.Is(err, solutionhost.ErrInvalid) {
+				t.Errorf("invalid surface did not retain Core's refusal: %v", err)
 			}
 		})
 	}
@@ -394,12 +394,12 @@ func TestTheDeclaredFrontendIsStrictAndNamed(t *testing.T) {
 		{"no file", "", FrontendFileName},
 		{"whitespace only", "\n  \n", FrontendFileName},
 		{"an unknown key", complete + "nav_order: 3\n", "nav_order"},
-		{"no title", strings.Replace(complete, "title: Notes\n", "", 1), "no title"},
+		{"no title", strings.Replace(complete, "title: Notes\n", "", 1), "frontend.title"},
 		{"an empty title", strings.Replace(complete, "title: Notes\n", "title: ''\n", 1), "title"},
 		{"a title of two lines", strings.Replace(complete, "title: Notes\n", "title: \"Notes\\nmore\"\n", 1), "title"},
-		{"no order", strings.Replace(complete, "order: 3\n", "", 1), "no order"},
-		{"no exposed module", strings.Replace(complete, "exposed_module: ./Page\n", "", 1), "no exposed_module"},
-		{"no host contract", strings.Replace(complete, "host_contract: 1\n", "", 1), "no host_contract"},
+		{"no order", strings.Replace(complete, "order: 3\n", "", 1), "frontend.order"},
+		{"no exposed module", strings.Replace(complete, "exposed_module: ./Page\n", "", 1), "frontend.exposed_module"},
+		{"no host contract", strings.Replace(complete, "host_contract: 1\n", "", 1), "frontend.host_contract"},
 		{"a host contract of zero", strings.Replace(complete, "host_contract: 1\n", "host_contract: 0\n", 1), "host_contract"},
 		{"a negative host contract", strings.Replace(complete, "host_contract: 1\n", "host_contract: -1\n", 1), "host_contract"},
 		{"a dashboard with a non-string key", complete + "dashboard:\n  1: widget\n", "dashboard"},
@@ -408,7 +408,7 @@ func TestTheDeclaredFrontendIsStrictAndNamed(t *testing.T) {
 		{"a dashboard over the bound", complete + "dashboard:\n  pad: " + strings.Repeat("a", frontendDashboardMaxBytes) + "\n", "dashboard"},
 		{"a surface with no contract", complete + strings.Replace(footnoteSurface, "    contract: 1\n", "", 1), "contract"},
 		{"two documents", complete + "---\ntitle: Other\n", "more than one"},
-		{"not a mapping", "- title: Notes\n", "cannot be decoded"},
+		{"not a mapping", "- title: Notes\n", "frontend declaration"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := parseFrontend([]byte(tc.file))
@@ -1911,5 +1911,32 @@ func TestAnOrdinaryConflictDoesNotRetireAValidCapability(t *testing.T) {
 	}
 	if first.WorkContext != second.WorkContext {
 		t.Error("the second call presented a different capability than the first: the ordinary conflict evicted the cached one, which is the re-mint this check exists to prevent")
+	}
+}
+
+// The surface assertions exercise the production file reader rather than a
+// second surface validator kept by this runtime.
+func validateSurfaces(surfaces []frontendSurface) error {
+	raw, err := yaml.Marshal(frontendDeclaration{Title: "Example", Order: 0, ExposedModule: "./Page", HostContract: 1, Surfaces: surfaces})
+	if err != nil {
+		return err
+	}
+	_, err = parseFrontend(raw)
+	return err
+}
+
+func TestFrontendReaderRetainsCoreLimitsAndExtensibleClientKinds(t *testing.T) {
+	surface := wordFootnote()
+	surface.Client = "new-client"
+	if err := validateSurfaces([]frontendSurface{surface}); err != nil {
+		t.Fatal(err)
+	}
+	for _, extra := range []string{
+		"title: " + strings.Repeat("x", solutionhost.FrontendTextMaxBytes+1) + "\norder: 0\nexposed_module: ./Page\nhost_contract: 1\n",
+		string(frontendYAML(strings.Replace(footnoteSurface, "contract: 1", "contract: -1", 1))),
+	} {
+		if _, err := parseFrontend([]byte(extra)); !errors.Is(err, solutionhost.ErrInvalid) {
+			t.Fatalf("invalid file was not refused by Core: %v", err)
+		}
 	}
 }

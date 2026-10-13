@@ -8,7 +8,7 @@ handshake, the manifest served from the declared frontend file, the published
 authority contract, and the gateway client each handler uses to read composed
 modules on the viewer's behalf.
 
-A solution author writes a manifest, embeds the frontend it declares, and
+A component author writes a manifest, optionally embeds a frontend, and
 writes one handler:
 
 ```go
@@ -638,8 +638,9 @@ The backend embeds it — `//go:embed solution.frontend.codefly.yaml` into
 file into the presence document's `frontend` block (core's
 `solutionhost.Frontend`), which is what the host's registry projects. Two
 readers of one file cannot disagree, where a Go field beside a file could, and
-nothing is reported at mint any more. A boot without the file is refused
-naming it; so is a file the CLI would refuse.
+nothing is reported at mint any more. The declaration is optional for either
+component kind: a nil `Manifest.Frontend` is headless. A present malformed file
+is refused by the same Core reader used by the CLI.
 
 ```yaml
 title: Widgets           # nav title; one non-empty line
@@ -1362,3 +1363,17 @@ descriptor, with protobuf JSON names.
 > that leaf was tagged). Every capability's format changed in the v0.9.0
 > cutover, so verifiers upgrade before minters or calls fail closed in the
 > window — which is a statement about the rollout order, not about these pins.
+
+### Shared frontend validation and headless components
+
+`Manifest.Frontend == nil` declares a headless component: it boots normally and
+its frontend manifest route returns 404. A present file, including an empty one,
+is validated by Core's `solutionhost.ParseFrontend`, the same reader the CLI uses
+for modules and solutions before signed delivery. The runtime carries Core's
+frontend types and bounds directly; it no longer maintains a client-kind list
+or a second set of field validators. Client kinds are declared names, with
+support decided by the consuming client.
+
+Core limits text to 1 KiB, surface/event/tag collections to 64 entries, a
+dashboard to 64 KiB and the complete canonical frontend to 128 KiB. These are
+file/declaration constraints, independent of per-organisation page admission.
