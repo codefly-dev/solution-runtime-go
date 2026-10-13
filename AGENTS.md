@@ -3,7 +3,7 @@
 This repository owns the generic Go runtime for **codefly solutions** — modules
 deployed independently of the host they extend, with no build-time coupling. It
 owns what every solution needs identically: configuration resolution through the
-codefly SDK, obtaining this execution's credential once from the projected
+codefly SDK, obtaining this execution's credential at boot and on demand from the projected
 service-account token, a plain-HTTP listener on the port Codefly resolves —
 the cell's mesh carries transport security and destination identity for every
 hop inside it — CORS, Module Federation asset serving, the capability
@@ -418,15 +418,13 @@ embedding it.
   anything about this process to the host: a process cannot declare what the
   composition did not.
 - **`412` is "admitted, installed nowhere", and it is a state, not an error.**
-  The host issues this execution's credential only after the install step is
-  acknowledged, so the step must run without it — it acts under the capability
-  the host carries in — and `/health` must answer 200, both from what the
-  controller already recorded (`uninstalled`) without asking again.
-  `awaitInstallation` is the one asker, through `askOnce` like every other
-  ask: an ask made around the controller left a terminal answer latched in the
-  source and reported by nobody. A viewer's route still answers 503. Do not
-  widen the exemption to any other unavailable state: a host that cannot be
-  reached is not an uninstalled solution.
+  The install step runs under the host's incoming capability before an execution
+  credential exists. Its acknowledgement can trigger a bounded retry sequence
+  to bridge activation; there is no idle installation poll. Health only reads
+  process state, never asks for or renews a credential. An idle process must
+  make zero further mints, even after its held credential expires. Actual viewer
+  work still uses the single-flight credential controller and the host's live
+  installation checks. Never turn probes back into authorization traffic.
 - **The execution mint follows the host's module broker contract natively,
   over plain HTTP to the gateway's workload endpoint.**
   `saas-sdk-go/moduleauthority` at `217bf9fe3f10` is the wire reference; its
@@ -469,7 +467,7 @@ embedding it.
   only, with no raw diagnostic cause. Boot and renewal use the same decision;
   terminal answers are retained where they land, even after waiters leave.
 - **A terminal credential refusal ends the process; a transient one does not.**
-  `ErrMintRefused` or a terminal broker error at renewal fails `/health` and ends `serve` with the reason.
+  `ErrMintRefused` or a terminal broker error observed during actual work fails `/health` and ends `serve` with the reason. Health does not discover it by minting.
   `ErrMintUnavailable` must not: it is transient by construction and exiting on
   it is a crash loop. `ErrRevoked` is not in either set, and three review rounds
   found this file still saying it was: the mint client does not return it at all

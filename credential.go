@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -402,54 +401,29 @@ func (s *Server) openCredential(ctx context.Context) error {
 	}
 }
 
-// awaitInstallation asks the host for this execution's credential for as long
-// as this process holds none because nothing has installed the solution, and
-// returns when ctx ends or the credential is refused for good.
-//
-// It exists because an uninstalled solution has no other asker. Health and the
-// install step answer from what is already known (see uninstalled), and a
-// viewer's request cannot arrive: the host routes nobody to a solution
-// installed nowhere. So without this the first credential would wait for a
-// request the host will not send.
-//
-// Every ask goes through the controller (askOnce): single-flight with any
-// viewer's ask, the answer recorded where every other reader looks, and a
-// terminal answer ending the process exactly as it does on any other path. An
-// ask made around the controller left a refusal latched in the source and
-// reported by nobody.
-//
-// Two cadences. Uninstalled and idle it asks slowly, with jitter so replicas
-// that booted together stop asking together. After an install step has been
-// acknowledged (installAcknowledged) it asks at once and then a few times in
-// quick succession, because the host activates the installation only after it
-// has read this runtime's answer — the first ask can race it.
+// awaitInstallation reacts only to an acknowledged installation. The host
+// activates it after reading the acknowledgement, so a bounded retry sequence
+// may bridge that transition. No idle timer acquires or renews credentials;
+// after the sequence, an actual viewer request can acquire through the same
+// single-flight controller. Presence and admission never depend on this loop.
 func (s *Server) awaitInstallation(ctx context.Context) {
-	idle := time.NewTimer(awaitInstallationWait())
-	defer idle.Stop()
 	for {
-		followUps := []time.Duration(nil)
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.credentialRefusedC():
 			return
 		case <-s.installed:
-			followUps = awaitInstallationFollowUps
-		case <-idle.C:
 		}
 		for ask := 0; s.awaitsInstallation(); ask++ {
 			credential, err := s.askOnce(ctx, platformRequestTimeout)
 			if err == nil {
 				seal := credential.Seal()
-				log.Printf("solution %q: installed; holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
-					s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation(),
-					credential.ExpiresAt().UTC().Format(time.RFC3339))
+				log.Printf("solution %q: installation acknowledged; credential sealed to installation %s revision %d and build incarnation %d, valid until %s",
+					s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation(), credential.ExpiresAt().UTC().Format(time.RFC3339))
 				break
 			}
-			if errors.Is(err, ErrCredentialRefused) || ask >= len(followUps) {
-				// Refused: askOnce has recorded it and the process is
-				// ending. Otherwise still uninstalled, or the host is not
-				// answering — the idle cadence asks again.
+			if errors.Is(err, ErrCredentialRefused) || ask >= len(awaitInstallationFollowUps) {
 				break
 			}
 			select {
@@ -457,35 +431,15 @@ func (s *Server) awaitInstallation(ctx context.Context) {
 				return
 			case <-s.credentialRefusedC():
 				return
-			case <-time.After(followUps[ask]):
+			case <-time.After(awaitInstallationFollowUps[ask]):
 			}
 		}
-		if !idle.Stop() {
-			select {
-			case <-idle.C:
-			default:
-			}
-		}
-		idle.Reset(awaitInstallationWait())
 	}
 }
 
-// awaitInstallationEvery is how often an uninstalled solution asks again, and
-// awaitInstallationJitter the fraction of it one ask may arrive early by.
-const (
-	awaitInstallationEvery  = 20 * time.Second
-	awaitInstallationJitter = 0.2
-)
-
-// awaitInstallationFollowUps paces the asks after an acknowledged install
-// step: the host activates the installation once it has read the answer, so
-// the credential is a moment away rather than a cadence away.
+// Bounded retries for the activation race after an installation acknowledgement.
 var awaitInstallationFollowUps = []time.Duration{
 	250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second,
-}
-
-func awaitInstallationWait() time.Duration {
-	return time.Duration(float64(awaitInstallationEvery) * (1 - awaitInstallationJitter*rand.Float64()))
 }
 
 // awaitingInstallation reports the host's answer that nobody has installed

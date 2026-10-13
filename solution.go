@@ -198,7 +198,7 @@ type Server struct {
 	installed chan struct{}
 	// awaiting is set once the host has answered that nothing has installed
 	// this solution, and cleared when a credential is held. It is what keeps
-	// awaitInstallation asking through a transient answer in between; whether
+	// installation-triggered retries going through a transient answer; whether
 	// the process may SERVE uninstalled is a stricter question (uninstalled).
 	awaiting    atomic.Bool
 	terminalErr atomic.Pointer[error]
@@ -1017,67 +1017,18 @@ const (
 	inboundIdleTimeout   = 30 * time.Second
 )
 
-// handleHealth answers the host's probe with what this process can actually do.
-//
-// It was an unconditional 200, which is only right while the one thing this
-// runtime needs is still true. Once the issuer has refused this execution's
-// credential for good, the process can serve no module call for any viewer: a
-// 200 then invites the host to keep routing to a binding that answers 503 to
-// everything, and the probe is the only channel this runtime has to say
-// otherwise — it does not push liveness, so it has to answer honestly.
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+// handleHealth reports process health without acquiring a credential. An idle
+// process must not renew merely because an orchestrator probes it. Every real
+// viewer operation still passes actingForAViewer and the host's live checks.
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	if err := s.terminalErr.Load(); err != nil {
-		// Named, not detailed: a probe is not a place to put the issuer's text.
 		http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
 		return
-	}
-	// The probe asks the credential, rather than only reporting a refusal some
-	// *other* request happened to discover.
-	//
-	// Renewal is lazy by design — the client renews when a caller asks for the
-	// credential — so a solution that serves only ViewerBearer routes, plain
-	// handlers and assets never asks, and therefore never learns that the
-	// issuer has stopped approving this build. It would keep answering 200 and
-	// keep serving, with the refusal arriving only if some request eventually
-	// needed a capability. That is the same "serves nothing, looks alive" shape
-	// one layer out, and the probe is the one channel this runtime has.
-	//
-	// Asking is cheap and is not a heartbeat: the client holds one credential
-	// and hands the same one back until its renewal point, so this is a
-	// mutex and a comparison except at the renewal the credential's own expiry
-	// dictates. Nothing here runs on a timer this runtime chose.
-	// Admitted and installed nowhere is healthy: this process serves the one
-	// thing it can be asked for, its install step, and a probe that failed it
-	// would have the orchestrator restart a solution for not being installed.
-	// Answered from what the host last said, without asking it again.
-	if s.uninstalled() {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	if s.credential != nil || s.brokerCredential != nil {
-		// Through credentialWithin, so the deadline is real: passing a context
-		// to the SDK's client does not bound it, because what blocks is a
-		// mutex held across the mint.
-		if _, err := s.credentialWithin(r.Context(), healthCredentialTimeout); err != nil {
-			if errors.Is(err, ErrCredentialRefused) {
-				http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
-				return
-			}
-			// Transient: the issuer cannot answer right now. Still unhealthy —
-			// this process cannot act for a viewer until it can — but it is not
-			// a judgement, so nothing ends.
-			http.Error(w, "this execution's credential cannot currently be obtained", http.StatusServiceUnavailable)
-			return
-		}
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
 const routeCredentialTimeout = 500 * time.Millisecond
-
-// healthCredentialTimeout bounds what a probe will wait for the credential, so
-// a hung issuer makes the probe fail rather than parking it.
-const healthCredentialTimeout = 2 * time.Second
 
 // actingForAViewer refuses to act on a viewer's behalf while this process holds
 // no credential the issuer still approves.

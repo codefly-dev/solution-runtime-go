@@ -9,7 +9,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
 // postInstall sends one well-formed install step to a booted runtime as the
@@ -95,13 +98,13 @@ func TestAnUninstalledSolutionServesItsInstallStepAndThenHoldsACredential(t *tes
 
 	// Held promptly — well inside the idle cadence, because the acknowledged
 	// step is what says the credential is now worth asking for.
-	deadline := time.Now().Add(awaitInstallationEvery / 2)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, held := s.heldCredential(); held {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no credential held %s after the install step was acknowledged and the host began issuing", awaitInstallationEvery/2)
+			t.Fatalf("no credential held %s after the install step was acknowledged and the host began issuing", 10*time.Second)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -164,19 +167,46 @@ func TestAnInstalledRuntimeStillHoldsTheInstallStepToItsCredential(t *testing.T)
 	}
 }
 
-func TestAwaitInstallationCadenceIsJitteredDownward(t *testing.T) {
-	low := time.Duration(float64(awaitInstallationEvery) * (1 - awaitInstallationJitter))
-	distinct := map[time.Duration]bool{}
-	for range 200 {
-		wait := awaitInstallationWait()
-		if wait > awaitInstallationEvery || wait < low {
-			t.Fatalf("wait %s outside [%s, %s]", wait, low, awaitInstallationEvery)
-		}
-		distinct[wait] = true
+// Advancing beyond both the former polling and renewal intervals must make no
+// acquisition. The same controller is then exercised by a real request.
+func TestIdleRuntimeAndHealthNeverMint(t *testing.T) {
+	for _, uninstalled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "registered", true: "uninstalled"}[uninstalled], func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var calls atomic.Int32
+				s := New(Manifest{ID: testSolutionID})
+				s.credential = countingIdleSource{calls: &calls}
+				if uninstalled {
+					s.noteCredentialAnswer(&brokerMintError{class: brokerAwaitingInstallation})
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go s.awaitInstallation(ctx)
+				for range 120 {
+					time.Sleep(30 * time.Second)
+					if status, _ := healthStatus(t, s); status != http.StatusOK {
+						t.Fatalf("idle health = %d", status)
+					}
+				}
+				if got := calls.Load(); got != 0 {
+					t.Fatalf("one idle hour produced %d credential acquisitions", got)
+				}
+				if err := s.actingForAViewer(ctx); err == nil {
+					t.Fatal("actual work was not refused without a credential")
+				}
+				if got := calls.Load(); got != 1 {
+					t.Fatalf("actual work made %d acquisitions, want 1", got)
+				}
+			})
+		})
 	}
-	if len(distinct) < 2 {
-		t.Fatal("every replica waits the same time, so replicas that boot together ask together")
-	}
+}
+
+type countingIdleSource struct{ calls *atomic.Int32 }
+
+func (s countingIdleSource) Credential(context.Context) (workcontext.Credential, error) {
+	s.calls.Add(1)
+	return workcontext.Credential{}, workcontext.ErrMintUnavailable
 }
 
 // TestTheAskerSurvivesATransientAnswerWhileUninstalled: one answer that
@@ -204,13 +234,13 @@ func TestTheAskerSurvivesATransientAnswerWhileUninstalled(t *testing.T) {
 		t.Fatalf("install step = %d, want 204", status)
 	}
 	phase.Store(1)
-	deadline := time.Now().Add(awaitInstallationEvery / 2)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if _, held := s.heldCredential(); held {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no credential held %s after one transient answer: the asker stopped, and nothing but the host's next install delivery would start it again", awaitInstallationEvery/2)
+			t.Fatalf("no credential held %s after one transient answer: the asker stopped, and nothing but the host's next install delivery would start it again", 10*time.Second)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

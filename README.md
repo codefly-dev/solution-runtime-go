@@ -59,7 +59,7 @@ workload identity; the host reconciles towards it. Authority is delivered the
 same way, by a signed document bound to one approved build. This runtime's only
 outbound act at boot is to obtain its own credential once, from the
 service-account token the platform projects for it; it renews that credential
-when it expires and otherwise says nothing to anyone. Health is **answered**,
+on demand when actual work needs it and otherwise says nothing. Health is **answered**,
 never pushed: the host probes the destination its own presence document names,
 and nothing this process answers can make it present.
 
@@ -95,11 +95,11 @@ answers `412`. That is not a refusal. The runtime serves holding no credential:
 `/health` answers `200`, and the [install step](#install-step) runs, because it
 acts under the capability the host carries in and the host issues this
 execution's credential only after that step is acknowledged. Neither asks the
-host again. The runtime asks every 20 seconds (jittered) for as long as it holds
-no credential — through a transient answer too — and at once, then a few times
-in quick succession, after it acknowledges an install step. It holds the first
-credential issued. A viewer's route still answers `503` until then. A
-`401`/`403`
+host again. An acknowledged install step triggers a bounded sequence of up to
+six attempts to bridge the host's activation-after-acknowledgement race. After
+that sequence the runtime remains idle; an actual viewer operation can acquire
+through the same controller. There is no periodic polling while uninstalled.
+A `401`/`403`
 stays what it was: a judgement, which fails the boot and is never retried.
 
 The answer carries `token`, `expiresAt`,
@@ -355,24 +355,18 @@ which establishes the principal, the installation and the build from that token
 and its own records, never from anything this process reports — answers with a
 credential sealed to this build incarnation and this installation.
 
-The runtime runs **no registration heartbeat** — which is the claim this cutover is about. It does run other
-timers, and saying otherwise here was wrong twice: the inbound and outbound
-trust watchers re-verify an established peer once a second, the credential
-acquisition holds off after a failure (capped, jittered), and the listener has
-idle and header bounds. None of them tells the host this process exists, which
-is the property; "no timers at all" was never it. Every use goes through the client, which hands back the
-credential it holds while that one is current and renews it once it has entered
-its renewal lead, re-reading the rotated projection and rechecking the frozen
-authority values first. A process that runs for a week under credentials the
-issuer chose to make long-lived mints once and renews a handful of times; it
-never mints per beat or per probe, and does not mint per request: acquisition is
-single-flight, a failed ask quiets the next ones for a second, and a credential
-already in hand and unexpired is what serves meanwhile. That last part is not a
-detail — renewal begins inside a lead *before* expiry, so refusing while the
-issuer is slow would answer 503 to every viewer over a dependency this process
-does not yet need. A route gate that asked per request turned a 503-ing issuer
-into one audited mint per request, which is worse than the heartbeat this
-runtime replaced, because the heartbeat at least minted on a timer.
+An idle runtime makes **no credential acquisition or renewal requests** after
+boot and installation processing. Health probes read process state only. Real
+viewer operations acquire on demand through the existing single-flight controller:
+it returns a held current credential, and renews only when work needs a credential
+inside its renewal lead. Renewal rereads the rotated projection and checks the
+frozen authority before sending. A transient failure backs off while a held,
+unexpired credential remains usable; an expired one is never used.
+
+Presence and build admission belong to delivered declarations and installation
+transitions. A short-lived Work Context authorizes actual work; it does not
+register this process or extend registry presence. The host still checks live
+installation consent, revisions and revocation on protected requests.
 
 **A refused first mint fails the boot and is never retried. An unavailable one
 is waited for, within a bound.** The two are different answers:
@@ -606,29 +600,13 @@ Publishing is not announcing — nothing is pushed, and answering makes this
 solution present to nobody: the host builds its registry entry from the
 delivered presence document and its own constants, never from this route.
 
-`/health` **asks the credential** rather than reporting only what some other
-request happened to discover. Renewal is lazy by design, so a solution serving
-only ViewerBearer routes, plain handlers and assets would otherwise never ask and
-never learn that the issuer had stopped approving its build. Asking is not a
-heartbeat: the client holds one credential and returns the same one until its own
-renewal point, so a probe is a mutex and a comparison except at the renewal the
-credential's expiry dictates. A credential that cannot currently be obtained is
-503 and nothing ends; a refusal is 503 **and** ends the process.
-
-So `/health` answers 200 while this process can do its job, and **503 once the
-issuer has refused this execution's credential for good** — `ErrMintRefused` at
-renewal, which is a judgement about this execution that no retry changes.
-(`ErrRevoked` is not one of these: it never comes back from the mint, only from
-a callee rejecting a capability this runtime minted for a viewer, which is a 409
-on that request.) The process then stops serving and returns that reason, for the
-orchestrator to restart it against the delivery as it stands. An unconditional
-200 was wrong in exactly the case the probe exists for: the boot already treats a
-refusal as terminal, while at renewal the same judgement reached a page as
-"unavailable, one renewal fixes it", so a solution would answer 503 to every
-request forever and report itself healthy throughout — a solution that serves
-nothing and looks alive, which is what the delivered-presence model replaced the
-heartbeat to avoid. An *unavailable* mint is not a judgement and deliberately
-does not do this: exiting on a transient dependency failure is a crash loop.
+`/health` reports process health without acquiring or renewing a credential.
+It answers 200 while idle, including when installed nowhere or a held credential
+has expired. This is not an authorization verdict: every actual viewer operation
+passes the credential gate and the host's live consent and revocation checks.
+A terminal refusal observed during actual work is retained, makes health answer
+503 and ends the process. A transient mint outage refuses work that has no
+usable credential but does not turn health probes into repeated mint attempts.
 
 The manifest declares the majors it is built against rather than leaving a
 reader to assume them — `schemaVersion: 1`, this runtime's manifest schema, and

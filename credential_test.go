@@ -714,12 +714,9 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 			server := New(Manifest{ID: testSolutionID}).Credential(refusingSource{err: tc.err})
 			server.cfg.gatewayURL = gw.URL
 
-			// Health asks the credential, so with a source that refuses it is
-			// already unhealthy before any request — which is the point of
-			// C5: a solution serving no module calls must not look alive while
-			// the issuer has stopped approving its build.
-			if status, _ := healthStatus(t, server); status != http.StatusServiceUnavailable {
-				t.Errorf("health = %d while the credential cannot be obtained, want 503: the probe is the only channel this runtime has, and lazy renewal means nothing else may ever ask", status)
+			// Health observes; only actual work may acquire a credential.
+			if status, _ := healthStatus(t, server); status != http.StatusOK {
+				t.Errorf("health before any credential request = %d, want 200", status)
 			}
 
 			header := http.Header{}
@@ -753,13 +750,10 @@ func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *tes
 					t.Error("the reason this process is ending was not recorded, so its exit would say nothing")
 				}
 			} else {
-				// Unhealthy, because this process cannot act for a viewer
-				// until the credential can be obtained — but NOT ending, which
-				// is the distinction that matters: the host stops routing to
-				// it, and it recovers when the issuer does. Exiting here would
-				// turn a dependency blip into a crash loop.
-				if status != http.StatusServiceUnavailable {
-					t.Errorf("health = %d while the credential cannot be obtained, want 503", status)
+				// The failed operation is unavailable; the process stays alive
+				// without health probes retrying the mint.
+				if status != http.StatusOK {
+					t.Errorf("health = %d after transient request failure, want 200 without an idle retry", status)
 				}
 				if strings.Contains(body, "refused") {
 					t.Errorf("the probe says %q, which reads as a judgement on this build: this condition is transient", body)
@@ -802,8 +796,8 @@ func TestHealthIsHonestAboutTheCredential(t *testing.T) {
 		for range 5 {
 			healthStatus(t, server)
 		}
-		if got := mint.count(); got != 1 {
-			t.Errorf("six probes produced %d mints, want 1: the client holds one credential and the probe must not become a heartbeat", got)
+		if got := mint.count(); got != 0 {
+			t.Errorf("six probes produced %d mints, want 0: probes never acquire credentials", got)
 		}
 	})
 
