@@ -98,7 +98,7 @@ func serveMCP(t *testing.T, env MCPEnvironment, register func(*mcp.Server)) *htt
 	// Before the cutover nothing here held one; the refusal is the point, and
 	// a test seam that skipped it would be testing a path no deployment has.
 	mint := newHostMint(t, &hostMint{})
-	s := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	s := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(stubCredentialSource{credential: mintedCredential(t, mint, testProjectionAudience)})
 	handler, err := s.mcpHandler(env)
@@ -847,7 +847,7 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 			})
 	}
 
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(stubCredentialSource{credential: mintedCredential(t, mint, testProjectionAudience)})
 	// A resolved contract with one audience, which is what the ceiling is read
@@ -1181,7 +1181,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 						return nil, askOutput{Status: 200}, nil
 					})
 			}
-			server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+			server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 				ServeMCP(mcpServerName, "v1.2.3", register).
 				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/modules/_work-context (dial tcp 10.4.1.9:8443: connection refused)", tc.err)})
 
@@ -1235,7 +1235,7 @@ func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
 		// A withdrawn credential must not read as "this solution serves no
 		// MCP": one is a back-off, the other sends a client looking for an
 		// endpoint that does not exist.
-		server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+		server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 			ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
 			Credential(refusingSource{err: workcontext.ErrMintRefused})
 		handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
@@ -1323,7 +1323,7 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 				return nil, askOutput{Status: 200}, nil
 			})
 	}
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(attestingSource(t))
 	server.cfg.gatewayURL = gw.URL
@@ -1373,7 +1373,7 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 // through that handler — and it is the layer that knows the method name, so it
 // is where the allowlist lives.
 func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 		ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
 		Credential(refusingSource{err: fmt.Errorf("%w: at https://mint.internal.example/modules/_work-context", workcontext.ErrMintUnavailable)})
 
@@ -1612,7 +1612,7 @@ func TestAToolResultNeverCarriesTheRuntimesInternals(t *testing.T) {
 				return nil, askOutput{Status: resp.StatusCode}, nil
 			})
 	}
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(attestingSource(t))
 	server.cfg.gatewayURL = gw.URL
@@ -1662,7 +1662,7 @@ func TestAToolsOwnRefusalIsLeftAlone(t *testing.T) {
 				return nil, askOutput{}, errors.New("no such collection in this wiki")
 			})
 	}
-	server := New(Manifest{ID: mcpServerName, Title: "Wiki"}).
+	server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
 		ServeMCP(mcpServerName, "v1.2.3", register).
 		Credential(attestingSource(t))
 	server.cfg.gatewayURL = gw.URL
@@ -1916,3 +1916,7 @@ func (v sabotagingMarshaler) MarshalJSON() ([]byte, error) {
 	v.text.Text = v.to
 	return []byte(`{}`), nil
 }
+
+// wikiFrontend is the declared frontend file the MCP fixtures embed: the title
+// is what the metadata document names the resource by.
+const wikiFrontend = "title: Wiki\norder: 1\nexposed_module: ./Page\nhost_contract: 1\n"

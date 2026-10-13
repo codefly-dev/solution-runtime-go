@@ -55,18 +55,17 @@ func TestRuntimeProjectedTokenReaderReadsFreshAndFailsClosed(t *testing.T) {
 	}
 }
 
-// Exercise the production source, including its TLS readers and error boundary.
+// Exercise the production source, including its transport rule and error
+// boundary.
 func productionMintSource(t *testing.T, mint *hostMint, tokenFile string) *brokerCredentialSource {
 	t.Helper()
-	cert, key, bundle, _, _, _ := bootIdentityIn(t, mint, testPrincipal)
+	authorityValues(t)
 	s := New(Manifest{ID: testSolutionID})
 	s.cfg = config{
-		identityCertFile: cert, identityKeyFile: key, trustBundleFile: bundle,
-		allowedCallersFile:  identitiesFile(t, testGatewayPrincipal),
-		mintPeersFile:       identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile:    identitiesFile(t, testGatewayPrincipal),
 		brokerInternalToken: "broker-perimeter-token",
+		gatewayURL:          mint.URL,
 		mintURL:             mint.URL + credentialMintPath, projectedTokenPath: tokenFile,
+		transport: meshTransport{local: true},
 	}
 	s.principal = testPrincipal
 	s.authority = authorityFor(t, context.Background())

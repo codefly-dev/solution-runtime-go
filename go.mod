@@ -6,7 +6,7 @@ require (
 	connectrpc.com/connect v1.21.0
 	github.com/codefly-dev/core v0.19.1
 	github.com/codefly-dev/sdk-go v0.3.2
-	github.com/codefly-dev/sdk-go/workcontext v0.1.0
+	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261013172033-aabfb4cf5359
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	golang.org/x/tools v0.51.0

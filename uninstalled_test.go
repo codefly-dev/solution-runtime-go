@@ -2,8 +2,6 @@ package solution
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,8 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/codefly-dev/core/resources"
 )
 
 // postInstall sends one well-formed install step to a booted runtime as the
@@ -21,7 +17,7 @@ import (
 func postInstall(t *testing.T, b *booted) int {
 	t.Helper()
 	r := installRequest(t, installBody)
-	r.URL.Scheme, r.URL.Host = "https", strings.TrimPrefix(b.base, "https://")
+	r.URL.Scheme, r.URL.Host = "http", strings.TrimPrefix(b.base, "http://")
 	r.RequestURI = ""
 	resp, err := b.client.Do(r)
 	if err != nil {
@@ -180,127 +176,6 @@ func TestAwaitInstallationCadenceIsJitteredDownward(t *testing.T) {
 	}
 	if len(distinct) < 2 {
 		t.Fatal("every replica waits the same time, so replicas that boot together ask together")
-	}
-}
-
-// selfCarrier is the advertised-address carrier for the service these tests
-// run as.
-func selfCarrier(t *testing.T, value string) []string {
-	t.Helper()
-	t.Setenv(resources.ModulePrefix, "wiki")
-	t.Setenv(resources.ServicePrefix, "backend")
-	key := resources.SelfEndpointAsEnvironmentVariableKey(&resources.EndpointInformation{
-		Module: "wiki", Service: "backend", Name: "http", API: "http",
-	})
-	if value == "" {
-		return nil
-	}
-	return []string{key + "=" + value}
-}
-
-// TestTheReportedOriginIsTheAdvertisedAddress: a rendered cell hands a service
-// its own endpoint as the address it listens on, localized to localhost, and
-// the address its peers reach it at under a separate carrier. Reporting the
-// former tells the gateway to proxy the solution to the gateway's own loopback.
-func TestTheReportedOriginIsTheAdvertisedAddress(t *testing.T) {
-	for _, tc := range []struct {
-		name, self, port, advertised, want string
-	}{
-		{"a rendered cell", "localhost:8080", "8080", "http://backend.platform-wiki.svc.cluster.local:8080", "https://backend.platform-wiki.svc.cluster.local:8080"},
-		{"a cell whose listen port was overridden", "localhost:8080", "9443", "http://backend.platform-wiki.svc.cluster.local:8080", "https://backend.platform-wiki.svc.cluster.local:8080"},
-		{"an advertised host and port with no scheme", "localhost:8080", "8080", "backend.platform-wiki.svc:8080", "https://backend.platform-wiki.svc:8080"},
-		{"an advertised IPv6 address", "localhost:8080", "8080", "http://[fd00::12]:8080", "https://[fd00::12]:8080"},
-		{"no carrier, on a developer machine", "localhost:22631", "22631", "", "https://localhost:22631"},
-		{"no carrier, and a listen port overridden by PORT", "http://127.0.0.1:22631", "9443", "", "https://127.0.0.1:9443"},
-		{"no carrier, and a listen address naming no host", ":8080", "8080", "", "https://localhost:8080"},
-		{"no carrier, listening on the unspecified address", "0.0.0.0:8080", "8080", "", "https://localhost:8080"},
-		{"no carrier and no resolved endpoint", "", "8080", "", "https://localhost:8080"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := advertisedOrigin(context.Background(), tc.self, tc.port, selfCarrier(t, tc.advertised))
-			if err != nil || got != tc.want {
-				t.Fatalf("advertisedOrigin = %q, %v; want %q", got, err, tc.want)
-			}
-		})
-	}
-}
-
-// TestAnAdvertisedAddressThatIsNotOneIsRefusedNotReplaced: a carrier that is
-// present and wrong is never read as absent. Falling back to the listen
-// address is how a typo becomes a loopback upstream.
-func TestAnAdvertisedAddressThatIsNotOneIsRefusedNotReplaced(t *testing.T) {
-	for name, advertised := range map[string]string{
-		"not an address":          "backend",
-		"a path":                  "http://backend.platform-wiki.svc.cluster.local:8080/api",
-		"userinfo":                "http://ops@backend.platform-wiki.svc.cluster.local:8080",
-		"a query":                 "http://backend.platform-wiki.svc.cluster.local:8080?x=1",
-		"the unspecified address": "http://0.0.0.0:8080",
-		"a port that is not one":  "backend.platform-wiki.svc:0",
-	} {
-		t.Run(name, func(t *testing.T) {
-			got, err := advertisedOrigin(context.Background(), "localhost:8080", "8080", selfCarrier(t, advertised))
-			if err == nil || got != "" {
-				t.Fatalf("advertisedOrigin(%q) = %q, %v; want a refusal and nothing to report", advertised, got, err)
-			}
-		})
-	}
-}
-
-// TestADeployedRuntimeRefusesToReportItsOwnLoopback is the boot refusal: in a
-// deployed runtime context a loopback origin is reachable by no peer, whether
-// it came from a missing carrier or was advertised.
-func TestADeployedRuntimeRefusesToReportItsOwnLoopback(t *testing.T) {
-	load := func(t *testing.T, runtimeContext, advertised string) (config, error) {
-		t.Helper()
-		bootableEnvironment(t)
-		t.Setenv(resources.RuntimeContextPrefix, runtimeContext)
-		for _, entry := range selfCarrier(t, advertised) {
-			key, value, _ := strings.Cut(entry, "=")
-			t.Setenv(key, value)
-		}
-		c := loadConfig(context.Background(), "solution-under-test", nil)
-		return c, c.validate()
-	}
-	t.Run("a developer machine reports its loopback port", func(t *testing.T) {
-		c, err := load(t, resources.RuntimeContextNative, "")
-		if err != nil || c.upstream != "https://localhost:8090" {
-			t.Fatalf("upstream %q, %v; want the loopback port this process listens on", c.upstream, err)
-		}
-	})
-	t.Run("a cell reports the advertised address", func(t *testing.T) {
-		c, err := load(t, "kubernetes", "http://backend.platform-wiki.svc.cluster.local:8080")
-		if err != nil || c.upstream != "https://backend.platform-wiki.svc.cluster.local:8080" {
-			t.Fatalf("upstream %q, %v; want the advertised cluster-local origin", c.upstream, err)
-		}
-	})
-	for name, advertised := range map[string]string{
-		"a cell with no carrier":           "",
-		"a cell advertising localhost":     "http://localhost:8080",
-		"a cell advertising a loopback IP": "http://127.0.0.1:8080",
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := load(t, "kubernetes", advertised)
-			if err == nil || !strings.Contains(err.Error(), resources.SelfEndpointPrefix) {
-				t.Fatalf("validate = %v; want a refusal naming the %s carrier", err, resources.SelfEndpointPrefix)
-			}
-		})
-	}
-}
-
-// TestAnOversizeMintRequestIsRefusedAtBoot: the host bounds what it reads and
-// answers an oversize body as malformed, which this client can only classify
-// as a refusal — at boot and at every renewal after it.
-func TestAnOversizeMintRequestIsRefusedAtBoot(t *testing.T) {
-	s, _, _ := brokerFixture(t)
-	options := s.mintOptions("accounts", func() (*x509.CertPool, error) { return x509.NewCertPool(), nil }, func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &tls.Certificate{}, nil })
-	options.Authority = fixedAuthority{audience: testAudience}
-	options.Manifest = `{"pad":"` + strings.Repeat("a", brokerMintBodyMaxBytes) + `"}`
-	if _, err := newBrokerCredentialSource(options); err == nil || !strings.Contains(err.Error(), "manifest") {
-		t.Fatalf("an oversize mint request was accepted at boot (%v); it must be refused naming the manifest", err)
-	}
-	options.Manifest = `{"pad":"` + strings.Repeat("a", brokerMintBodyMaxBytes/2) + `"}`
-	if _, err := newBrokerCredentialSource(options); err != nil {
-		t.Fatalf("a mint request inside the bound was refused: %v", err)
 	}
 }
 

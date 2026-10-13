@@ -1,10 +1,7 @@
 package solution
 
 import (
-	"connectrpc.com/connect"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"connectrpc.com/connect"
 
 	"github.com/codefly-dev/core/solution/manifest"
 	corework "github.com/codefly-dev/core/workcontext"
@@ -308,21 +307,11 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 func TestABootedRuntimeRegistersNothing(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 
-	// A listener of its own for every deleted URL, which boot cannot move.
-	//
-	// These pointed at mint.URL, captured before boot. The boot then calls
-	// hostMint.serveTLS, which CLOSES that server and starts another on a new
-	// port — so every deleted URL named an address nothing was listening on,
-	// and a surviving registration would have failed to connect and been
-	// counted by nobody. The test passed because nothing could be observed.
-	//
-	// This is the second time this test watched the wrong thing. The first
-	// version aimed the URLs at example.com, which a reviewer caught for the
-	// same reason: aimed somewhere nothing answers, it proved only that the
-	// old code never minted. The comment then said "every deleted URL points
-	// at the host this test counts requests on", which was true when it was
-	// written and stopped being true when serveTLS started replacing the
-	// server underneath it.
+	// A listener of its own for every deleted URL, so a surviving registration
+	// is observed rather than failing to connect and being counted by nobody.
+	// The first version aimed the URLs at example.com, which a reviewer caught
+	// for that reason: aimed somewhere nothing answers, it proved only that the
+	// old code never minted.
 	var legacyHits atomic.Int64
 	var legacyPaths sync.Map
 	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -651,13 +640,9 @@ func mintClientFor(t *testing.T, mint *hostMint, tokenFile string) CredentialSou
 		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: testProjectionAudience,
-		// The three readers sdk-go#51 takes, each asked during the handshake.
-		// The client still builds and owns the transport; what it no longer
-		// does is fix the anchor, present nothing, and admit any peer the
-		// anchor signed.
-		TrustAnchor:       mint.roots,
-		ClientCertificate: func() (*tls.Certificate, error) { return mint.caller, nil },
-		AdmittedPeers:     func() ([]string, error) { return []string{testGatewayPrincipal}, nil },
+		// Plaintext to loopback on a local run, which is what the SDK's rule
+		// admits and what the fake host serves.
+		Transport: localRun{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -2082,9 +2067,7 @@ func expiredCredential(t *testing.T, mint *hostMint, tokenFile string) workconte
 		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: testProjectionAudience,
-		TrustAnchor:        mint.roots,
-		ClientCertificate:  func() (*tls.Certificate, error) { return mint.caller, nil },
-		AdmittedPeers:      func() ([]string, error) { return []string{testGatewayPrincipal}, nil },
+		Transport:          localRun{},
 		Now:                func() time.Time { return backdated },
 	})
 	if err != nil {
@@ -2241,133 +2224,6 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 	})
 }
 
-// TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs is round thirteen's
-// blocker, closed where it had to be closed: in the SDK.
-//
-// Round eleven asked for this and I could not do it. v0.3.0 took RootCAs as a
-// VALUE and built its transport from it on the spot, presented no client
-// certificate, and offered no peer hook — so the mint hop had no identity of
-// its own going out, admitted any peer the anchor signed, and fixed its anchor
-// for the client's lifetime. Reimplementing the transport here would have been
-// the hack this repo's rule 2 forbids, so it went out as an sdk-go issue and
-// came back as sdk-go#51: three READERS, each consulted during the handshake.
-//
-// So these are the negative controls round thirteen named. Each is about the
-// mint hop specifically, driven through a real TLS handshake against the fake
-// endpoint rather than by inspecting the options struct.
-func TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs(t *testing.T) {
-	t.Run("an unreadable anchor refuses rather than dialling under the last good one", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		var fail atomic.Bool
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			o.TrustAnchor = func() (*x509.CertPool, error) {
-				if fail.Load() {
-					return nil, errors.New("the projected bundle is unreadable")
-				}
-				pool, _ := mint.roots()
-				return pool, nil
-			}
-		})
-		held, err := source.Credential(context.Background())
-		if err != nil {
-			t.Fatalf("the first ask was refused: %v", err)
-		}
-		// The anchor goes away. A client that captured the last good pool goes
-		// on dialling the endpoint that receives the projected
-		// service-account token under trust that no longer exists.
-		fail.Store(true)
-		if _, err := freshMint(t, source, held); err == nil {
-			t.Fatal("a mint succeeded while the trust anchor could not be read: the projected service-account token went to an endpoint verified against nothing this process can currently vouch for")
-		}
-	})
-
-	t.Run("a peer the anchor signed but the peer set does not name is refused", func(t *testing.T) {
-		// THE finding. Every workload in the trust domain holds a certificate
-		// from this anchor, the consumed modules included, so "signed by the
-		// right CA" is authentication and not authorisation. Before sdk-go#51
-		// a neighbouring workload presenting a certificate valid for the
-		// mint's hostname received the projected token.
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			// The endpoint's certificate is valid and issued by the accepted
-			// anchor. It simply is not the party this runtime talks to.
-			o.AdmittedPeers = func() ([]string, error) { return []string{rivalPrincipal}, nil }
-		})
-		if _, err := source.Credential(context.Background()); err == nil {
-			t.Fatal("the mint was dialled and the projected service-account token handed over to a peer the admitted set does not name: a certificate from the cell's anchor says which trust domain answered, not which party")
-		} else if mint.count() != 0 {
-			t.Errorf("the endpoint answered %d requests before the identity was refused, want 0: the refusal has to happen in the handshake, not after the token is on the wire", mint.count())
-		}
-	})
-
-	t.Run("peer withdrawal takes effect with the anchor unchanged", func(t *testing.T) {
-		// The second half of the same finding, and the one an anchor check
-		// cannot do: the CA never changes here. Only the provisioned set does.
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		var withdrawn atomic.Bool
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			o.AdmittedPeers = func() ([]string, error) {
-				if withdrawn.Load() {
-					return []string{rivalPrincipal}, nil
-				}
-				return []string{testGatewayPrincipal}, nil
-			}
-		})
-		held, err := source.Credential(context.Background())
-		if err != nil {
-			t.Fatalf("the first ask was refused: %v", err)
-		}
-		withdrawn.Store(true)
-		if _, err := freshMint(t, source, held); err == nil {
-			t.Fatal("a mint succeeded after the endpoint's identity was withdrawn from the admitted set while its certificate and the anchor stayed exactly as they were: this is the revocation an anchor check cannot express, and the reason the set is read per handshake rather than once")
-		}
-	})
-
-	t.Run("the mint request presents this workload's own identity", func(t *testing.T) {
-		// The fixture REQUIRES a client certificate now, so a mint that
-		// completes at all proves one was presented — and the identity is
-		// asserted rather than expected to be empty, which is what the
-		// fixture was weakened to expect while the SDK presented nothing.
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		if _, err := mintClientFor(t, mint, tokenFile).Credential(context.Background()); err != nil {
-			t.Fatalf("the mint refused a caller presenting this workload's certificate: %v", err)
-		}
-		if len(mint.callers) == 0 {
-			t.Fatal("the endpoint recorded no caller at all")
-		}
-		if got := mint.callers[0]; got != testPrincipal {
-			t.Errorf("the mint endpoint saw the caller as %q, want %q: the projected service-account token is no longer the whole of what attests which workload is asking", got, testPrincipal)
-		}
-	})
-
-	t.Run("a certificate reader that cannot answer refuses the mint", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			o.ClientCertificate = func() (*tls.Certificate, error) {
-				return nil, errors.New("the projected pair is half-written")
-			}
-		})
-		if _, err := source.Credential(context.Background()); err == nil {
-			t.Fatal("the mint was dialled with no certificate to present: an endpoint that requires one would refuse, and one that does not would attribute this request to nobody")
-		}
-	})
-}
-
 // freshMint forces a NEW handshake against the endpoint.
 //
 // Calling Credential again would not: a mint client holds the credential it
@@ -2393,30 +2249,6 @@ func freshMint(t *testing.T, source any, held executionCredential) (executionCre
 		t.Fatalf("the source under test is %T, not the SDK's mint client, so this would not exercise the transport at all", source)
 	}
 	return client.Refresh(context.Background(), held.(workcontext.Credential))
-}
-
-// mintClientWith is a mint client against the fake endpoint, with one or more
-// of the three handshake readers replaced.
-func mintClientWith(t *testing.T, mint *hostMint, tokenFile string, with ...func(*workcontext.MintOptions)) CredentialSource {
-	t.Helper()
-	options := workcontext.MintOptions{
-		URL:                mint.URL + "/platform/_credential",
-		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
-		Authority:          fixedAuthority{audience: testAudience},
-		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
-		ProjectionAudience: testProjectionAudience,
-		TrustAnchor:        mint.roots,
-		ClientCertificate:  func() (*tls.Certificate, error) { return mint.caller, nil },
-		AdmittedPeers:      func() ([]string, error) { return []string{testGatewayPrincipal}, nil },
-	}
-	for _, apply := range with {
-		apply(&options)
-	}
-	client, err := workcontext.NewMintClient(options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return client
 }
 
 // TestARenewalSealedToADifferentExecutionIsRefused is the half of round
@@ -2496,100 +2328,6 @@ func TestARenewalSealedToADifferentExecutionIsRefused(t *testing.T) {
 			t.Fatalf("an ordinary renewal from the same issuer was refused: %v", err)
 		}
 	})
-}
-
-// TestTheMintRefusesToPresentARotatedIdentity is round fourteen's blocker, on
-// the production path rather than through a hand-built client.
-//
-// platformCredentialSource handed outboundLeaf — the SDK's reloader over the
-// projected files — straight to MintOptions.ClientCertificate. The gateway's
-// configuration gets holdPresentedCertificate; this reader got nothing. So
-// after a same-CA rotation to a neighbouring workload's certificate, the mint
-// hop presented THAT identity while the frozen principal was still this one,
-// and the SDK cannot catch it: it checks that a certificate is non-empty and
-// has a key, which is the right division of labour and not a statement about
-// whose certificate it is.
-//
-// The three steps the reviewer asked for, in order: A mints; a rotation to B
-// produces NO mint request; a fresh certificate for A mints again. The middle
-// one is the finding — and "no request" rather than "an error" is the
-// assertion, because the refusal has to happen before the projected
-// service-account token is on the wire.
-func TestTheMintRefusesToPresentARotatedIdentity(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	// The boot's own environment and projected material, under the anchor the
-	// fake host is served with — this test is about the production path, so it
-	// uses what a boot uses rather than a hand-built client.
-	certFile, keyFile, bundleFile, _, _, c := bootIdentityIn(t, mint, testPrincipal)
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	writeFile(t, tokenFile, "projected")
-
-	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{
-		identityCertFile:    certFile,
-		identityKeyFile:     keyFile,
-		trustBundleFile:     bundleFile,
-		allowedCallersFile:  identitiesFile(t, testGatewayPrincipal),
-		mintPeersFile:       identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile:    identitiesFile(t, testGatewayPrincipal),
-		brokerInternalToken: "broker-perimeter-token",
-		mintURL:             mint.URL + credentialMintPath,
-		projectedTokenPath:  tokenFile,
-	}
-	server.principal = testPrincipal
-	// The frozen authority, read through the SDK the way a boot reads it.
-	server.authority = authorityFor(t, context.Background())
-	source, err := server.platformCredentialSource()
-	if err != nil {
-		t.Fatalf("configure the production credential source: %v", err)
-	}
-
-	// A mints.
-	held, err := source.Credential(context.Background())
-	if err != nil {
-		t.Fatalf("the mint refused this workload's own identity: %v", err)
-	}
-	if got := mint.count(); got != 1 {
-		t.Fatalf("the issuer served %d requests for the first credential, want 1", got)
-	}
-
-	// rotate replaces the projected pair in place, as a projected Secret
-	// update does, and advances the modification time so the SDK's reloader
-	// observes it (it refreshes on mtime, per handshake).
-	rotate := func(spiffeID string) {
-		t.Helper()
-		leafPEM, keyPEM, _ := issueLeaf(t, c.anchor, c.anchorKey, spiffeID)
-		writeFile(t, certFile, string(leafPEM))
-		writeFile(t, keyFile, string(keyPEM))
-		ahead := time.Now().Add(time.Minute)
-		for _, path := range []string{certFile, keyFile} {
-			if err := os.Chtimes(path, ahead, ahead); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	// An ordinary rotation remains usable by this same client.
-	rotate(testPrincipal)
-	if _, err := freshMint(t, source, held); err != nil {
-		t.Fatalf("ordinary identity rotation refused: %v", err)
-	}
-	// A valid same-CA certificate for another workload is refused before HTTP.
-	rotate(rivalPrincipal)
-	before := mint.count()
-	if _, err := freshMint(t, source, held); !terminalCredentialFailure(err) {
-		t.Fatalf("wrong workload identity was not terminal: %v", err)
-	}
-	if got := mint.count(); got != before {
-		t.Fatalf("wrong identity sent %d requests", got-before)
-	}
-	// The new retry allowlist makes this permanent TLS/configuration failure
-	// terminal, even if the files are repaired. Only a restarted process retries.
-	rotate(testPrincipal)
-	if _, err := freshMint(t, source, held); !terminalCredentialFailure(err) || mint.count() != before {
-		t.Fatalf("terminal identity failure was retried: %v", err)
-	}
-
 }
 
 // TestEachSealedFieldIsComparedOnItsOwn isolates the three comparisons that

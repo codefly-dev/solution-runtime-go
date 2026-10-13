@@ -62,7 +62,6 @@ func TestABootThatNamesNoModuleIsRefused(t *testing.T) {
 			// Every endpoint overridden, so nothing else can be the reason.
 			t.Setenv("PORT", "8443")
 			t.Setenv("GATEWAY_URL", "https://gateway.cell")
-			t.Setenv(CredentialMintURLEnvironmentVariable, "https://gateway.cell"+credentialMintPath)
 			t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
 
 			_, initErr := codefly.Init(context.Background())

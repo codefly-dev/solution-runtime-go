@@ -3,11 +3,8 @@ package solution
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -46,20 +43,12 @@ func (c brokerCredential) Attach(r *http.Request) error    { return workcontext.
 
 type brokerMintOptions struct {
 	URL, Prefix, InternalToken, ProjectionAudience string
-	// Upstream is the origin this runtime serves its backend at, reported with
-	// the mint as the dynamic half of its registration: the host records it
-	// only for the workload the projected token proves, and reaches it only
-	// under this workload's SVID. Empty reports nothing.
-	Upstream string
-	// Manifest is the solution's frontend manifest, as this runtime serves it:
-	// the other dynamic half of a solution's registration. Empty for a module.
-	Manifest          string
-	Audience          workcontext.AuthorityValue
-	Authority         workcontext.AuthorityPin
-	ProjectedToken    workcontext.ProjectedTokenSource
-	TrustAnchor       func() (*x509.CertPool, error)
-	ClientCertificate func() (*tls.Certificate, error)
-	AdmittedPeers     func() ([]string, error)
+	Audience                                       workcontext.AuthorityValue
+	Authority                                      workcontext.AuthorityPin
+	ProjectedToken                                 workcontext.ProjectedTokenSource
+	// Transport answers whether a plaintext URL is admitted — the SDK's rule,
+	// asked with the composition's mesh assertion as loadConfig read it.
+	Transport workcontext.TransportSource
 }
 
 type brokerCredentialSource struct {
@@ -75,44 +64,35 @@ type brokerCredentialSource struct {
 }
 
 func newBrokerCredentialSource(options brokerMintOptions) (*brokerCredentialSource, error) {
-	u, err := url.Parse(options.URL)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != credentialMintPath || u.RawPath != "" {
-		return nil, errors.New("credential mint URL must be an https module broker endpoint at /modules/_work-context without userinfo, query or fragment")
+	// The SDK's rule decides whether the projected token may travel to this
+	// URL: https anywhere; http only to a loopback host on a local run, or to
+	// an in-cluster Service address under the composition's mesh assertion.
+	// The path is the host's published route and nothing else.
+	u, err := workcontext.AdmitEndpoint(options.URL, options.Transport, "credential mint")
+	if err != nil {
+		return nil, err
 	}
-	if options.Prefix == "" || options.InternalToken == "" || options.ProjectedToken == nil || options.Authority == nil || options.TrustAnchor == nil || options.ClientCertificate == nil || options.AdmittedPeers == nil {
-		return nil, errors.New("module broker requires a declared solution prefix, module-authority/INTERNAL_TOKEN, projected token, frozen authority and TLS identity readers")
+	if u.Path != credentialMintPath || u.RawPath != "" {
+		return nil, errors.New("credential mint URL must name the module broker endpoint " + credentialMintPath)
+	}
+	if options.Prefix == "" || options.InternalToken == "" || options.ProjectedToken == nil || options.Authority == nil {
+		return nil, errors.New("module broker requires a declared solution prefix, module-authority/INTERNAL_TOKEN, a projected token and the frozen authority")
 	}
 	if options.ProjectionAudience != "accounts" {
 		return nil, errors.New("module-authority/PROJECTION_AUDIENCE must be accounts for the module broker")
-	}
-	// At boot, where it names the cause. The host bounds what it reads, and an
-	// oversize body is answered there as a malformed request — which this
-	// client can only classify as a refusal, at boot and again at every
-	// renewal: a crash loop that says "request failed" about a manifest.
-	if size := len(options.body()); size > brokerMintBodyMaxBytes {
-		return nil, fmt.Errorf("the mint request is %d bytes and the module broker reads at most %d: the frontend manifest this solution reports with it is too large", size, brokerMintBodyMaxBytes)
 	}
 	c := &brokerCredentialSource{options: options}
 	c.client = c.httpClient(u)
 	return c, nil
 }
 
-// brokerMintBodyMaxBytes bounds the mint request this client will send. It is
-// under what the host reads, so the bound that fires is the one that can say
-// why.
-const brokerMintBodyMaxBytes = 64 << 10
-
-// body is the mint request: the declared prefix, and the dynamic half of this
-// runtime's registration when it has one to report.
+// body is the mint request: the declared prefix and nothing else. Where this
+// runtime serves and what its frontend declares are not reported here: the
+// gateway resolves this solution's address from the delivered presence
+// document's endpoints, and the frontend travels in the same document, read by
+// the CLI from the file this runtime embeds (FrontendFileName).
 func (o brokerMintOptions) body() []byte {
-	body := map[string]string{"prefix": o.Prefix}
-	if o.Upstream != "" {
-		body["upstream"] = o.Upstream
-	}
-	if o.Manifest != "" {
-		body["manifest"] = o.Manifest
-	}
-	payload, _ := json.Marshal(body)
+	payload, _ := json.Marshal(map[string]string{"prefix": o.Prefix})
 	return payload
 }
 
@@ -232,68 +212,41 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	return credential, nil
 }
 
-// This transport is private, uses a fresh mutually authenticated handshake for
-// every mint and rechecks trust after it, before any HTTP bytes can be sent.
+// httpClient is the transport the mint goes out on: owned, never the default
+// one (which carries Proxy: ProxyFromEnvironment), pinned to the one origin the
+// mint URL names, following no redirect and reusing no connection. Plain HTTP
+// inside the cell, where the mesh carries the hop; https where the URL says
+// so, verified against the system roots, since an https gateway is an edge
+// presenting a public certificate. The transportReading slot bounds the dial
+// as boundedBrokerRead bounds the token read: at most one outstanding,
+// cancelled by the ask's own deadline.
 func (c *brokerCredentialSource) httpClient(endpoint *url.URL) *http.Client {
-	o := c.options
-	trust := func() (*x509.CertPool, error) {
-		pool, err := o.TrustAnchor()
-		if err != nil || pool == nil {
-			return nil, errors.New("broker trust anchor unavailable")
-		}
-		return pool, nil
-	}
-	// Build an owned transport; never inherit mutable global transport hooks.
-	transport := &http.Transport{DisableKeepAlives: true}
+	transport := newPlatformTransport()
+	transport.DisableKeepAlives = true
 	port := endpoint.Port()
 	if port == "" {
-		port = "443"
+		port = "80"
+		if endpoint.Scheme == "https" {
+			port = "443"
+		}
 	}
 	address := net.JoinHostPort(endpoint.Hostname(), port)
-	transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if addr != address {
 			return nil, errors.New("broker origin mismatch")
 		}
-		ctx, cancel := context.WithTimeout(ctx, platformHandshakeTimeout)
+		ctx, cancel := context.WithTimeout(ctx, brokerDialTimeout)
 		defer cancel()
 		return boundedBrokerRead(ctx, &c.transportReading, func() (net.Conn, error) {
-			anchor, err := trust()
-			if err != nil || anchor == nil {
-				return nil, errors.New("broker trust anchor unavailable")
-			}
-			presented := false
-			config := &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: anchor, ServerName: endpoint.Hostname(), SessionTicketsDisabled: true}
-			config.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-				pair, err := o.ClientCertificate()
-				if err != nil || pair == nil || len(pair.Certificate) == 0 || pair.PrivateKey == nil {
-					return nil, errors.New("broker client identity unavailable")
-				}
-				presented = true
-				return pair, nil
-			}
-			admitOnlyPlatform(config, o.AdmittedPeers)
-			raw, err := (&net.Dialer{}).DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			conn := tls.Client(raw, config)
-			if err := conn.HandshakeContext(ctx); err != nil {
-				_ = conn.Close()
-				return nil, err
-			}
-			if !presented {
-				_ = conn.Close()
-				return nil, errors.New("broker did not request a client identity")
-			}
-			if err := peerStillTrusted(conn.ConnectionState(), endpoint.Hostname(), trust, o.AdmittedPeers); err != nil {
-				_ = conn.Close()
-				return nil, err
-			}
-			return conn, nil
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
 		})
 	}
 	return &http.Client{Transport: transport, Timeout: platformRequestTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
+
+// brokerDialTimeout bounds one dial of the mint on its own: a mint request may
+// wait on the host, a dial never does.
+const brokerDialTimeout = 10 * time.Second
 
 func boundedBrokerRead[T any](ctx context.Context, busy *atomic.Bool, read func() (T, error)) (T, error) {
 	var zero T

@@ -6,10 +6,10 @@
 // same boot check — over an httptest server, reached through internal/seam.
 // Only the host is fake. The seam is not public API: Server.PassthroughHandler
 // was exported once, and a deployment calling it completed a viewer mint and a
-// module call over plaintext with no validate(), no mTLS boot, no caller
-// allow-list, no ceiling and no authenticated outbound. This package is the one
-// caller Go's internal rule lets reach it, and because any module can import
-// *this* package, its constructors refuse a non-test binary. Host stands in for the gateway the passthrough calls through:
+// module call with no validate(), no boot, no ceiling and no origin-pinned
+// outbound. This package is the one caller Go's internal rule lets reach it,
+// and because any module can import *this* package, its constructors refuse a
+// non-test binary. Host stands in for the gateway the passthrough calls through:
 // it mints the viewer's Work Context (the accounts StartTask procedure the
 // gateway routes) and forwards each /v1/<as>/* call to the module address the
 // test gave it, typically an httptest server of the test's own that answers
@@ -26,11 +26,8 @@ package passthroughtest
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	corework "github.com/codefly-dev/core/workcontext"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -41,6 +38,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	corework "github.com/codefly-dev/core/workcontext"
 
 	"github.com/codefly-dev/core/solution/manifest"
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -146,25 +145,6 @@ type Host struct {
 	calls   []Call
 	// workloadMints counts the solution's own execution credentials.
 	workloadMints int
-	// mintServer serves the workload mint over TLS, separately from the
-	// gateway's own plaintext server.
-	//
-	// The SDK's mint client refuses plain HTTP outright — the projected
-	// service-account token travels on that request — and it requires the
-	// roots that may sign the endpoint, with no system-pool fallback. Both are
-	// right, and neither can be satisfied by the plaintext server the rest of
-	// this host uses.
-	//
-	// Only the mint moves. Making the whole host TLS would need a SPIFFE leaf
-	// from a test CA for the gateway's own identity, because the runtime's
-	// outbound client admits a platform destination by its certificate — and
-	// the seam deliberately runs without that boot. That remains the
-	// fidelity gap seam.go already names; this closes the half the SDK now
-	// requires rather than pretending to close both.
-	mintServer *httptest.Server
-	// cell is the fake host's own CA, because the mint endpoint is now held to
-	// WHICH party it is and not merely to a certificate from an accepted root.
-	cell *mintCell
 }
 
 // NewHost starts a fake host, closed when the test ends.
@@ -172,31 +152,12 @@ func NewHost(t testing.TB) *Host {
 	mustBeATest()
 	t.Helper()
 	h := &Host{modules: map[string]*httputil.ReverseProxy{}, dir: t.TempDir()}
+	// Plain HTTP, the workload mint included: inside a cell every hop past the
+	// gateway is plaintext carried by the mesh, and the gateway's workload
+	// endpoint serves the mint beside every other route. The SDK's mint
+	// client admits a plaintext loopback URL on a local run, which a test is.
 	h.server = httptest.NewServer(http.HandlerFunc(h.serveHTTP))
 	t.Cleanup(h.server.Close)
-	cell, err := newMintCell()
-	if err != nil {
-		t.Fatalf("start the fake host: %v", err)
-	}
-	h.cell = cell
-	// mTLS, with the client certificate REQUIRED and verified.
-	//
-	// The real endpoint receives the projected service-account token, and
-	// sdk-go#51 makes the client present this workload's X.509-SVID on that
-	// request. A fake host that merely tolerated a client certificate would
-	// let a consumer's green run mean less than it looks like: the seam is
-	// where a consumer finds out their passthrough works against the posture
-	// a deployment has.
-	mint := httptest.NewUnstartedServer(http.HandlerFunc(h.serveHTTP))
-	mint.TLS = &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{cell.mint},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    cell.roots,
-	}
-	mint.StartTLS()
-	h.mintServer = mint
-	t.Cleanup(h.mintServer.Close)
 	return h
 }
 
@@ -449,22 +410,27 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 		return nil, err
 	}
 	return workcontext.NewMintClient(workcontext.MintOptions{
-		URL: h.mintServer.URL + workloadMintPath,
+		URL: h.server.URL + workloadMintPath,
 		// The audience is named as a pinned value now, not passed as a string
 		// beside the pin, so the seam supplies a pin that answers it.
 		Audience:           workcontext.AuthorityValue{Name: authorityGroup, Key: audienceKey},
 		Authority:          fixedAuthority{audience: WorkloadAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: "accounts",
-		// The three readers sdk-go#51 takes in place of a pool by value. They
-		// are readers here for the same reason they are readers in a booted
-		// runtime: each is consulted during the handshake, so what this seam
-		// exercises is the check and not a snapshot of it.
-		TrustAnchor:       func() (*x509.CertPool, error) { return h.cell.roots, nil },
-		ClientCertificate: func() (*tls.Certificate, error) { return &h.cell.workload, nil },
-		AdmittedPeers:     func() ([]string, error) { return []string{mintPeerIdentity}, nil },
+		// A local run, with no mesh assertion: exactly what admits a plaintext
+		// URL to a loopback host, and nothing else — the rule a booted runtime
+		// applies to its resolved gateway, answered here the way a test's
+		// environment answers it.
+		Transport: localRun{},
 	})
 }
+
+// localRun is the SDK's transport source for a test: a local run that asserts
+// no mesh, so the only plaintext the mint client admits is loopback.
+type localRun struct{}
+
+func (localRun) WorkspaceValueIfSet(string, string) (string, bool, error) { return "", false, nil }
+func (localRun) IsLocalRun() bool                                         { return true }
 
 // mustBeATest refuses to build any of this outside a test binary.
 //
@@ -472,8 +438,8 @@ func (h *Host) credentialSource() (solution.CredentialSource, error) {
 // passthrough seam, and that made it the bypass it was built to close: the root
 // package's exported constructor is gone, but Handler is exported from a package
 // any module can import, so a deployment importing it got the same
-// credential-bearing handler with no validate(), no mTLS boot, no caller
-// allow-list, no ceiling and no authenticated outbound. Taking a testing.TB is
+// credential-bearing handler with no validate(), no boot, no ceiling and no
+// origin-pinned outbound. Taking a testing.TB is
 // not the gate it resembles — testing.TB's unexported method only stops a
 // type *declaring* the interface, and a struct that EMBEDS testing.TB satisfies
 // it in any program, so the signature proves nothing about where the call came
@@ -492,7 +458,7 @@ func mustBeATest() { refuseOutsideTest(testing.Testing()) }
 // can enter — a mutation that neutered it left every gate here passing.
 func refuseOutsideTest(isTest bool) {
 	if !isTest {
-		panic("passthroughtest is a test seam and this is not a test binary: it builds a handler that holds a real execution credential without validate(), the mTLS boot, the caller allow-list, the published ceiling or authenticated outbound, so a deployment reaching it would serve the viewer's bearer and this workload's credential over whatever it was mounted on. Boot the runtime with solution.Serve instead")
+		panic("passthroughtest is a test seam and this is not a test binary: it builds a handler that holds a real execution credential without validate(), the boot, the published ceiling or the origin-pinned outbound client, so a deployment reaching it would serve the viewer's bearer and this workload's credential over whatever it was mounted on. Boot the runtime with solution.Serve instead")
 	}
 }
 

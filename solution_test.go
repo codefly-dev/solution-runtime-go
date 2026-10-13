@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	corework "github.com/codefly-dev/core/workcontext"
 	"io"
 	"log"
 	"net/http"
@@ -16,8 +15,12 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	corework "github.com/codefly-dev/core/workcontext"
+	"gopkg.in/yaml.v3"
 
 	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
@@ -132,11 +135,45 @@ func sampleDataGraph() map[string]any {
 	}
 }
 
+// frontendYAML is a declared frontend file (FrontendFileName) with extra YAML
+// — a dashboard, surfaces — under the required fields.
+func frontendYAML(extra string) []byte {
+	return []byte("title: Notes\norder: 3\nexposed_module: ./Page\nhost_contract: 1\n" + extra)
+}
+
+// declaredFrontend is the fixture above as a boot decodes it.
+func declaredFrontend(t *testing.T, extra string) frontendDeclaration {
+	t.Helper()
+	frontend, err := parseFrontend(frontendYAML(extra))
+	if err != nil {
+		t.Fatalf("parse the declared frontend: %v", err)
+	}
+	return frontend
+}
+
+// footnoteSurface is the surface shape the notes solution declares for a Word
+// document: the whole set of slots a client reads, so a test can assert on all
+// of them.
+const footnoteSurface = `surfaces:
+  - id: footnote
+    client: word
+    title: Footnote
+    description: Cite a claim from the notes solution.
+    module: /surfaces/word/footnote.js
+    contract: 1
+    applies: always
+    events: [documents.entry]
+`
+
 // The served manifest must carry a declared dashboard data-graph verbatim
 // through JSON, so the host receives exactly what the solution declared.
 func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
 	graph := sampleDataGraph()
-	s := &Server{manifest: Manifest{ID: testSolutionID, Dashboard: graph}}
+	declared, err := yaml.Marshal(map[string]any{"dashboard": graph})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{manifest: Manifest{ID: testSolutionID}, frontend: declaredFrontend(t, string(declared))}
 
 	var got map[string]any
 	body, err := json.Marshal(s.manifestMap())
@@ -155,32 +192,16 @@ func TestServedManifestCarriesDashboardVerbatim(t *testing.T) {
 // not even a null one, which would break a host that feeds a present slot into
 // its data-graph validator and would perturb the existing wire contract.
 func TestManifestOmitsAbsentDashboard(t *testing.T) {
-	s := &Server{manifest: Manifest{ID: testSolutionID}}
+	s := &Server{manifest: Manifest{ID: testSolutionID}, frontend: declaredFrontend(t, "")}
 	if _, ok := s.manifestMap()["dashboard"]; ok {
 		t.Errorf("emitted a dashboard key with no dashboard declared")
 	}
 }
 
-// wordFootnote is the surface shape the notes solution declares for a Word document: the
-// whole set of slots a client reads, so a test can assert on all of them.
-func wordFootnote() Surface {
-	return Surface{
-		ID:          "footnote",
-		Client:      "word",
-		Title:       "Footnote",
-		Description: "Cite a claim from the notes solution.",
-		Module:      "/surfaces/word/footnote.js",
-		Contract:    1,
-		Applies:     "always",
-		Events:      []string{"documents.entry.*"},
-	}
-}
-
 // A client discovers what a solution offers it from the served manifest alone,
-// so every declared slot must survive the trip through JSON — including the
-// applies selector, which the runtime carries without interpreting.
+// so every declared slot must survive the trip through JSON.
 func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
-	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{wordFootnote()}}}
+	s := &Server{manifest: Manifest{ID: "notes"}, frontend: declaredFrontend(t, footnoteSurface)}
 
 	var got map[string]any
 	body, err := json.Marshal(s.manifestMap())
@@ -198,7 +219,7 @@ func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
 		"module":      "/surfaces/word/footnote.js",
 		"contract":    float64(1),
 		"applies":     "always",
-		"events":      []any{"documents.entry.*"},
+		"events":      []any{"documents.entry"},
 	}}
 	if !reflect.DeepEqual(got["surfaces"], want) {
 		t.Errorf("served surfaces = %#v, want %#v", got["surfaces"], want)
@@ -208,10 +229,8 @@ func TestServedManifestCarriesDeclaredSurfaces(t *testing.T) {
 // A tagged selector is a structure, not a keyword, and the runtime must hand it
 // to the client exactly as declared rather than flattening it.
 func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
-	applies := map[string]any{"tagged": []any{"legal", "finance"}}
-	surface := wordFootnote()
-	surface.Applies = applies
-	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{surface}}}
+	declared := strings.Replace(footnoteSurface, "applies: always", "applies: {tagged: [legal, finance]}", 1)
+	s := &Server{manifest: Manifest{ID: "notes"}, frontend: declaredFrontend(t, declared)}
 
 	var got map[string]any
 	body, _ := json.Marshal(s.manifestMap())
@@ -219,34 +238,26 @@ func TestServedSurfaceCarriesTaggedAppliesVerbatim(t *testing.T) {
 		t.Fatalf("unmarshal manifest: %v", err)
 	}
 	entry := got["surfaces"].([]any)[0].(map[string]any)
-	if !reflect.DeepEqual(entry["applies"], applies) {
-		t.Errorf("served applies = %#v, want %#v", entry["applies"], applies)
+	if want := map[string]any{"tagged": []any{"legal", "finance"}}; !reflect.DeepEqual(entry["applies"], want) {
+		t.Errorf("served applies = %#v, want %#v", entry["applies"], want)
 	}
 }
 
-// A solution that offers nothing inside a client must not gain the key at all.
-func TestManifestOmitsAbsentSurfaces(t *testing.T) {
-	bare := &Server{manifest: Manifest{ID: testSolutionID}}
+// A solution that offers nothing inside a client must not gain the key at all,
+// and a surface's optional slots say what they mean by being absent: nothing
+// to show and nothing to reconcile on are different from a null the client
+// still has to interpret. The selector is not optional — core carries no
+// default — so the minimal surface spells it.
+func TestManifestOmitsAbsentSurfacesAndTheirEmptySlots(t *testing.T) {
+	bare := &Server{manifest: Manifest{ID: testSolutionID}, frontend: declaredFrontend(t, "")}
 	if _, ok := bare.manifestMap()["surfaces"]; ok {
 		t.Errorf("emitted a surfaces key with no surface declared")
 	}
-}
-
-// A surface is in the manifest whether or not it declares a selector, so an
-// absent applies is not the absence of the surface — it is the default the
-// contract names, and every client would otherwise have to invent it alike.
-// Nothing to show and nothing to reconcile on are different: those slots say
-// what they mean by being absent.
-func TestManifestDefaultsAppliesAndOmitsEmptySurfaceSlots(t *testing.T) {
-	surface := wordFootnote()
-	surface.Applies = nil
-	surface.Events = nil
-	surface.Description = ""
-	s := &Server{manifest: Manifest{ID: "notes", Surfaces: []Surface{surface}}}
-
+	minimal := "surfaces:\n  - id: footnote\n    client: word\n    title: Footnote\n    module: /surfaces/word/footnote.js\n    contract: 1\n    applies: always\n"
+	s := &Server{manifest: Manifest{ID: "notes"}, frontend: declaredFrontend(t, minimal)}
 	entry := s.manifestMap()["surfaces"].([]any)[0].(map[string]any)
-	if got := entry["applies"]; got != "always" {
-		t.Errorf("applies with no selector declared = %#v, want %q", got, "always")
+	if got := entry["applies"]; got != surfaceAppliesAlways {
+		t.Errorf("applies = %#v, want %q as declared", got, surfaceAppliesAlways)
 	}
 	if _, ok := entry["description"]; ok {
 		t.Errorf("emitted a description key with no description declared")
@@ -256,65 +267,72 @@ func TestManifestDefaultsAppliesAndOmitsEmptySurfaceSlots(t *testing.T) {
 	}
 }
 
+// wordFootnote is the declared surface as the file decodes it.
+func wordFootnote() frontendSurface {
+	return frontendSurface{
+		ID:          "footnote",
+		Client:      "word",
+		Title:       "Footnote",
+		Description: "Cite a claim from the notes solution.",
+		Module:      "/surfaces/word/footnote.js",
+		Contract:    1,
+		Applies:     "always",
+		Events:      []string{"documents.entry"},
+	}
+}
+
 // A surface no client could load must fail the boot, not register quietly and
 // show up as a solution that simply never appears in the add-in.
 func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
+	with := func(edit func(*frontendSurface)) []frontendSurface {
+		s := wordFootnote()
+		edit(&s)
+		return []frontendSurface{s}
+	}
 	cases := []struct {
 		name     string
-		surfaces []Surface
+		surfaces []frontendSurface
 		want     string
 	}{
-		{"no id", []Surface{func() Surface { s := wordFootnote(); s.ID = ""; return s }()}, "no id"},
-		{"id with uppercase", []Surface{func() Surface { s := wordFootnote(); s.ID = "Footnote"; return s }()}, "id must be"},
-		{"id with a slash", []Surface{func() Surface { s := wordFootnote(); s.ID = "word/footnote"; return s }()}, "id must be"},
-		{"id with a leading dash", []Surface{func() Surface { s := wordFootnote(); s.ID = "-footnote"; return s }()}, "id must be"},
-		{"id with a trailing dash", []Surface{func() Surface { s := wordFootnote(); s.ID = "footnote-"; return s }()}, "id must be"},
-		{"id of one dash", []Surface{func() Surface { s := wordFootnote(); s.ID = "-"; return s }()}, "id must be"},
-		{"duplicate id in one client", []Surface{wordFootnote(), wordFootnote()}, "declared twice"},
-		{"no title", []Surface{func() Surface { s := wordFootnote(); s.Title = ""; return s }()}, "no title"},
-		{"unknown client", []Surface{func() Surface { s := wordFootnote(); s.Client = "notion"; return s }()}, "unknown client kind"},
-		{"no client", []Surface{func() Surface { s := wordFootnote(); s.Client = ""; return s }()}, "unknown client kind"},
-		{"undeclared contract", []Surface{func() Surface { s := wordFootnote(); s.Contract = 0; return s }()}, "contract"},
-		{"negative contract", []Surface{func() Surface { s := wordFootnote(); s.Contract = -1; return s }()}, "contract"},
-		{"absolute module URL", []Surface{func() Surface {
-			s := wordFootnote()
-			s.Module = "https://evil.example/footnote.js"
-			return s
-		}()}, "own origin"},
-		{"protocol-relative module", []Surface{func() Surface {
-			s := wordFootnote()
-			s.Module = "//evil.example/footnote.js"
-			return s
-		}()}, "own origin"},
+		{"no id", with(func(s *frontendSurface) { s.ID = "" }), "no id"},
+		{"id with uppercase", with(func(s *frontendSurface) { s.ID = "Footnote" }), "id must be"},
+		{"id with a slash", with(func(s *frontendSurface) { s.ID = "word/footnote" }), "id must be"},
+		{"id with a leading dash", with(func(s *frontendSurface) { s.ID = "-footnote" }), "id must be"},
+		{"id with a trailing dash", with(func(s *frontendSurface) { s.ID = "footnote-" }), "id must be"},
+		{"id of one dash", with(func(s *frontendSurface) { s.ID = "-" }), "id must be"},
+		{"duplicate id in one client", []frontendSurface{wordFootnote(), wordFootnote()}, "declared twice"},
+		{"no title", with(func(s *frontendSurface) { s.Title = "" }), "no title"},
+		{"unknown client", with(func(s *frontendSurface) { s.Client = "notion" }), "unknown client kind"},
+		{"no client", with(func(s *frontendSurface) { s.Client = "" }), "unknown client kind"},
+		{"undeclared contract", with(func(s *frontendSurface) { s.Contract = 0 }), "contract"},
+		{"negative contract", with(func(s *frontendSurface) { s.Contract = -1 }), "contract"},
+		// The selector is declared, in one of the two shapes the host client
+		// reads; core signs no default and refuses every other shape.
+		{"no applies", with(func(s *frontendSurface) { s.Applies = nil }), "no applies"},
+		{"an applies keyword that is not always", with(func(s *frontendSurface) { s.Applies = "sometimes" }), "applies"},
+		{"a tagged selector naming no tag", with(func(s *frontendSurface) { s.Applies = map[string]any{"tagged": []any{}} }), "one or more tags"},
+		{"a tagged selector with an empty tag", with(func(s *frontendSurface) { s.Applies = map[string]any{"tagged": []any{""}} }), "empty tag"},
+		{"a selector mapping with another key", with(func(s *frontendSurface) { s.Applies = map[string]any{"tagged": []any{"legal"}, "also": true} }), "one key tagged"},
+		{"a selector of another type", with(func(s *frontendSurface) { s.Applies = 7 }), "applies"},
+		// Events are journal namespaces as core signs them.
+		{"an event with a wildcard", with(func(s *frontendSurface) { s.Events = []string{"documents.entry.*"} }), "journal namespace"},
+		{"an event with uppercase", with(func(s *frontendSurface) { s.Events = []string{"Documents.entry"} }), "journal namespace"},
+		{"an event named twice", with(func(s *frontendSurface) { s.Events = []string{"documents.entry", "documents.entry"} }), "named twice"},
+		{"absolute module URL", with(func(s *frontendSurface) { s.Module = "https://evil.example/footnote.js" }), "own origin"},
+		{"protocol-relative module", with(func(s *frontendSurface) { s.Module = "//evil.example/footnote.js" }), "own origin"},
 		// A browser reads the backslash beside the leading slash as a slash and
 		// what follows as a host, so each of these loads third-party code even
 		// though net/url reports no host in any of them.
-		{"backslash authority module", []Surface{func() Surface {
-			s := wordFootnote()
-			s.Module = `/\evil.example/footnote.js`
-			return s
-		}()}, "own origin"},
-		{"backslash-slash authority module", []Surface{func() Surface {
-			s := wordFootnote()
-			s.Module = `/\/evil.example/footnote.js`
-			return s
-		}()}, "own origin"},
-		{"tab-smuggled authority module", []Surface{func() Surface {
-			s := wordFootnote()
-			s.Module = "/\t/evil.example/footnote.js"
-			return s
-		}()}, "own origin"},
-		{"newline-smuggled authority module", []Surface{func() Surface {
-			s := wordFootnote()
-			s.Module = "/\n//evil.example/footnote.js"
-			return s
-		}()}, "own origin"},
-		{"relative module", []Surface{func() Surface { s := wordFootnote(); s.Module = "surfaces/footnote.js"; return s }()}, "own origin"},
-		{"no module", []Surface{func() Surface { s := wordFootnote(); s.Module = ""; return s }()}, "own origin"},
+		{"backslash authority module", with(func(s *frontendSurface) { s.Module = `/\evil.example/footnote.js` }), "own origin"},
+		{"backslash-slash authority module", with(func(s *frontendSurface) { s.Module = `/\/evil.example/footnote.js` }), "own origin"},
+		{"tab-smuggled authority module", with(func(s *frontendSurface) { s.Module = "/\t/evil.example/footnote.js" }), "own origin"},
+		{"newline-smuggled authority module", with(func(s *frontendSurface) { s.Module = "/\n//evil.example/footnote.js" }), "own origin"},
+		{"relative module", with(func(s *frontendSurface) { s.Module = "surfaces/footnote.js" }), "own origin"},
+		{"no module", with(func(s *frontendSurface) { s.Module = "" }), "own origin"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := Manifest{ID: "notes", Surfaces: tc.surfaces}.validateSurfaces()
+			err := validateSurfaces(tc.surfaces)
 			if err == nil {
 				t.Fatalf("validateSurfaces accepted %s", tc.name)
 			}
@@ -325,21 +343,22 @@ func TestSurfaceValidationRejectsUnusableDeclarations(t *testing.T) {
 	}
 }
 
-// The same offering in two clients carries the same id — the notes solution's footnote is
-// "footnote" in Word and in PowerPoint — and neither client can see the other's,
-// so that is not a collision. Only two surfaces of one client are ambiguous.
+// The same offering in two clients carries the same id — the notes solution's
+// footnote is "footnote" in Word and in PowerPoint — and neither client can see
+// the other's, so that is not a collision. Only two surfaces of one client are
+// ambiguous.
 func TestSurfaceIDsAreUniquePerClientNotPerSolution(t *testing.T) {
 	powerpoint := wordFootnote()
 	powerpoint.Client = "powerpoint"
 	powerpoint.Module = "/surfaces/powerpoint/footnote.js"
-	if err := (Manifest{ID: "notes", Surfaces: []Surface{wordFootnote(), powerpoint}}).validateSurfaces(); err != nil {
+	if err := validateSurfaces([]frontendSurface{wordFootnote(), powerpoint}); err != nil {
 		t.Errorf("validateSurfaces refused one id shared across two clients: %v", err)
 	}
 
 	second := wordFootnote()
 	second.Title = "Footnote, again"
 	second.Module = "/surfaces/word/footnote-2.js"
-	err := (Manifest{ID: "notes", Surfaces: []Surface{wordFootnote(), second}}).validateSurfaces()
+	err := validateSurfaces([]frontendSurface{wordFootnote(), second})
 	if err == nil {
 		t.Fatal("validateSurfaces accepted two surfaces sharing an id within one client")
 	}
@@ -348,14 +367,13 @@ func TestSurfaceIDsAreUniquePerClientNotPerSolution(t *testing.T) {
 	}
 }
 
-// Serve must refuse a manifest whose surface no client could load, and name the
-// surface — the mistake is in the author's code, and it is the same mistake in
-// every environment, so it must not wait on the environment resolving first.
+// Serve must refuse a declaration whose surface no client could load, and name
+// the surface — the mistake is in the author's file, and it is the same
+// mistake in every environment, so it must not wait on the environment
+// resolving first.
 func TestServeRejectsUnusableSurface(t *testing.T) {
-	surface := wordFootnote()
-	surface.Module = `/\evil.example/footnote.js`
-
-	s := New(Manifest{ID: "notes", Title: "Notes", Surfaces: []Surface{surface}})
+	declared := frontendYAML(strings.Replace(footnoteSurface, "/surfaces/word/footnote.js", `"/\\evil.example/footnote.js"`, 1))
+	s := New(Manifest{ID: "notes", Frontend: declared})
 	err := s.Serve()
 	if err == nil {
 		t.Fatal("Serve returned nil for an off-origin surface module; expected a boot error and no bind")
@@ -363,6 +381,57 @@ func TestServeRejectsUnusableSurface(t *testing.T) {
 	if !strings.Contains(err.Error(), "footnote") {
 		t.Errorf("boot error should name the surface, got: %v", err)
 	}
+}
+
+// TestTheDeclaredFrontendIsStrictAndNamed: the file is the one source of what
+// the host lists a solution under, and the author writes it by hand, so every
+// way of getting it wrong is refused at boot naming the file — and a file the
+// CLI would read differently (an unknown key, a second document) is refused
+// rather than read as whatever this runtime makes of it.
+func TestTheDeclaredFrontendIsStrictAndNamed(t *testing.T) {
+	complete := "title: Notes\norder: 3\nexposed_module: ./Page\nhost_contract: 1\n"
+	for _, tc := range []struct{ name, file, want string }{
+		{"no file", "", FrontendFileName},
+		{"whitespace only", "\n  \n", FrontendFileName},
+		{"an unknown key", complete + "nav_order: 3\n", "nav_order"},
+		{"no title", strings.Replace(complete, "title: Notes\n", "", 1), "no title"},
+		{"an empty title", strings.Replace(complete, "title: Notes\n", "title: ''\n", 1), "title"},
+		{"a title of two lines", strings.Replace(complete, "title: Notes\n", "title: \"Notes\\nmore\"\n", 1), "title"},
+		{"no order", strings.Replace(complete, "order: 3\n", "", 1), "no order"},
+		{"no exposed module", strings.Replace(complete, "exposed_module: ./Page\n", "", 1), "no exposed_module"},
+		{"no host contract", strings.Replace(complete, "host_contract: 1\n", "", 1), "no host_contract"},
+		{"a host contract of zero", strings.Replace(complete, "host_contract: 1\n", "host_contract: 0\n", 1), "host_contract"},
+		{"a negative host contract", strings.Replace(complete, "host_contract: 1\n", "host_contract: -1\n", 1), "host_contract"},
+		{"a dashboard with a non-string key", complete + "dashboard:\n  1: widget\n", "dashboard"},
+		{"a dashboard that is not a mapping", complete + "dashboard: [1, 2]\n", "dashboard"},
+		{"a dashboard carrying a fraction", complete + "dashboard:\n  ratio: 0.5\n", "dashboard"},
+		{"a dashboard over the bound", complete + "dashboard:\n  pad: " + strings.Repeat("a", frontendDashboardMaxBytes) + "\n", "dashboard"},
+		{"a surface with no contract", complete + strings.Replace(footnoteSurface, "    contract: 1\n", "", 1), "contract"},
+		{"two documents", complete + "---\ntitle: Other\n", "more than one"},
+		{"not a mapping", "- title: Notes\n", "cannot be decoded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseFrontend([]byte(tc.file))
+			if err == nil {
+				t.Fatalf("a frontend file with %s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the refusal %q does not say %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), FrontendFileName) {
+				t.Errorf("the refusal %q does not name the file the author has to fix", err)
+			}
+		})
+	}
+	t.Run("a complete declaration decodes as written", func(t *testing.T) {
+		frontend, err := parseFrontend([]byte("title: Notes\norder: 0\nexposed_module: ./Entry\nhost_contract: 2\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frontend.Title != "Notes" || frontend.Order != 0 || frontend.HostContract != 2 || frontend.ExposedModule != "./Entry" {
+			t.Errorf("decoded %+v, want the declared title, order, exposed module and host contract", frontend)
+		}
+	})
 }
 
 // setEndpoint injects a single Codefly endpoint into the SDK's env-var snapshot
@@ -393,17 +462,26 @@ func setEndpoint(t *testing.T, key, addr string) {
 func TestOnlyTheCurrentGatewayRoleResolves(t *testing.T) {
 	const addr = "https://gateway:42152"
 	t.Run("the current role resolves", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", addr)
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__WORKLOAD__HTTP", addr)
 		cfg := loadConfig(context.Background(), testSolutionID, nil)
 		if cfg.gatewayURL != addr {
 			t.Fatalf("gatewayURL = %q, want %q resolved from the current role without an override", cfg.gatewayURL, addr)
 		}
-		// And the mint URL is NOT derived from it. A resolved gateway says
-		// where the gateway is, not where the host mints a credential: that
-		// endpoint is unsettled and undeployed, and the address this runtime
-		// POSTs its projected service-account token to is not one to assume.
-		if cfg.mintURL != "" {
-			t.Errorf("mintURL = %q, want empty: a resolved gateway must not produce a mint address, because the attestation this runtime sends there would be going somewhere nobody published", cfg.mintURL)
+		// And the mint is the host's broker route on that same origin: the
+		// workload endpoint serves the gateway's whole handler, so there is
+		// no second address to resolve for the projected token to go to.
+		if cfg.mintURL != addr+credentialMintPath {
+			t.Errorf("mintURL = %q, want %q: the mint is the published route on the resolved gateway", cfg.mintURL, addr+credentialMintPath)
+		}
+	})
+
+	t.Run("the public rest endpoint does not resolve the gateway", func(t *testing.T) {
+		// The public endpoint stops serving the mint, so resolving it would
+		// boot a solution that 404s at the one request it cannot do without.
+		t.Chdir(t.TempDir())
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", addr)
+		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
+			t.Fatalf("resolveGateway = %q from the rest endpoint, want nothing: the workload endpoint is the one that serves the mint", got)
 		}
 	})
 
@@ -436,7 +514,7 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__REST__REST", gatewayAddr)
+			setEndpoint(t, "CODEFLY__ENDPOINT__"+tc.module+"__"+tc.gateway+"__WORKLOAD__HTTP", gatewayAddr)
 
 			cfg := loadConfig(context.Background(), testSolutionID, nil)
 			if cfg.gatewayURL != gatewayAddr {
@@ -444,17 +522,6 @@ func TestLoadConfigResolvesHostByRole(t *testing.T) {
 			}
 		})
 	}
-}
-
-// identitiesFile writes an admission set to a file and returns its path, which
-// is the form both admission sets are provisioned in: they are read per
-// handshake and per dial, so they have to be something this process can re-read
-// rather than a value fixed when it started.
-func identitiesFile(t *testing.T, identities ...string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "identities")
-	writeFile(t, path, strings.Join(identities, "\n")+"\n")
-	return path
 }
 
 // writeFile writes content to path, creating parent directories, for building
@@ -480,15 +547,15 @@ func TestResolveGatewayAmbiguousModuleFailsLoud(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	t.Run("single owning module resolves", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "https://gateway:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__WORKLOAD__HTTP", "https://gateway:42152")
 		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "https://gateway:42152" {
 			t.Fatalf("resolveGateway = %q, want the single module's address", got)
 		}
 	})
 
 	t.Run("two modules owning the same role are ambiguous", func(t *testing.T) {
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__REST__REST", "https://gateway-a:42152")
-		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__REST__REST", "https://gateway-b:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS__AUTH_GATEWAY__WORKLOAD__HTTP", "https://gateway-a:42152")
+		setEndpoint(t, "CODEFLY__ENDPOINT__SAAS_STARTER__AUTH_GATEWAY__WORKLOAD__HTTP", "https://gateway-b:42152")
 		if got := resolveGateway(context.Background(), "", "auth-gateway"); got != "" {
 			t.Fatalf("resolveGateway = %q, want %q so validate() fails loud on the ambiguous host", got, "")
 		}
@@ -524,7 +591,8 @@ agent:
   version: 0.0.1
   publisher: codefly.dev
 endpoints:
-  - name: rest
+  - name: workload
+    api: http
     visibility: public
     exposure: public
 `)
@@ -762,7 +830,7 @@ func serveHandler(t *testing.T, gatewayURL string, handler Handler) *httptest.Se
 // for an assertion about the credential itself.
 func serveHandlerWith(t *testing.T, gatewayURL string, source CredentialSource, handler Handler) *httptest.Server {
 	t.Helper()
-	s := New(Manifest{ID: "notes", Title: "Notes"}).Credential(source)
+	s := New(Manifest{ID: "notes"}).Credential(source)
 	s.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gatewayURL}
 	server := httptest.NewServer(s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
 		return handler(r.Context(), gw)
@@ -1159,110 +1227,73 @@ func TestA409IsNotReadAsSupersessionAtAll(t *testing.T) {
 	}
 }
 
-// TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload keeps the viewer's
-// credentials and this workload's own off an arbitrary egress host, and makes
-// the outbound hop authenticated rather than merely https.
-//
-// Every platform target is composition-local, and these requests carry the
-// viewer's bearer, the capability minted for them, and — on a mint — the
-// projected token that attests which workload this process is. An https URL
-// alone says only that the scheme is https: without a trust anchor the far end
-// is verified against whatever the image's system roots happen to hold, and
-// without a client certificate it cannot tell this workload from anything else
-// that reached it.
-func TestPlatformTrafficIsNeverProxiedAndPresentsThisWorkload(t *testing.T) {
+// TestPlatformTrafficIsNeverProxiedOrRedirected: every destination a gateway
+// has is composition-local, and every request to it carries the viewer's
+// bearer, the capability minted for them or this workload's own credential.
+// A proxy would dial those to an arbitrary egress host, and a redirect would
+// hand them to whatever answered with a Location.
+func TestPlatformTrafficIsNeverProxiedOrRedirected(t *testing.T) {
 	if unauthenticatedTransport.Proxy != nil {
 		t.Error("the platform transport carries a proxy: with HTTP(S)_PROXY set and a NO_PROXY that misses the in-cluster gateway, the viewer's bearer and capability would be dialled to an arbitrary egress host")
 	}
-
-	certFile, keyFile, bundleFile, _, _ := workloadIdentity(t, testPrincipal)
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{brokerInternalToken: "broker-perimeter-token", identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal),
-		// This test inspects the transport rather than dialling, so any
-		// resolved destination will do.
-		mintURL: "https://mint.cell:443" + credentialMintPath}
-	server.principal = testPrincipal
-	client, err := server.outboundClient(nil)
-	if err != nil {
-		t.Fatalf("outboundClient: %v", err)
-	}
+	client := server.outboundClient()
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("outbound transport is %T, want *http.Transport", client.Transport)
 	}
-	switch {
-	case transport.Proxy != nil:
+	if transport.Proxy != nil {
 		t.Error("the outbound client carries a proxy")
-	case transport.DialTLSContext == nil:
-		t.Fatal("the outbound client has no per-connection dialler, so its trust is whatever was snapshotted at boot")
-	case transport.TLSClientConfig != nil:
-		t.Error("the outbound transport carries a snapshotted TLS configuration: peer trust must be built per connection, or a removed root keeps authenticating the platform")
-	case transport.IdleConnTimeout == 0 || transport.IdleConnTimeout > outboundTrustReloadBound:
-		t.Errorf("idle connections live for %s, so per-dial reloading bounds nothing: want at most %s", transport.IdleConnTimeout, outboundTrustReloadBound)
+	}
+	if transport.IdleConnTimeout == 0 || transport.IdleConnTimeout > outboundIdleTimeout {
+		t.Errorf("idle connections live for %s, want at most %s", transport.IdleConnTimeout, outboundIdleTimeout)
 	}
 	if client.CheckRedirect == nil {
 		t.Error("the outbound client follows redirects: net/http copies every header but three across hosts, so a Location would be handed this workload's credentials")
 	}
-	// A pair that rotated to another workload's identity must not be presented
-	// to the platform, which the default path never checked: the listener's
-	// leaf was held to the principal and this second reloader over the same
-	// files was not.
-	rival, rivalKey, _, _, _ := workloadIdentity(t, "spiffe://codefly.test/ns/solutions/sa/another-workload")
-	writeFile(t, certFile, readFile(t, rival))
-	writeFile(t, keyFile, readFile(t, rivalKey))
-	if _, err := server.outboundClient(nil); err == nil {
-		t.Error("an outbound client was built presenting a leaf issued for another workload")
-	}
-	// A boot with no trust anchor cannot build one at all, which is the same
-	// refusal the listener makes.
-	server.cfg.trustBundleFile = ""
-	if _, err := server.outboundClient(nil); err == nil {
-		t.Error("an outbound client was built with no projected anchor to verify the platform against")
+	if client.Timeout == 0 {
+		t.Error("the outbound client has no timeout, so a host that accepts a request and never answers parks a goroutine in Do forever")
 	}
 }
 
-// TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport is the leg the
-// test above was missing, and a reviewer showed it: everything there inspects
-// the client outboundClient *returns*, and the defect this file's comments are
-// about was the gateway handed to a handler not carrying it. Deleting
-// gatewayFor's one assignment left every assertion above passing while a
-// handler's reads went out over the unauthenticated fallback.
-//
-// So this drives the production gateway client at a platform host that requires
-// a caller's certificate, and asks the host who called. The answer has to be
-// this workload.
-func TestAHandlersGatewayDialsThroughTheBootsAuthenticatedTransport(t *testing.T) {
-	c := newCell(t)
-	certFile, keyFile, bundleFile, _, _ := c.workload(t, testPrincipal)
-	host := newPlatformHost(t, c, testGatewayPrincipal)
+// TestAHandlersGatewayDialsThroughTheBootsTransport: everything above inspects
+// the client outboundClient *returns*, and a reviewer showed the defect was the
+// gateway handed to a handler not carrying it — deleting gatewayFor's one
+// assignment left every assertion passing while a handler's reads went out over
+// the fallback transport. So this drives the production gateway client and
+// asks the boot's transport whether it carried the request.
+func TestAHandlersGatewayDialsThroughTheBootsTransport(t *testing.T) {
+	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "yes"})
+	}))
+	t.Cleanup(host.Close)
 
 	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{brokerInternalToken: "broker-perimeter-token", identityCertFile: certFile, identityKeyFile: keyFile, trustBundleFile: bundleFile,
-		mintPeersFile:    identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile: identitiesFile(t, testGatewayPrincipal), gatewayURL: host.URL}
-	server.principal = testPrincipal
-	outbound, err := server.outboundClient(nil)
-	if err != nil {
-		t.Fatalf("outboundClient: %v", err)
-	}
-	server.outbound = outbound
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: host.URL}
+	server.outbound = server.outboundClient()
+	carried := &countingTransport{base: server.outbound.Transport}
+	server.outbound.Transport = carried
 
 	gateway := server.gatewayFor(http.Header{"authorization": {viewerBearer()}})
 	resp, err := gateway.HTTPClient().Get(host.URL + "/v1/things/search")
 	if err != nil {
-		t.Fatalf("a handler's gateway could not reach a platform host that requires this workload's certificate: %v\n"+
-			"a gateway that does not carry the boot's transport dials the platform as an anonymous client", err)
+		t.Fatalf("a handler's gateway could not reach the host: %v", err)
 	}
-	_ = resp.Body.Close()
-	called := host.called()
-	if len(called) == 0 {
-		t.Fatal("the platform host recorded no caller")
+	drainAndClose(resp)
+	if carried.count.Load() == 0 {
+		t.Fatal("the handler's gateway did not dial through the boot's transport: a gateway that does not carry it dials the platform through whatever transport it was built with")
 	}
-	if called[0] != testPrincipal {
-		t.Errorf("the platform saw a request from %q, want this workload's own %q", called[0], testPrincipal)
-	}
+}
+
+// countingTransport counts the requests the transport it wraps carried.
+type countingTransport struct {
+	base  http.RoundTripper
+	count atomic.Int64
+}
+
+func (c *countingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.count.Add(1)
+	return c.base.RoundTrip(r)
 }
 
 // A refused mint exposes its status, with no upstream diagnostics in either
@@ -1560,237 +1591,38 @@ func TestWorkContextPrincipalsReportsWhomAccountsIssuedFor(t *testing.T) {
 	}
 }
 
-// optionalIdentitiesFile is identitiesFile, or no path at all for an empty set
-// — the distinction a boot-refusal table needs, since "the platform never
-// provisioned a path" and "the path is there and names nobody" are two
-// different refusals and each has its own row.
-func optionalIdentitiesFile(t *testing.T, identities string) string {
-	t.Helper()
-	if identities == "" {
-		return ""
-	}
-	return identitiesFile(t, identities)
-}
-
-// TestABootWithoutAResolvedMintURLIsRefused: the previous revision derived the
-// mint address from the resolved gateway and labelled the result a guess — the
-// field was literally named mintURLGuessed, the code said the endpoint was "NOT
-// settled" and that "neither endpoint exists yet", and the README and the boot
-// log both said "settled". Both could not be true.
-//
-// This is the address the projected service-account token goes to, which is the
-// strongest statement this process can make about which workload it is. A
-// guessed address for that is what fail-closed forbids, and this package
-// already refuses rather than guesses when it cannot pair a token-exchange URL.
-func TestABootWithoutAResolvedMintURLIsRefused(t *testing.T) {
-	cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile}
+// TestABootWithoutAResolvedGatewayIsRefused: the gateway is the one address
+// this runtime dials — every viewer call and the mint that issues this
+// execution's credential go to it — so a boot that resolved none is refused
+// naming the endpoint role the composition declares.
+func TestABootWithoutAResolvedGatewayIsRefused(t *testing.T) {
+	cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", profile: localProfile}
 	err := cfg.validate()
 	if err == nil {
-		t.Fatal("the boot accepted a configuration with no mint URL, so this runtime would POST its projected token to an address nobody resolved")
+		t.Fatal("the boot accepted a configuration with no gateway, so this runtime would POST its projected token to nowhere and serve")
 	}
-	if !strings.Contains(err.Error(), CredentialMintURLEnvironmentVariable) {
-		t.Errorf("the refusal %q does not name %s, the variable that sets it", err, CredentialMintURLEnvironmentVariable)
-	}
-	// And the refusal must not read as a provisioning gap in the gateway,
-	// which resolved perfectly well.
-	if strings.Contains(err.Error(), "unresolved gateway") {
-		t.Errorf("the refusal %q blames the gateway, which resolved: that sends an operator to inspect endpoint resolution over a value that is simply not set", err)
-	}
-}
-
-// TestNoProductionCodeDerivesTheMintAddress pins the absence. A default address
-// is the thing this repository's rules single out, and the previous one came
-// back as a "labelled stopgap" that the README then described as settled.
-func TestNoProductionCodeDerivesTheMintAddress(t *testing.T) {
-	for _, name := range moduleSources(t) {
-		source, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		body := string(source)
-		for _, derived := range []string{"gatewayURL + credentialMintPath", "gatewayURL+credentialMintPath"} {
-			if strings.Contains(body, derived) {
-				t.Errorf("%s derives the credential mint address from the resolved gateway: the gateway's address says where the gateway is, not where this host mints a credential, and the projected token this runtime sends there is not something to address by assumption", name)
-			}
-		}
-		if strings.Contains(body, "mintURLGuessed") {
-			t.Errorf("%s still carries mintURLGuessed: a guessed address for the endpoint this runtime attests itself to is refused now, so there is nothing to label", name)
+	for _, named := range []string{"gateway URL", "GATEWAY_URL", "workload"} {
+		if !strings.Contains(err.Error(), named) {
+			t.Errorf("the refusal %q does not name %s", err, named)
 		}
 	}
 }
 
-// TestTwoAdmissionSourcesAreRefusedRatherThanRanked: an admission set answered
-// by both an operator override and the platform's provisioning is two sources
-// for one authorization fact. The previous revision logged which one won, which
-// reports the conflict without resolving it — whichever this process picked, the
-// other is a decision somebody made that is not in force, and for admission
-// being wrong admits a caller.
-//
-// It is the stance the SDK already takes on the same question: a value
-// delivered inline and by file carrier is refused as two sources for one fact.
-func TestTwoAdmissionSourcesAreRefusedRatherThanRanked(t *testing.T) {
-	base := func(t *testing.T) config {
-		t.Helper()
-		return config{brokerInternalToken: "broker-perimeter-token",
-			port: "8080", gatewayURL: "https://gateway:42152",
-			mintURL: "https://gateway:42152" + credentialMintPath,
-			profile: localProfile,
-		}
+// TestTheMintAddressIsTheGatewaysBrokerRoute: the mint used to be a separate,
+// required address, because nothing published where the host minted. The
+// gateway's workload endpoint now serves the gateway's whole handler, the mint
+// included, so the mint is the host's published route on the one origin this
+// runtime resolved — and nothing else resolves or overrides it.
+func TestTheMintAddressIsTheGatewaysBrokerRoute(t *testing.T) {
+	t.Setenv("PORT", "8080")
+	t.Setenv("GATEWAY_URL", "https://gateway.cell:8443/")
+	cfg := loadConfig(context.Background(), testSolutionID, nil)
+	if want := "https://gateway.cell:8443" + credentialMintPath; cfg.mintURL != want {
+		t.Errorf("mintURL = %q, want %q", cfg.mintURL, want)
 	}
-
-	t.Run("an override alone is accepted", func(t *testing.T) {
-		cfg := base(t)
-		cfg.allowedCallersFile = identitiesFile(t, testGatewayPrincipal)
-		if err := cfg.validate(); err != nil {
-			t.Fatalf("an override with no provisioning behind it was refused: %v", err)
-		}
-	})
-
-	// Driven through the real resolver, not injected. The comment that used to
-	// stand here said a test cannot make the SDK's workspace configuration
-	// answer, and that was simply false — authorityValues does it for the
-	// authority group, the same way. So the conflict rule had no behavioural
-	// test at all and three mutants of it survived.
-	t.Run("both answering is refused, through the resolver", func(t *testing.T) {
-		provisionedWorkloadValue(t, WorkloadIdentityAllowedCallersFileKey, "/provisioned/callers")
-		t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, "/override/callers")
-		conflict := conflictingAdmissionSources(context.Background(), nil)
-		if conflict == nil {
-			t.Fatal("the resolver saw no conflict while both the override and the platform answered for the caller set")
-		}
-		for _, named := range []string{"/override/callers", "/provisioned/callers"} {
-			if !strings.Contains(conflict.Error(), named) {
-				t.Errorf("the refusal %q does not name %s, so an operator cannot tell which two answers are in play", conflict, named)
-			}
-		}
-
-		cfg := base(t)
-		cfg.admissionConflict = conflict
-		err := cfg.validate()
-		if err == nil {
-			t.Fatal("a boot accepted an admission set answered by two sources: ranking them silently is how a caller set gets widened with nothing recording that the platform's decision was not in force")
-		}
-		if !strings.Contains(err.Error(), "answered twice") {
-			t.Errorf("the refusal %q does not say the set has two answers", err)
-		}
-		// And it is reported before every other provisioning message, or it
-		// reads as ordinary advice next to them.
-		cfg.port = "not-a-port"
-		if again := cfg.validate(); again == nil || !strings.Contains(again.Error(), "answered twice") {
-			t.Errorf("with another refusal also pending, validate reported %v: the conflicting-authorization refusal is the one that says a decision is not in force", again)
-		}
-	})
-
-	t.Run("the resolver finds no conflict with no override set", func(t *testing.T) {
-		provisionedWorkloadValue(t, WorkloadIdentityAllowedCallersFileKey, "/provisioned/callers")
-		if err := conflictingAdmissionSources(context.Background(), nil); err != nil {
-			t.Errorf("a conflict was reported with no override set: %v", err)
-		}
-	})
-
-	// And an override against provisioning this process cannot READ is a
-	// conflict too. The resolver discarded the SDK's error, saw no second
-	// answer, and put the override in force — against provisioning it simply
-	// could not see.
-	t.Run("an unreadable platform answer is a conflict, not an absent one", func(t *testing.T) {
-		t.Setenv(IdentityAllowedCallersFileEnvironmentVariable, "/override/wide")
-		// No workspace configuration loaded at all, so the SDK errors rather
-		// than answering empty.
-		withoutWorkloadValues(t)
-		// With a failed environment load, which is the one signal that
-		// separates "never provisioned" from "could not be read": the SDK
-		// answers both with the same error.
-		err := conflictingAdmissionSources(context.Background(), errors.New("loading the injected environment failed"))
-		if err == nil {
-			t.Fatal("an override was put in force while the platform's own answer could not be read: an unreadable answer is still an answer somebody provisioned, and choosing between two is exactly what this rule refuses")
-		}
-		if !strings.Contains(err.Error(), "cannot be read") {
-			t.Errorf("the refusal %q does not say the platform's answer was unreadable", err)
-		}
-	})
-}
-
-// TestAnAdmissionFileIsReadWholeOrRefused: each entry has to be a complete
-// line, which is the part that is not obvious.
-//
-// The previous reader split whatever it was handed, so a file caught mid-write
-// — a platform rewriting it without an atomic swap, an operator's `>` redirect
-// — truncated an entry and the truncation was admitted as an identity of its
-// own. The executed review showed ".../sa/gateway-internal" read as
-// ".../sa/gateway", admitting a caller the set never named.
-func TestAnAdmissionFileIsReadWholeOrRefused(t *testing.T) {
-	const gateway = "spiffe://codefly.test/ns/platform/sa/gateway"
-	const internal = "spiffe://codefly.test/ns/platform/sa/gateway-internal"
-
-	read := func(t *testing.T, content string) ([]string, error) {
-		t.Helper()
-		path := filepath.Join(t.TempDir(), "identities")
-		writeFile(t, path, content)
-		return resolvedIdentities(path, "unresolved")()
+	if cfg.gatewayURL != "https://gateway.cell:8443" {
+		t.Errorf("gatewayURL = %q, want the override without its trailing slash", cfg.gatewayURL)
 	}
-
-	t.Run("a truncated last line is refused, not admitted", func(t *testing.T) {
-		// What a reader sees partway through a non-atomic rewrite of a file
-		// whose only entry is the -internal identity.
-		got, err := read(t, internal[:len(internal)-len("-internal")])
-		if err == nil {
-			t.Fatalf("a file caught mid-write resolved to %v: the fragment %q is a different identity from the one being written, and admitting it lets in a caller the set never named", got, gateway)
-		}
-		if !strings.Contains(err.Error(), "newline") {
-			t.Errorf("the refusal %q does not say why the file is not whole", err)
-		}
-	})
-
-	t.Run("a terminated file is read", func(t *testing.T) {
-		got, err := read(t, gateway+"\n"+internal+"\n")
-		if err != nil {
-			t.Fatalf("a complete file was refused: %v", err)
-		}
-		if len(got) != 2 || got[0] != gateway || got[1] != internal {
-			t.Errorf("resolved %v, want both identities", got)
-		}
-	})
-
-	t.Run("entries that can never match are refused at the file", func(t *testing.T) {
-		for _, tc := range []struct{ name, content string }{
-			{"a byte-order mark", "\ufeff" + gateway + "\n"},
-			{"a NUL in an entry", "spiffe://codefly.test/ns/platform/sa/gate\x00way\n"},
-			{"not a URI at all", "gateway\n"},
-			{"another scheme", "https://codefly.test/ns/platform/sa/gateway\n"},
-			{"no path", "spiffe://codefly.test\n"},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				if got, err := read(t, tc.content); err == nil {
-					t.Errorf("resolved %v: an entry that cannot match any peer is a provisioning mistake, and carrying it silently turns into a caller nobody admits at a handshake far from the cause", got)
-				}
-			})
-		}
-	})
-
-	t.Run("a file too large to re-read every second is refused", func(t *testing.T) {
-		big := strings.Repeat(gateway+"\n", (admissionFileLimit/(len(gateway)+1))+16)
-		got, err := read(t, big)
-		if err == nil {
-			t.Fatalf("resolved %d identities from a file over the limit: this is read on every handshake, every dial, and once a second per established connection in each direction", len(got))
-		}
-		// And refused BY THE CAP. Without this the case passes for the wrong
-		// reason: the reader stops at the limit, so the last line it sees is a
-		// fragment and the whole-line rule refuses it — which means removing
-		// the cap entirely left this green.
-		if !strings.Contains(err.Error(), "larger than") {
-			t.Errorf("the refusal %q is not about the file's size, so this case does not cover the cap", err)
-		}
-	})
-
-	t.Run("comments, CRLF and commas still work", func(t *testing.T) {
-		got, err := read(t, "# the gateway\r\n"+gateway+", "+internal+"\r\n")
-		if err != nil {
-			t.Fatalf("a conforming file was refused: %v", err)
-		}
-		if len(got) != 2 {
-			t.Errorf("resolved %v, want two identities", got)
-		}
-	})
 }
 
 // TestACredentialBearingURLCarriesNothingButADestination: userinfo, a query and
@@ -1799,19 +1631,22 @@ func TestAnAdmissionFileIsReadWholeOrRefused(t *testing.T) {
 // and, in the userinfo case, that net/http strips before the request is even
 // sent, so it is never used for anything except being logged.
 func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
-	for _, tc := range []struct{ name, mint, names string }{
-		{"userinfo", "https://ops:s3cr3t@mint.cell/modules/_work-context", "userinfo"},
-		{"a query", "https://mint.cell/modules/_work-context?token=s3cr3t", "query"},
-		{"a fragment", "https://mint.cell/modules/_work-context#part", "fragment"},
+	for _, tc := range []struct{ name, gateway, names string }{
+		{"userinfo", "https://ops:s3cr3t@gateway.cell", "credentials"},
+		{"a query", "https://gateway.cell?token=s3cr3t", "query"},
+		{"a fragment", "https://gateway.cell#part", "fragment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: "https://gateway:42152", mintURL: tc.mint, profile: localProfile}
+			cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: tc.gateway, mintURL: tc.gateway + credentialMintPath, profile: localProfile}
 			err := cfg.validate()
 			if err == nil {
-				t.Fatalf("a credential mint URL carrying %s was accepted", tc.names)
+				t.Fatalf("a gateway URL carrying %s was accepted", tc.names)
 			}
 			if !strings.Contains(err.Error(), tc.names) {
 				t.Errorf("the refusal %q does not say the URL carries %s", err, tc.names)
+			}
+			if !strings.Contains(err.Error(), "s3cr3t") == false {
+				t.Errorf("the refusal %q carries the secret", err)
 			}
 		})
 	}
@@ -1833,17 +1668,17 @@ func TestACredentialBearingURLCarriesNothingButADestination(t *testing.T) {
 		log.SetOutput(&captured)
 		t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
-		cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", gatewayURL: "https://gateway:42152", profile: localProfile,
-			mintURL: "https://ops:s3cr3t-password@mint.cell/modules/_work-context"}
+		cfg := config{brokerInternalToken: "broker-perimeter-token", port: "8080", profile: localProfile,
+			gatewayURL: "https://ops:s3cr3t-password@gateway.cell", mintURL: "https://ops:s3cr3t-password@gateway.cell/modules/_work-context"}
 		// validate() refuses this URL, and the log line still must not carry
 		// the secret: the refusal and the logging are independent, which is
 		// the whole reason the log redacts regardless.
 		_ = cfg.validate()
-		cfg.mintURL = "https://mint.cell/modules/_work-context"
+		cfg.gatewayURL, cfg.mintURL = "https://gateway.cell", "https://gateway.cell/modules/_work-context"
 		if err := cfg.validate(); err != nil {
 			t.Fatalf("a conforming configuration was refused: %v", err)
 		}
-		cfg.mintURL = "https://ops:s3cr3t-password@mint.cell/modules/_work-context"
+		cfg.mintURL = "https://ops:s3cr3t-password@gateway.cell/modules/_work-context"
 		cfg.logResolved()
 		if got := captured.String(); strings.Contains(got, "s3cr3t-password") {
 			t.Errorf("the boot log carries the secret from the mint URL:\n%s", got)
@@ -1881,10 +1716,11 @@ func TestTheEnvironmentLoadErrorReachesTheRefusals(t *testing.T) {
 	})
 
 	t.Run("a missing path says which it is", func(t *testing.T) {
-		cfg := config{brokerInternalToken: "broker-perimeter-token", environmentLoadErr: loadErr}
-		err := cfg.requirePath("workload identity certificate", "", "OVERRIDE", "CERT_FILE")
+		server := New(Manifest{ID: testSolutionID})
+		server.cfg = config{brokerInternalToken: "broker-perimeter-token", environmentLoadErr: loadErr}
+		err := server.validateSources()
 		if err == nil {
-			t.Fatal("an unresolved path was accepted")
+			t.Fatal("an unresolved projected token path was accepted")
 		}
 		if !strings.Contains(err.Error(), "environment failed first") {
 			t.Errorf("the refusal %q does not distinguish an unprovisioned path from an environment that never loaded", err)

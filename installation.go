@@ -72,10 +72,10 @@ const (
 	installationFailure  = "installation step failed"
 )
 
-// handleInstallation is mounted only by serve, on the workload-identity
-// listener. Its allowed-callers file admits the gateway; FromHeaders checks
-// the carrier's structure, not its authority. The host verifies the carried
-// bearer on each outgoing call, just as it does for viewer calls.
+// handleInstallation is mounted only by serve, on the one listener, whose
+// port the cell's mesh admits only from the gateway. FromHeaders checks the
+// carrier's structure, not its authority. The host verifies the carried bearer
+// on each outgoing call, just as it does for viewer calls.
 func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 	token, err := workcontext.FromHeaders(r.Header)
 	if err != nil {

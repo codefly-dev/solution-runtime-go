@@ -199,8 +199,8 @@ type MCPEnvironment struct {
 // callers are tests: an exported method that hands back a servable handler is
 // the PassthroughHandler defect again — whoever mounts it serves the viewer's
 // bearer and this workload's credential over whatever they mounted it on,
-// having skipped validate(), the mTLS boot, the caller allow-list, the ceiling
-// and authenticated outbound. This one also writes boot configuration from
+// having skipped validate(), the boot, the ceiling and the origin-pinned
+// outbound client. This one also writes boot configuration from
 // values its caller supplies, which is the one thing loadConfig exists to be
 // the only source of.
 //
@@ -220,6 +220,16 @@ func (s *Server) mcpHandler(env MCPEnvironment) (http.Handler, error) {
 	if s.mcp == nil {
 		return nil, fmt.Errorf("solution %q declares no MCP server (ServeMCP)", s.manifest.ID)
 	}
+	// The declared frontend, when the test supplied one: the metadata document
+	// names the resource by its title. A boot refuses a solution without one;
+	// this seam serves only the MCP surface and lets the title be absent.
+	if len(s.manifest.Frontend) > 0 {
+		frontend, err := parseFrontend(s.manifest.Frontend)
+		if err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+		}
+		s.frontend = frontend
+	}
 	s.cfg.gatewayURL, s.cfg.mcpIssuerURL, s.cfg.mcpPublicURL = env.GatewayURL, env.IssuerURL, env.PublicURL
 	// And the derived set, because this overwrites what it was derived FROM.
 	//
@@ -228,7 +238,7 @@ func (s *Server) mcpHandler(env MCPEnvironment) (http.Handler, error) {
 	// runs, so the net that stops a tool naming an address this runtime
 	// dialled was silently off there. A derived field whose sources are
 	// reassigned is stale until it is not.
-	s.cfg.dialled = dialledAddresses(s.cfg.gatewayURL, s.cfg.mintURL)
+	s.cfg.dialled = dialledAddresses(s.cfg.gatewayURL)
 	// The caller named both, so they are as explicit as the composition's
 	// declared values: what validate() refuses is an issuer nobody chose, and
 	// what a refusal has to name for a public URL is whoever set it.
@@ -567,7 +577,7 @@ func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.
 		Resource:               s.mcpResource(r),
 		AuthorizationServers:   []string{s.cfg.mcpIssuerURL},
 		BearerMethodsSupported: []string{"header"},
-		ResourceName:           s.manifest.Title,
+		ResourceName:           s.frontend.Title,
 	}).ServeHTTP(w, r)
 }
 

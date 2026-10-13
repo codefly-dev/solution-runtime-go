@@ -2,9 +2,6 @@ package solution
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -84,62 +81,25 @@ func readAuthority(ctx context.Context) (*codefly.Authority, error) {
 	return authority, nil
 }
 
-// platformCredentialSource is the native module broker client,
-// pointed at the host's mint endpoint, presenting the service-account token the
-// platform projects for this workload.
+// platformCredentialSource is the native module broker client, pointed at the
+// host's broker route on the resolved gateway, presenting the service-account
+// token the platform projects for this workload.
 //
-// It carries this runtime's outbound client, so the mint presents this
-// workload's own X.509-SVID, verifies the host against the anchor the platform
-// projected, is not proxied, and does not follow redirects: the request carries
-// the projected token that attests which workload this process is, and a
-// Location would hand that to whatever answered at the mint URL.
+// It carries no identity of its own. The hop is plain HTTP inside the cell,
+// carried by the mesh, and the projected token is what attests which workload
+// asks: the host establishes the principal, the installation and the build
+// from that token and its own records, never from anything this process
+// reports. The client is not proxied, follows no redirect and dials the one
+// origin it was built for, because the request carries that token and a
+// Location would hand it to whatever answered.
 func (s *Server) platformCredentialSource() (*brokerCredentialSource, error) {
 	projectionAudience, err := s.authority.Value(AuthorityGroup, AuthorityProjectionAudienceKey)
 	if err != nil {
 		return nil, err
 	}
-	identity, err := s.serverIdentity()
+	client, err := newBrokerCredentialSource(s.mintOptions(projectionAudience))
 	if err != nil {
-		return nil, err
-	}
-	// ONE long-lived reloader for the leaf, built here and closed over.
-	//
-	// The thing that keeps a rotated leaf presented is the reloader's own
-	// re-read, not a fresh reloader: the SDK's swallows a half-written pair
-	// and keeps the last good one, and a constructor per handshake would
-	// report that error instead of surviving it. outboundLeaf says the same
-	// about the dial path for the same reason.
-	leaf, err := s.outboundLeaf(identity)
-	if err != nil {
-		return nil, err
-	}
-	// HELD TO THE FROZEN PRINCIPAL, at the moment it is presented.
-	//
-	// outboundLeaf is the raw reader — on the default path, the SDK's reloader
-	// over the projected files — and handing it to the SDK unwrapped was the
-	// identity binding this hop lost. The gateway's configuration gets the
-	// same hold through holdPresentedCertificate; this is the other outbound
-	// reader, and it is the one that carries the projected service-account
-	// token. A same-CA rotation to a neighbouring workload's certificate was
-	// presented to the mint while the frozen principal was still this one, and
-	// the SDK cannot catch it: it checks that a certificate is non-empty and
-	// has a key, which is the right division of labour and not a statement
-	// about whose certificate it is.
-	held := heldToTheFrozenPrincipal(leaf, s.principal, "the credential mint")
-	// Refused at boot as well, for the reason holdPresentedCertificate
-	// records: a mismatch found at the first dial is a mismatch found after
-	// the projected token has gone out under it. Only a MISMATCH refuses here
-	// — a read error is the reloader's business and it keeps the last good
-	// pair, so failing the boot on one would refuse a rotation that is merely
-	// half-written.
-	if pair, readErr := leaf(&tls.CertificateRequestInfo{}); readErr == nil && pair != nil {
-		if err := pairPresentsThisWorkload(pair, s.principal); err != nil {
-			return nil, fmt.Errorf("this workload would present a certificate the host has not approved it under to the credential mint: %w", err)
-		}
-	}
-	client, err := newBrokerCredentialSource(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), held))
-	if err != nil {
-		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
+		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", redactedURL(s.cfg.mintURL), err)
 	}
 	return client, nil
 }
@@ -281,25 +241,17 @@ type sealedIdentity struct {
 }
 
 // mintOptions binds the declared prefix and perimeter credential to the frozen
-// authority and live TLS readers. No environment is read after loadConfig.
-func (s *Server) mintOptions(
-	projectionAudience string,
-	anchor func() (*x509.CertPool, error),
-	leaf func(*tls.CertificateRequestInfo) (*tls.Certificate, error),
-) brokerMintOptions {
+// authority and the resolved gateway. No environment is read after loadConfig.
+func (s *Server) mintOptions(projectionAudience string) brokerMintOptions {
 	return brokerMintOptions{
 		URL:                s.cfg.mintURL,
-		Upstream:           s.cfg.upstream,
-		Manifest:           s.manifestJSON(),
 		Prefix:             s.manifest.ID,
 		InternalToken:      s.cfg.brokerInternalToken,
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
 		ProjectedToken:     projectedTokenFile(s.cfg.projectedTokenPath),
 		ProjectionAudience: projectionAudience,
 		Authority:          s.authority,
-		TrustAnchor:        anchor,
-		ClientCertificate:  func() (*tls.Certificate, error) { return leaf(&tls.CertificateRequestInfo{}) },
-		AdmittedPeers:      s.admittedMint(),
+		Transport:          s.cfg.transport,
 	}
 }
 
@@ -448,19 +400,6 @@ func (s *Server) openCredential(ctx context.Context) error {
 			wait = firstMintRetryCap
 		}
 	}
-}
-
-// manifestJSON is the frontend manifest this runtime serves, reported with
-// the mint so the host's registration carries it without a self-registration.
-func (s *Server) manifestJSON() string {
-	if s.manifest.ID == "" {
-		return ""
-	}
-	encoded, err := json.Marshal(s.manifestMap())
-	if err != nil {
-		return ""
-	}
-	return string(encoded)
 }
 
 // awaitInstallation asks the host for this execution's credential for as long

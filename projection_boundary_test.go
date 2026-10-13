@@ -30,7 +30,6 @@ func bootableEnvironment(t *testing.T) {
 	t.Helper()
 	t.Setenv("PORT", "8090")
 	t.Setenv("GATEWAY_URL", "https://gateway.cell.test:42152")
-	t.Setenv(CredentialMintURLEnvironmentVariable, "https://mint.cell.test/modules/_work-context")
 	t.Setenv(ContractProfileEnvironmentVariable, "test")
 	t.Setenv("CODEFLY__RUNTIME_CONTEXT", "")
 	// The broker requires its declared workspace secret even when nothing is
@@ -134,7 +133,7 @@ func TestADeclaredPassthroughIsCheckedAgainstTheProjection(t *testing.T) {
 	declared := passthroughModule() // valid: an as, scopes, and a resolvable method
 
 	t.Run("listed in the projection", func(t *testing.T) {
-		s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+		s := New(Manifest{ID: "solution-under-test"})
 		s.consumed = []ConsumedModule{declared}
 		s.cfg = bootConfig(t, projectionOf(declared.As))
 		if _, err := s.validatePassthrough(); err != nil {
@@ -143,7 +142,7 @@ func TestADeclaredPassthroughIsCheckedAgainstTheProjection(t *testing.T) {
 	})
 
 	t.Run("absent from the projection", func(t *testing.T) {
-		s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+		s := New(Manifest{ID: "solution-under-test"})
 		s.consumed = []ConsumedModule{declared}
 		s.cfg = bootConfig(t, projectionOf("something-else"))
 		_, err := s.validatePassthrough()
@@ -170,7 +169,7 @@ func TestADeclaredPassthroughIsCheckedAgainstTheProjection(t *testing.T) {
 // happily counted as success. A mutation that deleted the decode left it
 // green, which is the defect it now fails on.
 func TestTheSeamJudgesItsOwnProjection(t *testing.T) {
-	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	s := New(Manifest{ID: "solution-under-test"})
 	s.consumed = []ConsumedModule{passthroughModule()}
 	_, err := passthroughSeam(s, "https://gateway.cell.test", `{"not":"a list"}`)
 	if err == nil {
@@ -184,7 +183,7 @@ func TestTheSeamJudgesItsOwnProjection(t *testing.T) {
 // And the seam accepts the projection it should: the same declaration, listed.
 // Without this, the test above is satisfied by a seam that refuses everything.
 func TestTheSeamAcceptsAProjectionThatListsTheDeclaration(t *testing.T) {
-	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	s := New(Manifest{ID: "solution-under-test"})
 	s.consumed = []ConsumedModule{passthroughModule()}
 	if _, err := passthroughSeam(s, "https://gateway.cell.test", projectionOf(passthroughModule().As)); err != nil {
 		t.Fatalf("the seam refused a projection that lists the declared module: %v", err)
@@ -204,7 +203,7 @@ func startRefusal(t *testing.T, projection string) error {
 	bootableEnvironment(t)
 	t.Setenv(manifest.APIConsumesEnvironmentVariable, projection)
 
-	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	s := New(Manifest{ID: "solution-under-test", Frontend: []byte(testFrontend)})
 	ln, err := s.start(context.Background())
 	if ln != nil {
 		_ = ln.Close()
@@ -238,7 +237,7 @@ func TestEveryProjectedTargetIsDecodedNotJustTheFirst(t *testing.T) {
 	// And the later target is usable, which is what a dropped one costs: the
 	// declaration names only the second module, so it agrees with the
 	// projection exactly when that entry survived decoding.
-	s := New(Manifest{ID: "solution-under-test", Title: "Solution Under Test"})
+	s := New(Manifest{ID: "solution-under-test"})
 	s.consumed = []ConsumedModule{passthroughModule()}
 	s.cfg = cfg
 	if _, err := s.validatePassthrough(); err != nil {

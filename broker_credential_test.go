@@ -2,8 +2,8 @@ package solution
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,7 +34,7 @@ func brokerFixture(t *testing.T) (*Server, *hostMint, string) {
 	s.cfg.mintURL = "https://broker.example/modules/_work-context"
 	s.cfg.brokerInternalToken = "broker-perimeter-token"
 	s.cfg.projectedTokenPath = path
-	options := s.mintOptions("accounts", func() (*x509.CertPool, error) { return x509.NewCertPool(), nil }, func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &tls.Certificate{}, nil })
+	options := s.mintOptions("accounts")
 	options.Authority = fixedAuthority{audience: testAudience}
 	c, err := newBrokerCredentialSource(options)
 	if err != nil {
@@ -70,7 +70,12 @@ func TestBrokerExecutionProtocolConformance(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requireBrokerBody(t, raw, "widgets-go")
+		// The prefix and nothing else: where this runtime serves and what
+		// its frontend declares travel in the presence document, not here.
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil || len(body) != 1 || body["prefix"] != "widgets-go" {
+			t.Fatalf("the mint body is %s, want exactly {\"prefix\":\"widgets-go\"}", raw)
+		}
 		r.Body = io.NopCloser(strings.NewReader(string(raw)))
 		return wire.RoundTrip(r)
 	})
@@ -229,7 +234,7 @@ func TestBrokerConfigurationUsesDeclaredSecretAndRefusesMissingValues(t *testing
 	}
 	s, _, _ := brokerFixture(t)
 	options := s.brokerCredential.options
-	for _, field := range []string{"prefix", "secret", "audience", "path"} {
+	for _, field := range []string{"prefix", "secret", "audience", "path", "plaintext to a host the mesh does not carry", "plaintext to loopback in a deployment", "a misspelled mesh assertion"} {
 		bad := options
 		switch field {
 		case "prefix":
@@ -240,9 +245,31 @@ func TestBrokerConfigurationUsesDeclaredSecretAndRefusesMissingValues(t *testing
 			bad.ProjectionAudience = "different"
 		case "path":
 			bad.URL = "https://broker.example/platform/_credential"
+		case "plaintext to a host the mesh does not carry":
+			bad.URL = "http://broker.example/modules/_work-context"
+			bad.Transport = meshTransport{value: "true", set: true}
+		case "plaintext to loopback in a deployment":
+			bad.URL = "http://127.0.0.1:8080/modules/_work-context"
+			bad.Transport = meshTransport{}
+		case "a misspelled mesh assertion":
+			bad.URL = "http://auth-gateway.platform.svc:8080/modules/_work-context"
+			bad.Transport = meshTransport{value: "yes", set: true}
 		}
 		if _, err := newBrokerCredentialSource(bad); err == nil {
 			t.Fatalf("accepted missing/wrong %s", field)
+		}
+	}
+	// And admitted exactly where the SDK's rule admits plaintext: the mint
+	// hop carries the projected token, so it is held to the same rule the
+	// gateway URL is held to at validation, through the same function.
+	for name, admitted := range map[string]brokerMintOptions{
+		"loopback on a local run":                   {URL: "http://127.0.0.1:8080/modules/_work-context", Transport: meshTransport{local: true}},
+		"an in-cluster Service under the assertion": {URL: "http://auth-gateway.platform.svc.cluster.local:8080/modules/_work-context", Transport: meshTransport{value: "true", set: true}},
+	} {
+		good := options
+		good.URL, good.Transport = admitted.URL, admitted.Transport
+		if _, err := newBrokerCredentialSource(good); err != nil {
+			t.Fatalf("%s was refused by the native mint client: %v", name, err)
 		}
 	}
 }
