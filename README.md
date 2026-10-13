@@ -65,10 +65,37 @@ Four things follow, and each is a boot failure rather than a degraded run:
 Execution minting uses the host's module broker protocol natively. The reference
 is `saas-sdk-go/moduleauthority` at `217bf9fe3f10`; importing that package is
 incompatible with this runtime's SDK capability API, so no dependency was added.
-The request is `POST /modules/_work-context`, with exactly
+The request is `POST /modules/_work-context`, with
 `{"prefix":"<Manifest.ID>"}`, `Authorization: Bearer <projected token>`, and
 `X-Codefly-Internal-Token`. The prefix is the declared solution ID, separate from
-the frozen SPIFFE principal. The answer carries `token`, `expiresAt`,
+the frozen SPIFFE principal. Beside the prefix the body reports the dynamic half
+of this runtime's registration, since nothing self-registers: `upstream`, the
+https origin the gateway dials to reach this runtime, and `manifest`, the
+frontend manifest this runtime serves. The host records both under the identity
+the projected token proves and reaches the origin only under this workload's
+SVID. The whole request is bounded at 64 KiB, and a manifest that takes it over
+is refused at boot, naming the manifest.
+
+`upstream` is the address Codefly **advertises** for this service's http
+endpoint — the `CODEFLY__SELF_ENDPOINT__<MODULE>__<SERVICE>__HTTP__HTTP` carrier
+— and never the address it listens on. A rendered cell localizes a service's own
+`CODEFLY__ENDPOINT__` carrier to `localhost`, so reporting that would have the
+gateway proxy the solution to the gateway's own loopback. With no carrier, a
+process on a developer machine reports the loopback port it actually binds
+(`PORT` included). In a deployed runtime context a loopback origin, a missing
+carrier and a carrier that does not hold exactly a host and a port each fail the
+boot; a present carrier is never treated as absent.
+
+A host that admits this workload but has not been asked to install it anywhere
+answers `412`. That is not a refusal. The runtime serves holding no credential:
+`/health` answers `200`, and the [install step](#install-step) runs, because it
+acts under the capability the host carries in and the host issues this
+execution's credential only after that step is acknowledged. Neither asks the
+host again. The runtime asks every 20 seconds (jittered), and at once — then a
+few times in quick succession — after it acknowledges an install step, and holds
+the first credential issued. A viewer's route still answers `503` until then. A
+`401`/`403`
+stays what it was: a judgement, which fails the boot and is never retried. The answer carries `token`, `expiresAt`,
 `principalId`, and `tenant`. Core alone reads the returned capability, through
 its structural `Decode` (named `Inspect` before core v0.15); the runtime does not
 implement a signed encoding or verify an issuer's authority, and that read

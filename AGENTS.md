@@ -444,10 +444,33 @@ embedding it.
   answer is recorded **where the answer lands** rather than by whichever caller
   was still waiting — the ask is detached, so it can finish with nobody
   listening.
+- **The mint reports the dynamic half of the registration; nothing else
+  does.** `upstream` (where the gateway dials this runtime) and `manifest` (the
+  frontend manifest it serves) travel in the mint body, recorded by the host
+  under the identity the projected token proves. This is not the registration
+  this runtime removed: it adds no request, no timer and no credential, and it
+  cannot make a workload present — the host completes only a declaration its
+  own delivery already applied. `upstream` is the **advertised** address
+  (`CODEFLY__SELF_ENDPOINT__…`, through core's accessor), never the listen
+  address a cell localizes to `localhost`; a present carrier is never read as
+  absent, and a deployed runtime context refuses a loopback origin at boot.
+  `brokerMintBodyMaxBytes` bounds the request at boot, under what the host
+  reads, so the bound that fires is the one that can name the manifest.
+- **`412` is "admitted, installed nowhere", and it is a state, not an error.**
+  The host issues this execution's credential only after the install step is
+  acknowledged, so the step must run without it — it acts under the capability
+  the host carries in — and `/health` must answer 200, both from what the
+  controller already recorded (`uninstalled`) without asking again.
+  `awaitInstallation` is the one asker, through `askOnce` like every other
+  ask: an ask made around the controller left a terminal answer latched in the
+  source and reported by nobody. A viewer's route still answers 503. Do not
+  widen the exemption to any other unavailable state: a host that cannot be
+  reached is not an uninstalled solution.
 - **The execution mint follows the host's module broker contract natively.**
   `saas-sdk-go/moduleauthority` at `217bf9fe3f10` is the wire reference; its
-  capability dependency is incompatible with this runtime. Send exactly
-  `prefix: Manifest.ID` to `/modules/_work-context`, with the projected token
+  capability dependency is incompatible with this runtime. Send
+  `prefix: Manifest.ID` — and beside it only `upstream` and `manifest`, below —
+  to `/modules/_work-context`, with the projected token
   as bearer and `X-Codefly-Internal-Token` from the declared workspace secret
   `module-authority/INTERNAL_TOKEN`. Resolve it in `loadConfig`, refuse absence
   in `validate()`, and never resurrect a legacy secret reader. The projection

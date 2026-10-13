@@ -324,7 +324,10 @@ type Server struct {
 	// cannot act for anyone and nothing it does locally changes that.
 	terminal     chan struct{}
 	terminalOnce sync.Once
-	terminalErr  atomic.Pointer[error]
+	// installed signals awaitInstallation that an install step was just
+	// acknowledged. One slot: a pending signal is as good as several.
+	installed   chan struct{}
+	terminalErr atomic.Pointer[error]
 	// The one in-flight credential ask and what it last produced. See askOnce:
 	// without single-flight, a credential entering its renewal window turns
 	// every concurrent viewer request into its own audited mint.
@@ -384,7 +387,12 @@ type config struct {
 	assetsDir string
 	// mintURL is the explicitly configured module broker endpoint. The prefix
 	// comes from Manifest.ID; authority audiences remain frozen separately.
-	mintURL             string
+	mintURL string
+	// upstream is the https origin peers reach this runtime at, reported at
+	// mint (see brokerMintOptions.Upstream), and upstreamErr is why there is
+	// none. See advertisedOrigin.
+	upstream            string
+	upstreamErr         error
 	brokerInternalToken string
 	// projectedTokenPath is the file the platform projects this workload's
 	// service-account token into. It is re-read before every renewal, because
@@ -520,6 +528,134 @@ func env(key, fallback string) string {
 // "localhost:8080"), and other endpoints as URLs; url.Parse reads the bare form
 // as scheme "localhost" with no port, which left every rendered solution
 // refusing to boot with an empty listen port. Both forms resolve here.
+// advertisedOrigin is the https origin this runtime reports to the host as
+// where it serves: what the gateway dials to proxy to it.
+//
+// It is the address Codefly ADVERTISES for this service's http endpoint — the
+// CODEFLY__SELF_ENDPOINT__ carrier, read through core's accessor — and never
+// the one it listens on. The two differ exactly where it matters: a rendered
+// cell localizes a service's own CODEFLY__ENDPOINT__ carrier to
+// "localhost:8080", so a runtime that reported its listen address told the
+// gateway to proxy the solution to the gateway's own loopback.
+//
+// Without the carrier, a process on a developer machine reports the loopback
+// port it actually listens on — PORT included, since that is the port the
+// listener binds — because the gateway beside it reaches it there. In a
+// deployed runtime context that answer is a loopback address no peer can
+// dial, and validate() refuses the boot naming the carrier.
+//
+// The scheme is always https: the listener is TLS-only, whatever scheme the
+// carrier's value was written with.
+func advertisedOrigin(ctx context.Context, self, port string, environment []string) (string, error) {
+	module, service := os.Getenv(resources.ModulePrefix), os.Getenv(resources.ServicePrefix)
+	info := &resources.EndpointInformation{Module: module, Service: service, Name: "http", API: "http"}
+	carrier := resources.SelfEndpointAsEnvironmentVariableKey(info)
+	if module != "" && service != "" {
+		instance, err := resources.FindSelfNetworkInstanceInEnvironmentVariables(ctx, info, environment)
+		switch {
+		case err == nil:
+			origin, err := httpsOrigin(instance.Address)
+			if err != nil {
+				return "", fmt.Errorf("the advertised address in %s is not one a peer can dial: %w", carrier, err)
+			}
+			return origin, nil
+		case !errors.Is(err, resources.ErrEndpointCarrierAbsent):
+			// Present and not an address. Never treated as absence: falling
+			// back to the listen address here is how a typo becomes a
+			// solution proxied to the gateway's own loopback.
+			return "", fmt.Errorf("the advertised address in %s cannot be read: %w", carrier, err)
+		}
+	}
+	// No carrier. The listen address, on the port actually bound.
+	host := "localhost"
+	if listening := hostnameOf(self); listening != "" {
+		host = listening
+	}
+	if port == "" {
+		// Nothing to report, and nothing to add: validate() refuses an
+		// unresolved listen port in its own words.
+		return "", nil
+	}
+	origin, err := httpsOrigin(net.JoinHostPort(host, port))
+	if err != nil {
+		return "", fmt.Errorf("no advertised address in %s, and the listen address is not one a peer can dial: %w", carrier, err)
+	}
+	return origin, nil
+}
+
+// httpsOrigin is "https://host:port" for an address written as host:port or as
+// a URL, and an error for anything that is not exactly a host and a port.
+//
+// Strict, because this value is handed to another component to dial. A path, a
+// query, userinfo, a missing port, a port that is not one, and a host that
+// names no machine (the unspecified address a listener binds) are all refused
+// rather than trimmed: each is a destination that is not the one somebody
+// meant.
+func httpsOrigin(raw string) (string, error) {
+	hostport := strings.TrimSpace(raw)
+	if strings.Contains(hostport, "://") {
+		u, err := url.Parse(hostport)
+		if err != nil {
+			return "", errors.New("it does not parse as a URL")
+		}
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.Trim(u.Path, "/") != "" {
+			return "", errors.New("it carries more than a host and a port")
+		}
+		hostport = u.Host
+	}
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return "", errors.New("it is not a host and a port")
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "", errors.New("its port is not a port")
+	}
+	if host == "" || strings.ContainsAny(host, "/@?# ") {
+		return "", errors.New("it names no host")
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return "", errors.New("it is the unspecified address, which names no machine")
+	}
+	return "https://" + net.JoinHostPort(host, port), nil
+}
+
+// hostnameOf is the host of a listen address written as host:port or as a URL,
+// or "" when it names none — a bare ":8080", or the unspecified address.
+func hostnameOf(raw string) string {
+	hostport := raw
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return ""
+		}
+		hostport = u.Host
+	}
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return ""
+	}
+	return host
+}
+
+// loopbackOrigin reports whether origin names this machine: localhost (or a
+// name under .localhost) or a loopback IP. Such an origin is reachable only
+// from the process's own host.
+func loopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func listenPort(self string) string {
 	if strings.Contains(self, "://") {
 		if u, err := url.Parse(self); err == nil {
@@ -700,12 +836,15 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 	public := strings.TrimRight(env("PUBLIC_URL", ""), "/")
 
 	// Own endpoint: the port Codefly assigned this service, not a fixed default.
+	self := address(ctx, "", "", "http", "http")
 	port := env("PORT", "")
-	if port == "" {
-		if self := address(ctx, "", "", "http", "http"); self != "" {
-			port = listenPort(self)
-		}
+	if port == "" && self != "" {
+		port = listenPort(self)
 	}
+	// Where peers reach this runtime, reported with the mint: the address
+	// Codefly ADVERTISES for this endpoint, never the one it listens on. See
+	// advertisedOrigin.
+	upstream, upstreamErr := advertisedOrigin(ctx, self, port, os.Environ())
 
 	// Host endpoints, resolved via the SDK (no localhost:port literals).
 	gatewayURL := strings.TrimRight(env("GATEWAY_URL", resolveGateway(ctx, hostModule, hostGateway)), "/")
@@ -727,6 +866,8 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 		assetsDir:           env("ASSETS_DIR", "../fe-remote/dist"),
 		// The broker path is published, but its origin remains explicit.
 		mintURL:            strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, "")),
+		upstream:           upstream,
+		upstreamErr:        upstreamErr,
 		dialled:            dialledAddresses(gatewayURL, strings.TrimSpace(env(CredentialMintURLEnvironmentVariable, ""))),
 		projectedTokenPath: projectedTokenPath,
 		identityCertFile:   workloadPath(ctx, IdentityCertFileEnvironmentVariable, WorkloadIdentityCertFileKey),
@@ -966,6 +1107,23 @@ func (c config) validate() error {
 	}
 	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
+	}
+	// Where the gateway is told to dial this runtime. Checked at boot because
+	// it is reported with the mint, where the host could only store it: a
+	// wrong origin is a solution that installs and then answers nothing.
+	if c.upstreamErr != nil {
+		if deployedRuntimeContext(c.runtimeContext) {
+			return fmt.Errorf("no origin to report to the host in the deployed runtime context %q: %w — Codefly's render injects the address peers reach this service at as %s__<MODULE>__<SERVICE>__HTTP__HTTP, and a deployed runtime never falls back to the address it listens on",
+				c.runtimeContext, c.upstreamErr, resources.SelfEndpointPrefix)
+		}
+		return fmt.Errorf("no origin to report to the host: %w", c.upstreamErr)
+	}
+	// A loopback origin reported from a deployment is reachable by no peer:
+	// the gateway, dialling its own localhost, would proxy this solution to
+	// itself.
+	if deployedRuntimeContext(c.runtimeContext) && loopbackOrigin(c.upstream) {
+		return fmt.Errorf("the origin this runtime would report to the host, %q, is a loopback address in the deployed runtime context %q: the gateway would proxy this solution to itself. Codefly's render injects the reachable address as %s__<MODULE>__<SERVICE>__HTTP__HTTP",
+			c.upstream, c.runtimeContext, resources.SelfEndpointPrefix)
 	}
 	// Both of these carry credentials: the mint presents the projected token
 	// that attests which workload this process is, and the gateway carries the
@@ -1459,7 +1617,7 @@ func New(manifest Manifest) *Server {
 		// unset announced that product's capability contract to the host.
 		manifest.Contract = manifest.ID
 	}
-	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler), terminal: make(chan struct{})}
+	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler), terminal: make(chan struct{}), installed: make(chan struct{}, 1)}
 }
 
 // Handle registers a solution endpoint. Chainable.
@@ -1643,6 +1801,11 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		}
 		_ = srv.Close()
 	}()
+	// For as long as this server serves, and no longer: Serve hands this
+	// function a context nothing cancels.
+	serving, stopped := context.WithCancel(ctx)
+	defer stopped()
+	go s.awaitInstallation(serving)
 
 	log.Printf("solution %q listening on :%s (gateway=%s, profile=%s)", s.manifest.ID, s.cfg.port, redactedURL(s.cfg.gatewayURL), s.cfg.profile)
 	if serveErr := srv.Serve(ln); !errors.Is(serveErr, http.ErrServerClosed) {
@@ -1686,6 +1849,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// and hands the same one back until its renewal point, so this is a
 	// mutex and a comparison except at the renewal the credential's own expiry
 	// dictates. Nothing here runs on a timer this runtime chose.
+	// Admitted and installed nowhere is healthy: this process serves the one
+	// thing it can be asked for, its install step, and a probe that failed it
+	// would have the orchestrator restart a solution for not being installed.
+	// Answered from what the host last said, without asking it again.
+	if s.uninstalled() {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if s.credential != nil || s.brokerCredential != nil {
 		// Through credentialWithin, so the deadline is real: passing a context
 		// to the SDK's client does not bound it, because what blocks is a

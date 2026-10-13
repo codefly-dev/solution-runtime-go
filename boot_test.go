@@ -97,6 +97,10 @@ type hostMint struct {
 	// as the path it would have used.
 	callers []string
 	paths   []string
+	// answer, when set, decides each workload mint in place of status and
+	// recoverAfter: the status to answer, or zero to issue. It is called on
+	// the host's goroutines, so what it reads must be safe to read there.
+	answer func() int
 	// recoverAfter, when positive, is how many times status is answered before
 	// the host starts issuing: an issuer catching up with a presence
 	// generation that has just been applied.
@@ -360,7 +364,7 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/modules/_work-context" {
 		var body map[string]string
-		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 1 || body["prefix"] != testSolutionID {
+		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || body["prefix"] != testSolutionID || !onlyBrokerBodyKeys(body) {
 			http.Error(w, "invalid broker request", http.StatusBadRequest)
 			return
 		}
@@ -368,7 +372,12 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&m.mints, 1)
 	// recoverAfter 0 means this host never issues; a positive one means it
 	// issues once that many asks have been answered with status.
-	if m.status != 0 && (m.recoverAfter == 0 || atomic.LoadInt64(&m.mints) <= m.recoverAfter) {
+	if m.answer != nil {
+		if status := m.answer(); status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+	} else if m.status != 0 && (m.recoverAfter == 0 || atomic.LoadInt64(&m.mints) <= m.recoverAfter) {
 		w.WriteHeader(m.status)
 		return
 	}

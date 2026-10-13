@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -78,6 +79,10 @@ const (
 func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 	token, err := workcontext.FromHeaders(r.Header)
 	if err != nil {
+		// Named in this process's log, never in the answer: the host's job
+		// retries and dead-letters on a bare 401, and the operator reading
+		// the installation needs to know what the carrier got wrong.
+		log.Printf("solution %q: install step refused: %v", s.manifest.ID, err)
 		http.Error(w, "invalid work context", http.StatusUnauthorized)
 		return
 	}
@@ -86,9 +91,18 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid installation", http.StatusBadRequest)
 		return
 	}
-	if err := s.actingForAViewer(r.Context()); err != nil {
-		installationOutcome{status: http.StatusServiceUnavailable}.write(w)
-		return
+	// An uninstalled solution holds no execution credential and needs none
+	// here: the step acts under the capability the host carried in, and the
+	// host issues this execution's credential only once the step has been
+	// acknowledged. Refusing the step for want of that credential is a
+	// solution nobody can ever install. Every other state is held to what a
+	// viewer's call is held to.
+	uninstalled := s.uninstalled()
+	if !uninstalled {
+		if err := s.actingForAViewer(r.Context()); err != nil {
+			installationOutcome{status: http.StatusServiceUnavailable}.write(w)
+			return
+		}
 	}
 	// The supplied capability is the step's bearer. No viewer session is
 	// involved, and no viewer capability is minted for an install step.
@@ -96,7 +110,13 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 	gw.carriedContext = token
 	gw.orgID = installation.OrganizationID
 	ctx := context.WithValue(r.Context(), mcpViewerKey{}, gw)
-	s.installOnce(ctx, installation).write(w)
+	outcome := s.installOnce(ctx, installation)
+	outcome.write(w)
+	if outcome.status == http.StatusNoContent {
+		// After the answer is written: the host activates the installation
+		// when it reads it, and only then is there a credential to hold.
+		s.installAcknowledged()
+	}
 }
 
 // decodeInstallation bounds the entire body, including whitespace after the

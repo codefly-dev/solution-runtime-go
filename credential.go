@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -287,6 +289,8 @@ func (s *Server) mintOptions(
 ) brokerMintOptions {
 	return brokerMintOptions{
 		URL:                s.cfg.mintURL,
+		Upstream:           s.cfg.upstream,
+		Manifest:           s.manifestJSON(),
 		Prefix:             s.manifest.ID,
 		InternalToken:      s.cfg.brokerInternalToken,
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
@@ -409,6 +413,15 @@ func (s *Server) openCredential(ctx context.Context) error {
 			// wait, and accepting a late success would make it advisory.
 			return fmt.Errorf("obtain this execution's credential from %s: a credential arrived after the %s window closed, so this boot does not hold one",
 				s.cfg.mintURL, window)
+		case awaitingInstallation(err):
+			// Admitted by the host, installed nowhere yet. The install step is
+			// delivered to this runtime's own listener and carries its own
+			// authority, so this boot serves — the install endpoint and health
+			// — holding no credential. serve keeps asking (awaitInstallation)
+			// and holds the first one the host issues.
+			s.noteCredentialAnswer(err)
+			log.Printf("solution %q: no organization has installed this solution yet; serving its install endpoint, and holding a credential once one has", s.manifest.ID)
+			return nil
 		case !errors.Is(err, workcontext.ErrMintUnavailable):
 			// A judgement, or a configuration this client will not even send.
 			return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
@@ -439,6 +452,148 @@ func (s *Server) openCredential(ctx context.Context) error {
 
 // mustDeadline is the deadline of a context that has one. openCredential sets
 // it, so the fallback is only there to keep the arithmetic total.
+// manifestJSON is the frontend manifest this runtime serves, reported with
+// the mint so the host's registration carries it without a self-registration.
+func (s *Server) manifestJSON() string {
+	if s.manifest.ID == "" {
+		return ""
+	}
+	encoded, err := json.Marshal(s.manifestMap())
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// awaitInstallation asks the host for this execution's credential for as long
+// as this process holds none because nothing has installed the solution, and
+// returns when ctx ends or the credential is refused for good.
+//
+// It exists because an uninstalled solution has no other asker. Health and the
+// install step answer from what is already known (see uninstalled), and a
+// viewer's request cannot arrive: the host routes nobody to a solution
+// installed nowhere. So without this the first credential would wait for a
+// request the host will not send.
+//
+// Every ask goes through the controller (askOnce): single-flight with any
+// viewer's ask, the answer recorded where every other reader looks, and a
+// terminal answer ending the process exactly as it does on any other path. An
+// ask made around the controller left a refusal latched in the source and
+// reported by nobody.
+//
+// Two cadences. Uninstalled and idle it asks slowly, with jitter so replicas
+// that booted together stop asking together. After an install step has been
+// acknowledged (installAcknowledged) it asks at once and then a few times in
+// quick succession, because the host activates the installation only after it
+// has read this runtime's answer — the first ask can race it.
+func (s *Server) awaitInstallation(ctx context.Context) {
+	idle := time.NewTimer(awaitInstallationWait())
+	defer idle.Stop()
+	for {
+		followUps := []time.Duration(nil)
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.credentialRefusedC():
+			return
+		case <-s.installed:
+			followUps = awaitInstallationFollowUps
+		case <-idle.C:
+		}
+		for ask := 0; s.uninstalled(); ask++ {
+			credential, err := s.askOnce(ctx, platformRequestTimeout)
+			if err == nil {
+				seal := credential.Seal()
+				log.Printf("solution %q: installed; holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
+					s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation(),
+					credential.ExpiresAt().UTC().Format(time.RFC3339))
+				break
+			}
+			if errors.Is(err, ErrCredentialRefused) || ask >= len(followUps) {
+				// Refused: askOnce has recorded it and the process is
+				// ending. Otherwise still uninstalled, or the host is not
+				// answering — the idle cadence asks again.
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.credentialRefusedC():
+				return
+			case <-time.After(followUps[ask]):
+			}
+		}
+		if !idle.Stop() {
+			select {
+			case <-idle.C:
+			default:
+			}
+		}
+		idle.Reset(awaitInstallationWait())
+	}
+}
+
+// awaitInstallationEvery is how often an uninstalled solution asks again, and
+// awaitInstallationJitter the fraction of it one ask may arrive early by.
+const (
+	awaitInstallationEvery  = 20 * time.Second
+	awaitInstallationJitter = 0.2
+)
+
+// awaitInstallationFollowUps paces the asks after an acknowledged install
+// step: the host activates the installation once it has read the answer, so
+// the credential is a moment away rather than a cadence away.
+var awaitInstallationFollowUps = []time.Duration{
+	250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second,
+}
+
+func awaitInstallationWait() time.Duration {
+	return time.Duration(float64(awaitInstallationEvery) * (1 - awaitInstallationJitter*rand.Float64()))
+}
+
+// awaitingInstallation reports the host's answer that nobody has installed
+// this solution yet.
+func awaitingInstallation(err error) bool {
+	var broker *brokerMintError
+	return errors.As(err, &broker) && broker.class == brokerAwaitingInstallation
+}
+
+// uninstalled reports that this process holds no credential because the host,
+// when last asked, said nothing has installed this solution.
+//
+// It is a reading of what the controller already recorded and asks nobody. A
+// probe or an install step that asked would be one more mint attempt per
+// request against a host that has already answered.
+func (s *Server) uninstalled() bool {
+	if s.terminalErr.Load() != nil {
+		return false
+	}
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	if held := s.credentialHeld; held != nil && held.Token() != "" && time.Now().Before(held.ExpiresAt()) {
+		return false
+	}
+	return awaitingInstallation(s.credentialAskErr)
+}
+
+// noteCredentialAnswer records an answer the controller did not itself
+// receive — the boot's — so every reader sees the same last answer.
+func (s *Server) noteCredentialAnswer(err error) {
+	s.credentialMu.Lock()
+	s.credentialAskErr = err
+	s.credentialMu.Unlock()
+}
+
+// installAcknowledged tells awaitInstallation that an install step has just
+// been answered with success, so the credential is worth asking for now.
+// Never blocks: one pending signal is as good as several.
+func (s *Server) installAcknowledged() {
+	select {
+	case s.installed <- struct{}{}:
+	default:
+	}
+}
+
 func mustDeadline(ctx context.Context) time.Time {
 	if at, ok := ctx.Deadline(); ok {
 		return at
