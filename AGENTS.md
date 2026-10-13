@@ -162,6 +162,7 @@ embedding it.
   `RequestHandler`) as much as the calls it makes. Read that list before you
   change a signature, a struct field or an exported constant; a change that
   breaks a consumer carries a `!` in the commit type and says so in the PR body.
+- Native local listeners bind their SDK-resolved loopback host; `PORT` overrides only the port. Container and Kubernetes listeners retain container-wide binding under platform network admission.
 - Boot configuration is resolved in one place, `loadConfig`, and checked in one
   place, `validate()`: resolved through the SDK, with an explicit env override,
   refused loudly when unresolved. New configuration follows both rather than

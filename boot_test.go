@@ -396,6 +396,8 @@ func bootEnvironment(t *testing.T, mint *hostMint) {
 	ln, port := boundPort(t)
 	provideListener(t, ln)
 	t.Setenv("PORT", port)
+	t.Setenv(resources.ServicePrefix, "backend")
+	t.Setenv("CODEFLY__ENDPOINT__WIDGETS__BACKEND__HTTP__HTTP", ln.Addr().String())
 	// The gateway's workload endpoint, which serves the mint beside every
 	// other route: one resolved origin, and the mint address derived on it.
 	// Plaintext to loopback, which the SDK's rule admits on a local run — and
@@ -752,7 +754,7 @@ func TestABootRefusesAPlaintextGatewayTheMeshDoesNotCarry(t *testing.T) {
 // derived on the same origin is held by the same words at every mint.
 func TestAPlaintextGatewayIsAdmittedExactlyWhereTheSDKsRuleAdmitsIt(t *testing.T) {
 	base := func(gateway string, transport meshTransport) config {
-		return config{brokerInternalToken: "broker-perimeter-token", port: "8080", profile: localProfile,
+		return config{brokerInternalToken: "broker-perimeter-token", port: "8080", listenHost: "127.0.0.1", profile: localProfile,
 			gatewayURL: gateway, mintURL: gateway + credentialMintPath, transport: transport}
 	}
 	asserted := meshTransport{value: "true", set: true}

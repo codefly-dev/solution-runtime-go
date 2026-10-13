@@ -244,6 +244,7 @@ type Server struct {
 }
 
 type config struct {
+	listenHost string
 	port       string
 	gatewayURL string
 	// dialled is every address this process talks to, assembled at boot.
@@ -349,6 +350,21 @@ func listenPort(self string) string {
 		return port
 	}
 	return ""
+}
+
+// listenHost preserves the owning endpoint's allocated interface on native runs.
+func listenHost(self string) string {
+	if strings.Contains(self, "://") {
+		if u, err := url.Parse(self); err == nil {
+			return u.Hostname()
+		}
+		return ""
+	}
+	host, _, err := net.SplitHostPort(self)
+	if err != nil {
+		return ""
+	}
+	return host
 }
 
 // address returns a resolved endpoint's "scheme://host:port", or "" if the SDK
@@ -557,6 +573,7 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 	cfg := config{
 		brokerInternalToken: strings.TrimSpace(internalToken),
 		port:                port,
+		listenHost:          listenHost(self),
 		gatewayURL:          gatewayURL,
 		assetsDir:           env("ASSETS_DIR", "../fe-remote/dist"),
 		dialled:             dialledAddresses(gatewayURL),
@@ -717,6 +734,12 @@ func (c config) validate() error {
 	// from refusing the boot of a solution that serves none.
 	if err := c.validateMCP(); err != nil {
 		return err
+	}
+	if c.nativeListener() {
+		ip := net.ParseIP(c.listenHost)
+		if c.listenHost != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("native listener requires the SDK-resolved loopback host of this service's http endpoint; PORT overrides only its port")
+		}
 	}
 	c.logResolved()
 	return nil
@@ -974,7 +997,7 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	defer stopped()
 	go s.awaitInstallation(serving)
 
-	log.Printf("solution %q listening on :%s (gateway=%s, profile=%s)", s.manifest.ID, s.cfg.port, redactedURL(s.cfg.gatewayURL), s.cfg.profile)
+	log.Printf("solution %q listening on %s (gateway=%s, profile=%s)", s.manifest.ID, ln.Addr(), redactedURL(s.cfg.gatewayURL), s.cfg.profile)
 	if serveErr := srv.Serve(ln); !errors.Is(serveErr, http.ErrServerClosed) {
 		return serveErr
 	}
@@ -997,11 +1020,19 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 // decision the cell makes for every workload. What this process still decides
 // is what a caller may do once admitted, which the stamped identity headers
 // and this execution's credential govern route by route.
+func (c config) nativeListener() bool {
+	return c.transport.local && c.runtimeContext != resources.RuntimeContextContainer && c.runtimeContext != resources.RuntimeContextKubernetes
+}
+
 func (s *Server) listen() (net.Listener, error) {
 	if s.boundListener != nil {
 		return s.boundListener, nil
 	}
-	ln, err := net.Listen("tcp", ":"+s.cfg.port)
+	host := ""
+	if s.cfg.nativeListener() {
+		host = s.cfg.listenHost
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, s.cfg.port))
 	if err != nil {
 		return nil, fmt.Errorf("listen on :%s: %w", s.cfg.port, err)
 	}

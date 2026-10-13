@@ -119,6 +119,19 @@ The CLI projects the service-account token read-only at
 still available. Token reads are bounded to 64 KiB and repeated for every mint;
 missing, empty, unreadable or oversized files fail closed before a request.
 
+## Native listener isolation
+
+On a local native run the runtime binds the loopback host and port of its own
+SDK-resolved `http` endpoint. `PORT` can change the port, but cannot broaden the
+listener to other interfaces. An absent or non-loopback native endpoint fails
+configuration validation. The CLI supplies the endpoint automatically; there is
+no separate host override to copy into each component.
+
+Container and Kubernetes processes retain their container-wide listener, where
+the platform owns network admission. A local environment name alone does not
+turn a container listener into a loopback listener. Production admission still
+requires the declared mesh boundary; this change does not qualify that boundary.
+
 ## Handler errors
 
 Return `ClientError` for an explicitly public validation message. Connect errors
