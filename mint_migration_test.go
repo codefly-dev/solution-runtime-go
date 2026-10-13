@@ -95,8 +95,15 @@ func TestUnusableProjectedTokenNeverReachesTheMint(t *testing.T) {
 			mint := newHostMint(t, &hostMint{})
 			source := productionMintSource(t, mint, path)
 			credential, err := source.Credential(context.Background())
-			if credential.Token() != "" || !terminalCredentialFailure(err) {
+			if credential.Token() != "" || err == nil {
 				t.Fatalf("unusable projection did not fail closed: %v", err)
+			}
+			// Not there yet is waited for; there and unusable is not.
+			if wantTerminal := kind != "missing"; terminalCredentialFailure(err) != wantTerminal {
+				t.Fatalf("a %s projection: terminal = %v, want %v (%v)", kind, !wantTerminal, wantTerminal, err)
+			}
+			if kind == "missing" && !errors.Is(err, workcontext.ErrMintUnavailable) {
+				t.Fatalf("a projection that is not there yet must read as unavailable: %v", err)
 			}
 			if !strings.Contains(err.Error(), "projected service-account token") || strings.Contains(err.Error(), path) {
 				t.Fatalf("projection error is unclear or discloses its raw path: %v", err)

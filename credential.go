@@ -450,8 +450,6 @@ func (s *Server) openCredential(ctx context.Context) error {
 	}
 }
 
-// mustDeadline is the deadline of a context that has one. openCredential sets
-// it, so the fallback is only there to keep the arithmetic total.
 // manifestJSON is the frontend manifest this runtime serves, reported with
 // the mint so the host's registration carries it without a self-registration.
 func (s *Server) manifestJSON() string {
@@ -500,7 +498,7 @@ func (s *Server) awaitInstallation(ctx context.Context) {
 			followUps = awaitInstallationFollowUps
 		case <-idle.C:
 		}
-		for ask := 0; s.uninstalled(); ask++ {
+		for ask := 0; s.awaitsInstallation(); ask++ {
 			credential, err := s.askOnce(ctx, platformRequestTimeout)
 			if err == nil {
 				seal := credential.Seal()
@@ -576,9 +574,26 @@ func (s *Server) uninstalled() bool {
 	return awaitingInstallation(s.credentialAskErr)
 }
 
+// awaitsInstallation reports that this process holds no credential and the
+// host has said, at some point since it last held one, that nothing has
+// installed the solution.
+//
+// Wider than uninstalled on purpose. One transient answer after a 412 — the
+// host restarting, a pass in flight — leaves the solution exactly as
+// uninstalled as it was, and an asker that stopped there would leave the
+// first credential waiting for the host's next install delivery.
+func (s *Server) awaitsInstallation() bool {
+	if s.terminalErr.Load() != nil || !s.awaiting.Load() {
+		return false
+	}
+	_, held := s.heldCredential()
+	return !held
+}
+
 // noteCredentialAnswer records an answer the controller did not itself
 // receive — the boot's — so every reader sees the same last answer.
 func (s *Server) noteCredentialAnswer(err error) {
+	s.awaiting.Store(awaitingInstallation(err))
 	s.credentialMu.Lock()
 	s.credentialAskErr = err
 	s.credentialMu.Unlock()
@@ -594,6 +609,8 @@ func (s *Server) installAcknowledged() {
 	}
 }
 
+// mustDeadline is the deadline of a context that has one. openCredential sets
+// it, so the fallback is only there to keep the arithmetic total.
 func mustDeadline(ctx context.Context) time.Time {
 	if at, ok := ctx.Deadline(); ok {
 		return at

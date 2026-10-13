@@ -6,8 +6,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"syscall"
 
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -44,12 +46,20 @@ type projectedTokenFile string
 func (path projectedTokenFile) ProjectedToken() (string, error) {
 	token, err := workcontext.ProjectedTokenFile(path).ProjectedToken()
 	if err != nil {
-		return "", &projectedTokenError{}
+		// Absent is told apart from unusable, and only by asking the
+		// filesystem the one question: is there anything at this path. A
+		// token that is not there has not been projected yet; one that is
+		// there and cannot be used is a projection somebody got wrong.
+		_, statErr := os.Lstat(string(path))
+		return "", &projectedTokenError{absent: errors.Is(statErr, fs.ErrNotExist)}
 	}
 	return token, nil
 }
 
-type projectedTokenError struct{}
+type projectedTokenError struct {
+	// absent: nothing exists at the projection path.
+	absent bool
+}
 
 func (*projectedTokenError) Error() string {
 	return "projected service-account token is missing, empty, unreadable or exceeds 65536 bytes"
@@ -68,6 +78,10 @@ const (
 	brokerTransport
 	brokerInvalidAnswer
 	brokerProjection
+	// brokerProjectionAbsent: there is no token at the projection path. The
+	// platform has not projected it yet; nothing is sent, and the ask is
+	// retried.
+	brokerProjectionAbsent
 	// brokerAwaitingInstallation: the host admits this workload and has not
 	// been asked to install it anywhere yet. The install step arrives on this
 	// runtime's own listener; until then there is nothing to mint for.
@@ -102,6 +116,8 @@ func (e *brokerMintError) Error() string {
 		return fmt.Sprintf("module broker: HTTP %d: request failed", e.status)
 	case brokerInvalidAnswer:
 		return "module broker: invalid credential response"
+	case brokerProjectionAbsent:
+		return "projected service-account token is missing: it has not been projected yet"
 	case brokerProjection:
 		return "projected service-account token is missing, empty, unreadable or exceeds 65536 bytes"
 	}
@@ -118,9 +134,19 @@ func (e *brokerMintError) Error() string {
 		return "module broker: transport or response read failed"
 	}
 }
+
+// retryable reports an answer that judges nothing about this build.
+//
+// A projection that is not there yet is one of them. The platform projects the
+// token, and a process can be running before it has; nothing is sent without
+// one, so waiting costs no authority: a boot waits inside its bounded window
+// and exits as unavailable if the projection never arrives. A projection that
+// is there and unusable — empty, oversized, not a file — is a different thing
+// and stays terminal: no amount of waiting repairs it.
 func (e *brokerMintError) retryable() bool {
-	return e.class == brokerNotEstablished || e.class == brokerAwaitingInstallation || e.class == brokerTransport &&
-		(e.transport == brokerTransportTimeout || e.transport == brokerTransportRefused || e.transport == brokerTransportReset)
+	return e.class == brokerNotEstablished || e.class == brokerAwaitingInstallation || e.class == brokerProjectionAbsent ||
+		e.class == brokerTransport &&
+			(e.transport == brokerTransportTimeout || e.transport == brokerTransportRefused || e.transport == brokerTransportReset)
 }
 func (e *brokerMintError) Unwrap() error {
 	if e.class == brokerRefused {

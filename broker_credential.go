@@ -145,6 +145,9 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	if err != nil {
 		var projection *projectedTokenError
 		if errors.As(err, &projection) {
+			if projection.absent {
+				return workcontext.Credential{}, &brokerMintError{class: brokerProjectionAbsent}
+			}
 			return workcontext.Credential{}, &brokerMintError{class: brokerProjection}
 		}
 		return workcontext.Credential{}, classifyBrokerTransport(err)

@@ -82,20 +82,24 @@ endpoint — the `CODEFLY__SELF_ENDPOINT__<MODULE>__<SERVICE>__HTTP__HTTP` carri
 `CODEFLY__ENDPOINT__` carrier to `localhost`, so reporting that would have the
 gateway proxy the solution to the gateway's own loopback. With no carrier, a
 process on a developer machine reports the loopback port it actually binds
-(`PORT` included). In a deployed runtime context a loopback origin, a missing
-carrier and a carrier that does not hold exactly a host and a port each fail the
-boot; a present carrier is never treated as absent.
+(`PORT` included). In a deployed runtime context a loopback origin fails the
+boot — which is what a missing carrier resolves to in a rendered cell — and so
+does a carrier that does not hold exactly a host and a port; a present carrier
+is never treated as absent.
 
 A host that admits this workload but has not been asked to install it anywhere
 answers `412`. That is not a refusal. The runtime serves holding no credential:
 `/health` answers `200`, and the [install step](#install-step) runs, because it
 acts under the capability the host carries in and the host issues this
 execution's credential only after that step is acknowledged. Neither asks the
-host again. The runtime asks every 20 seconds (jittered), and at once — then a
-few times in quick succession — after it acknowledges an install step, and holds
-the first credential issued. A viewer's route still answers `503` until then. A
+host again. The runtime asks every 20 seconds (jittered) for as long as it holds
+no credential — through a transient answer too — and at once, then a few times
+in quick succession, after it acknowledges an install step. It holds the first
+credential issued. A viewer's route still answers `503` until then. A
 `401`/`403`
-stays what it was: a judgement, which fails the boot and is never retried. The answer carries `token`, `expiresAt`,
+stays what it was: a judgement, which fails the boot and is never retried.
+
+The answer carries `token`, `expiresAt`,
 `principalId`, and `tenant`. Core alone reads the returned capability, through
 its structural `Decode` (named `Inspect` before core v0.15); the runtime does not
 implement a signed encoding or verify an issuer's authority, and that read
@@ -555,13 +559,14 @@ is waited for, within a bound.** The two are different answers:
 - A **refusal** (`401` or `403`, wrapping `ErrMintRefused`) is terminal and
   retained. It is never retried.
 - An **unavailable** mint (`503`, timeout, connection refused or connection
-  reset, wrapping `ErrMintUnavailable`) is retried with backoff inside the
+  reset, or a projected token that is not there yet, wrapping
+  `ErrMintUnavailable`) is retried with backoff inside the
   **two-minute** boot deadline. Renewal uses the same classification and keeps
   an unexpired held credential available during transient failures.
 - Every other HTTP status, including `400`, `404`, `429`, `500`, and redirects,
   is a **terminal error**. TLS, permanent DNS, cancellation, unclassified
-  transport failures, invalid responses and unusable projections are terminal
-  too. They stop renewal and fail health. Status, status class and transport
+  transport failures, invalid responses and a projection that is present but
+  unusable are terminal too. They stop renewal and fail health. Status, status class and transport
   category survive; raw body, headers, parser diagnostics and causes do not.
 
 Every mint makes a fresh TLS 1.3 handshake, presents this workload's identity,

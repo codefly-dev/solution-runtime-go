@@ -961,7 +961,11 @@ func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
 // the port is released by construction. Nothing is released here.
 func boundPort(t *testing.T) (net.Listener, string) {
 	t.Helper()
-	ln, err := net.Listen("tcp", ":0")
+	// On the loopback address the tests dial, not the wildcard. A wildcard
+	// bind succeeds on a port another local process holds on 127.0.0.1, and
+	// the test's own client then reaches that process instead: "first record
+	// does not look like a TLS handshake", from a neighbour.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
