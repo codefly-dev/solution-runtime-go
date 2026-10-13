@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — the mint reports the registration's dynamic half; the runtime serves uninstalled
+
+The mint body carries `upstream` (the advertised https origin, never the listen
+address) and `manifest` beside `prefix`, bounded at 64 KiB at boot. A deployed
+runtime context refuses a loopback origin.
+
+`412` from the broker is "admitted, installed nowhere": the runtime serves its
+install step and `/health` holding no credential, and asks again until one is
+issued. A viewer's route still answers 503.
+
+A projected token that is not there yet is unavailable, not terminal: a boot
+waits for it inside the two-minute window, and a renewal keeps an unexpired
+credential. One that is present and unusable stays terminal.
+
 ## Unreleased — native module-broker execution mint
 
 Breaking API change: `WorkContextRefusal.Code` and `WorkContextRefusal.Message`

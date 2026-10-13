@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -300,5 +301,78 @@ func TestAnOversizeMintRequestIsRefusedAtBoot(t *testing.T) {
 	options.Manifest = `{"pad":"` + strings.Repeat("a", brokerMintBodyMaxBytes/2) + `"}`
 	if _, err := newBrokerCredentialSource(options); err != nil {
 		t.Fatalf("a mint request inside the bound was refused: %v", err)
+	}
+}
+
+// TestTheAskerSurvivesATransientAnswerWhileUninstalled: one answer that
+// judges nothing — the host restarting, a pass in flight — leaves the solution
+// exactly as uninstalled as it was. An asker that stopped there left the first
+// credential waiting for the host's next install delivery.
+func TestTheAskerSurvivesATransientAnswerWhileUninstalled(t *testing.T) {
+	var phase atomic.Int32 // 0: installed nowhere, 1: one transient answer, 2: issuing
+	host := newHostMint(t, &hostMint{answer: func() int {
+		switch phase.Load() {
+		case 0:
+			return http.StatusPreconditionFailed
+		case 1:
+			phase.Store(2)
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}})
+	s := New(Manifest{ID: testSolutionID}).OnInstall(func(context.Context, Installation) error { return nil })
+	b := boot(t, s, host)
+	t.Cleanup(b.client.CloseIdleConnections)
+	b.client.Timeout = 5 * time.Second
+
+	if status := postInstall(t, b); status != http.StatusNoContent {
+		t.Fatalf("install step = %d, want 204", status)
+	}
+	phase.Store(1)
+	deadline := time.Now().Add(awaitInstallationEvery / 2)
+	for {
+		if _, held := s.heldCredential(); held {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no credential held %s after one transient answer: the asker stopped, and nothing but the host's next install delivery would start it again", awaitInstallationEvery/2)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestABootWaitsForAProjectionThatIsNotThereYet: the platform projects the
+// token, and a process can be running before it has. Nothing is sent without
+// one, so the boot waits inside its window instead of ending on a state the
+// platform is about to leave.
+func TestABootWaitsForAProjectionThatIsNotThereYet(t *testing.T) {
+	host := newHostMint(t, &hostMint{})
+	s := New(Manifest{ID: testSolutionID})
+	bootEnvironment(t, host)
+	tokenFile := os.Getenv(ProjectedTokenFileEnvironmentVariable)
+	projected, err := os.ReadFile(tokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = os.WriteFile(tokenFile, projected, 0o600)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ln, err := takeListener(s).start(ctx)
+	if err != nil {
+		t.Fatalf("a boot whose projected token arrived a moment late was refused: %v", err)
+	}
+	_ = ln.Close()
+	if _, held := s.heldCredential(); !held {
+		t.Fatal("the boot came up holding no credential")
+	}
+	if got := host.count(); got != 1 {
+		t.Fatalf("the host was asked %d time(s); nothing is sent without a token, so exactly one ask reaches it", got)
 	}
 }

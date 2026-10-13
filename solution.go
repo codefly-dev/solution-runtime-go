@@ -326,7 +326,12 @@ type Server struct {
 	terminalOnce sync.Once
 	// installed signals awaitInstallation that an install step was just
 	// acknowledged. One slot: a pending signal is as good as several.
-	installed   chan struct{}
+	installed chan struct{}
+	// awaiting is set once the host has answered that nothing has installed
+	// this solution, and cleared when a credential is held. It is what keeps
+	// awaitInstallation asking through a transient answer in between; whether
+	// the process may SERVE uninstalled is a stricter question (uninstalled).
+	awaiting    atomic.Bool
 	terminalErr atomic.Pointer[error]
 	// The one in-flight credential ask and what it last produced. See askOnce:
 	// without single-flight, a credential entering its renewal window turns
@@ -519,15 +524,6 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// address returns a resolved endpoint's "scheme://host:port", or "" if the SDK
-// could not resolve it. Using the SDK keeps addresses and ports out of the
-// runtime: they come from Codefly's runtime-injected endpoint map (or, in a
-// local run, its deterministic native workspace map) — never a hardcoded port.
-// listenPort is the port of this service's own endpoint address. Codefly hands a
-// service its own endpoint as a bare "host:port" (a rendered cell writes
-// "localhost:8080"), and other endpoints as URLs; url.Parse reads the bare form
-// as scheme "localhost" with no port, which left every rendered solution
-// refusing to boot with an empty listen port. Both forms resolve here.
 // advertisedOrigin is the https origin this runtime reports to the host as
 // where it serves: what the gateway dials to proxy to it.
 //
@@ -656,6 +652,11 @@ func loopbackOrigin(origin string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// listenPort is the port of this service's own endpoint address. Codefly hands a
+// service its own endpoint as a bare "host:port" (a rendered cell writes
+// "localhost:8080"), and other endpoints as URLs; url.Parse reads the bare form
+// as scheme "localhost" with no port, which left every rendered solution
+// refusing to boot with an empty listen port. Both forms resolve here.
 func listenPort(self string) string {
 	if strings.Contains(self, "://") {
 		if u, err := url.Parse(self); err == nil {
@@ -669,6 +670,10 @@ func listenPort(self string) string {
 	return ""
 }
 
+// address returns a resolved endpoint's "scheme://host:port", or "" if the SDK
+// could not resolve it. Using the SDK keeps addresses and ports out of the
+// runtime: they come from Codefly's runtime-injected endpoint map (or, in a
+// local run, its deterministic native workspace map) — never a hardcoded port.
 func address(ctx context.Context, module, service, endpoint, api string) string {
 	q := codefly.For(ctx).Endpoint(endpoint)
 	if module != "" {
@@ -1113,7 +1118,7 @@ func (c config) validate() error {
 	// wrong origin is a solution that installs and then answers nothing.
 	if c.upstreamErr != nil {
 		if deployedRuntimeContext(c.runtimeContext) {
-			return fmt.Errorf("no origin to report to the host in the deployed runtime context %q: %w — Codefly's render injects the address peers reach this service at as %s__<MODULE>__<SERVICE>__HTTP__HTTP, and a deployed runtime never falls back to the address it listens on",
+			return fmt.Errorf("no origin to report to the host in the deployed runtime context %q: %w — Codefly's render injects the address peers reach this service at as %s__<MODULE>__<SERVICE>__HTTP__HTTP, and a deployed runtime never reports a loopback address it only listens on",
 				c.runtimeContext, c.upstreamErr, resources.SelfEndpointPrefix)
 		}
 		return fmt.Errorf("no origin to report to the host: %w", c.upstreamErr)
@@ -1991,6 +1996,7 @@ func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (executi
 // holdCredential records a credential the controller did not itself acquire —
 // the boot's — so the first caller after boot sees a process that holds one.
 func (s *Server) holdCredential(credential executionCredential) {
+	s.awaiting.Store(false)
 	s.credentialMu.Lock()
 	s.credentialHeld = credential
 	s.credentialQuietUntil = time.Time{}
@@ -2111,6 +2117,12 @@ func (s *Server) resolveCredential(ctx context.Context, flight *credentialFlight
 	// former and never the latter.
 	flight.credential, flight.err = credential, err
 
+	switch {
+	case err == nil:
+		s.awaiting.Store(false)
+	case awaitingInstallation(err):
+		s.awaiting.Store(true)
+	}
 	s.credentialMu.Lock()
 	s.credentialAskErr = err
 	if err != nil {
