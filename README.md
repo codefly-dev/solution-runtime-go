@@ -1488,8 +1488,12 @@ descriptor, with protobuf JSON names.
 > **no `replace` directive** — every one is an ordinary `require` of a released
 > tag, so this module builds from its own tag for anyone.
 >
-> The pins are `core v0.19.1`, `sdk-go v0.3.2` and the `sdk-go/workcontext` leaf
+> The pins are `core v0.19.4`, `sdk-go v0.3.2` and the `sdk-go/workcontext` leaf
 > at its first tag, `workcontext/v0.1.0` (it was a `main` pseudo-version until
-> that leaf was tagged). Every capability's format changed in the v0.9.0
+> that leaf was tagged). Core v0.19.4 restores the dependency graph compatible
+> with stable client-go: no `structured-merge-diff/v7`, and `kube-openapi` no
+> newer than `v0.0.0-20260721132016-d427ff9ee9ad`. This dependency update preserves
+> the runtime's public APIs and mutual-TLS transport. Every capability's format
+> changed in the v0.9.0
 > cutover, so verifiers upgrade before minters or calls fail closed in the
 > window — which is a statement about the rollout order, not about these pins.
