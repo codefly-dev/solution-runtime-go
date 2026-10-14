@@ -2,16 +2,11 @@ package solution
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"net/http"
 	"sync"
-	"time"
 
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -82,66 +77,6 @@ func readAuthority(ctx context.Context) (*codefly.Authority, error) {
 		return nil, fmt.Errorf("%w — provision the workspace configuration group %q and declare it as a workspace-configuration dependency of this backend", err, AuthorityGroup)
 	}
 	return authority, nil
-}
-
-// platformCredentialSource is the native module broker client,
-// pointed at the host's mint endpoint, presenting the service-account token the
-// platform projects for this workload.
-//
-// It carries this runtime's outbound client, so the mint presents this
-// workload's own X.509-SVID, verifies the host against the anchor the platform
-// projected, is not proxied, and does not follow redirects: the request carries
-// the projected token that attests which workload this process is, and a
-// Location would hand that to whatever answered at the mint URL.
-func (s *Server) platformCredentialSource() (*brokerCredentialSource, error) {
-	projectionAudience, err := s.authority.Value(AuthorityGroup, AuthorityProjectionAudienceKey)
-	if err != nil {
-		return nil, err
-	}
-	identity, err := s.serverIdentity()
-	if err != nil {
-		return nil, err
-	}
-	// ONE long-lived reloader for the leaf, built here and closed over.
-	//
-	// The thing that keeps a rotated leaf presented is the reloader's own
-	// re-read, not a fresh reloader: the SDK's swallows a half-written pair
-	// and keeps the last good one, and a constructor per handshake would
-	// report that error instead of surviving it. outboundLeaf says the same
-	// about the dial path for the same reason.
-	leaf, err := s.outboundLeaf(identity)
-	if err != nil {
-		return nil, err
-	}
-	// HELD TO THE FROZEN PRINCIPAL, at the moment it is presented.
-	//
-	// outboundLeaf is the raw reader — on the default path, the SDK's reloader
-	// over the projected files — and handing it to the SDK unwrapped was the
-	// identity binding this hop lost. The gateway's configuration gets the
-	// same hold through holdPresentedCertificate; this is the other outbound
-	// reader, and it is the one that carries the projected service-account
-	// token. A same-CA rotation to a neighbouring workload's certificate was
-	// presented to the mint while the frozen principal was still this one, and
-	// the SDK cannot catch it: it checks that a certificate is non-empty and
-	// has a key, which is the right division of labour and not a statement
-	// about whose certificate it is.
-	held := heldToTheFrozenPrincipal(leaf, s.principal, "the credential mint")
-	// Refused at boot as well, for the reason holdPresentedCertificate
-	// records: a mismatch found at the first dial is a mismatch found after
-	// the projected token has gone out under it. Only a MISMATCH refuses here
-	// — a read error is the reloader's business and it keeps the last good
-	// pair, so failing the boot on one would refuse a rotation that is merely
-	// half-written.
-	if pair, readErr := leaf(&tls.CertificateRequestInfo{}); readErr == nil && pair != nil {
-		if err := pairPresentsThisWorkload(pair, s.principal); err != nil {
-			return nil, fmt.Errorf("this workload would present a certificate the host has not approved it under to the credential mint: %w", err)
-		}
-	}
-	client, err := newBrokerCredentialSource(s.mintOptions(projectionAudience, s.peerTrustAnchor(identity), held))
-	if err != nil {
-		return nil, fmt.Errorf("configure this workload's credential mint at %s: %w", s.cfg.mintURL, err)
-	}
-	return client, nil
 }
 
 // heldToTheFrozenAuthority rechecks the authority whenever a source hands back
@@ -281,357 +216,20 @@ type sealedIdentity struct {
 }
 
 // mintOptions binds the declared prefix and perimeter credential to the frozen
-// authority and live TLS readers. No environment is read after loadConfig.
-func (s *Server) mintOptions(
-	projectionAudience string,
-	anchor func() (*x509.CertPool, error),
-	leaf func(*tls.CertificateRequestInfo) (*tls.Certificate, error),
-) brokerMintOptions {
+// authority and the resolved gateway. No environment is read after loadConfig.
+func (s *Server) mintOptions(projectionAudience string) brokerMintOptions {
 	return brokerMintOptions{
+		projectionRead:     &s.projectionRead,
 		URL:                s.cfg.mintURL,
-		Upstream:           s.cfg.upstream,
-		Manifest:           s.manifestJSON(),
 		Prefix:             s.manifest.ID,
 		InternalToken:      s.cfg.brokerInternalToken,
 		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
 		ProjectedToken:     projectedTokenFile(s.cfg.projectedTokenPath),
 		ProjectionAudience: projectionAudience,
 		Authority:          s.authority,
-		TrustAnchor:        anchor,
-		ClientCertificate:  func() (*tls.Certificate, error) { return leaf(&tls.CertificateRequestInfo{}) },
-		AdmittedPeers:      s.admittedMint(),
+		Transport:          s.cfg.transport,
 	}
 }
-
-// openCredential obtains this execution's credential, once, before the listener
-// exists.
-//
-// The two outcomes the SDK distinguishes are not the same outcome here, and
-// conflating them was the first thing the host asked me to change:
-//
-//   - A **refusal** is the host judging this workload: this build is not the one
-//     its presence document approved, the pod's identity does not match, the
-//     token attests to another subject. No number of attempts changes any of
-//     those answers, so the boot reports what the issuer said and returns —
-//     which is a non-zero exit for whoever called Serve, and a redeploy or a
-//     corrected delivery for whoever reads it. It is never retried: the old
-//     runtime answered every refusal by beating again, minting a fresh
-//     single-use token each time, so one undeployable solution produced an
-//     audited mint every 15 seconds for as long as it ran.
-//
-//   - An **unavailable** mint is not a judgement at all. A workload may
-//     legitimately start before its presence generation has been applied, and
-//     then there is no incarnation to mint against yet; the issuer may also be
-//     unable to reach the Kubernetes API or its own policy log, and a host that
-//     issues nothing in those cases is a host behaving correctly. Each is
-//     transient by construction, so the boot waits and asks again, within a
-//     bound.
-//
-// The bound is what keeps this from being the heartbeat again. It is a boot
-// waiting for a dependency, not a process announcing itself: there is no steady
-// state in which it runs, nothing is minted on success beyond the one
-// credential, and when the bound is spent the boot fails rather than settling
-// into a loop. A process that cannot obtain a credential inside it has an
-// orchestrator whose job is to restart it, and a restart is cheaper to read
-// than a solution that serves nothing while logging forever.
-func (s *Server) openCredential(ctx context.Context) error {
-	if s.credential == nil && s.brokerCredential == nil {
-		source, err := s.platformCredentialSource()
-		if err != nil {
-			return err
-		}
-		s.brokerCredential = source
-	}
-	// Consumer sources receive the same authority hold as the native broker.
-	if s.credential != nil {
-		s.credential = heldToTheFrozenAuthority(s.credential, s.authority)
-	}
-	window := s.firstMintWindow
-	if window == 0 {
-		window = firstMintWait
-	}
-	// The window is a deadline on the whole operation, not a stopwatch read
-	// between attempts. It used to be the latter: elapsed time was checked only
-	// after an unavailable answer, so an attempt could start at the deadline
-	// and a success after it was accepted — and a source that blocks until its
-	// context is cancelled was never cancelled at all, so a boot could wait
-	// forever inside one attempt.
-	deadline, cancel := context.WithDeadline(ctx, time.Now().Add(window))
-	defer cancel()
-	// The first wait is a quarter of the window at most, so a window shorter
-	// than the backoff still gets more than one attempt. At the real window
-	// (two minutes) this is just firstMintRetry; it matters for a caller that
-	// sets a short one, where a fixed first backoff would spend the whole
-	// window waiting after a single ask.
-	wait := firstMintRetry
-	if quarter := window / 4; quarter < wait {
-		wait = quarter
-	}
-	for attempt := 1; ; attempt++ {
-		credential, err := s.nextCredential(deadline)
-		switch {
-		case err == nil && usableCredential(credential) != nil:
-			// A source may hand back the zero credential or an expired one,
-			// and this boot used to accept either: it logged a credential
-			// sealed to installation "" and served. The classification is
-			// usableCredential's — an empty token is a judgement, an expired
-			// one is not — so an unavailable answer here keeps waiting inside
-			// the window and a refused one fails the boot.
-			err = usableCredential(credential)
-			if !errors.Is(err, workcontext.ErrMintUnavailable) {
-				return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
-			}
-		case err == nil && deadline.Err() == nil:
-			// Into the controller, which is the half that was missing: the
-			// boot obtained the credential and then nothing held it, so the
-			// first route after boot saw an empty controller, asked again, and
-			// got none of the backoff or held-credential behaviour the
-			// controller exists to provide. "One credential per execution"
-			// starts at the boot's own credential or it starts one request
-			// late.
-			s.holdCredential(credential)
-			// Through the generated GETTERS, not the fields.
-			//
-			// SealedValues is core's protobuf type now (an alias for
-			// basev0.WorkSealV1), so its scalars are POINTERS: formatting
-			// seal.BuildIncarnation with %d printed a pointer address into the
-			// boot log instead of the incarnation — the one line an operator
-			// reads to see which approved build this credential is sealed to.
-			// The getters return values and answer zero for a nil seal.
-			//
-			// golangci-lint's govet caught this and plain `go vet ./...` did
-			// not, which is worth knowing: the four gate commands would have
-			// shipped it.
-			seal := credential.Seal()
-			log.Printf("solution %q: holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
-				s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation(),
-				credential.ExpiresAt().UTC().Format(time.RFC3339))
-			return nil
-		case err == nil:
-			// A credential that arrived after the window closed is not a
-			// credential this boot may act on: the deadline is what bounds the
-			// wait, and accepting a late success would make it advisory.
-			return fmt.Errorf("obtain this execution's credential from %s: a credential arrived after the %s window closed, so this boot does not hold one",
-				s.cfg.mintURL, window)
-		case awaitingInstallation(err):
-			// Admitted by the host, installed nowhere yet. The install step is
-			// delivered to this runtime's own listener and carries its own
-			// authority, so this boot serves — the install endpoint and health
-			// — holding no credential. serve keeps asking (awaitInstallation)
-			// and holds the first one the host issues.
-			s.noteCredentialAnswer(err)
-			log.Printf("solution %q: no organization has installed this solution yet; serving its install endpoint, and holding a credential once one has", s.manifest.ID)
-			return nil
-		case !errors.Is(err, workcontext.ErrMintUnavailable):
-			// A judgement, or a configuration this client will not even send.
-			return fmt.Errorf("obtain this execution's credential from %s: %w", s.cfg.mintURL, err)
-		case deadline.Err() != nil:
-			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s and %d attempt(s): %w — the issuer answers this way while a presence generation has not been applied yet, or while it cannot reach the Kubernetes API or its policy log; all three are transient, so this is an exit for the orchestrator to retry rather than a judgement on this build",
-				s.cfg.mintURL, window, attempt, err)
-		}
-		remaining := time.Until(mustDeadline(deadline))
-		if remaining <= 0 {
-			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s (transient): %w", s.cfg.mintURL, window, err)
-		}
-		if wait > remaining {
-			wait = remaining
-		}
-		log.Printf("solution %q: this execution's credential is not available yet (attempt %d, retrying in %s): %v",
-			s.manifest.ID, attempt, wait, err)
-		select {
-		case <-deadline.Done():
-			return fmt.Errorf("obtain this execution's credential from %s: still unavailable after %s and %d attempt(s): %w — the issuer answers this way while a presence generation has not been applied yet, or while it cannot reach the Kubernetes API or its policy log; all three are transient, so this is an exit for the orchestrator to retry rather than a judgement on this build",
-				s.cfg.mintURL, window, attempt, err)
-		case <-time.After(wait):
-		}
-		if wait *= 2; wait > firstMintRetryCap {
-			wait = firstMintRetryCap
-		}
-	}
-}
-
-// manifestJSON is the frontend manifest this runtime serves, reported with
-// the mint so the host's registration carries it without a self-registration.
-func (s *Server) manifestJSON() string {
-	if s.manifest.ID == "" {
-		return ""
-	}
-	encoded, err := json.Marshal(s.manifestMap())
-	if err != nil {
-		return ""
-	}
-	return string(encoded)
-}
-
-// awaitInstallation asks the host for this execution's credential for as long
-// as this process holds none because nothing has installed the solution, and
-// returns when ctx ends or the credential is refused for good.
-//
-// It exists because an uninstalled solution has no other asker. Health and the
-// install step answer from what is already known (see uninstalled), and a
-// viewer's request cannot arrive: the host routes nobody to a solution
-// installed nowhere. So without this the first credential would wait for a
-// request the host will not send.
-//
-// Every ask goes through the controller (askOnce): single-flight with any
-// viewer's ask, the answer recorded where every other reader looks, and a
-// terminal answer ending the process exactly as it does on any other path. An
-// ask made around the controller left a refusal latched in the source and
-// reported by nobody.
-//
-// Two cadences. Uninstalled and idle it asks slowly, with jitter so replicas
-// that booted together stop asking together. After an install step has been
-// acknowledged (installAcknowledged) it asks at once and then a few times in
-// quick succession, because the host activates the installation only after it
-// has read this runtime's answer — the first ask can race it.
-func (s *Server) awaitInstallation(ctx context.Context) {
-	idle := time.NewTimer(awaitInstallationWait())
-	defer idle.Stop()
-	for {
-		followUps := []time.Duration(nil)
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.credentialRefusedC():
-			return
-		case <-s.installed:
-			followUps = awaitInstallationFollowUps
-		case <-idle.C:
-		}
-		for ask := 0; s.awaitsInstallation(); ask++ {
-			credential, err := s.askOnce(ctx, platformRequestTimeout)
-			if err == nil {
-				seal := credential.Seal()
-				log.Printf("solution %q: installed; holding one execution credential, sealed to installation %s revision %d and build incarnation %d, valid until %s",
-					s.manifest.ID, seal.GetInstallationId(), seal.GetInstallationRevision(), seal.GetBuildIncarnation(),
-					credential.ExpiresAt().UTC().Format(time.RFC3339))
-				break
-			}
-			if errors.Is(err, ErrCredentialRefused) || ask >= len(followUps) {
-				// Refused: askOnce has recorded it and the process is
-				// ending. Otherwise still uninstalled, or the host is not
-				// answering — the idle cadence asks again.
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-s.credentialRefusedC():
-				return
-			case <-time.After(followUps[ask]):
-			}
-		}
-		if !idle.Stop() {
-			select {
-			case <-idle.C:
-			default:
-			}
-		}
-		idle.Reset(awaitInstallationWait())
-	}
-}
-
-// awaitInstallationEvery is how often an uninstalled solution asks again, and
-// awaitInstallationJitter the fraction of it one ask may arrive early by.
-const (
-	awaitInstallationEvery  = 20 * time.Second
-	awaitInstallationJitter = 0.2
-)
-
-// awaitInstallationFollowUps paces the asks after an acknowledged install
-// step: the host activates the installation once it has read the answer, so
-// the credential is a moment away rather than a cadence away.
-var awaitInstallationFollowUps = []time.Duration{
-	250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second,
-}
-
-func awaitInstallationWait() time.Duration {
-	return time.Duration(float64(awaitInstallationEvery) * (1 - awaitInstallationJitter*rand.Float64()))
-}
-
-// awaitingInstallation reports the host's answer that nobody has installed
-// this solution yet.
-func awaitingInstallation(err error) bool {
-	var broker *brokerMintError
-	return errors.As(err, &broker) && broker.class == brokerAwaitingInstallation
-}
-
-// uninstalled reports that this process holds no credential because the host,
-// when last asked, said nothing has installed this solution.
-//
-// It is a reading of what the controller already recorded and asks nobody. A
-// probe or an install step that asked would be one more mint attempt per
-// request against a host that has already answered.
-func (s *Server) uninstalled() bool {
-	if s.terminalErr.Load() != nil {
-		return false
-	}
-	s.credentialMu.Lock()
-	defer s.credentialMu.Unlock()
-	if held := s.credentialHeld; held != nil && held.Token() != "" && time.Now().Before(held.ExpiresAt()) {
-		return false
-	}
-	return awaitingInstallation(s.credentialAskErr)
-}
-
-// awaitsInstallation reports that this process holds no credential and the
-// host has said, at some point since it last held one, that nothing has
-// installed the solution.
-//
-// Wider than uninstalled on purpose. One transient answer after a 412 — the
-// host restarting, a pass in flight — leaves the solution exactly as
-// uninstalled as it was, and an asker that stopped there would leave the
-// first credential waiting for the host's next install delivery.
-func (s *Server) awaitsInstallation() bool {
-	if s.terminalErr.Load() != nil || !s.awaiting.Load() {
-		return false
-	}
-	_, held := s.heldCredential()
-	return !held
-}
-
-// noteCredentialAnswer records an answer the controller did not itself
-// receive — the boot's — so every reader sees the same last answer.
-func (s *Server) noteCredentialAnswer(err error) {
-	s.awaiting.Store(awaitingInstallation(err))
-	s.credentialMu.Lock()
-	s.credentialAskErr = err
-	s.credentialMu.Unlock()
-}
-
-// installAcknowledged tells awaitInstallation that an install step has just
-// been answered with success, so the credential is worth asking for now.
-// Never blocks: one pending signal is as good as several.
-func (s *Server) installAcknowledged() {
-	select {
-	case s.installed <- struct{}{}:
-	default:
-	}
-}
-
-// mustDeadline is the deadline of a context that has one. openCredential sets
-// it, so the fallback is only there to keep the arithmetic total.
-func mustDeadline(ctx context.Context) time.Time {
-	if at, ok := ctx.Deadline(); ok {
-		return at
-	}
-	return time.Now()
-}
-
-// firstMintWait bounds how long a boot waits for a credential the issuer says
-// is not available yet, and firstMintRetry/firstMintRetryCap pace the asks
-// inside it.
-//
-// The bound is deliberately short. What it covers is a workload that started
-// before its own presence generation was applied, which is a reconcile away,
-// not an outage to ride out — and anything longer is a process holding a pod
-// slot while serving nothing, which an orchestrator reads less clearly than an
-// exit.
-const (
-	firstMintWait     = 2 * time.Minute
-	firstMintRetry    = 2 * time.Second
-	firstMintRetryCap = 15 * time.Second
-)
 
 // openAuthority freezes the authority-bearing values this process runs under
 // and reports the principal it runs as.
@@ -641,8 +239,8 @@ const (
 // value the platform never provisioned is a refusal that should not cost a
 // round trip to discover.
 //
-// It happens on **every** path, including a boot that supplied its own
-// credential source. A hook changes where a credential comes from; it does not
+// It happens for every authority-consuming declaration, including one with
+// a custom credential source. Authority-free declarations skip this step. A hook changes where a credential comes from; it does not
 // change who this workload is. Skipping this for a custom source left the
 // published contract naming no principal and the listener held to nothing —
 // so the two strongest properties in the boot were off for exactly the
@@ -694,26 +292,9 @@ func (s *Server) openAuthority(ctx context.Context) error {
 // controller means one controller.
 type credentialAcquirer func(context.Context) (executionCredential, error)
 
-// attestWorkloadReporting is attestWorkload with somewhere to report a
-// *terminal* failure, which is the half that is easy to get backwards.
-//
-// The boot already separates the issuer's two answers and must: a refusal is a
-// judgement on this build — the installation moved, the build is not the one
-// the presence document approved, the principal's epoch advanced — and no
-// number of attempts changes it, while an unavailable mint is a transient
-// condition worth waiting out. At *renewal* both were collapsed into
-// ErrNotAttested, which relayedError maps to unavailable with the note that one
-// renewal fixes it. For a refusal that is false: nothing fixes it, so the
-// process answered 503 to every request, forever, while reporting itself
-// healthy — the one shape this cutover was supposed to end, because a solution
-// that serves nothing while looking alive is exactly what the delivered-presence
-// model replaced the heartbeat to avoid.
-//
-// A terminal refusal therefore ends the process. Health starts failing so the
-// host's own probe takes the binding out, and serve returns non-zero so the
-// orchestrator restarts it against the delivery as it now stands — which is
-// where a build the host no longer approves gets resolved, and it is not here.
-func attestWorkloadReporting(ctx context.Context, acquire credentialAcquirer, report *attestationReport, request *http.Request, id string, terminal func(error)) error {
+// attestWorkloadReporting attaches the selected installation credential before
+// any viewer mint. Errors retain safe classification and are logged once.
+func attestWorkloadReporting(ctx context.Context, acquire credentialAcquirer, report *attestationReport, request *http.Request, id string) error {
 	if acquire == nil {
 		// No source at all is a programming error on a path that mints: every
 		// boot opens one, and a consumer that supplied its own supplied a
@@ -725,9 +306,6 @@ func attestWorkloadReporting(ctx context.Context, acquire credentialAcquirer, re
 	credential, err := acquire(ctx)
 	if err != nil {
 		report.say(id, "refusing to mint for a viewer: this execution's credential could not be obtained: "+err.Error())
-		if terminal != nil && terminalCredentialFailure(err) {
-			terminal(err)
-		}
 		return fmt.Errorf("%w: %w", ErrNotAttested, err)
 	}
 	// Defence in depth, and unreachable by design since round seven: a
@@ -794,21 +372,9 @@ func (r *attestationReport) recovered(id string) {
 }
 
 // terminalCredentialFailure preserves refusals separately from terminal broker
-// protocol/configuration errors. Neither may cause another execution mint.
+// protocol/configuration errors. Both refuse this acquisition and held fallback.
 func terminalCredentialFailure(err error) bool {
 	var broker *brokerMintError
 	return errors.Is(err, workcontext.ErrMintRefused) ||
 		(errors.As(err, &broker) && !broker.retryable())
-}
-
-// Both sources enter the same acquisition controller; the public SDK source
-// keeps its original signature while the broker carries Core's inspected value.
-func (s *Server) nextCredential(ctx context.Context) (executionCredential, error) {
-	if s.credential != nil {
-		return s.credential.Credential(ctx)
-	}
-	if s.brokerCredential != nil {
-		return s.brokerCredential.Credential(ctx)
-	}
-	return workcontext.Credential{}, errors.New("no credential source")
 }

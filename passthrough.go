@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -342,11 +341,11 @@ func init() {
 // "exported" part.
 //
 // Exported, it was a production bypass: a solution could build a usable
-// credential-bearing handler that had skipped validate(), the mTLS boot, the
-// caller allow-list, the published ceiling and authenticated outbound, and a
-// deployment calling it completed a viewer mint and a module call over
-// plaintext, 200, with the viewer's bearer and this workload's own credential
-// on the wire. Supplying a credential source — which a real deployment does —
+// credential-bearing handler that had skipped validate(), the boot, the
+// published ceiling and the origin-pinned outbound client, and a deployment
+// calling it completed a viewer mint and a module call, 200, with the
+// viewer's bearer and this workload's own credential sent wherever it was
+// mounted. Supplying a credential source — which a real deployment does —
 // defeated the "no source, nothing to mint with" mitigation it relied on. Fail
 // closed admits no exception for a shape that exists to make testing
 // convenient, so the shape moved behind the compiler instead: see
@@ -483,22 +482,6 @@ func (s *Server) forward(ctx context.Context, route passthroughRoute, req *conne
 // this method (or the bearer alone, for a ViewerBearer module), and the
 // declared pin merged into the request.
 func (s *Server) authorize(ctx context.Context, route passthroughRoute, header http.Header, msg *dynamicpb.Message) (*Gateway, error) {
-	// Whether or not this route mints anything. A ViewerBearer route forwards
-	// the viewer's bearer and asks the credential for nothing, so it was the
-	// one route that never consulted it — and it kept forwarding that bearer
-	// to the gateway after the issuer refused this build. See
-	// actingForAViewer: the credential is what authorises this process to act
-	// for a viewer, not merely what it mints with.
-	if err := s.actingForAViewer(ctx); err != nil {
-		// Sanitized, for the reason wrapRequest records: the error wraps what
-		// the source said, and this branch handed it to the page verbatim.
-		code := connect.CodeUnavailable
-		if errors.Is(err, ErrCredentialRefused) {
-			code = connect.CodeFailedPrecondition
-		}
-		log.Printf("solution: refusing to act for a viewer on %s: %v", route.module.As, err)
-		return nil, connect.NewError(code, errors.New(credentialRefusalForAViewer(err)))
-	}
 	gw := s.gatewayFor(header)
 	if !route.module.ViewerBearer {
 		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)

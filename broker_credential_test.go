@@ -2,8 +2,8 @@ package solution
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	codefly "github.com/codefly-dev/sdk-go"
@@ -24,7 +25,7 @@ import (
 
 // The fake broker runs as an HTTP handler through an in-memory transport. This
 // tests the actual request/response boundary even where listening is forbidden.
-func brokerFixture(t *testing.T) (*Server, *hostMint, string) {
+func brokerFixture(t *testing.T) (*brokerHarness, *hostMint, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "projection")
 	writeFile(t, path, "projected-first")
@@ -34,7 +35,7 @@ func brokerFixture(t *testing.T) (*Server, *hostMint, string) {
 	s.cfg.mintURL = "https://broker.example/modules/_work-context"
 	s.cfg.brokerInternalToken = "broker-perimeter-token"
 	s.cfg.projectedTokenPath = path
-	options := s.mintOptions("accounts", func() (*x509.CertPool, error) { return x509.NewCertPool(), nil }, func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &tls.Certificate{}, nil })
+	options := s.mintOptions("accounts")
 	options.Authority = fixedAuthority{audience: testAudience}
 	c, err := newBrokerCredentialSource(options)
 	if err != nil {
@@ -45,8 +46,8 @@ func brokerFixture(t *testing.T) (*Server, *hostMint, string) {
 		host.serve(response, r)
 		return response.Result(), nil
 	})
-	s.brokerCredential = c
-	return s, host, path
+	h := &brokerHarness{Server: s, brokerCredential: c, controller: &credentialController{nextCredential: c.Credential}}
+	return h, host, path
 }
 
 func TestBrokerExecutionProtocolConformance(t *testing.T) {
@@ -70,11 +71,16 @@ func TestBrokerExecutionProtocolConformance(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		requireBrokerBody(t, raw, "widgets-go")
+		// The prefix and nothing else: where this runtime serves and what
+		// its frontend declares travel in the presence document, not here.
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil || len(body) != 1 || body["prefix"] != "widgets-go" {
+			t.Fatalf("the mint body is %s, want exactly {\"prefix\":\"widgets-go\"}", raw)
+		}
 		r.Body = io.NopCloser(strings.NewReader(string(raw)))
 		return wire.RoundTrip(r)
 	})
-	if err := s.openCredential(context.Background()); err != nil {
+	if _, err := s.acquireCredential(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	first, err := s.acquireCredential(context.Background())
@@ -118,8 +124,7 @@ func TestBrokerStatusClassesAndRetryAllowlist(t *testing.T) {
 				return &http.Response{StatusCode: status, Body: unreadBrokerBody{}, Header: http.Header{"Location": {"https://elsewhere.example/private-token"}}}, nil
 			})
 			_, firstErr := s.brokerCredential.Credential(context.Background())
-			s.firstMintWindow = 60 * time.Millisecond
-			err := s.openCredential(context.Background())
+			_, err := s.brokerCredential.Credential(context.Background())
 			var broker *brokerMintError
 			if !errors.As(firstErr, &broker) || broker.status != status {
 				t.Fatalf("lost status: %v", err)
@@ -144,7 +149,7 @@ func TestBrokerStatusClassesAndRetryAllowlist(t *testing.T) {
 				for range 3 {
 					_, _ = s.acquireCredential(context.Background())
 				}
-				if calls.Load() != 1 || s.terminalErr.Load() == nil {
+				if calls.Load() != 1 || s.controller.terminalErr.Load() == nil {
 					t.Fatal("terminal result was not retained by renewal controller")
 				}
 			}
@@ -175,8 +180,7 @@ func TestBrokerTransportCategoriesAndRetryAllowlist(t *testing.T) {
 			raw := &url.Error{Op: "POST", URL: "https://private-token.example", Err: fmt.Errorf("private-token: %w", tc.cause)}
 			s.brokerCredential.client.Transport = mintRoundTrip(func(*http.Request) (*http.Response, error) { calls.Add(1); return nil, raw })
 			_, firstErr := s.brokerCredential.Credential(context.Background())
-			s.firstMintWindow = 60 * time.Millisecond
-			err := s.openCredential(context.Background())
+			_, err := s.brokerCredential.Credential(context.Background())
 			var broker *brokerMintError
 			if !errors.As(firstErr, &broker) || broker.transport != tc.category || broker.retryable() != tc.retry || errors.Is(err, workcontext.ErrMintUnavailable) != tc.retry {
 				t.Fatalf("incorrect transport class: %v", err)
@@ -223,13 +227,14 @@ func TestBrokerConfigurationUsesDeclaredSecretAndRefusesMissingValues(t *testing
 		t.Fatal(err)
 	}
 	cfg = loadConfig(context.Background(), testSolutionID, nil)
+	cfg.requiresAuthority = true
 	cfg.port, cfg.gatewayURL, cfg.mintURL, cfg.profile = "8080", "https://broker.example", "https://broker.example/modules/_work-context", localProfile
 	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "module-authority/INTERNAL_TOKEN") {
 		t.Fatalf("missing declared perimeter token was accepted: %v", err)
 	}
 	s, _, _ := brokerFixture(t)
 	options := s.brokerCredential.options
-	for _, field := range []string{"prefix", "secret", "audience", "path"} {
+	for _, field := range []string{"prefix", "secret", "audience", "path", "plaintext to a host the mesh does not carry", "plaintext to loopback in a deployment", "a misspelled mesh assertion"} {
 		bad := options
 		switch field {
 		case "prefix":
@@ -240,9 +245,31 @@ func TestBrokerConfigurationUsesDeclaredSecretAndRefusesMissingValues(t *testing
 			bad.ProjectionAudience = "different"
 		case "path":
 			bad.URL = "https://broker.example/platform/_credential"
+		case "plaintext to a host the mesh does not carry":
+			bad.URL = "http://broker.example/modules/_work-context"
+			bad.Transport = meshTransport{value: "true", set: true}
+		case "plaintext to loopback in a deployment":
+			bad.URL = "http://127.0.0.1:8080/modules/_work-context"
+			bad.Transport = meshTransport{}
+		case "a misspelled mesh assertion":
+			bad.URL = "http://auth-gateway.platform.svc:8080/modules/_work-context"
+			bad.Transport = meshTransport{value: "yes", set: true}
 		}
 		if _, err := newBrokerCredentialSource(bad); err == nil {
 			t.Fatalf("accepted missing/wrong %s", field)
+		}
+	}
+	// And admitted exactly where the SDK's rule admits plaintext: the mint
+	// hop carries the projected token, so it is held to the same rule the
+	// gateway URL is held to at validation, through the same function.
+	for name, admitted := range map[string]brokerMintOptions{
+		"loopback on a local run":                   {URL: "http://127.0.0.1:8080/modules/_work-context", Transport: meshTransport{local: true}},
+		"an in-cluster Service under the assertion": {URL: "http://auth-gateway.platform.svc.cluster.local:8080/modules/_work-context", Transport: meshTransport{value: "true", set: true}},
+	} {
+		good := options
+		good.URL, good.Transport = admitted.URL, admitted.Transport
+		if _, err := newBrokerCredentialSource(good); err != nil {
+			t.Fatalf("%s was refused by the native mint client: %v", name, err)
 		}
 	}
 }
@@ -274,10 +301,10 @@ func TestBrokerProjectionWaitIsBoundedAndDoesNotAccumulateReaders(t *testing.T) 
 	}
 	close(release)
 	deadline := time.Now().Add(time.Second)
-	for c.tokenReading.Load() && time.Now().Before(deadline) {
+	for projectionBusy(c.options.projectionRead) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if c.tokenReading.Load() {
+	if projectionBusy(c.options.projectionRead) {
 		t.Fatal("reader slot not released")
 	}
 	if host.count() != 0 {
@@ -287,10 +314,10 @@ func TestBrokerProjectionWaitIsBoundedAndDoesNotAccumulateReaders(t *testing.T) 
 
 func TestBrokerTransientRenewalKeepsHeldCredentialAndBacksOff(t *testing.T) {
 	s, host, _ := brokerFixture(t)
-	if err := s.openCredential(context.Background()); err != nil {
+	if _, err := s.acquireCredential(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	initial, _ := s.heldCredential()
+	initial, _ := s.controller.heldCredential()
 	s.brokerCredential.renewAt = time.Time{}
 	host.status = 503
 	for range 20 {
@@ -299,14 +326,14 @@ func TestBrokerTransientRenewalKeepsHeldCredentialAndBacksOff(t *testing.T) {
 			t.Fatalf("transient renewal discarded held credential: %v", err)
 		}
 	}
-	if host.count() != 2 || s.terminalErr.Load() != nil {
+	if host.count() != 2 || s.controller.terminalErr.Load() != nil {
 		t.Fatalf("transient renewal did not back off: %d mints", host.count())
 	}
 }
 
 func TestBrokerTerminalRenewalDiscardsHeldAuthority(t *testing.T) {
 	s, host, _ := brokerFixture(t)
-	if err := s.openCredential(context.Background()); err != nil {
+	if _, err := s.acquireCredential(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	s.brokerCredential.renewAt = time.Time{}
@@ -321,14 +348,12 @@ func TestBrokerTerminalRenewalDiscardsHeldAuthority(t *testing.T) {
 	if host.count() != 2 {
 		t.Fatalf("terminal renewal retried: %d", host.count())
 	}
-	if err := s.actingForAViewer(context.Background()); err == nil {
-		t.Fatal("viewer gate ignored terminal broker failure")
-	}
 	recorder := httptest.NewRecorder()
 	s.handleHealth(recorder, httptest.NewRequest("GET", "/health", nil))
-	if recorder.Code == http.StatusOK {
-		t.Fatal("health accepted terminal broker failure")
+	if recorder.Code != 200 {
+		t.Fatal("scoped refusal affected process health")
 	}
+
 }
 
 type brokerAuthorityPin struct {
@@ -390,7 +415,7 @@ func TestBrokerHoldsAuthorityAndExecutionAcrossRenewals(t *testing.T) {
 			host.switchTo = tc.after
 			host.switchTo.prepareAuthority(t)
 			host.switchAfter = 1
-			if err := s.openCredential(context.Background()); err != nil {
+			if _, err := s.acquireCredential(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			s.brokerCredential.renewAt = time.Time{}
@@ -405,14 +430,98 @@ func TestBrokerHoldsAuthorityAndExecutionAcrossRenewals(t *testing.T) {
 			// Exercise the native broker through the controller without a
 			// socket. The booted test separately proves serve observes this
 			// signal and returns without cancellation by the test.
-			select {
-			case <-s.credentialRefusedC():
-			default:
-				t.Fatal("the execution refusal did not signal serve to stop")
-			}
-			if terminal := s.terminalErr.Load(); terminal == nil || !errors.Is(*terminal, workcontext.ErrMintRefused) {
+
+			if terminal := s.controller.terminalErr.Load(); terminal == nil || !errors.Is(*terminal, workcontext.ErrMintRefused) {
 				t.Fatal("the execution refusal was not recorded for serve")
 			}
 		})
 	}
+}
+
+// brokerHarness supplies an in-memory wire to the production acquisition controller.
+type brokerHarness struct {
+	*Server
+	brokerCredential *brokerCredentialSource
+	controller       *credentialController
+}
+
+func (h *brokerHarness) acquireCredential(ctx context.Context) (executionCredential, error) {
+	return h.controller.credentialWithin(ctx, routeCredentialTimeout)
+}
+
+func TestProjectionReadSlotSurvivesScopeReplacement(t *testing.T) {
+	h, host, _ := brokerFixture(t)
+	release := make(chan struct{})
+	var reads atomic.Int32
+	options := h.brokerCredential.options
+	options.ProjectedToken = brokerTokenRead(func() (string, error) { reads.Add(1); <-release; return "late", nil })
+	for range 8 {
+		source, err := newBrokerCredentialSource(options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+		_, err = source.Credential(ctx)
+		cancel()
+		if err == nil {
+			t.Fatal("blocked projection succeeded")
+		}
+	}
+	if reads.Load() != 1 || host.count() != 0 {
+		t.Fatalf("readers=%d mints=%d", reads.Load(), host.count())
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for projectionBusy(options.projectionRead) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if projectionBusy(options.projectionRead) {
+		t.Fatal("late reader retained shared slot")
+	}
+}
+
+func projectionBusy(r *brokerProjectionReader) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.flight != nil
+}
+
+func TestConcurrentScopesShareSuccessfulProjectionRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := &brokerProjectionReader{}
+		release := make(chan struct{})
+		var calls atomic.Int32
+		source := brokerTokenRead(func() (string, error) { calls.Add(1); <-release; return "rotated", nil })
+		result := make(chan error, 2)
+		for range 2 {
+			go func() {
+				token, err := reader.read(t.Context(), source)
+				if err == nil && token != "rotated" {
+					err = errors.New("wrong token")
+				}
+				result <- err
+			}()
+		}
+		// Both callers are blocked on the same flight before the source completes.
+		synctest.Wait()
+		if calls.Load() != 1 {
+			t.Fatalf("concurrent source reads = %d, want 1", calls.Load())
+		}
+		if len(result) != 0 {
+			t.Fatal("projection caller returned before source completion")
+		}
+		close(release)
+		for range 2 {
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+		}
+		// A later mint reads again, even if the projection has not changed.
+		if _, err := reader.read(t.Context(), source); err != nil {
+			t.Fatal(err)
+		}
+		if calls.Load() != 2 {
+			t.Fatalf("source reads after later mint = %d, want 2", calls.Load())
+		}
+	})
 }

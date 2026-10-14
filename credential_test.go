@@ -1,10 +1,7 @@
 package solution
 
 import (
-	"connectrpc.com/connect"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
@@ -18,121 +15,36 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/codefly-dev/core/solution/manifest"
 	corework "github.com/codefly-dev/core/workcontext"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
-// TestARefusedMintFailsTheBootAndIsNeverRetried is the model's sharpest edge: a
-// host that has judged this workload is not a condition to retry. The old
-// runtime answered every refusal by beating again, minting a fresh single-use
-// token each time, so one undeployable solution produced an audited mint every
-// 15 seconds for as long as it ran. This boot reports the refusal and returns,
-// which is a non-zero exit for the process that called Serve.
-func TestARefusedMintFailsTheBootAndIsNeverRetried(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		status int
-	}{
-		{"the host refuses this workload's build or identity", http.StatusForbidden},
-		{"the projected token is not acceptable", http.StatusUnauthorized},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			mint := newHostMint(t, &hostMint{status: tc.status})
-			err := bootFails(t, New(Manifest{ID: testSolutionID}), mint)
-			if !errors.Is(err, workcontext.ErrMintRefused) {
-				t.Fatalf("boot error = %v, want one wrapping %v so a caller can tell a judgement from an outage", err, workcontext.ErrMintRefused)
-			}
-			if !strings.Contains(err.Error(), mint.URL) {
-				t.Errorf("boot error %q does not name the mint endpoint it asked", err)
-			}
-			if got := mint.count(); got != 1 {
-				t.Errorf("the boot asked the host %d times, want exactly 1: a refusal is terminal", got)
-			}
-		})
+func TestBrokerRefusalDoesNotPreventIdleBoot(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		mint := newHostMint(t, &hostMint{status: status})
+		solution := boot(t, New(Manifest{ID: testSolutionID}), mint)
+		if got := getStatus(t, solution.client, solution.base+HealthPath); got != 200 {
+			t.Fatalf("health = %d", got)
+		}
+		if mint.count() != 0 {
+			t.Fatal("idle boot contacted broker")
+		}
 	}
 }
 
-// TestAnUnavailableMintIsWaitedForWithinABound is the other half, and the half
-// the host asked for: a workload may legitimately start before its presence
-// generation has been applied, and the issuer answers that — and its own
-// unreachable dependencies — with a retryable status. Treating it as terminal
-// would make a pod that is one reconcile early fail for a reason that is not
-// about it.
-func TestAnUnavailableMintIsWaitedForWithinABound(t *testing.T) {
-	t.Run("it recovers when the issuer catches up", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{status: http.StatusServiceUnavailable})
-		mint.recoverAfter = 2
-		server := New(Manifest{ID: testSolutionID})
-		server.firstMintWindow = 20 * time.Second
-		solution := boot(t, server, mint)
-		if status := getStatus(t, solution.client, solution.base+HealthPath); status != http.StatusOK {
-			t.Fatalf("health = %d, want 200: the boot waited out an unapplied presence generation", status)
-		}
-		if got := mint.count(); got < 3 {
-			t.Errorf("the host was asked %d times, want the two refusals plus the one that answered", got)
-		}
-	})
-
-	t.Run("it gives up when the window is spent, and the window is a deadline", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{status: http.StatusServiceUnavailable})
-		server := New(Manifest{ID: testSolutionID})
-		// Long enough for more than one attempt over TLS, short enough that
-		// the test spends the window rather than waiting out the real two
-		// minutes.
-		server.firstMintWindow = 1500 * time.Millisecond
-		started := time.Now()
-		// Bounded here, not measured afterwards: against a runtime whose
-		// window is not a deadline this call never returns, and every
-		// assertion below is unreachable.
-		err := bootFailsWithin(t, server, mint, 4*server.firstMintWindow)
-		elapsed := time.Since(started)
-
-		if !errors.Is(err, workcontext.ErrMintUnavailable) {
-			t.Fatalf("boot error = %v, want one wrapping %v", err, workcontext.ErrMintUnavailable)
-		}
-		if !strings.Contains(err.Error(), "transient") {
-			t.Errorf("boot error %q does not say the cause is transient, which is what makes the exit the orchestrator's to retry", err)
-		}
-		if got := mint.count(); got < 2 {
-			t.Errorf("the host was asked %d times, want more than one: an unavailable mint is waited for, not judged — boot said: %v", got, err)
-		}
-		// The window bounds the whole operation. It used to be read only
-		// between attempts, so an attempt could start at the deadline and run
-		// as long as it liked past it.
-		if elapsed > 4*server.firstMintWindow {
-			t.Errorf("the boot took %s for a %s window: the window is a deadline on the operation, not a stopwatch read between attempts", elapsed.Round(time.Millisecond), server.firstMintWindow)
-		}
-	})
-
-	t.Run("a source that never answers is cut off by the window", func(t *testing.T) {
-		// The sharpest case for the deadline: a source that waits for its
-		// context rather than returning. Without the window on the context it
-		// is handed, the boot waits in one attempt forever — no listener, no
-		// log, and nothing for an orchestrator to act on.
-		mint := newHostMint(t, &hostMint{})
-		blocking := &blockingCredentialSource{entered: make(chan struct{}, 1)}
-		server := New(Manifest{ID: testSolutionID}).Credential(blocking)
-		server.firstMintWindow = 400 * time.Millisecond
-		started := time.Now()
-		err := bootFailsWithin(t, server, mint, 10*server.firstMintWindow)
-		elapsed := time.Since(started)
-		if err == nil {
-			t.Fatal("the boot came up on a source that never answered")
-		}
-		if elapsed > 10*server.firstMintWindow {
-			t.Fatalf("the boot waited %s on a source that never answers, for a %s window", elapsed.Round(time.Millisecond), server.firstMintWindow)
-		}
-		select {
-		case <-blocking.entered:
-		default:
-			t.Error("the source was never called, so this test did not exercise the deadline")
-		}
-		if !blocking.sawCancellation() {
-			t.Error("the source's context was never cancelled: the window has to reach the attempt, not just the loop around it")
-		}
-	})
+func TestUnavailableBrokerDoesNotDelayIdleBoot(t *testing.T) {
+	mint := newHostMint(t, &hostMint{status: http.StatusServiceUnavailable})
+	solution := boot(t, New(Manifest{ID: testSolutionID}), mint)
+	if got := getStatus(t, solution.client, solution.base+HealthPath); got != 200 {
+		t.Fatalf("health = %d", got)
+	}
+	if mint.count() != 0 {
+		t.Fatal("idle boot contacted unavailable broker")
+	}
 }
 
 // blockingCredentialSource waits for its context instead of answering: the
@@ -308,21 +220,11 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 func TestABootedRuntimeRegistersNothing(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 
-	// A listener of its own for every deleted URL, which boot cannot move.
-	//
-	// These pointed at mint.URL, captured before boot. The boot then calls
-	// hostMint.serveTLS, which CLOSES that server and starts another on a new
-	// port — so every deleted URL named an address nothing was listening on,
-	// and a surviving registration would have failed to connect and been
-	// counted by nobody. The test passed because nothing could be observed.
-	//
-	// This is the second time this test watched the wrong thing. The first
-	// version aimed the URLs at example.com, which a reviewer caught for the
-	// same reason: aimed somewhere nothing answers, it proved only that the
-	// old code never minted. The comment then said "every deleted URL points
-	// at the host this test counts requests on", which was true when it was
-	// written and stopped being true when serveTLS started replacing the
-	// server underneath it.
+	// A listener of its own for every deleted URL, so a surviving registration
+	// is observed rather than failing to connect and being counted by nobody.
+	// The first version aimed the URLs at example.com, which a reviewer caught
+	// for that reason: aimed somewhere nothing answers, it proved only that the
+	// old code never minted.
 	var legacyHits atomic.Int64
 	var legacyPaths sync.Map
 	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -454,28 +356,10 @@ func TestABootedRuntimeRegistersNothing(t *testing.T) {
 	// about the runtime rather than about a port that closed with it.
 	listening("after the shutdown")
 
-	if got := mint.count(); got != 1 {
-		t.Errorf("the host received %d requests, want exactly 1 (the mint): anything more is a registration that survived", got)
+	if got := mint.count(); got != 0 {
+		t.Fatalf("idle run made %d broker calls", got)
 	}
-	// The broker requires a perimeter header, but its value must come from the
-	// declared workspace secret, never the nonempty legacy variable above.
-	if mint.headers[0].Get("X-Codefly-Internal-Token") != "broker-perimeter-token" {
-		t.Error("broker perimeter header did not use the declared secret")
-	}
-	for _, header := range []string{
-		"x-codefly-solution-registration",
-		"x-codefly-module-registration",
-		removedClaimShape(t, "header"),
-	} {
-		if value := mint.headers[0].Get(header); value != "" {
-			t.Errorf("the one request this runtime made presented %s=%q: this runtime has no registration credential to present", header, value)
-		}
-	}
-	for _, path := range mint.paths {
-		if path != credentialMintPath {
-			t.Errorf("the host was asked for %q: the only endpoint this runtime calls on its own behalf is the mint", path)
-		}
-	}
+
 }
 
 // TestTheMintCarriesThisWorkloadsCredentialForAViewersMint: the mint this
@@ -497,7 +381,7 @@ func TestTheMintCarriesThisWorkloadsCredentialForAViewersMint(t *testing.T) {
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	gateway := server.gatewayFor(header)
@@ -541,7 +425,7 @@ func TestAMintIsRefusedWhenThisWorkloadCannotAttest(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	for range 3 {
@@ -579,7 +463,7 @@ func TestAServerWithNoCredentialSourceMintsNothing(t *testing.T) {
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	_, err := server.gatewayFor(header).ForModule(context.Background(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
@@ -651,13 +535,9 @@ func mintClientFor(t *testing.T, mint *hostMint, tokenFile string) CredentialSou
 		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: testProjectionAudience,
-		// The three readers sdk-go#51 takes, each asked during the handshake.
-		// The client still builds and owns the transport; what it no longer
-		// does is fix the anchor, present nothing, and admit any peer the
-		// anchor signed.
-		TrustAnchor:       mint.roots,
-		ClientCertificate: func() (*tls.Certificate, error) { return mint.caller, nil },
-		AdmittedPeers:     func() ([]string, error) { return []string{testGatewayPrincipal}, nil },
+		// Plaintext to loopback on a local run, which is what the SDK's rule
+		// admits and what the fake host serves.
+		Transport: localRun{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -704,91 +584,21 @@ func (r refusingSource) Credential(context.Context) (workcontext.Credential, err
 // forever while /health returned 200, which is the exact shape the
 // delivered-presence model replaced the heartbeat to avoid: a solution that
 // serves nothing and looks alive.
-func TestATerminalRenewalRefusalEndsTheProcessRatherThanServing503Forever(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		err      error
-		terminal bool
-	}{
-		{"the host refuses this build", fmt.Errorf("mint: %w", workcontext.ErrMintRefused), true},
-		// NOT terminal, and the earlier revision of this test asserted the
-		// opposite. ErrRevoked does not come back from the mint at all — it is
-		// a *callee* refusing a capability sealed to state that has moved — and
-		// the SDK's contract for it is a refresh and one retry. Ending the
-		// process on it would be ending on a condition the client recovers
-		// from. It is handled where it arrives: the far end's 409 drops the
-		// capability so the next call mints.
-		{"a capability a callee says is superseded", fmt.Errorf("mint: %w", workcontext.ErrRevoked), false},
-		// The control, and the reason this is not just "exit on any error": an
-		// issuer that cannot reach its own policy log is behaving correctly,
-		// and exiting on it turns a dependency blip into a crash loop.
-		{"the issuer is briefly unavailable", fmt.Errorf("mint: %w", workcontext.ErrMintUnavailable), false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
-			server := New(Manifest{ID: testSolutionID}).Credential(refusingSource{err: tc.err})
-			server.cfg.gatewayURL = gw.URL
-
-			// Health asks the credential, so with a source that refuses it is
-			// already unhealthy before any request — which is the point of
-			// C5: a solution serving no module calls must not look alive while
-			// the issuer has stopped approving its build.
-			if status, _ := healthStatus(t, server); status != http.StatusServiceUnavailable {
-				t.Errorf("health = %d while the credential cannot be obtained, want 503: the probe is the only channel this runtime has, and lazy renewal means nothing else may ever ask", status)
-			}
-
-			header := http.Header{}
-			header.Set("authorization", viewerBearer())
-			header.Set(orgHeader, "org-1")
-			header.Set(sessionHeader, "session-1")
-			header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-			_, err := server.gatewayFor(header).ForModule(context.Background(), "things",
-				Scope{ResourceKind: "things", Actions: []string{"read"}})
-			if !errors.Is(err, ErrNotAttested) {
-				t.Fatalf("ForModule error = %v, want ErrNotAttested", err)
-			}
-			if got := len(gw.observedMints()); got != 0 {
-				t.Errorf("observed %d viewer mints, want 0", got)
-			}
-
-			status, body := healthStatus(t, server)
-			if tc.terminal {
-				if status != http.StatusServiceUnavailable {
-					t.Errorf("health = %d after a refusal the issuer will not reverse, want 503: a 200 invites the host to keep routing to a binding that answers nothing", status)
-				}
-				if !strings.Contains(body, "refused") {
-					t.Errorf("the probe says %q, want it to name the condition", body)
-				}
-				select {
-				case <-server.credentialRefusedC():
-				default:
-					t.Error("the process was not asked to end: a credential the host has stopped honouring cannot be waited out")
-				}
-				if stored := server.terminalErr.Load(); stored == nil || !errors.Is(*stored, workcontext.ErrMintRefused) {
-					t.Error("the reason this process is ending was not recorded, so its exit would say nothing")
-				}
-			} else {
-				// Unhealthy, because this process cannot act for a viewer
-				// until the credential can be obtained — but NOT ending, which
-				// is the distinction that matters: the host stops routing to
-				// it, and it recovers when the issuer does. Exiting here would
-				// turn a dependency blip into a crash loop.
-				if status != http.StatusServiceUnavailable {
-					t.Errorf("health = %d while the credential cannot be obtained, want 503", status)
-				}
-				if strings.Contains(body, "refused") {
-					t.Errorf("the probe says %q, which reads as a judgement on this build: this condition is transient", body)
-				}
-				select {
-				case <-server.credentialRefusedC():
-					t.Error("the process was ended on a transient condition")
-				default:
-				}
-				if server.terminalErr.Load() != nil {
-					t.Error("a transient condition was recorded as the reason this process is ending")
-				}
-			}
-		})
+func TestScopedRefusalDoesNotEndTheProcess(t *testing.T) {
+	for _, failure := range []error{workcontext.ErrMintRefused, workcontext.ErrRevoked, workcontext.ErrMintUnavailable} {
+		gw := newModuleGateway(t, http.StatusOK, `{}`)
+		server := declaredWorkServer(t).Credential(refusingSource{err: failure})
+		server.cfg.gatewayURL = gw.URL
+		_, err := server.gatewayFor(workHeaders()).ForModule(t.Context(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
+		if !errors.Is(err, ErrNotAttested) || len(gw.observedMints()) != 0 {
+			t.Fatalf("unattested work escaped: %v", err)
+		}
+		if status, _ := healthStatus(t, server); status != 200 {
+			t.Fatal("scoped failure ended shared process")
+		}
+		if terminalCredentialFailure(failure) != (failure == workcontext.ErrMintRefused) {
+			t.Fatal("failure classification changed")
+		}
 	}
 }
 
@@ -817,8 +627,8 @@ func TestHealthIsHonestAboutTheCredential(t *testing.T) {
 		for range 5 {
 			healthStatus(t, server)
 		}
-		if got := mint.count(); got != 1 {
-			t.Errorf("six probes produced %d mints, want 1: the client holds one credential and the probe must not become a heartbeat", got)
+		if got := mint.count(); got != 0 {
+			t.Errorf("six probes produced %d mints, want 0: probes never acquire credentials", got)
 		}
 	})
 
@@ -847,68 +657,28 @@ func (f failingCredentialSource) Credential(context.Context) (workcontext.Creden
 //
 // handleHealth already made this argument in full and it was applied to the
 // probe alone: the probe answered honestly while the routes carried on.
-func TestAPlainHandlerRefusesToActWithoutACredential(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		err   error
-		ends  bool
-		names error
-	}{
-		{
-			"a refused build",
-			fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused),
-			true, ErrCredentialRefused,
-		},
-		{
-			"an issuer that cannot answer",
-			fmt.Errorf("%w: the issuer cannot reach its own dependencies", workcontext.ErrMintUnavailable),
-			false, ErrCredentialUnavailable,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var reached atomic.Int64
-			server := New(Manifest{ID: testSolutionID}).
-				Credential(failingCredentialSource{err: tc.err})
-			handler := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
-				reached.Add(1)
-				return map[string]string{"ok": "yes"}, nil
-			})
-
-			request := httptest.NewRequest(http.MethodGet, "/thing", nil)
-			request.Header.Set("authorization", viewerBearer())
-			recorder := httptest.NewRecorder()
-			handler(recorder, request)
-
-			if recorder.Code != http.StatusServiceUnavailable {
-				t.Errorf("the handler answered %d while this process held no approved credential, want 503: it would forward the viewer's bearer to the gateway under an authority the issuer has withdrawn", recorder.Code)
+func TestModuleWorkRefusesWithoutACredential(t *testing.T) {
+	for _, failure := range []error{workcontext.ErrMintRefused, workcontext.ErrMintUnavailable} {
+		server := declaredWorkServer(t).Credential(failingCredentialSource{err: fmt.Errorf("private issuer dependencies: %w", failure)})
+		reached := false
+		handler := server.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
+			_, err := gw.ForModule(r.Context(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
+			if err != nil {
+				return nil, err
 			}
-			if got := reached.Load(); got != 0 {
-				t.Errorf("the handler body ran %d times, want 0: the refusal has to come before anything acts for the viewer", got)
-			}
-			body := recorder.Body.String()
-			if !strings.Contains(body, "authority") {
-				t.Errorf("the 503 body %q does not say why this solution will not act", body)
-			}
-			// And it carries nothing the source said. The error wraps whatever
-			// came back — a mint URL, the issuer's own text, a dial failure
-			// naming an internal address — and this gate wrote it into the
-			// viewer's response verbatim, which is the disclosure
-			// handlerErrorResponse exists to prevent. A new gate in front of
-			// the handler put a path *around* the sanitization.
-			for _, leaked := range []string{"issuer", "presence document", "dependencies", "mint"} {
-				if strings.Contains(body, leaked) {
-					t.Errorf("the 503 body %q carries %q from the source's own error", body, leaked)
-				}
-			}
-			// Terminal and transient stay distinguishable: conflating them was
-			// a review blocker in both directions.
-			if err := server.actingForAViewer(context.Background()); !errors.Is(err, tc.names) {
-				t.Errorf("the route's refusal is %v, want one wrapping %v", err, tc.names)
-			}
-			if ended := server.terminalErr.Load() != nil; ended != tc.ends {
-				t.Errorf("the process ending = %v, want %v: a judgement about this build ends it, an issuer that cannot answer right now does not", ended, tc.ends)
-			}
+			reached = true
+			return "ok", nil
 		})
+		request := httptest.NewRequest("GET", "/thing", nil)
+		request.Header = workHeaders()
+		response := httptest.NewRecorder()
+		handler(response, request)
+		if response.Code != 503 || reached {
+			t.Fatalf("unauthorised work = %d; reached=%v", response.Code, reached)
+		}
+		if strings.Contains(response.Body.String(), "private issuer") {
+			t.Fatal("source diagnostic leaked")
+		}
 	}
 }
 
@@ -965,7 +735,7 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 		server := New(Manifest{ID: testSolutionID}).Credential(slow)
 		started := time.Now()
 		done := make(chan error, 1)
-		go func() { done <- server.actingForAViewer(context.Background()) }()
+		go func() { done <- testWorkCredential(server, context.Background()) }()
 		select {
 		case err := <-done:
 			if err == nil {
@@ -989,9 +759,9 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 		mint := newHostMint(t, &hostMint{})
 		held := mintedCredential(t, mint, "held")
 		server := New(Manifest{ID: testSolutionID}).Credential(slow)
-		server.credentialHeld = held
+		scopeController(t, server).credentialHeld = held
 		done := make(chan error, 1)
-		go func() { done <- server.actingForAViewer(context.Background()) }()
+		go func() { done <- testWorkCredential(server, context.Background()) }()
 		select {
 		case err := <-done:
 			if err != nil {
@@ -1011,9 +781,9 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 		// under. No waiting: see expiredCredential.
 		expired := expiredCredential(t, mint, tokenFile)
 		server := New(Manifest{ID: testSolutionID}).Credential(slow)
-		server.credentialHeld = expired
+		scopeController(t, server).credentialHeld = expired
 		done := make(chan error, 1)
-		go func() { done <- server.actingForAViewer(context.Background()) }()
+		go func() { done <- testWorkCredential(server, context.Background()) }()
 		select {
 		case err := <-done:
 			if err == nil {
@@ -1050,14 +820,14 @@ func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server := New(Manifest{ID: testSolutionID}).Credential(handing)
+	server := declaredWorkServer(t).Credential(handing)
 	if _, err := takeListener(server).start(ctx); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
 
 	// The control: with the authority as this process froze it, a renewal is
 	// handed over.
-	if _, err := server.nextCredential(ctx); err != nil {
+	if _, err := scopeController(t, server).nextCredential(ctx); err != nil {
 		t.Fatalf("a renewal was refused while the authority had not drifted: %v", err)
 	}
 
@@ -1068,7 +838,7 @@ func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
 	if err := codefly.LoadEnvironmentVariables(); err != nil {
 		t.Fatal(err)
 	}
-	_, err := server.nextCredential(ctx)
+	_, err := scopeController(t, server).nextCredential(ctx)
 	if err == nil {
 		t.Fatal("a renewal proceeded after an authority-bearing value drifted from the one this process froze: that renewal is the one moment the drift would be laundered into a differently-sealed credential")
 	}
@@ -1221,7 +991,7 @@ func TestConcurrentViewerRequestsShareOneCredentialAsk(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, _ = server.credentialWithin(context.Background(), 5*time.Second)
+			_, _ = scopeController(t, server).credentialWithin(context.Background(), 5*time.Second)
 		}()
 	}
 	close(start)
@@ -1289,14 +1059,15 @@ func TestACredentialThatAuthorisesNothingIsRefused(t *testing.T) {
 			// At the boot.
 			boot := newHostMint(t, &hostMint{})
 			server := New(Manifest{ID: testSolutionID}).Credential(stubCredentialSource{credential: tc.credential})
-			server.firstMintWindow = 750 * time.Millisecond
-			if err := bootFailsWithin(t, server, boot, 10*time.Second); err == nil {
+			running := bootComponent(t, server, boot, false)
+			_ = running
+			if err := testWorkCredential(server, t.Context()); err == nil {
 				t.Fatal("the boot accepted a credential that authorises nothing: this process would serve, answer /health 200, and act for viewers under it")
 			}
 
 			// And at a route, for a source that only degrades later.
 			serving := New(Manifest{ID: testSolutionID}).Credential(stubCredentialSource{credential: tc.credential})
-			if err := serving.actingForAViewer(context.Background()); err == nil {
+			if err := testWorkCredential(serving, context.Background()); err == nil {
 				t.Fatal("a route acted for a viewer under a credential that authorises nothing")
 			}
 			// And classified: nothing to mint with is a judgement, an expiry
@@ -1353,11 +1124,11 @@ func TestATerminalRefusalIsRecordedWhereverItLands(t *testing.T) {
 	source := &slowThenRefused{after: 750 * time.Millisecond, asked: make(chan struct{}, 1)}
 
 	server := New(Manifest{ID: testSolutionID}).Credential(source)
-	server.credentialHeld = held
+	scopeController(t, server).credentialHeld = held
 
 	// A route asks, times out well before the source answers, and is served
 	// from the credential in hand — which is correct.
-	if err := server.actingForAViewer(context.Background()); err != nil {
+	if err := testWorkCredential(server, context.Background()); err != nil {
 		t.Fatalf("a route was refused while this process held a valid credential and the source was merely slow: %v", err)
 	}
 	select {
@@ -1368,16 +1139,16 @@ func TestATerminalRefusalIsRecordedWhereverItLands(t *testing.T) {
 
 	// The refusal lands with nobody waiting.
 	deadline := time.Now().Add(5 * time.Second)
-	for server.terminalErr.Load() == nil && time.Now().Before(deadline) {
+	for scopeController(t, server).terminalErr.Load() == nil && time.Now().Before(deadline) {
 		time.Sleep(25 * time.Millisecond)
 	}
-	if server.terminalErr.Load() == nil {
+	if scopeController(t, server).terminalErr.Load() == nil {
 		t.Fatal("this execution's credential was refused and nothing recorded it, because the caller that started the ask had already been served: the process keeps acting for viewers under an authority its own source says is gone, and /health keeps answering 200")
 	}
 
 	// And the process now refuses to act, rather than carrying on with the
 	// credential it still holds.
-	if err := server.actingForAViewer(context.Background()); !errors.Is(err, ErrCredentialRefused) {
+	if err := testWorkCredential(server, context.Background()); !errors.Is(err, ErrCredentialRefused) {
 		t.Errorf("after a recorded refusal a route answered %v, want one wrapping %v: a held credential does not survive a judgement about the build that holds it", err, ErrCredentialRefused)
 	}
 }
@@ -1397,7 +1168,7 @@ func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
 	bootEnvironment(t, mint)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	server := New(Manifest{ID: testSolutionID}).Credential(handing)
+	server := declaredWorkServer(t).Credential(handing)
 	if _, err := takeListener(server).start(ctx); err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -1409,7 +1180,7 @@ func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
 	if err := codefly.LoadEnvironmentVariables(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.nextCredential(ctx); err == nil {
+	if _, err := scopeController(t, server).nextCredential(ctx); err == nil {
 		t.Fatal("an ask proceeded under a drifted authority")
 	}
 	// And the source was never reached, so nothing was minted under it.
@@ -1462,7 +1233,7 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
@@ -1472,14 +1243,11 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 
 	// That refusal cost the viewer their call and nothing else: this process
 	// still holds its credential and still acts for everybody else.
-	if _, ok := server.heldCredential(); !ok {
+	if _, ok := scopeController(t, server).heldCredential(); !ok {
 		t.Error("a conflict on one viewer's mint dropped this process's own credential: the host does not say whether the conflict is about this workload's authority or that viewer's, so inferring the former makes one viewer's missing permission a process-wide outage")
 	}
-	if err := server.actingForAViewer(context.Background()); err != nil {
+	if err := testWorkCredential(server, context.Background()); err != nil {
 		t.Errorf("this process stopped acting for viewers after one ambiguous conflict: %v", err)
-	}
-	if server.terminalErr.Load() != nil {
-		t.Error("an ambiguous conflict was recorded as a judgement about this build")
 	}
 
 	// THE CONTROL a reviewer asked for: another viewer, asking for something
@@ -1489,7 +1257,7 @@ func TestNothingIsInferredFromAConflictOnAViewersMint(t *testing.T) {
 	gw.conflict = ""
 	another := http.Header{}
 	another.Set("authorization", viewerBearer())
-	another.Set(orgHeader, "org-2")
+	another.Set(orgHeader, testOrganization)
 	another.Set(sessionHeader, "session-2")
 	another.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	if _, err := server.gatewayFor(another).ForModule(context.Background(), "things",
@@ -1525,7 +1293,7 @@ func TestAViewersMintGoesThroughTheOneController(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	mintFor := func(t *testing.T) error {
@@ -1568,7 +1336,7 @@ func TestTheBackoffAppliesWhenNothingIsHeld(t *testing.T) {
 
 	const callers = 30
 	for range callers {
-		if err := server.actingForAViewer(context.Background()); err == nil {
+		if err := testWorkCredential(server, context.Background()); err == nil {
 			t.Fatal("a route acted for a viewer with no credential at all")
 		}
 	}
@@ -1609,7 +1377,7 @@ func TestAWaiterReadsItsOwnFlightsResult(t *testing.T) {
 		go func(at int) {
 			defer wg.Done()
 			<-start
-			credential, err := server.credentialWithin(context.Background(), 5*time.Second)
+			credential, err := scopeController(t, server).credentialWithin(context.Background(), 5*time.Second)
 			if err == nil {
 				got[at] = credential.Token()
 			}
@@ -1689,11 +1457,11 @@ func TestDriftDuringAnAskIsCaughtAfterIt(t *testing.T) {
 		},
 	}
 
-	server := New(Manifest{ID: testSolutionID})
+	server := declaredWorkServer(t)
 	server.authority = authorityFor(t, ctx)
 	server.credential = heldToTheFrozenAuthority(source, server.authority)
 
-	_, err := server.nextCredential(ctx)
+	_, err := scopeController(t, server).nextCredential(ctx)
 	<-drifted
 	if err == nil {
 		t.Fatal("a credential obtained while an authority-bearing value drifted mid-ask was handed over: the recheck before the ask cannot see a drift that lands after it, so the one after the ask is what catches this — and gating that on the token changing means a first credential, an unchanged one, and a mid-ask drift all go unchecked")
@@ -1721,35 +1489,24 @@ func authorityFor(t *testing.T, ctx context.Context) *codefly.Authority {
 //
 // "One credential per execution" starts at the boot's own credential or it
 // starts one request late.
-func TestTheBootsCredentialIsHeldByTheController(t *testing.T) {
+func TestFirstWorkAcquiresAfterIdleBoot(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
-	bootEnvironment(t, mint)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	server := New(Manifest{ID: testSolutionID})
-	ln, err := takeListener(server).start(ctx)
-	if err != nil {
-		t.Fatalf("boot: %v", err)
+	server := declaredWorkServer(t)
+	running := boot(t, server, mint)
+	if mint.count() != 0 {
+		t.Fatal("boot minted")
 	}
-	_ = ln.Close()
-
-	held, ok := server.heldCredential()
-	if !ok {
-		t.Fatal("the boot obtained a credential and the controller holds nothing: the first route after boot therefore asks again, outside the single-flight and the backoff, which is the per-request minting this controller was built to stop")
+	credential, err := server.acquireForInstallation(t.Context(), testOrganization, testInstallation)
+	if err != nil || credential.Token() == "" {
+		t.Fatalf("first work: %v", err)
 	}
-	if held.Token() == "" {
-		t.Fatal("the controller holds a credential with no token")
+	for range 5 {
+		if _, err := server.acquireForInstallation(t.Context(), testOrganization, testInstallation); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	// And the boot's mint is the only one: a route served immediately after
-	// boot must not produce a second.
-	before := mint.count()
-	if err := server.actingForAViewer(ctx); err != nil {
-		t.Fatalf("a route was refused immediately after a successful boot: %v", err)
-	}
-	if got := mint.count(); got != before {
-		t.Errorf("the host minted %d more times for the first route after boot: the boot's credential is what that route acts under", got-before)
+	if mint.count() != 1 || healthOf(t, running) != 200 {
+		t.Fatal("work did not reuse the credential")
 	}
 }
 
@@ -2082,9 +1839,7 @@ func expiredCredential(t *testing.T, mint *hostMint, tokenFile string) workconte
 		Authority:          fixedAuthority{audience: testAudience},
 		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
 		ProjectionAudience: testProjectionAudience,
-		TrustAnchor:        mint.roots,
-		ClientCertificate:  func() (*tls.Certificate, error) { return mint.caller, nil },
-		AdmittedPeers:      func() ([]string, error) { return []string{testGatewayPrincipal}, nil },
+		Transport:          localRun{},
 		Now:                func() time.Time { return backdated },
 	})
 	if err != nil {
@@ -2119,21 +1874,25 @@ func expiredCredential(t *testing.T, mint *hostMint, tokenFile string) workconte
 // purpose is attesting which build is asking, so a host can hold a mint to the
 // build its presence document approved.
 func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
-	t.Run("the boot refuses it, terminally", func(t *testing.T) {
+	t.Run("first work refuses it", func(t *testing.T) {
 		mint := newHostMint(t, &hostMint{executionFree: true})
 		bootEnvironment(t, mint)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		server := New(Manifest{ID: testSolutionID})
+		server := declaredWorkServer(t)
 		// Short, so a refusal that were wrongly classified as transient shows
 		// up as a bounded wait rather than hanging this test.
-		server.firstMintWindow = 2 * time.Second
+
 		ln, err := takeListener(server).start(ctx)
 		if ln != nil {
 			_ = ln.Close()
 		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = testWorkCredential(server, ctx)
 		if err == nil {
-			t.Fatal("the boot accepted a credential sealing no execution: it attests no approved build, so the host has nothing to hold a mint to and the ceiling it is held to is nobody's")
+			t.Fatal("first work accepted a credential sealing no execution: it attests no approved build, so the host has nothing to hold a mint to and the ceiling it is held to is nobody's")
 		}
 		if !errors.Is(err, workcontext.ErrMintRefused) {
 			t.Errorf("the boot failed with %v, want ErrMintRefused: the issuer will seal the same thing next time, so this is a judgement and not an outage", err)
@@ -2157,13 +1916,16 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 		gw := newWorkContextGateway(t, &workContextGateway{})
 
 		var ran atomic.Bool
-		server := New(Manifest{ID: testSolutionID}).
+		server := declaredWorkServer(t).
 			Credential(mintClientFor(t, mint, tokenFile))
-		server.cfg = config{gatewayURL: gw.URL}
+		server.cfg.gatewayURL = gw.URL
 		// wrapRequest is what Serve mounts each route through
 		// (mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))), so this
 		// drives the route's own gate rather than calling the gate directly.
-		route := server.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+		route := server.wrapRequest(func(r *http.Request, g *Gateway) (any, error) {
+			if _, err := g.ForModule(r.Context(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+				return nil, err
+			}
 			ran.Store(true)
 			return map[string]string{"ok": "yes"}, nil
 		})
@@ -2201,7 +1963,7 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 
 		// And the gate itself, named, because the route's 503 does not say
 		// WHICH refusal produced it.
-		if err := server.actingForAViewer(context.Background()); err == nil {
+		if err := testWorkCredential(server, context.Background()); err == nil {
 			t.Fatal("a route acted for a viewer under a credential sealing no execution")
 		} else if !errors.Is(err, ErrCredentialRefused) {
 			t.Errorf("the route refused with %v, want one wrapping ErrCredentialRefused", err)
@@ -2211,10 +1973,13 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 		// that does seal an execution. Without it the 503 above is satisfied
 		// by a route that answers 503 to everything.
 		sound := newHostMint(t, &hostMint{})
-		healthy := New(Manifest{ID: testSolutionID}).
+		healthy := declaredWorkServer(t).
 			Credential(mintClientFor(t, sound, tokenFile))
-		healthy.cfg = config{gatewayURL: gw.URL}
-		controlRoute := healthy.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+		healthy.cfg.gatewayURL = gw.URL
+		controlRoute := healthy.wrapRequest(func(r *http.Request, g *Gateway) (any, error) {
+			if _, err := g.ForModule(r.Context(), "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+				return nil, err
+			}
 			return map[string]string{"ok": "yes"}, nil
 		})
 		control := httptest.NewRecorder()
@@ -2237,133 +2002,6 @@ func TestAnExecutionFreeCredentialIsRefusedEverywhere(t *testing.T) {
 		}
 		if boundary["execution-missing"] != carried {
 			t.Error("the carrier refuses core's execution-missing fixture: a capability core mints legitimately is not the carrier's to reject, and refusing it here would be the silent-downgrade failure this boundary exists to prevent")
-		}
-	})
-}
-
-// TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs is round thirteen's
-// blocker, closed where it had to be closed: in the SDK.
-//
-// Round eleven asked for this and I could not do it. v0.3.0 took RootCAs as a
-// VALUE and built its transport from it on the spot, presented no client
-// certificate, and offered no peer hook — so the mint hop had no identity of
-// its own going out, admitted any peer the anchor signed, and fixed its anchor
-// for the client's lifetime. Reimplementing the transport here would have been
-// the hack this repo's rule 2 forbids, so it went out as an sdk-go issue and
-// came back as sdk-go#51: three READERS, each consulted during the handshake.
-//
-// So these are the negative controls round thirteen named. Each is about the
-// mint hop specifically, driven through a real TLS handshake against the fake
-// endpoint rather than by inspecting the options struct.
-func TestTheMintHopIsHeldToTheSameThingsTheGatewayHopIs(t *testing.T) {
-	t.Run("an unreadable anchor refuses rather than dialling under the last good one", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		var fail atomic.Bool
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			o.TrustAnchor = func() (*x509.CertPool, error) {
-				if fail.Load() {
-					return nil, errors.New("the projected bundle is unreadable")
-				}
-				pool, _ := mint.roots()
-				return pool, nil
-			}
-		})
-		held, err := source.Credential(context.Background())
-		if err != nil {
-			t.Fatalf("the first ask was refused: %v", err)
-		}
-		// The anchor goes away. A client that captured the last good pool goes
-		// on dialling the endpoint that receives the projected
-		// service-account token under trust that no longer exists.
-		fail.Store(true)
-		if _, err := freshMint(t, source, held); err == nil {
-			t.Fatal("a mint succeeded while the trust anchor could not be read: the projected service-account token went to an endpoint verified against nothing this process can currently vouch for")
-		}
-	})
-
-	t.Run("a peer the anchor signed but the peer set does not name is refused", func(t *testing.T) {
-		// THE finding. Every workload in the trust domain holds a certificate
-		// from this anchor, the consumed modules included, so "signed by the
-		// right CA" is authentication and not authorisation. Before sdk-go#51
-		// a neighbouring workload presenting a certificate valid for the
-		// mint's hostname received the projected token.
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			// The endpoint's certificate is valid and issued by the accepted
-			// anchor. It simply is not the party this runtime talks to.
-			o.AdmittedPeers = func() ([]string, error) { return []string{rivalPrincipal}, nil }
-		})
-		if _, err := source.Credential(context.Background()); err == nil {
-			t.Fatal("the mint was dialled and the projected service-account token handed over to a peer the admitted set does not name: a certificate from the cell's anchor says which trust domain answered, not which party")
-		} else if mint.count() != 0 {
-			t.Errorf("the endpoint answered %d requests before the identity was refused, want 0: the refusal has to happen in the handshake, not after the token is on the wire", mint.count())
-		}
-	})
-
-	t.Run("peer withdrawal takes effect with the anchor unchanged", func(t *testing.T) {
-		// The second half of the same finding, and the one an anchor check
-		// cannot do: the CA never changes here. Only the provisioned set does.
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		var withdrawn atomic.Bool
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			o.AdmittedPeers = func() ([]string, error) {
-				if withdrawn.Load() {
-					return []string{rivalPrincipal}, nil
-				}
-				return []string{testGatewayPrincipal}, nil
-			}
-		})
-		held, err := source.Credential(context.Background())
-		if err != nil {
-			t.Fatalf("the first ask was refused: %v", err)
-		}
-		withdrawn.Store(true)
-		if _, err := freshMint(t, source, held); err == nil {
-			t.Fatal("a mint succeeded after the endpoint's identity was withdrawn from the admitted set while its certificate and the anchor stayed exactly as they were: this is the revocation an anchor check cannot express, and the reason the set is read per handshake rather than once")
-		}
-	})
-
-	t.Run("the mint request presents this workload's own identity", func(t *testing.T) {
-		// The fixture REQUIRES a client certificate now, so a mint that
-		// completes at all proves one was presented — and the identity is
-		// asserted rather than expected to be empty, which is what the
-		// fixture was weakened to expect while the SDK presented nothing.
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		if _, err := mintClientFor(t, mint, tokenFile).Credential(context.Background()); err != nil {
-			t.Fatalf("the mint refused a caller presenting this workload's certificate: %v", err)
-		}
-		if len(mint.callers) == 0 {
-			t.Fatal("the endpoint recorded no caller at all")
-		}
-		if got := mint.callers[0]; got != testPrincipal {
-			t.Errorf("the mint endpoint saw the caller as %q, want %q: the projected service-account token is no longer the whole of what attests which workload is asking", got, testPrincipal)
-		}
-	})
-
-	t.Run("a certificate reader that cannot answer refuses the mint", func(t *testing.T) {
-		mint := newHostMint(t, &hostMint{})
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-
-		source := mintClientWith(t, mint, tokenFile, func(o *workcontext.MintOptions) {
-			o.ClientCertificate = func() (*tls.Certificate, error) {
-				return nil, errors.New("the projected pair is half-written")
-			}
-		})
-		if _, err := source.Credential(context.Background()); err == nil {
-			t.Fatal("the mint was dialled with no certificate to present: an endpoint that requires one would refuse, and one that does not would attribute this request to nobody")
 		}
 	})
 }
@@ -2393,30 +2031,6 @@ func freshMint(t *testing.T, source any, held executionCredential) (executionCre
 		t.Fatalf("the source under test is %T, not the SDK's mint client, so this would not exercise the transport at all", source)
 	}
 	return client.Refresh(context.Background(), held.(workcontext.Credential))
-}
-
-// mintClientWith is a mint client against the fake endpoint, with one or more
-// of the three handshake readers replaced.
-func mintClientWith(t *testing.T, mint *hostMint, tokenFile string, with ...func(*workcontext.MintOptions)) CredentialSource {
-	t.Helper()
-	options := workcontext.MintOptions{
-		URL:                mint.URL + "/platform/_credential",
-		Audience:           workcontext.AuthorityValue{Name: AuthorityGroup, Key: AuthorityAudienceKey},
-		Authority:          fixedAuthority{audience: testAudience},
-		ProjectedToken:     workcontext.ProjectedTokenFile(tokenFile),
-		ProjectionAudience: testProjectionAudience,
-		TrustAnchor:        mint.roots,
-		ClientCertificate:  func() (*tls.Certificate, error) { return mint.caller, nil },
-		AdmittedPeers:      func() ([]string, error) { return []string{testGatewayPrincipal}, nil },
-	}
-	for _, apply := range with {
-		apply(&options)
-	}
-	client, err := workcontext.NewMintClient(options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return client
 }
 
 // TestARenewalSealedToADifferentExecutionIsRefused is the half of round
@@ -2496,100 +2110,6 @@ func TestARenewalSealedToADifferentExecutionIsRefused(t *testing.T) {
 			t.Fatalf("an ordinary renewal from the same issuer was refused: %v", err)
 		}
 	})
-}
-
-// TestTheMintRefusesToPresentARotatedIdentity is round fourteen's blocker, on
-// the production path rather than through a hand-built client.
-//
-// platformCredentialSource handed outboundLeaf — the SDK's reloader over the
-// projected files — straight to MintOptions.ClientCertificate. The gateway's
-// configuration gets holdPresentedCertificate; this reader got nothing. So
-// after a same-CA rotation to a neighbouring workload's certificate, the mint
-// hop presented THAT identity while the frozen principal was still this one,
-// and the SDK cannot catch it: it checks that a certificate is non-empty and
-// has a key, which is the right division of labour and not a statement about
-// whose certificate it is.
-//
-// The three steps the reviewer asked for, in order: A mints; a rotation to B
-// produces NO mint request; a fresh certificate for A mints again. The middle
-// one is the finding — and "no request" rather than "an error" is the
-// assertion, because the refusal has to happen before the projected
-// service-account token is on the wire.
-func TestTheMintRefusesToPresentARotatedIdentity(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	// The boot's own environment and projected material, under the anchor the
-	// fake host is served with — this test is about the production path, so it
-	// uses what a boot uses rather than a hand-built client.
-	certFile, keyFile, bundleFile, _, _, c := bootIdentityIn(t, mint, testPrincipal)
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	writeFile(t, tokenFile, "projected")
-
-	server := New(Manifest{ID: testSolutionID})
-	server.cfg = config{
-		identityCertFile:    certFile,
-		identityKeyFile:     keyFile,
-		trustBundleFile:     bundleFile,
-		allowedCallersFile:  identitiesFile(t, testGatewayPrincipal),
-		mintPeersFile:       identitiesFile(t, testGatewayPrincipal),
-		gatewayPeersFile:    identitiesFile(t, testGatewayPrincipal),
-		brokerInternalToken: "broker-perimeter-token",
-		mintURL:             mint.URL + credentialMintPath,
-		projectedTokenPath:  tokenFile,
-	}
-	server.principal = testPrincipal
-	// The frozen authority, read through the SDK the way a boot reads it.
-	server.authority = authorityFor(t, context.Background())
-	source, err := server.platformCredentialSource()
-	if err != nil {
-		t.Fatalf("configure the production credential source: %v", err)
-	}
-
-	// A mints.
-	held, err := source.Credential(context.Background())
-	if err != nil {
-		t.Fatalf("the mint refused this workload's own identity: %v", err)
-	}
-	if got := mint.count(); got != 1 {
-		t.Fatalf("the issuer served %d requests for the first credential, want 1", got)
-	}
-
-	// rotate replaces the projected pair in place, as a projected Secret
-	// update does, and advances the modification time so the SDK's reloader
-	// observes it (it refreshes on mtime, per handshake).
-	rotate := func(spiffeID string) {
-		t.Helper()
-		leafPEM, keyPEM, _ := issueLeaf(t, c.anchor, c.anchorKey, spiffeID)
-		writeFile(t, certFile, string(leafPEM))
-		writeFile(t, keyFile, string(keyPEM))
-		ahead := time.Now().Add(time.Minute)
-		for _, path := range []string{certFile, keyFile} {
-			if err := os.Chtimes(path, ahead, ahead); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	// An ordinary rotation remains usable by this same client.
-	rotate(testPrincipal)
-	if _, err := freshMint(t, source, held); err != nil {
-		t.Fatalf("ordinary identity rotation refused: %v", err)
-	}
-	// A valid same-CA certificate for another workload is refused before HTTP.
-	rotate(rivalPrincipal)
-	before := mint.count()
-	if _, err := freshMint(t, source, held); !terminalCredentialFailure(err) {
-		t.Fatalf("wrong workload identity was not terminal: %v", err)
-	}
-	if got := mint.count(); got != before {
-		t.Fatalf("wrong identity sent %d requests", got-before)
-	}
-	// The new retry allowlist makes this permanent TLS/configuration failure
-	// terminal, even if the files are repaired. Only a restarted process retries.
-	rotate(testPrincipal)
-	if _, err := freshMint(t, source, held); !terminalCredentialFailure(err) || mint.count() != before {
-		t.Fatalf("terminal identity failure was retried: %v", err)
-	}
-
 }
 
 // TestEachSealedFieldIsComparedOnItsOwn isolates the three comparisons that
@@ -2708,19 +2228,19 @@ func TestTheCredentialBackoffGrowsAndBreaksPhase(t *testing.T) {
 // leave the next failure starting from the ceiling.
 func TestASuccessfulAcquisitionResetsTheBackoff(t *testing.T) {
 	server := New(Manifest{ID: testSolutionID})
-	server.credentialAskFailures = 7
 	mint := newHostMint(t, &hostMint{})
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	writeFile(t, tokenFile, "projected")
 	server.credential = mintClientFor(t, mint, tokenFile)
+	scopeController(t, server).credentialAskFailures = 7
 
-	if _, err := server.acquireCredential(context.Background()); err != nil {
+	if _, err := server.acquireForInstallation(context.Background(), testOrganization, testInstallation); err != nil {
 		t.Fatalf("the acquisition failed, so this says nothing about the reset: %v", err)
 	}
-	if got := server.credentialAskFailures; got != 0 {
+	if got := scopeController(t, server).credentialAskFailures; got != 0 {
 		t.Errorf("after a successful acquisition the failure count is %d, want 0: an issuer that recovers and fails again would start from the ceiling rather than from a second", got)
 	}
-	if !server.credentialQuietUntil.IsZero() {
-		t.Errorf("a successful acquisition left a quiet period until %s, so the next ask is held off for no reason", server.credentialQuietUntil)
+	if !scopeController(t, server).credentialQuietUntil.IsZero() {
+		t.Errorf("a successful acquisition left a quiet period until %s, so the next ask is held off for no reason", scopeController(t, server).credentialQuietUntil)
 	}
 }

@@ -5,11 +5,11 @@
 // Server.PassthroughHandler used to be exported, and that was a public
 // production bypass: New(...).Consumes(...).Credential(source).
 // PassthroughHandler(gatewayURL) returned a usable, credential-bearing handler
-// having skipped validate(), the mTLS boot, the caller allow-list, the
-// published ceiling and authenticated outbound. A deployment that called it
-// completed a viewer mint and a module call over plaintext and answered 200 —
-// with the viewer's bearer and this workload's credential on the wire — and
-// supplying a real credential source defeated the one mitigation it had.
+// having skipped validate(), the boot, the published ceiling and the
+// origin-pinned outbound client. A deployment that called it completed a
+// viewer mint and a module call and answered 200 — with the viewer's bearer
+// and this workload's credential sent wherever it was mounted — and supplying
+// a real credential source defeated the one mitigation it had.
 //
 // It had to stay reachable from passthroughtest, which is a consumer-facing
 // package in this module and the documented seam for running the real

@@ -2,7 +2,6 @@ package solution
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -236,9 +235,10 @@ func TestInstallStepReceivesCarriedContext(t *testing.T) {
 	}
 }
 
-// Exercise the production boot and mux, including the listener's caller
-// admission. No exported handler or auxiliary listener mounts this route.
-func TestInstallWorkloadIdentityListener(t *testing.T) {
+// Exercise the production boot and mux: the route is served by the one
+// listener, plain HTTP on the resolved port, and the mesh admits that port only
+// from the gateway. No exported handler or auxiliary listener mounts it.
+func TestInstallRouteIsServedByTheBoot(t *testing.T) {
 	var calls atomic.Int32
 	s := New(Manifest{ID: testSolutionID}).OnInstall(func(_ context.Context, installation Installation) error {
 		calls.Add(1)
@@ -252,7 +252,7 @@ func TestInstallWorkloadIdentityListener(t *testing.T) {
 	b.client.Timeout = 5 * time.Second
 	for _, revision := range []int{7, 7, 8, 8} {
 		r := installRequest(t, strings.Replace(installBody, `"revision":7`, fmt.Sprintf(`"revision":%d`, revision), 1))
-		r.URL.Scheme, r.URL.Host = "https", strings.TrimPrefix(b.base, "https://")
+		r.URL.Scheme, r.URL.Host = "http", strings.TrimPrefix(b.base, "http://")
 		r.RequestURI = ""
 		resp, err := b.client.Do(r)
 		if err != nil {
@@ -274,38 +274,6 @@ func TestInstallWorkloadIdentityListener(t *testing.T) {
 	// is refused and not remembered, so its repeat runs the step again.
 	if calls.Load() != 3 {
 		t.Fatalf("step ran %d times, want 3", calls.Load())
-	}
-	admitted := calls.Load()
-	for _, tc := range []struct {
-		name   string
-		scheme string
-		caller *tls.Certificate
-	}{
-		{"plaintext", "http", nil},
-		{"no client certificate", "https", nil},
-		{"another workload under the same anchor", "https", b.cell.identity(t, rivalPrincipal)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := &tls.Config{RootCAs: b.cell.roots, MinVersion: tls.VersionTLS13}
-			if tc.caller != nil {
-				cfg.Certificates = []tls.Certificate{*tc.caller}
-			}
-			client := &http.Client{Transport: &http.Transport{TLSClientConfig: cfg}, Timeout: 5 * time.Second}
-			defer client.CloseIdleConnections()
-			r := installRequest(t, installBody)
-			r.URL.Scheme, r.URL.Host = tc.scheme, strings.TrimPrefix(b.base, "https://")
-			r.RequestURI = ""
-			resp, err := client.Do(r)
-			if err == nil {
-				_ = resp.Body.Close()
-				if tc.scheme == "https" || resp.StatusCode != http.StatusBadRequest {
-					t.Fatalf("unadmitted caller received HTTP %d", resp.StatusCode)
-				}
-			}
-			if calls.Load() != admitted {
-				t.Fatal("unadmitted caller ran the step")
-			}
-		})
 	}
 	resp, err := b.client.Get(b.base + installationPath)
 	if err != nil {

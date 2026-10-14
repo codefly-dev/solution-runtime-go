@@ -123,7 +123,7 @@ func watchRequest(entry string) *connect.Request[dynamicpb.Message] {
 	setField(msg, "entry_id", protoreflect.ValueOfString(entry))
 	req := connect.NewRequest(msg)
 	req.Header().Set("authorization", viewerBearer())
-	req.Header().Set(orgHeader, "org-1")
+	req.Header().Set(orgHeader, testOrganization)
 	req.Header().Set(sessionHeader, "session-1")
 	req.Header().Set(workcontext.InstallationIDHeaderName, testInstallation)
 	return req

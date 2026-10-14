@@ -26,7 +26,7 @@ import (
 // the other announces the new one.
 func TestServedDocumentsDeclareOneSetOfMajors(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
-	solution := boot(t, New(Manifest{ID: testSolutionID, Title: testSolutionTitle}), mint)
+	solution := boot(t, New(Manifest{ID: testSolutionID}), mint)
 
 	var capabilities map[string]any
 	readServed(t, solution, "/.well-known/capabilities", &capabilities)

@@ -278,7 +278,7 @@ func TestAnUnusableProfileNameIsRefused(t *testing.T) {
 	}
 	cfg := config{brokerInternalToken: "broker-perimeter-token",
 		port: "8080", gatewayURL: "https://gateway:42152", mintURL: "https://gateway:42152" + credentialMintPath,
-		identityCertFile: "c", identityKeyFile: "k", projectedTokenPath: "t", trustBundleFile: "b", profile: "../local",
+		projectedTokenPath: "t", profile: "../local",
 	}
 	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), ContractProfileEnvironmentVariable) {
 		t.Errorf("validate = %v, want a refusal naming %s", err, ContractProfileEnvironmentVariable)
@@ -402,7 +402,7 @@ func TestABootedRuntimeHoldsForModuleToThePublishedCeiling(t *testing.T) {
 				t.Fatal(err)
 			}
 			request.Header.Set("authorization", viewerBearer())
-			request.Header.Set(orgHeader, "org-1")
+			request.Header.Set(orgHeader, testOrganization)
 			request.Header.Set(sessionHeader, "session-1")
 			request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := solution.client.Do(request)
@@ -498,7 +498,7 @@ func TestTheCeilingRefusesAsksThatStateNoAuthority(t *testing.T) {
 				t.Fatal(err)
 			}
 			request.Header.Set("authorization", viewerBearer())
-			request.Header.Set(orgHeader, "org-1")
+			request.Header.Set(orgHeader, testOrganization)
 			request.Header.Set(sessionHeader, "session-1")
 			request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := solution.client.Do(request)
@@ -569,7 +569,7 @@ func TestAViewerBearerAudienceCannotBeMintedFor(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	_, err = server.gatewayFor(header).ForModule(context.Background(), "pages",
@@ -598,7 +598,7 @@ func TestAViewerBearerAudienceCannotBeMintedFor(t *testing.T) {
 // has one, and which one it is depends on a caller.
 func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 	t.Run("an empty id is refused at boot", func(t *testing.T) {
-		err := Manifest{ID: ""}.validateSurfaces()
+		err := Manifest{ID: ""}.validateID()
 		if err == nil {
 			t.Fatal("a manifest with no id was accepted: it is what the presence document names this solution by, what the published contract reports, and what every refusal here identifies this process as")
 		}
@@ -606,7 +606,7 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 			t.Errorf("the refusal %q does not name the field that fixes it", err)
 		}
 		// And whitespace is not an id either.
-		if err := (Manifest{ID: "   "}).validateSurfaces(); err == nil {
+		if err := (Manifest{ID: "   "}).validateID(); err == nil {
 			t.Error("a manifest whose id is whitespace was accepted")
 		}
 	})
@@ -643,7 +643,7 @@ func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
 
 		header := http.Header{}
 		header.Set("authorization", viewerBearer())
-		header.Set(orgHeader, "org-1")
+		header.Set(orgHeader, testOrganization)
 		header.Set(sessionHeader, "session-1")
 		header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 		// With a stated scope, so the ask reaches the ceiling rather than the

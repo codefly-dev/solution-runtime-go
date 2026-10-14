@@ -82,10 +82,8 @@ const (
 	// platform has not projected it yet; nothing is sent, and the ask is
 	// retried.
 	brokerProjectionAbsent
-	// brokerAwaitingInstallation: the host admits this workload and has not
-	// been asked to install it anywhere yet. The install step arrives on this
-	// runtime's own listener; until then there is nothing to mint for.
-	brokerAwaitingInstallation
+	// brokerPrecondition: a mutable installation or policy prerequisite is unmet.
+	brokerPrecondition
 )
 
 type brokerTransportCategory uint8
@@ -110,8 +108,8 @@ func (e *brokerMintError) Error() string {
 		return fmt.Sprintf("module broker: HTTP %d: request refused", e.status)
 	case brokerNotEstablished:
 		return "module broker: HTTP 503: execution not established"
-	case brokerAwaitingInstallation:
-		return "module broker: HTTP 412: no organization has installed this solution yet"
+	case brokerPrecondition:
+		return "module broker: HTTP 412: a required precondition is not met"
 	case brokerOtherStatus:
 		return fmt.Sprintf("module broker: HTTP %d: request failed", e.status)
 	case brokerInvalidAnswer:
@@ -144,7 +142,7 @@ func (e *brokerMintError) Error() string {
 // is there and unusable — empty, oversized, not a file — is a different thing
 // and stays terminal: no amount of waiting repairs it.
 func (e *brokerMintError) retryable() bool {
-	return e.class == brokerNotEstablished || e.class == brokerAwaitingInstallation || e.class == brokerProjectionAbsent ||
+	return e.class == brokerNotEstablished || e.class == brokerPrecondition || e.class == brokerProjectionAbsent ||
 		e.class == brokerTransport &&
 			(e.transport == brokerTransportTimeout || e.transport == brokerTransportRefused || e.transport == brokerTransportReset)
 }
@@ -165,7 +163,7 @@ func brokerStatusError(status int) *brokerMintError {
 	case http.StatusServiceUnavailable:
 		e.class = brokerNotEstablished
 	case http.StatusPreconditionFailed:
-		e.class = brokerAwaitingInstallation
+		e.class = brokerPrecondition
 	}
 	return e
 }

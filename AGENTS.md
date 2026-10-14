@@ -3,10 +3,12 @@
 This repository owns the generic Go runtime for **codefly solutions** — modules
 deployed independently of the host they extend, with no build-time coupling. It
 owns what every solution needs identically: configuration resolution through the
-codefly SDK, obtaining this execution's credential once from the projected
-service-account token, a listener that presents the workload's own X.509-SVID,
-CORS, Module Federation asset serving, the capability handshake, the manifest,
-the published authority contract, serving the solution's MCP server to agent
+codefly SDK, obtaining installation-scoped credentials on actual module work from the projected
+service-account token, a plain-HTTP listener on the port Codefly resolves —
+the cell's mesh carries transport security and destination identity for every
+hop inside it — CORS, Module Federation asset serving, the capability
+handshake, the manifest served from the one declared frontend file, the
+published authority contract, serving the solution's MCP server to agent
 clients, and the gateway client a handler uses to read composed modules on the
 viewer's behalf.
 
@@ -23,8 +25,9 @@ runtime removed.
 
 It owns none of the counterparts it talks to. The mint endpoint and the
 admission rules belong to the host (the composition's own host module) and the
-gateway; the authority reader and the TLS reloader to `codefly-dev/sdk-go`; the broker
-wire contract to the host, implemented natively here; endpoint, port and secret resolution to `sdk-go` as well;
+gateway; the authority reader and the one transport rule that admits a
+plaintext URL (`workcontext.AdmitEndpoint`) to `codefly-dev/sdk-go`; the broker
+wire contract and client to `saas-sdk-go/moduleauthority`; endpoint, port and secret resolution to `sdk-go` as well;
 workspace, manifest and presence/authority document types to `codefly-dev/core`;
 running a composition, provisioning its secrets and rendering the authority
 document to `codefly-dev/cli`. Everything here is a library — one Go package at
@@ -37,9 +40,9 @@ on the handler `Serve` mounts, reached through `internal/seam`.
 **That seam is not public API, and must not become one again.**
 `Server.PassthroughHandler` was exported, and a deployment calling it completed
 a viewer mint and a module call over plaintext, 200, having skipped
-`validate()`, the mTLS boot, the caller allow-list, the ceiling and
-authenticated outbound — with the viewer's bearer and this workload's own
-credential on the wire, and supplying a credential source defeated the "no
+`validate()`, the boot, the ceiling and the origin-pinned outbound client —
+with the viewer's bearer and this workload's own credential sent wherever it
+was mounted, and supplying a credential source defeated the "no
 source, nothing to mint with" mitigation it relied on. Go's internal-package
 rule is the gate, which is a compiler rather than a naming convention;
 `TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot` fails if an
@@ -159,6 +162,7 @@ embedding it.
   `RequestHandler`) as much as the calls it makes. Read that list before you
   change a signature, a struct field or an exported constant; a change that
   breaks a consumer carries a `!` in the commit type and says so in the PR body.
+- Native local listeners bind their SDK-resolved loopback host; `PORT` overrides only the port. Container and Kubernetes listeners retain container-wide binding under platform network admission.
 - Boot configuration is resolved in one place, `loadConfig`, and checked in one
   place, `validate()`: resolved through the SDK, with an explicit env override,
   refused loudly when unresolved. New configuration follows both rather than
@@ -253,59 +257,44 @@ embedding it.
 - Validate at the boundary — boot, and the headers a request arrives with — not
   between internal callers. `validate()` is the model: each refusal names the
   variable or the provisioning path that fixes it.
-- The listener presents this workload's own identity and there is no plain-HTTP
-  listener. A configuration that cannot produce one is refused at boot naming the
-  material, because a solution serving plain HTTP is refused at the edge instead,
-  for a reason only the edge can see. Where the identity comes from is the
-  platform's: `IdentitySource` is the hook, and the default reads the pair the
-  platform projects through the SDK's reloader. A source's configuration is
-  checked for what it must *have* (a certificate, a TLS 1.3 floor,
-  `RequireAndVerifyClientCert`, a named anchor) **and refused for what it must
-  not replace**: `Time`, `Rand`, `KeyLogWriter`, `WrapSession`, `UnwrapSession`,
-  `InsecureSkipVerify`. Each has a safe zero value, so refusing a non-zero one
-  is exact — and resumption is the sharpest, because a resumed connection
-  presents no certificate, so a source encoding its own tickets admits callers
-  without any check here seeing a handshake. That list is a denylist over a
-  struct this package does not own, and it is **not** complete. That claim was
-  made here and falsified twice: first by the session-ticket keys, then by
-  `VerifyPeerCertificate`. A `Clone()` copies 29 of 32 fields unchanged, so
-  whatever this list does not name, a source keeps. Where a property is
-  load-bearing, **take** it rather than check it — resumption is disabled
-  outright, and a caller's identity is read from a fresh parse of the raw DER
-  rather than from the `*x509.Certificate` a source's own verifier was handed a
-  pointer to. This list is what *tells* a source it has gone wrong; it is not
-  what makes the listener safe. The per-connection answer runs through the same
-  function rather than a copy of its reasoning. `SessionTicketKey`
-  is on that list for the same reason as the callbacks — choosing the key tickets
-  are sealed with is the same capability as encoding them — and
-  `SetSessionTicketKeys` is the one hole a check cannot close, because it is a
-  method and the keys it installs cannot be read back off the configuration.
-- **This listener does not resume TLS sessions, and that is a control rather
-  than a check.** A resumed connection presents no certificate, so anything
-  able to forge a ticket is admitted as whoever it was issued to — demonstrated
-  end to end with a source-supplied ticket key, against a listener whose
-  posture checks all passed. A denylist cannot close it (`SetSessionTicketKeys`
-  installs keys that cannot be read back), so `SessionTicketsDisabled` is set on
-  the served configuration and on every per-connection clone. Where a property
-  cannot be verified on a value a consumer hands over, take it rather than
-  inspect it.
-- **A source's anchor is asked for, never fabricated.** A consumer source that
-  resolves its anchor per handshake implements `PeerAnchorSource`; one that can
-  only answer through a `GetConfigForClient` call is refused at boot, because
-  obtaining the anchor would mean passing a `ClientHelloInfo` nobody sent — the
-  same synthetic-probe defect this cutover was blocked on for certificates, and
-  worse, since an anchor has no check behind it. The outbound *certificate* is
-  still taken through an empty hello, which is sound only because the frozen
-  principal hold catches a wrong answer at the moment it is presented.
-- The credential is obtained **once**, before the listener exists. A *refusal*
-  fails the boot and is never retried — the host is saying this build is not the
-  one its presence document approved, which no number of attempts changes, and a
-  loop around it is the audited-mint cost this runtime was changed to remove. An
-  *unavailable* mint is not a judgement (a presence generation not yet applied,
-  an issuer that cannot reach its own dependencies), so the boot waits inside a
-  bounded window, with the window as a deadline on the operation, and then exits
-  non-zero for the orchestrator. Those two answers must stay distinguishable:
-  conflating them was a review blocker in both directions.
+- **The listener is plain HTTP on the resolved port, and the cell's mesh is
+  what carries the hop.** Past the host's auth gateway every hop inside a cell
+  is plaintext under istio ambient's ztunnel mTLS, the workload's identity is
+  its ServiceAccount's SPIFFE ID — the mesh principal a presence document
+  names, not an SVID this process presents — and TLS ends at the edge. So this
+  listener presents no certificate and verifies no caller, and the mesh
+  admits its port only from the gateway's principal. The previous generation
+  served TLS 1.3 under a projected X.509-SVID, verified callers against a
+  projected anchor, admitted them by three provisioned peer files, re-verified
+  every established connection once a second in both directions and refused
+  session resumption; `identity.go` and all of it are **deleted, not fenced**,
+  because every one of those checks was this process re-deciding what the
+  cell decides for every workload. If you are about to add a check on who is
+  on the other end of a connection, you are rebuilding what this cutover
+  removed; what this process still decides is what a caller may do once
+  admitted (the stamped identity headers, this execution's credential) and
+  where its own credentials may travel (below).
+- **A plaintext destination is admitted only where the mesh is, by the SDK's
+  rule and never by a copy of it.** The gateway URL — and the mint derived on
+  it — goes through `workcontext.AdmitEndpoint`: `https` to any host; `http`
+  to a loopback host on a local run, or to an in-cluster Service address
+  (`<svc>.<ns>.svc[.<domain>]`) when the composition asserts
+  `internal-transport/mesh-protected=true`; anything else is `ErrInvalid`
+  naming the rule. It is the rule the composed modules apply to their own
+  gateway value, and `validate()` and `newBrokerCredentialSource` both call
+  it rather than restating it. The assertion is read ONCE, in `loadConfig`,
+  into `meshTransport`, and answered from that snapshot wherever the rule
+  asks — because every environment read sits in `loadConfig`'s call tree, and
+  a configuration value is fixed at process start anyway. The snapshot keeps
+  the SDK's three answers three (unset, set to a value, unreadable) and never
+  trims the value: only the literal `true` asserts, and a misspelled
+  assertion is a refusal rather than either answer. Do not add a boolean
+  beside it; a per-service opt-in is what an address never has to qualify for.
+- Workload credentials are acquired only for actual authority-consuming work,
+  after the declared ceiling is checked. Boot, health, viewer-only routes, MCP
+  handshakes and installation acknowledgements never mint. Authority-free
+  declarations need no broker credentials. Each organisation/installation has
+  independent acquisition, expiry and refusal state; no global credential.
 - **Credential-bearing traffic never follows a redirect and never leaves the
   gateway's origin.** Go copies a request's headers onto a redirected one and
   strips only `Authorization`, `WWW-Authenticate` and `Cookie`, a 307 re-sends
@@ -314,54 +303,17 @@ embedding it.
   Location: http://…` the viewer's bearer, their capability and this workload's
   credential in cleartext. Build clients through `Gateway.platformClient`, which
   carries `ErrUseLastResponse`, and leave the transport's origin pin in place.
-- **Peer trust is re-read per connection in BOTH directions, and established
-  connections are re-verified.** Inbound, per handshake through
-  `GetConfigForClient`; outbound, per dial through `DialTLSContext`. Per-dial
-  and per-handshake bound nothing about a connection that already exists, which
-  an idle timeout cannot fix because it only bounds a connection nobody is
-  using: a busy outbound connection answered 31s after its root was removed, and
-  the listener had no recheck, no `IdleTimeout` and no `ReadHeaderTimeout` at
-  all. Both directions now re-verify the established peer against current trust
-  once a second and close what stops verifying. The recheck reads only the
-  anchor and the admitted set — never this workload's own leaf, so a
-  half-written rotation of our own key pair cannot tear down connections whose
-  peers are fine — and the outbound leaf comes from ONE long-lived SDK reloader,
-  which keeps the last good pair; building one per dial threw that away. The outbound half went
-  unanswered through two review rounds while the inbound argument — judging by
-  a stale anchor admits whoever should be refused — was already written down
-  here. It applies harder outbound: those destinations receive the projected
-  token, the viewer's bearer and this workload's credential.
-- **Authentication is not authorisation.** Every workload in the trust domain
-  holds a certificate from the same anchor, the consumed modules included, so
-  the admitted caller set is provisioned
-  (`workload-identity`/`ALLOWED_CALLERS_FILE`) and refused at boot when absent.
-  Outbound there is **one set per destination** (`MINT_PEERS_FILE`,
-  `GATEWAY_PEERS_FILE`): the mint and the gateway are two parties, and a single
-  set spanning both authorises each to stand in for the other at the other's
-  address — the mint being the one that receives the projected token.
-  `MINT_PEERS_FILE` governs the mint hop again, per handshake, through the
-  native broker's live admitted-peer reader — so the question it was kept open
-  for is settled: it is the authorization set for the destination that receives
-  the projected service-account token. It also still narrows the shared-address
-  case, where the mint and the gateway answer at one address and a dial cannot
-  be attributed, and what is admitted there is the intersection of both sets. A dial to
-  a third address has no set and is refused, because this runtime talks to
-  exactly two destinations.
-  An admission set answered by **both** the env override and the platform's
-  provisioning is refused rather than ranked — two sources for one
-  authorization fact, which is the stance the SDK already takes on a value
-  delivered inline and by carrier. The other paths in that group still take the
-  override first, because the worst case there is this process reading its own
-  material from somewhere else, not admitting a caller.
-  Both admission sets are **paths this process reads itself**, per handshake and
-  per dial, not configuration values: a value is fixed at process start, so
-  "re-resolved per handshake" through the SDK's accessor returned the boot answer
-  forever while the code and the README both said revocation needed no restart.
-  Anything in `workload-identity` the platform can change is a path or it is a
-  snapshot pretending otherwise. A
-  listener that verifies every caller and admits all of them lets a consumed
-  module set its own `x-org-id`/`x-session-id` and drive mints under this
-  workload's attestation.
+- **Authentication is the mesh's; what is still this process's is which
+  stamped identity a request carries.** `x-org-id`, `x-session-id` and
+  `x-codefly-installation-id` are read as the gateway stamped them from
+  verified claims, and a request reaching this port came through the gateway
+  or the mesh would not have carried it. The admitted-caller file this
+  runtime once read per handshake, and the two per-destination peer files for
+  the mint and the gateway, are gone: `ALLOWED_CALLERS_FILE`,
+  `MINT_PEERS_FILE` and `GATEWAY_PEERS_FILE` admitted identities the mesh now
+  admits at L4 from the edges the CLI delivers, and a second set here would be
+  a second answer. The runtime dials exactly one origin, the gateway's
+  workload endpoint, and `originPinned` refuses every other destination.
 - **Every mint names the installation it acts under, and it comes from the
   header the gateway stamps.** The host requires it (core's
   `StartInput.InstallationID`) and refuses a mint naming none; an organization
@@ -389,37 +341,16 @@ embedding it.
   capability's seal on the held credential; no such path exists here, because
   every mint is viewer-driven and `ForModule` refuses a caller without an org
   and a session.
-- **This execution's own credential is held to what it was FIRST sealed to.**
-  The host seals it from the projected token — the broker request carries no installation field — so what this runtime owns is refusing one sealed to no
-  installation, refusing one sealed to no **execution** (image digest and build
-  incarnation, which core seals as a pair), and refusing a renewal sealed to a
-  *different* installation, digest or incarnation. The last is one value, not
-  three checks: a renewal that changed any part of it is a different
-  execution's credential arriving through the renewal path, and every work
-  context this process mints for a viewer is attested by it — so the mints
-  either side would name a different deployment or a different build,
-  including one the host's approved-build ceiling was never applied to. The
-  no-execution case is the one the sdk-go v0.3.0 migration opened: the previous
-  SDK's reader refused a zero incarnation, so a credential arriving here
-  carried one by construction, and core legitimately mints execution-free
-  credentials for a principal recorded as bearing none. The guarantee was
-  inherited and the inheritance ended.
-- **Every surface that acts for a viewer is held to this execution's
-  credential, and the MCP methods are held by an allowlist.** A plain handler
-  and a `ViewerBearer` passthrough were gated and a tool call was not, so an
-  MCP tool received a gateway carrying the viewer's bearer and ran while the
-  issuer had withdrawn this process's credential — the same fail-closed defect,
-  arriving with a surface rather than being missed in one. `actsForNobody`
-  lists the methods that run nothing for anyone (the handshake, the keepalive,
-  the listings, notifications) and **everything else** goes through
-  `actingForAViewer`: a method the MCP SDK adds is gated by default, because a
-  denylist over a set this package does not own is the mistake the TLS posture
-  made three times. The refusal carries the sanitized sentence, never the
-  source's error — an MCP client is a viewer's channel like a browser is. It
-  carries a JSON-RPC code, `-32001`: this file said the SDK's wire-error type
-  was internal and that no code could be set, which was false —
-  `jsonrpc.Error` is an exported alias for it, mutant `R10-8` holds the code,
-  and the claim survived here for two rounds after the code landed.
+- **Credentials remain scoped to their organisation and installation.** The
+  broker selects live consent from the organisation request; its response must
+  match both host-stamped identifiers. Renewals within a scope retain its
+  installation, digest and build incarnation. Across scopes and scope eviction,
+  the process retains the same digest and incarnation. A mismatch refuses that
+  work; it never adopts another execution or shuts down unrelated installations.
+- Every `ForModule` path, including HTTP and MCP, uses `gatewayFor` to carry
+  the declared ceiling and the host-stamped organisation/installation into
+  acquisition. Plain route entry is not a request for module authority. Keep
+  incoming identity validation and error sanitization at their boundaries.
 - **What a composition supplies is declared configuration, and a published URL
   is held to what a dialled one is.** A Codefly render cannot set a bare
   environment variable on a service, so anything the composition owns is a
@@ -434,7 +365,7 @@ embedding it.
   userinfo, a query, a fragment, and plaintext in a deployment, and those
   refusals redact: the pairing refusal printed an identifier's `?token=` into
   the boot log.
-- **Nothing mints per request.** One credential per execution plus the renewals
+- **Nothing mints per request.** One credential per organisation/installation plus renewals
   its own expiry dictates, and that has to survive the checks added in front of
   it: a route gate that asked the source on every viewer request turned a
   503-ing issuer into one audited mint per request, which is worse than the
@@ -444,81 +375,78 @@ embedding it.
   answer is recorded **where the answer lands** rather than by whichever caller
   was still waiting — the ask is detached, so it can finish with nobody
   listening.
-- **The mint reports the dynamic half of the registration; nothing else
-  does.** `upstream` (where the gateway dials this runtime) and `manifest` (the
-  frontend manifest it serves) travel in the mint body, recorded by the host
-  under the identity the projected token proves. This is not the registration
-  this runtime removed: it adds no request, no timer and no credential, and it
-  cannot make a workload present — the host completes only a declaration its
-  own delivery already applied. `upstream` is the **advertised** address
-  (`CODEFLY__SELF_ENDPOINT__…`, through core's accessor), never the listen
-  address a cell localizes to `localhost`; a present carrier is never read as
-  absent, and a deployed runtime context refuses a loopback origin at boot.
-  `brokerMintBodyMaxBytes` bounds the request at boot, under what the host
-  reads, so the bound that fires is the one that can name the manifest.
-- **`412` is "admitted, installed nowhere", and it is a state, not an error.**
-  The host issues this execution's credential only after the install step is
-  acknowledged, so the step must run without it — it acts under the capability
-  the host carries in — and `/health` must answer 200, both from what the
-  controller already recorded (`uninstalled`) without asking again.
-  `awaitInstallation` is the one asker, through `askOnce` like every other
-  ask: an ask made around the controller left a terminal answer latched in the
-  source and reported by nobody. A viewer's route still answers 503. Do not
-  widen the exemption to any other unavailable state: a host that cannot be
-  reached is not an uninstalled solution.
-- **The execution mint follows the host's module broker contract natively.**
-  `saas-sdk-go/moduleauthority` at `217bf9fe3f10` is the wire reference; its
-  capability dependency is incompatible with this runtime. Send
-  `prefix: Manifest.ID` — and beside it only `upstream` and `manifest`, below —
-  to `/modules/_work-context`, with the projected token
-  as bearer and `X-Codefly-Internal-Token` from the declared workspace secret
-  `module-authority/INTERNAL_TOKEN`. Resolve it in `loadConfig`, refuse absence
-  in `validate()`, and never resurrect a legacy secret reader. The projection
-  audience is `accounts`; the prefix never replaces the frozen SPIFFE principal.
-  The native transport owns a fresh mutually authenticated TLS handshake for
-  every mint, checks live trust and admission before and after it, disables
-  redirects/proxies/reuse, and holds the presented leaf to the frozen principal.
-  The SDK still owns the certificate reloader and authority reader. Core's
+- **Nothing is reported with the mint, and the frontend is declared in one
+  file.** `upstream` (the advertised origin) and `manifest` (the frontend
+  manifest) travelled in the mint body for one generation and are deleted:
+  the gateway resolves this solution's address from the delivered presence
+  document's endpoints, through the SDK, from the carrier the CLI hands it —
+  as for a module — and the frontend travels in the same document. The CLI
+  reads it from `solution.frontend.codefly.yaml` beside the backend's
+  `service.codefly.yaml`, the same file this runtime embeds
+  (`Manifest.Frontend`, `go:embed`) and serves its manifest from
+  (`frontend.go`): two readers of one file cannot disagree, where a Go field
+  beside a file could. Its keys are core's `frontend` block field for field,
+  every scalar declared because core refuses an omitted one, the dashboard
+  held to the JSON object core carries (a mapping, string keys, no fraction,
+  64 KiB encoded) and surfaces carried whole (`contract`, `applies`, `events`
+  included). A boot without the file is refused naming it. Do not add a Go
+  field for anything the host lists a solution under, and do not report
+  anything about this process to the host: a process cannot declare what the
+  composition did not.
+- The install endpoint acts under the host's incoming installation capability.
+  Its acknowledgement never acquires workload authority. HTTP 412 means a
+  failed precondition, not a unique "installed nowhere" state. Later actual
+  work may retry after bounded backoff; no startup/idle/install polling loop.
+- **The execution mint follows the host's module broker contract natively,
+  over plain HTTP to the gateway's workload endpoint.**
+  `saas-sdk-go/moduleauthority.MintModuleWorkContext` owns the broker wire
+  protocol. Supply `prefix: Manifest.ID` and the host-stamped organisation to
+  `/modules/_work-context`, with
+  the projected token as bearer and `X-Codefly-Internal-Token` from the
+  declared workspace secret `module-authority/INTERNAL_TOKEN` — kept: the
+  host's waiver of that header on its workload peer existed only because the
+  SVID authenticated the peer, and with the SVID gone the waiver goes too.
+  Resolve the secret in `loadConfig`, refuse absence in `validate()`, and
+  never resurrect a legacy secret reader. The projection audience is
+  `accounts`; the prefix never replaces the frozen SPIFFE principal. The mint
+  URL is the host's published route on the gateway this process already
+  resolved: the workload endpoint serves the gateway's whole handler, so there
+  is no second address to resolve and `CODEFLY__CREDENTIAL_MINT_URL` is gone.
+  The native transport owns one plain-HTTP request per mint on a connection
+  dialled for it, pinned to that origin, with redirects, proxies and reuse
+  disabled, and the URL held to the SDK's transport rule before anything is
+  sent; an `https` gateway is verified against the system roots, the right
+  anchor for an edge that presents a public certificate. The SDK still owns
+  the authority reader. `workcontext.MintClient` is NOT the production mint
+  client and must not become one without the host serving its wire shape: it
+  posts `{audience, projection_audience}` and reads `{work_context}`, where
+  the host takes `{prefix, organization_id}` and answers `{token, expiresAt, principalId,
+  tenant}`; this runtime replaced it with the native client in #59 for that
+  reason, and the two places that still construct one — `credential_test.go`
+  and `passthroughtest` — do so against fakes that speak the SDK's shape, which
+  is a finding for the audit and not something a deployment exercises. Core's
   `Decode` is the only structural reader of the returned token; no signed
   message is constructed or decoded here, and that read verifies no signature.
   It was `Inspect` until core v0.15, and the old name is now core's
   `Inspector` — a forwarding hop's **signature check** — so it is a verifier to
   this package and the verifier gate refuses it, with `Authenticator`, by name.
   A private credential view keeps the public SDK `CredentialSource` compatible.
-- **Only 503 and transient transport failures retry.** Timeout, connection
-  refused and connection reset are identified by error types/identities, never
-  text. 401/403 are terminal refusals. Every other HTTP status, TLS failure,
-  permanent DNS failure, cancellation, unclassified transport failure and
-  invalid broker response is a terminal error. Retain safe status/class/category
-  only, with no raw diagnostic cause. Boot and renewal use the same decision;
-  terminal answers are retained where they land, even after waiters leave.
-- **A terminal credential refusal ends the process; a transient one does not.**
-  `ErrMintRefused` or a terminal broker error at renewal fails `/health` and ends `serve` with the reason.
-  `ErrMintUnavailable` must not: it is transient by construction and exiting on
-  it is a crash loop. `ErrRevoked` is not in either set, and three review rounds
-  found this file still saying it was: the mint client does not return it at all
-  (see `credential.go`) — it comes back from a *callee* rejecting a capability
-  this runtime minted for a viewer, where it is a 409 on that request and no
-  statement about this execution's own credential.
-  **Nothing is inferred from that 409, and the code now matches what this file
-  has said all along.** A cached capability was dropped when a module answered
-  409 with an installation header, and that was wrong three times over: any 409
-  with any header; then any 409 whose header named the installation the
-  capability is sealed to — and a module answering an ordinary business
-  conflict IS in that installation, so a duplicate or a lost update evicted a
-  valid capability and the next call minted again. 409 means "the state you
-  were sealed to has moved" and it means "that page already exists"; nothing on
-  the wire says which, and matching installation metadata identifies the SCOPE
-  of a conflict rather than establishing supersession. A genuinely superseded
-  capability is refused call by call by the far end, correct if noisy, until its
-  own expiry. A sound inference needs a host-side discriminator, which is
-  nobody's to invent here. The boot and the run have to
-  classify these the same way — they did not, and the result was a solution
-  answering 503 forever while reporting itself healthy.
+- Refusals are scoped. Each controller retains the answer even if all waiters
+  leave, backs off, and never uses held authority after refusal or expiry.
+  Later work may recreate a refused scope after backoff to observe changed
+  consent. A failure never stops other installations or the shared listener.
+  Keep safe status/class/category, never bodies, parser messages or causes.
+  Missing projection, 412, 503 and transient transport failures are unavailable;
+  frozen authority and execution consistency still fail closed on every ask.
+- Bound retained scopes (256), waiters (cancellation/500ms), acquisition lifetime,
+  and detached projection reads. Never evict a scope with active work/acquisition.
+  The server shares the projection read slot across scopes so eviction cannot
+  accumulate blocked file reads. Do not let one caller cancel shared acquisition.
+- A module's 409 does not prove workload revocation. The host must provide a
+  machine-readable discriminator before the runtime may infer supersession.
 - **Fail closed, with no exception for a counterpart's current state.** A mint
-  this runtime cannot attest for is not sent; a listener that cannot
-  authenticate its callers does not start; a credential-bearing destination that
-  is not authenticated https is refused at boot. "The gateway presents no client
+  this runtime cannot attest for is not sent; a credential-bearing destination
+  outside the SDK's admitted transport rule is refused at boot. "The gateway presents no client
   certificate today" and "the host does not require the attestation yet" are
   statements about someone else's deployment, and leaving a hole open for as long
   as the counterpart takes is the concession this cutover exists to stop making.
@@ -587,14 +515,19 @@ against.
    fix by working, by being small, by being local, or by the real fix belonging
    to core, the SDK or the host.
 4. **Never hardcode what the system resolves, and never guess what it cannot.**
-   This package resolves every address, port and secret through the SDK; the
-   single `localhost` literal in it is the self upstream's listen-address
-   fallback, built from the *resolved* port and refused by `validate()` in a
-   deployed runtime context. The credential mint URL has **no default**: it is
-   the address the projected service-account token goes to, nothing resolves it
-   yet, and a derived path on the resolved gateway was carried for two rounds as
-   a "labelled stopgap" while the README described it as settled — a guess a
-   label does not make safe. It is refused at boot until something resolves it.
+   This package resolves every address, port and secret through the SDK, and
+   carries no address literal at all: the `localhost` the advertised-origin
+   fallback used went with the report it fed. The credential mint URL is the
+   one derived value, and it is derived from a published fact rather than a
+   guess: the gateway's workload endpoint serves the gateway's whole handler,
+   mint included, so the mint is `/modules/_work-context` on the one origin the
+   composition resolved. That is a different thing from the derivation this
+   rule used to forbid — a path assumed on the public gateway while the host
+   served its mint somewhere nobody had published, carried for two rounds as a
+   "labelled stopgap" — and the test that pinned its absence
+   (`TestNoProductionCodeDerivesTheMintAddress`) was replaced by one that pins
+   the published route. If the host moves the mint off the workload endpoint,
+   the fix is a resolved endpoint role, not an override.
    If you are typing an address, a port or a credential, you are encoding
    something true only on your machine for the next ten minutes; if you are
    deriving one the owner has not published, you are encoding a guess about
@@ -679,15 +612,20 @@ credentials, no running composition.
 Keep this file short; add depth to the file that owns the subject.
 
 - [README.md](README.md) — the consumer-facing contract: handler errors, the
-  full configuration and env-override table, the workload identity and the one
-  mint, the published contract, consumed-module federation, and reading a
+  full configuration and env-override table, plain HTTP inside the cell, the
+  declared frontend file and the one mint, the published contract,
+  consumed-module federation, and reading a
   Work-Context-authenticated module. It also carries the migration note: an old
   runtime against a new host gets 404, and nothing bridges the two.
 - The package doc comment and the comments in [`solution.go`](solution.go),
-  [`credential.go`](credential.go), [`identity.go`](identity.go) and
+  [`credential.go`](credential.go), [`frontend.go`](frontend.go) and
   [`contract.go`](contract.go) and [`mcp.go`](mcp.go) — why a refusal, a renewal point or a cache
   lifetime is what it is. Several record a failure mode that is not obvious from
   the code; read the one next to what you are changing before you change it.
 - `.claude/skills/` — procedures an agent repeats, loaded only when relevant.
   None exist yet, because nothing here repeats beyond the four commands above.
   Add one instead of growing this file.
+
+The optional frontend declaration uses Core's `solutionhost.ParseFrontend` and
+its types directly. Nil is headless; a present malformed file refuses boot.
+Do not introduce a second parser, size limits or a fixed client-kind inventory.

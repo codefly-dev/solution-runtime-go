@@ -127,13 +127,13 @@ func transcodeServer(t *testing.T, status int, reply string) (*Gateway, *recorde
 		_, _ = io.WriteString(w, reply)
 	}))
 	t.Cleanup(srv.Close)
-	return newGateway(srv.URL, "Bearer viewer", "org-1", "session-1"), got, hits
+	return newGateway(srv.URL, "Bearer viewer", testOrganization, "session-1"), got, hits
 }
 
 func TestTranscodedUsesTheBindingUnderThePrefix(t *testing.T) {
 	gw, got, _ := transcodeServer(t, http.StatusOK, `{"entryId":"e/1","big":"9007199254740993","added":"by a newer owner"}`)
 	req := thingMessage("GetThingRequest")
-	setField(req, "tenant", protoreflect.ValueOfString("org-1"))
+	setField(req, "tenant", protoreflect.ValueOfString(testOrganization))
 	setField(req, "entry_id", protoreflect.ValueOfString("e/1"))
 	setField(req, "page_size", protoreflect.ValueOfInt32(100))
 	ids := req.Mutable(req.Descriptor().Fields().ByName("ids")).List()
@@ -152,7 +152,7 @@ func TestTranscodedUsesTheBindingUnderThePrefix(t *testing.T) {
 	// The additional binding is the one under the prefix; the path variable is
 	// escaped so its slash cannot add a segment; every other set field is a
 	// query parameter by proto name.
-	want := "/v1/things/e%2F1?filter.name=x&ids=a&ids=b&page_size=100&tenant=org-1"
+	want := "/v1/things/e%2F1?filter.name=x&ids=a&ids=b&page_size=100&tenant=" + testOrganization
 	if got.uri != want {
 		t.Fatalf("uri = %s, want %s", got.uri, want)
 	}
@@ -167,7 +167,7 @@ func TestTranscodedUsesTheBindingUnderThePrefix(t *testing.T) {
 func TestTranscodedSendsTheBodyTheBindingNames(t *testing.T) {
 	gw, got, _ := transcodeServer(t, http.StatusOK, `{}`)
 	req := thingMessage("GetThingRequest")
-	setField(req, "tenant", protoreflect.ValueOfString("org-1"))
+	setField(req, "tenant", protoreflect.ValueOfString(testOrganization))
 	setField(req, "page_size", protoreflect.ValueOfInt32(5))
 	if err := gw.Transcoded(context.Background(), "/v1/things", "/things.v1.Things/Search", req, thingMessage("Thing")); err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestTranscodedSendsTheBodyTheBindingNames(t *testing.T) {
 		t.Fatalf("request = %s %s", got.method, got.uri)
 	}
 	var body map[string]any
-	if err := json.Unmarshal([]byte(got.body), &body); err != nil || body["tenant"] != "org-1" || body["pageSize"] != float64(5) {
+	if err := json.Unmarshal([]byte(got.body), &body); err != nil || body["tenant"] != testOrganization || body["pageSize"] != float64(5) {
 		t.Fatalf("body = %s (%v)", got.body, err)
 	}
 }
@@ -249,7 +249,7 @@ func TestTranscodedPresentsTheViewersCredentials(t *testing.T) {
 		_, _ = io.WriteString(w, `{}`)
 	}))
 	defer srv.Close()
-	gw := newGateway(srv.URL, "Bearer viewer", "org-1", "session-1")
+	gw := newGateway(srv.URL, "Bearer viewer", testOrganization, "session-1")
 	req := thingMessage("GetThingRequest")
 	setField(req, "entry_id", protoreflect.ValueOfString("e1"))
 	if err := gw.Transcoded(context.Background(), "/v1/things", "/things.v1.Things/Get", req, thingMessage("Thing")); err != nil {
