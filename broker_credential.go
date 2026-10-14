@@ -1,9 +1,7 @@
 package solution
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -15,6 +13,7 @@ import (
 	"time"
 
 	corework "github.com/codefly-dev/core/workcontext"
+	"github.com/codefly-dev/saas-sdk-go/moduleauthority"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
@@ -43,9 +42,11 @@ func (c brokerCredential) Attach(r *http.Request) error    { return workcontext.
 
 type brokerMintOptions struct {
 	URL, Prefix, InternalToken, ProjectionAudience string
+	OrganizationID                                 string
 	Audience                                       workcontext.AuthorityValue
 	Authority                                      workcontext.AuthorityPin
 	ProjectedToken                                 workcontext.ProjectedTokenSource
+	projectionRead                                 *brokerProjectionReader
 	// Transport answers whether a plaintext URL is admitted — the SDK's rule,
 	// asked with the composition's mesh assertion as loadConfig read it.
 	Transport workcontext.TransportSource
@@ -54,12 +55,12 @@ type brokerMintOptions struct {
 type brokerCredentialSource struct {
 	options          brokerMintOptions
 	client           *http.Client
+	origin           string
 	mu               sync.Mutex // the runtime's controller bounds waits and shares acquisition
 	held             executionCredential
 	renewAt          time.Time
 	terminal         error
 	identity         authorityHeldSource
-	tokenReading     atomic.Bool
 	transportReading atomic.Bool
 }
 
@@ -81,19 +82,12 @@ func newBrokerCredentialSource(options brokerMintOptions) (*brokerCredentialSour
 	if options.ProjectionAudience != "accounts" {
 		return nil, errors.New("module-authority/PROJECTION_AUDIENCE must be accounts for the module broker")
 	}
-	c := &brokerCredentialSource{options: options}
+	c := &brokerCredentialSource{options: options, origin: u.Scheme + "://" + u.Host}
+	if c.options.projectionRead == nil {
+		c.options.projectionRead = &brokerProjectionReader{}
+	}
 	c.client = c.httpClient(u)
 	return c, nil
-}
-
-// body is the mint request: the declared prefix and nothing else. Where this
-// runtime serves and what its frontend declares are not reported here: the
-// gateway resolves this solution's address from the delivered presence
-// document's endpoints, and the frontend travels in the same document, read by
-// the CLI from the file this runtime embeds (FrontendFileName).
-func (o brokerMintOptions) body() []byte {
-	payload, _ := json.Marshal(map[string]string{"prefix": o.Prefix})
-	return payload
 }
 
 func (c *brokerCredentialSource) Credential(ctx context.Context) (executionCredential, error) {
@@ -121,7 +115,7 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	}
 	// A FIFO or a consumer reader can ignore cancellation. Bound the wait and
 	// allow at most one outstanding read, discarding any late result.
-	projected, err := boundedBrokerRead(ctx, &c.tokenReading, c.options.ProjectedToken.ProjectedToken)
+	projected, err := c.options.projectionRead.read(ctx, c.options.ProjectedToken)
 	if err != nil {
 		var projection *projectedTokenError
 		if errors.As(err, &projection) {
@@ -135,46 +129,23 @@ func (c *brokerCredentialSource) obtain(ctx context.Context) (executionCredentia
 	if strings.TrimSpace(projected) == "" {
 		return workcontext.Credential{}, &brokerMintError{class: brokerProjection}
 	}
-	payload := c.options.body()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.options.URL, bytes.NewReader(payload))
+	// The host-owned SDK owns the request, parser, expiry and refusal protocol.
+	// The runtime supplies its already admitted, origin-pinned transport and
+	// bounded projection read. It retains acquisition, seal and deadline policy.
+	owner, err := moduleauthority.New(moduleauthority.Seams{
+		Gateway:       brokerGateway{origin: c.origin, client: c.client},
+		InternalToken: c.options.InternalToken,
+		// AdmitEndpoint above already judged the composition's mesh assertion.
+		AllowInsecureHTTP: true,
+	}, moduleauthority.Credentials{Prefix: c.options.Prefix, Token: brokerProjectionToken(projected), OrganizationID: c.options.OrganizationID})
 	if err != nil {
-		return workcontext.Credential{}, classifyBrokerTransport(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+projected)
-	req.Header.Set("X-Codefly-Internal-Token", c.options.InternalToken)
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return workcontext.Credential{}, classifyBrokerTransport(err)
-	}
-	// The response is classified and bounded below; closing is cleanup only.
-	// Do not drain an untrusted body to reuse a connection: every mint closes it.
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return workcontext.Credential{}, brokerStatusError(resp.StatusCode)
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, (64<<10)+1))
-	if err != nil {
-		return workcontext.Credential{}, classifyBrokerTransport(err)
-	}
-	if len(raw) > 64<<10 {
 		return fail()
 	}
-	// These are the broker's HTTP fields, not fields of a signed capability.
-	var issued struct {
-		Token       string `json:"token"`
-		ExpiresAt   string `json:"expiresAt"`
-		PrincipalID string `json:"principalId"`
-		Tenant      string `json:"tenant"`
+	issued, err := owner.MintModuleWorkContext(ctx)
+	if err != nil {
+		return workcontext.Credential{}, ownerBrokerFailure(ctx, err)
 	}
-	if json.Unmarshal(raw, &issued) != nil {
-		return fail()
-	}
-	expiry, err := time.Parse(time.RFC3339, issued.ExpiresAt)
-	if err != nil || !expiry.After(time.Now()) {
-		return fail()
-	}
+	expiry := issued.ExpiresAt
 	decoded, err := corework.Decode(issued.Token)
 	if err != nil {
 		return fail()
@@ -283,5 +254,47 @@ func boundedBrokerRead[T any](ctx context.Context, busy *atomic.Bool, read func(
 		return got.value, got.err
 	case <-ctx.Done():
 		return zero, ctx.Err()
+	}
+}
+
+// brokerProjectionReader shares only an in-flight projection read. A blocked
+// file retains one reader across scope eviction; waiters retain no per-caller
+// state in the flight. Completed reads are never cached across later mints.
+type brokerProjectionReader struct {
+	mu     sync.Mutex
+	flight *projectionFlight
+}
+type projectionFlight struct {
+	done  chan struct{}
+	token string
+	err   error
+}
+
+func (r *brokerProjectionReader) read(ctx context.Context, source workcontext.ProjectedTokenSource) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	r.mu.Lock()
+	flight := r.flight
+	if flight == nil {
+		flight = &projectionFlight{done: make(chan struct{})}
+		r.flight = flight
+		go func() {
+			flight.token, flight.err = source.ProjectedToken()
+			r.mu.Lock()
+			r.flight = nil
+			close(flight.done)
+			r.mu.Unlock()
+		}()
+	}
+	r.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-flight.done:
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return flight.token, flight.err
 	}
 }

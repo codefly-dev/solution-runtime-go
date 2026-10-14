@@ -84,7 +84,7 @@ var DefaultViewer = SealedViewer("passthroughtest-viewer")
 func SealedViewer(seed string) Viewer {
 	return Viewer{
 		Bearer:    "Bearer " + capability(seed),
-		OrgID:     "passthroughtest-org",
+		OrgID:     corework.FixtureOrganization,
 		SessionID: "passthroughtest-session",
 		// The installation the gateway stamps beside the org and the session.
 		// Every mint the runtime runs names one and refuses without it.

@@ -12,7 +12,6 @@ import (
 
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/modelcontextprotocol/go-sdk/auth"
-	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 )
@@ -286,46 +285,6 @@ func ViewerFromContext(ctx context.Context) (*Gateway, error) {
 	return gw, nil
 }
 
-// actsForNobody reports whether an MCP method runs nothing on a viewer's
-// behalf: the handshake, the keepalive, and the listings that describe what
-// this solution declares.
-//
-// Everything else is held to this execution's credential. The list is what a
-// method must be ON to skip that check, so a method nobody here has heard of is
-// checked.
-func actsForNobody(method string) bool {
-	switch method {
-	// The handshake, the keepalive and the listings that describe what this
-	// solution declares.
-	case "initialize", "ping",
-		"tools/list", "prompts/list", "resources/list", "resources/templates/list",
-		// The notifications the SDK itself sends, named one by one.
-		//
-		// This was strings.HasPrefix(method, "notifications/"), which is a
-		// DENYLIST wearing an allowlist's clothes: the namespace is open, the
-		// SDK's extension API lets author code register methods under it, and
-		// one registered there would have run with a viewer's gateway and no
-		// credential check — the round-nine defect, still reachable. An exact
-		// list cannot be widened by someone else's naming.
-		"notifications/initialized", "notifications/cancelled",
-		"notifications/progress", "notifications/roots/list_changed":
-		return true
-	}
-	return false
-}
-
-// mcpCredentialUnavailableCode is what an MCP client is told when this process
-// will not act for a viewer: -32001, in JSON-RPC's implementation-defined
-// server range, beside the SDK's own CodeResourceNotFound (-32002).
-//
-// I claimed this could not be set because the SDK's wire-error type was
-// internal. That was wrong, and wrong because I grepped for the type and
-// stopped: package jsonrpc exports it as an alias
-// (jsonrpc.Error = jsonrpc2.WireError) precisely so a server can set a code. A
-// client that only gets a generic protocol error cannot tell "this solution
-// cannot act right now" from a broken tool, so it cannot back off.
-const mcpCredentialUnavailableCode = -32001
-
 // mcpViewer binds each incoming MCP request to the viewer it arrived as, so a
 // tool handler reads composed modules on their behalf and not as the solution.
 //
@@ -360,35 +319,7 @@ func (s *Server) mcpViewer(next mcp.MethodHandler) mcp.MethodHandler {
 		// middleware, so the runtime's own errors are sanitized before the
 		// author ever holds one. See Gateway.surfaced.
 		gw.sanitizeErrors = true
-		// The credential gate, before anything author-written runs.
-		//
-		// This is R4-3 on the MCP path, and it arrived with the surface rather
-		// than being missed in it: a plain handler and a ViewerBearer
-		// passthrough are both held here, and a tool call was not. A tool
-		// receives a gateway carrying the viewer's bearer, so running one while
-		// the issuer has withdrawn this execution's credential is acting for a
-		// viewer without authority — and a tool that mints nothing still sends
-		// that bearer wherever it dials.
-		//
-		// An ALLOWLIST of the methods that act for nobody, not a denylist of
-		// the ones that act. A denylist over a method set this package does not
-		// own is the mistake the TLS posture made three times: whatever it does
-		// not name, the far side keeps. A method the SDK adds tomorrow is gated
-		// here by default, and the cost of that being wrong is a refusal rather
-		// than an ungated viewer action.
-		if !actsForNobody(method) {
-			if err := s.actingForAViewer(ctx); err != nil {
-				// The sanitized sentence, not the error: it wraps whatever the
-				// source said — a mint URL, an issuer's own text, a dial
-				// failure naming an internal address — and an MCP client is as
-				// much a viewer's channel as a browser is.
-				log.Printf("solution %q: refusing an MCP %s for a viewer: %v", s.manifest.ID, method, err)
-				return nil, &jsonrpc.Error{
-					Code:    mcpCredentialUnavailableCode,
-					Message: credentialRefusalForAViewer(err),
-				}
-			}
-		}
+
 		result, err := next(context.WithValue(ctx, mcpViewerKey{}, gw), method, req)
 		// An error RESULT, which is not an error at all as far as this
 		// middleware is concerned.
@@ -516,29 +447,6 @@ func (s *Server) requireStampedViewer(next http.Handler) http.Handler {
 			}
 			http.Error(w, fmt.Sprintf("MCP requires a user session: the gateway stamped %s and %s empty%s. A credential that authenticates without a session cannot act for a viewer: every tool call that does mints a Work Context rooted in one. Connect as a signed-in person.",
 				stamped, sessionHeader, detail), http.StatusForbidden)
-			return
-		}
-		// And this execution's own credential, at the HTTP boundary.
-		//
-		// The method-layer gate in mcpViewer refuses the same thing, and both
-		// are here on purpose. This one answers a real HTTP 503, which
-		// JSON-RPC has no equivalent for at all, and it holds anything that
-		// reaches this handler without going through the method middleware.
-		//
-		// The method layer is not codeless: it carries -32001 through
-		// jsonrpc.Error. This comment said the SDK's wire-error type was
-		// internal and a code could not be set, which was my own false claim —
-		// I grepped for the type, found internal/jsonrpc2, and stopped looking
-		// for the exported alias. Corrected in the code one commit and left
-		// standing here.
-		if err := s.actingForAViewer(r.Context()); err != nil {
-			// The sanitized sentence, never the source's error: it wraps
-			// whatever the issuer said, which is a mint URL and sometimes a
-			// dial failure naming an internal address. An agent client is a
-			// viewer's channel like a browser is, and this was the disclosure
-			// executed round eight reproduced.
-			log.Printf("solution %q: refusing an MCP request for a viewer: %v", s.manifest.ID, err)
-			http.Error(w, credentialRefusalForAViewer(err), http.StatusServiceUnavailable)
 			return
 		}
 		next.ServeHTTP(w, r)

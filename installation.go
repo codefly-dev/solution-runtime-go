@@ -91,19 +91,6 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid installation", http.StatusBadRequest)
 		return
 	}
-	// An uninstalled solution holds no execution credential and needs none
-	// here: the step acts under the capability the host carried in, and the
-	// host issues this execution's credential only once the step has been
-	// acknowledged. Refusing the step for want of that credential is a
-	// solution nobody can ever install. Every other state is held to what a
-	// viewer's call is held to.
-	uninstalled := s.uninstalled()
-	if !uninstalled {
-		if err := s.actingForAViewer(r.Context()); err != nil {
-			installationOutcome{status: http.StatusServiceUnavailable}.write(w)
-			return
-		}
-	}
 	// The supplied capability is the step's bearer. No viewer session is
 	// involved, and no viewer capability is minted for an install step.
 	gw := s.gatewayFor(nil)
@@ -112,11 +99,7 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), mcpViewerKey{}, gw)
 	outcome := s.installOnce(ctx, installation)
 	outcome.write(w)
-	if outcome.status == http.StatusNoContent {
-		// After the answer is written: the host activates the installation
-		// when it reads it, and only then is there a credential to hold.
-		s.installAcknowledged()
-	}
+
 }
 
 // decodeInstallation bounds the entire body, including whitespace after the

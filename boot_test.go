@@ -35,6 +35,7 @@ const (
 	// fixtures. Neutral on purpose: this runtime knows nothing about any
 	// specific solution, and a product's name in its fixtures is a name the
 	// next reader copies into production.
+	testOrganization  = viewerOrg
 	testSolutionID    = "widgets-go"
 	testSolutionTitle = "Widgets"
 
@@ -273,6 +274,7 @@ func (m *hostMint) execution() corework.Execution {
 }
 
 func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
+	organization := testOrganization
 	m.mu.Lock()
 	m.presented = append(m.presented, r.Header.Get("authorization"))
 	m.headers = append(m.headers, r.Header.Clone())
@@ -288,15 +290,18 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(body, &mint)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"token": capability("context-" + mint.Audience + ".1"), "orgId": mint.OrgID,
-			"expiresAt": time.Now().Add(m.ttl).UTC().Format(time.RFC3339),
+			"expiresAt": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 		})
 		return
 	}
 	if r.URL.Path == "/modules/_work-context" {
 		var body map[string]string
-		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || body["prefix"] != testSolutionID || len(body) != 1 {
+		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Accept") != "application/json" || r.Header.Get("X-Codefly-Internal-Token") != "broker-perimeter-token" || !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") || json.NewDecoder(r.Body).Decode(&body) != nil || body["prefix"] != testSolutionID || len(body) < 1 || len(body) > 2 {
 			http.Error(w, "invalid broker request", http.StatusBadRequest)
 			return
+		}
+		if body["organization_id"] != "" {
+			organization = body["organization_id"]
 		}
 	}
 	atomic.AddInt64(&m.mints, 1)
@@ -321,7 +326,7 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		OwnerPrincipalKind: "human",
 		TaskID:             fmt.Sprintf("workload-execution-%d", atomic.LoadInt64(&m.mints)),
 		Audience:           testAudience,
-		OrganizationID:     corework.FixtureOrganization,
+		OrganizationID:     organization,
 		InstallationID:     cmp.Or(m.installationFor(), testInstallation),
 		TTL:                m.ttl,
 		// Core v0.9.0 requires the caller to attest the build it is running:
@@ -520,7 +525,7 @@ func bootFailsWithin(t *testing.T, server *Server, mint *hostMint, within time.D
 // over any interval, and a plain-HTTP listener on the resolved port — the
 // cell's mesh carries the hop, and this process presents no identity of its
 // own.
-func TestBootMintsExactlyOnceAndServesPlainHTTP(t *testing.T) {
+func TestBootServesPlainHTTPWithoutMinting(t *testing.T) {
 	mint := newHostMint(t, &hostMint{})
 	solution := boot(t, New(Manifest{ID: testSolutionID}).
 		Handle("/thing", func(context.Context, *Gateway) (any, error) { return map[string]string{"ok": "yes"}, nil }), mint)
@@ -533,12 +538,10 @@ func TestBootMintsExactlyOnceAndServesPlainHTTP(t *testing.T) {
 			t.Fatalf("served manifest = %d, want 200", status)
 		}
 	}
-	if got := mint.count(); got != 1 {
-		t.Errorf("the host minted %d credentials for one process start, want exactly 1: nothing may mint per request, per beat or per probe", got)
+	if got := mint.count(); got != 0 {
+		t.Fatalf("boot and health minted %d credentials, want zero", got)
 	}
-	if want := "Bearer projected-token"; mint.presented[0] != want {
-		t.Errorf("the mint was presented %q, want %q — the projected service-account token is what attests which workload this is", mint.presented[0], want)
-	}
+
 }
 
 // TestABootedRuntimeMintsOnceUnderConcurrentRequests is the mint-once claim
@@ -585,7 +588,7 @@ func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
 			request.Header.Set("authorization", viewerBearer())
 			// The identity headers the gateway stamps from the verified bearer;
 			// ForModule needs both to mint.
-			request.Header.Set(orgHeader, "org-1")
+			request.Header.Set(orgHeader, testOrganization)
 			request.Header.Set(sessionHeader, "session-1")
 			request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 			resp, err := solution.client.Do(request)
@@ -796,47 +799,16 @@ func TestAPlaintextGatewayIsAdmittedExactlyWhereTheSDKsRuleAdmitsIt(t *testing.T
 	}
 }
 
-// TestServeEndsOnATerminalCredentialRefusal: a refused build is not something
-// to keep serving under. serve() watches credentialRefusedC and closes the
-// listener; removing that watch left the process serving indefinitely while
-// /health answered 503, which is the "answers 503 forever while reporting
-// itself healthy" shape inverted — and no committed test observed serve
-// returning.
-func TestServeEndsOnATerminalCredentialRefusal(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	bootEnvironment(t, mint)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	server := New(Manifest{ID: testSolutionID})
-	ln, err := takeListener(server).start(ctx)
-	if err != nil {
-		t.Fatalf("boot: %v", err)
+// A scoped refusal cannot stop the listener shared by other installations.
+func TestServeSurvivesScopedRefusalAndStopsOnCancellation(t *testing.T) {
+	mint := newHostMint(t, &hostMint{status: http.StatusForbidden})
+	server := declaredWorkServer(t)
+	running := boot(t, server, mint)
+	if err := testWorkCredential(server, t.Context()); err == nil {
+		t.Fatal("work was not refused")
 	}
-	served := make(chan error, 1)
-	go func() { served <- server.serve(ctx, ln) }()
-
-	// The control: it is still serving, so the assertion below is about the
-	// refusal and not about a listener that never came up.
-	select {
-	case err := <-served:
-		t.Fatalf("serve returned before anything refused this execution's credential: %v", err)
-	case <-time.After(250 * time.Millisecond):
-	}
-
-	refusal := fmt.Errorf("%w: this build is not the one the presence document approved", workcontext.ErrMintRefused)
-	server.credentialRefused(refusal)
-
-	select {
-	case err := <-served:
-		if err == nil {
-			t.Fatal("serve ended without reporting why: the orchestrator restarts against a judgement, so the reason is what it has to be given")
-		}
-		if !strings.Contains(err.Error(), "presence document approved") {
-			t.Errorf("serve ended with %q, which does not carry the issuer's judgement", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not end after this execution's credential was refused for good: the process keeps serving a binding it has no authority for, and the host keeps routing to it")
+	if healthOf(t, running) != http.StatusOK {
+		t.Fatal("scoped refusal stopped listener")
 	}
 }
 
@@ -926,7 +898,7 @@ func TestACredentialThatCannotBePresentedRefusesTheMint(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	_, err = server.gatewayFor(header).ForModule(context.Background(), "things",
@@ -975,152 +947,42 @@ func takeListener(server *Server) *Server {
 	return server
 }
 
-// TestABootedRenewalToAnotherExecutionEndsTheProcess is B3: the renewal
-// evidence for R9-1, driven through a real boot and the real mint client
-// rather than by calling the wrapper directly.
-//
-// The unit tests prove authorityHeldSource refuses a renewal sealed to no
-// execution or to a different one. They do not prove the booted runtime
-// classifies that refusal as terminal, stops serving, and ends — which is the
-// behaviour an orchestrator depends on and the thing a wrapper test cannot
-// see. The executed round validated these in scratch; they belong here.
-//
-// The issuer answers correctly for the first credential and switches shape
-// afterwards. The broker renews at one fifth of the issued lifetime (capped
-// at thirty seconds), so the first install and control call precede renewal.
-func TestABootedRenewalToAnotherExecutionEndsTheProcess(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		after *hostMint
-	}{
-		{"a renewal sealing no execution", &hostMint{executionFree: true}},
-		{"a renewal sealing a different build", &hostMint{incarnation: 99}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// Twelve seconds leaves roughly nine seconds for the control call
-			// before the native broker's renewal lead. Keep that margin: an
-			// earlier version depended on a loaded runner booting in a second.
-			mint := newHostMint(t, &hostMint{
-				ttl:         12 * time.Second,
-				switchAfter: 1,
-				switchTo:    tc.after,
-			})
-			var ran atomic.Bool
-			solution := boot(t, New(Manifest{ID: testSolutionID}).
-				HandleRequest("/thing", func(*http.Request, *Gateway) (any, error) {
-					ran.Store(true)
-					return map[string]string{"ok": "yes"}, nil
-				}), mint)
-
-			// call reports the status, or 0 with the reason the request did
-			// not complete. The reason is carried rather than swallowed: this
-			// test read a bare 0 as "the listener is gone", and a 0 is also
-			// what a refused handshake, a closed connection mid-request and a
-			// not-yet-bound port look like — so the one failure this test hit
-			// in CI reported only "answered 0" and said nothing about why.
-			call := func() (int, error) {
-				request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				request.Header.Set("authorization", viewerBearer())
-				resp, err := solution.client.Do(request)
-				if err != nil {
-					return 0, err
-				}
-				defer drainAndClose(resp)
-				return resp.StatusCode, nil
-			}
-
-			// The control: the first credential is sound and the route serves.
-			if got, err := call(); got != http.StatusOK {
-				t.Fatalf("the route answered %d (%v) before any renewal, so nothing below is about the renewal", got, err)
-			}
-			if !ran.Load() {
-				t.Fatal("the handler never ran on the first call")
-			}
-			ran.Store(false)
-
-			// Past the renewal lead, every ask renews — and the issuer has
-			// changed shape.
-			//
-			// THE ROUTE REFUSING IS NOT THE ASSERTION. This test returned on
-			// the first 503 or the first transport error, and a reviewer was
-			// right that a runtime refusing the request and then serving 503
-			// forever satisfied it — as would an unrelated transient renewal
-			// failure, and a transport error was being read as proof the
-			// listener had disappeared when it proves only that one request
-			// did not complete. Worse, cleanup stops the server itself, so
-			// "the process ended" was never observed at all.
-			//
-			// So the refusal is a waypoint, and what is asserted is: the
-			// handler did not run on the refused call, serve returned BY
-			// ITSELF, and it returned the terminal reason.
-			refused := false
-			deadline := time.Now().Add(20 * time.Second)
-			for time.Now().Before(deadline) {
-				// Reset per call, not once: a call made while the FIRST
-				// credential is still valid runs the handler legitimately, so
-				// the question is whether the handler ran on the call that was
-				// refused — not whether it ran at all during the wait.
-				ran.Store(false)
-				status, _ := call()
-				if status == http.StatusServiceUnavailable || status == 0 {
-					if ran.Load() {
-						t.Error("the handler ran on the refused call: the refusal has to come before anything author-written")
-					}
-					refused = true
-					break
-				}
-				time.Sleep(200 * time.Millisecond)
-			}
-			if !refused {
-				t.Fatalf("the route was still answering 200 twenty seconds after the issuer began sealing a different execution: a renewal that replaces this execution is terminal, so the process stops serving and ends for the orchestrator")
-			}
-
-			// And the process ends, by itself, with the reason.
-			//
-			// This is what an orchestrator depends on: a pod that refuses
-			// every request but stays up is reported healthy by its
-			// supervisor and keeps a routable endpoint, which is the exact
-			// failure the health/terminal coupling exists to prevent.
-			err, done := solution.ended(20 * time.Second)
-			if !done {
-				t.Fatal("serve was still running twenty seconds after the renewal was refused: the process refuses every request and never exits, so the orchestrator never restarts it and the host keeps routing to a binding this process has no authority for")
-			}
-			if err == nil {
-				t.Fatal("serve returned without reporting why: the orchestrator restarts against a judgement, so the reason is what it has to be given")
-			}
-			// The terminal reason, not any error: an unrelated transient
-			// failure ending the process would satisfy a nil check and is the
-			// crash loop ErrMintUnavailable must never cause.
-			if !errors.Is(err, workcontext.ErrMintRefused) {
-				t.Errorf("serve ended with %v, which does not wrap ErrMintRefused: a transient answer must not end this process, and only a terminal one may", err)
-			}
-			if tc.after.executionFree {
-				if !strings.Contains(err.Error(), "seals no execution") {
-					t.Errorf("serve ended with %q, which does not identify the missing execution", err)
-				}
-			} else {
-				// The native broker retains the terminal classification and
-				// redacts the old/new seals, unlike the former SDK wrapper's
-				// detailed diagnostic. Do not require those internals to leak.
-				want := fmt.Sprintf("solution %q stopped serving: %s", testSolutionID, workcontext.ErrMintRefused)
-				if err.Error() != want {
-					t.Errorf("serve ended with %q, want the redacted terminal refusal %q", err, want)
-				}
-			}
-			// The renewal landed exactly once and remains terminal after the
-			// listener stopped; a later caller cannot trigger another mint.
-			for range 2 {
-				if _, err := solution.server.acquireCredential(context.Background()); !errors.Is(err, workcontext.ErrMintRefused) {
-					t.Errorf("the terminal execution refusal was not retained: %v", err)
-				}
-			}
-			if got := mint.count(); got != 2 {
-				t.Errorf("the host saw %d mints, want the boot and one refused renewal", got)
-			}
-		})
+func TestABootedWorkRefusesARenewalToAnotherExecution(t *testing.T) {
+	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
+	mint := newHostMint(t, &hostMint{ttl: 2 * time.Second, switchAfter: 1, switchTo: &hostMint{incarnation: 99, ttl: 2 * time.Second}})
+	server := New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
+		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
+	}}).Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
+		_, err := gw.ForModule(ctx, "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
+		return map[string]string{"ok": "yes"}, err
+	})
+	solution := boot(t, server, mint)
+	request := func() int {
+		r, _ := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
+		r.Header.Set("authorization", viewerBearer())
+		r.Header.Set(orgHeader, testOrganization)
+		r.Header.Set(sessionHeader, "session")
+		r.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
+		response, err := solution.client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != 200 {
+			body, _ := io.ReadAll(response.Body)
+			t.Logf("work response: %s", body)
+		}
+		return response.StatusCode
+	}
+	if got := request(); got != 200 {
+		t.Fatalf("initial work = %d", got)
+	}
+	time.Sleep(2100 * time.Millisecond)
+	if got := request(); got != 503 {
+		t.Fatalf("changed execution = %d", got)
+	}
+	if getStatus(t, solution.client, solution.base+HealthPath) != 200 {
+		t.Fatal("scoped refusal ended process")
 	}
 }
 

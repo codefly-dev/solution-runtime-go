@@ -3,7 +3,7 @@
 This repository owns the generic Go runtime for **codefly solutions** — modules
 deployed independently of the host they extend, with no build-time coupling. It
 owns what every solution needs identically: configuration resolution through the
-codefly SDK, obtaining this execution's credential at boot and on demand from the projected
+codefly SDK, obtaining installation-scoped credentials on actual module work from the projected
 service-account token, a plain-HTTP listener on the port Codefly resolves —
 the cell's mesh carries transport security and destination identity for every
 hop inside it — CORS, Module Federation asset serving, the capability
@@ -27,7 +27,7 @@ It owns none of the counterparts it talks to. The mint endpoint and the
 admission rules belong to the host (the composition's own host module) and the
 gateway; the authority reader and the one transport rule that admits a
 plaintext URL (`workcontext.AdmitEndpoint`) to `codefly-dev/sdk-go`; the broker
-wire contract to the host, implemented natively here; endpoint, port and secret resolution to `sdk-go` as well;
+wire contract and client to `saas-sdk-go/moduleauthority`; endpoint, port and secret resolution to `sdk-go` as well;
 workspace, manifest and presence/authority document types to `codefly-dev/core`;
 running a composition, provisioning its secrets and rendering the authority
 document to `codefly-dev/cli`. Everything here is a library — one Go package at
@@ -290,15 +290,11 @@ embedding it.
   trims the value: only the literal `true` asserts, and a misspelled
   assertion is a refusal rather than either answer. Do not add a boolean
   beside it; a per-service opt-in is what an address never has to qualify for.
-- The credential is obtained **once**, before the listener exists. A *refusal*
-  fails the boot and is never retried — the host is saying this build is not the
-  one its presence document approved, which no number of attempts changes, and a
-  loop around it is the audited-mint cost this runtime was changed to remove. An
-  *unavailable* mint is not a judgement (a presence generation not yet applied,
-  an issuer that cannot reach its own dependencies), so the boot waits inside a
-  bounded window, with the window as a deadline on the operation, and then exits
-  non-zero for the orchestrator. Those two answers must stay distinguishable:
-  conflating them was a review blocker in both directions.
+- Workload credentials are acquired only for actual authority-consuming work,
+  after the declared ceiling is checked. Boot, health, viewer-only routes, MCP
+  handshakes and installation acknowledgements never mint. Authority-free
+  declarations need no broker credentials. Each organisation/installation has
+  independent acquisition, expiry and refusal state; no global credential.
 - **Credential-bearing traffic never follows a redirect and never leaves the
   gateway's origin.** Go copies a request's headers onto a redirected one and
   strips only `Authorization`, `WWW-Authenticate` and `Cookie`, a 307 re-sends
@@ -345,37 +341,16 @@ embedding it.
   capability's seal on the held credential; no such path exists here, because
   every mint is viewer-driven and `ForModule` refuses a caller without an org
   and a session.
-- **This execution's own credential is held to what it was FIRST sealed to.**
-  The host seals it from the projected token — the broker request carries no installation field — so what this runtime owns is refusing one sealed to no
-  installation, refusing one sealed to no **execution** (image digest and build
-  incarnation, which core seals as a pair), and refusing a renewal sealed to a
-  *different* installation, digest or incarnation. The last is one value, not
-  three checks: a renewal that changed any part of it is a different
-  execution's credential arriving through the renewal path, and every work
-  context this process mints for a viewer is attested by it — so the mints
-  either side would name a different deployment or a different build,
-  including one the host's approved-build ceiling was never applied to. The
-  no-execution case is the one the sdk-go v0.3.0 migration opened: the previous
-  SDK's reader refused a zero incarnation, so a credential arriving here
-  carried one by construction, and core legitimately mints execution-free
-  credentials for a principal recorded as bearing none. The guarantee was
-  inherited and the inheritance ended.
-- **Every surface that acts for a viewer is held to this execution's
-  credential, and the MCP methods are held by an allowlist.** A plain handler
-  and a `ViewerBearer` passthrough were gated and a tool call was not, so an
-  MCP tool received a gateway carrying the viewer's bearer and ran while the
-  issuer had withdrawn this process's credential — the same fail-closed defect,
-  arriving with a surface rather than being missed in one. `actsForNobody`
-  lists the methods that run nothing for anyone (the handshake, the keepalive,
-  the listings, notifications) and **everything else** goes through
-  `actingForAViewer`: a method the MCP SDK adds is gated by default, because a
-  denylist over a set this package does not own is the mistake the TLS posture
-  made three times. The refusal carries the sanitized sentence, never the
-  source's error — an MCP client is a viewer's channel like a browser is. It
-  carries a JSON-RPC code, `-32001`: this file said the SDK's wire-error type
-  was internal and that no code could be set, which was false —
-  `jsonrpc.Error` is an exported alias for it, mutant `R10-8` holds the code,
-  and the claim survived here for two rounds after the code landed.
+- **Credentials remain scoped to their organisation and installation.** The
+  broker selects live consent from the organisation request; its response must
+  match both host-stamped identifiers. Renewals within a scope retain its
+  installation, digest and build incarnation. Across scopes and scope eviction,
+  the process retains the same digest and incarnation. A mismatch refuses that
+  work; it never adopts another execution or shuts down unrelated installations.
+- Every `ForModule` path, including HTTP and MCP, uses `gatewayFor` to carry
+  the declared ceiling and the host-stamped organisation/installation into
+  acquisition. Plain route entry is not a request for module authority. Keep
+  incoming identity validation and error sanitization at their boundaries.
 - **What a composition supplies is declared configuration, and a published URL
   is held to what a dialled one is.** A Codefly render cannot set a bare
   environment variable on a service, so anything the composition owns is a
@@ -390,7 +365,7 @@ embedding it.
   userinfo, a query, a fragment, and plaintext in a deployment, and those
   refusals redact: the pairing refusal printed an identifier's `?token=` into
   the boot log.
-- **Nothing mints per request.** One credential per execution plus the renewals
+- **Nothing mints per request.** One credential per organisation/installation plus renewals
   its own expiry dictates, and that has to survive the checks added in front of
   it: a route gate that asked the source on every viewer request turned a
   503-ing issuer into one audited mint per request, which is worse than the
@@ -418,19 +393,15 @@ embedding it.
   field for anything the host lists a solution under, and do not report
   anything about this process to the host: a process cannot declare what the
   composition did not.
-- **`412` is "admitted, installed nowhere", and it is a state, not an error.**
-  The install step runs under the host's incoming capability before an execution
-  credential exists. Its acknowledgement can trigger a bounded retry sequence
-  to bridge activation; there is no idle installation poll. Health only reads
-  process state, never asks for or renews a credential. An idle process must
-  make zero further mints, even after its held credential expires. Actual viewer
-  work still uses the single-flight credential controller and the host's live
-  installation checks. Never turn probes back into authorization traffic.
+- The install endpoint acts under the host's incoming installation capability.
+  Its acknowledgement never acquires workload authority. HTTP 412 means a
+  failed precondition, not a unique "installed nowhere" state. Later actual
+  work may retry after bounded backoff; no startup/idle/install polling loop.
 - **The execution mint follows the host's module broker contract natively,
   over plain HTTP to the gateway's workload endpoint.**
-  `saas-sdk-go/moduleauthority` at `217bf9fe3f10` is the wire reference; its
-  capability dependency is incompatible with this runtime. Send
-  `prefix: Manifest.ID` and nothing else to `/modules/_work-context`, with
+  `saas-sdk-go/moduleauthority.MintModuleWorkContext` owns the broker wire
+  protocol. Supply `prefix: Manifest.ID` and the host-stamped organisation to
+  `/modules/_work-context`, with
   the projected token as bearer and `X-Codefly-Internal-Token` from the
   declared workspace secret `module-authority/INTERNAL_TOKEN` — kept: the
   host's waiver of that header on its workload peer existed only because the
@@ -449,7 +420,7 @@ embedding it.
   the authority reader. `workcontext.MintClient` is NOT the production mint
   client and must not become one without the host serving its wire shape: it
   posts `{audience, projection_audience}` and reads `{work_context}`, where
-  the host takes `{prefix}` and answers `{token, expiresAt, principalId,
+  the host takes `{prefix, organization_id}` and answers `{token, expiresAt, principalId,
   tenant}`; this runtime replaced it with the native client in #59 for that
   reason, and the two places that still construct one — `credential_test.go`
   and `passthroughtest` — do so against fakes that speak the SDK's shape, which
@@ -460,40 +431,22 @@ embedding it.
   `Inspector` — a forwarding hop's **signature check** — so it is a verifier to
   this package and the verifier gate refuses it, with `Authenticator`, by name.
   A private credential view keeps the public SDK `CredentialSource` compatible.
-- **Only 503 and transient transport failures retry.** Timeout, connection
-  refused and connection reset are identified by error types/identities, never
-  text. 401/403 are terminal refusals. Every other HTTP status, TLS failure,
-  permanent DNS failure, cancellation, unclassified transport failure and
-  invalid broker response is a terminal error. Retain safe status/class/category
-  only, with no raw diagnostic cause. Boot and renewal use the same decision;
-  terminal answers are retained where they land, even after waiters leave.
-- **A terminal credential refusal ends the process; a transient one does not.**
-  `ErrMintRefused` or a terminal broker error observed during actual work fails `/health` and ends `serve` with the reason. Health does not discover it by minting.
-  `ErrMintUnavailable` must not: it is transient by construction and exiting on
-  it is a crash loop. `ErrRevoked` is not in either set, and three review rounds
-  found this file still saying it was: the mint client does not return it at all
-  (see `credential.go`) — it comes back from a *callee* rejecting a capability
-  this runtime minted for a viewer, where it is a 409 on that request and no
-  statement about this execution's own credential.
-  **Nothing is inferred from that 409, and the code now matches what this file
-  has said all along.** A cached capability was dropped when a module answered
-  409 with an installation header, and that was wrong three times over: any 409
-  with any header; then any 409 whose header named the installation the
-  capability is sealed to — and a module answering an ordinary business
-  conflict IS in that installation, so a duplicate or a lost update evicted a
-  valid capability and the next call minted again. 409 means "the state you
-  were sealed to has moved" and it means "that page already exists"; nothing on
-  the wire says which, and matching installation metadata identifies the SCOPE
-  of a conflict rather than establishing supersession. A genuinely superseded
-  capability is refused call by call by the far end, correct if noisy, until its
-  own expiry. A sound inference needs a host-side discriminator, which is
-  nobody's to invent here. The boot and the run have to
-  classify these the same way — they did not, and the result was a solution
-  answering 503 forever while reporting itself healthy.
+- Refusals are scoped. Each controller retains the answer even if all waiters
+  leave, backs off, and never uses held authority after refusal or expiry.
+  Later work may recreate a refused scope after backoff to observe changed
+  consent. A failure never stops other installations or the shared listener.
+  Keep safe status/class/category, never bodies, parser messages or causes.
+  Missing projection, 412, 503 and transient transport failures are unavailable;
+  frozen authority and execution consistency still fail closed on every ask.
+- Bound retained scopes (256), waiters (cancellation/500ms), acquisition lifetime,
+  and detached projection reads. Never evict a scope with active work/acquisition.
+  The server shares the projection read slot across scopes so eviction cannot
+  accumulate blocked file reads. Do not let one caller cancel shared acquisition.
+- A module's 409 does not prove workload revocation. The host must provide a
+  machine-readable discriminator before the runtime may infer supersession.
 - **Fail closed, with no exception for a counterpart's current state.** A mint
-  this runtime cannot attest for is not sent; a listener that cannot
-  authenticate its callers does not start; a credential-bearing destination that
-  is not authenticated https is refused at boot. "The gateway presents no client
+  this runtime cannot attest for is not sent; a credential-bearing destination
+  outside the SDK's admitted transport rule is refused at boot. "The gateway presents no client
   certificate today" and "the host does not require the attestation yet" are
   statements about someone else's deployment, and leaving a hole open for as long
   as the counterpart takes is the concession this cutover exists to stop making.

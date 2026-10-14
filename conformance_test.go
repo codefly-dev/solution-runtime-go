@@ -262,7 +262,7 @@ func carryThroughThisRuntime(t *testing.T, token string) (*http.Request, error) 
 	}))
 	defer far.Close()
 
-	gateway := newGateway(far.URL, "Bearer viewer", "org-1", "session-1")
+	gateway := newGateway(far.URL, "Bearer viewer", testOrganization, "session-1")
 	// The capability as a mint would have left it in the cache, so the
 	// transport resolves this exact token rather than minting another.
 	const key = "conformance"

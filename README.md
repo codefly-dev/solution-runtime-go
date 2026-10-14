@@ -2,7 +2,7 @@
 
 Generic Go runtime for **codefly solutions** — independently deployed modules
 that plug into a host at runtime with no build-time coupling. Owns configuration
-resolution, this execution's one credential, a plain-HTTP listener on the port
+resolution, installation-scoped workload credentials, a plain-HTTP listener on the port
 Codefly resolves, CORS, Module Federation asset serving, the capability
 handshake, the manifest served from the declared frontend file, the published
 authority contract, and the gateway client each handler uses to read composed
@@ -42,8 +42,8 @@ bridges the two models, and the cutover is deliberate:
   fallback credential, and no version of the host that serves both.
 - A **new runtime against an old host** registers nothing, because it has
   nothing to register with, and mints nothing, because the old host serves no
-  mint endpoint: the boot fails, naming the endpoint it could not reach, and
-  the process exits non-zero.
+  mint endpoint: actual module work fails when it asks for authority. Boot and
+  health do not contact the broker.
 
 What changed, and why. A solution used to become present by announcing itself:
 two self-registrations — the manifest to the host frontend, the dialable
@@ -56,28 +56,29 @@ claim it.
 Presence is **delivered** now. A signed presence document declares which
 solution runs on which host, at which generation and build, under which
 workload identity; the host reconciles towards it. Authority is delivered the
-same way, by a signed document bound to one approved build. This runtime's only
-outbound act at boot is to obtain its own credential once, from the
-service-account token the platform projects for it; it renews that credential
-on demand when actual work needs it and otherwise says nothing. Health is **answered**,
+same way, by a signed document bound to one approved build. This runtime acquires workload authority only when an operation needs it,
+selecting the organisation and installation from the host-stamped request.
+Boot, health, route entry and install acknowledgement never mint. Health is **answered**,
 never pushed: the host probes the destination its own presence document names,
 and nothing this process answers can make it present.
 
-Four things follow, and each is a boot failure rather than a degraded run:
+The runtime enforces these boundaries:
 
 | | |
 |---|---|
 | The listener is plain HTTP on the resolved port | the cell's mesh carries transport security and destination identity; this process presents no identity of its own and verifies no caller — see [Plain HTTP inside the cell](#plain-http-inside-the-cell) |
-| The credential is obtained once, before the listener exists | a refusal is terminal and never retried; an unavailable mint is waited out inside a bounded deadline — see [One credential per execution](#one-credential-per-execution) |
+| Credentials are acquired for actual module work | each organisation/installation has independent acquisition, expiry and refusal state — see [One credential per execution](#one-credential-per-execution) |
 | The authority-bearing values are read once and frozen | the credential is sealed to the values it was minted under, so a value that drifts is an error, never a reload |
 | The contract is published, and the declaration is held to it | an ask outside its declared ceiling fails the boot — see [The published contract](#the-published-contract) |
 
-Execution minting uses the host's module broker protocol natively. The reference
-is `saas-sdk-go/moduleauthority` at `217bf9fe3f10`; importing that package is
-incompatible with this runtime's SDK capability API, so no dependency was added.
+Execution minting uses `saas-sdk-go/moduleauthority.MintModuleWorkContext`.
+The host-owned SDK encodes the broker request, parses its bounded answer and
+classifies its refusals. This runtime supplies its admitted, origin-pinned
+transport and bounded projection read; it retains deadline, single-flight,
+seal and renewal policy. The broker expiry may shorten the signed expiry.
 The request is `POST /modules/_work-context` on the gateway's **workload**
 endpoint — the one origin this runtime resolves, which serves the gateway's
-whole handler — with `{"prefix":"<Manifest.ID>"}` and nothing else,
+whole handler — with `{"prefix":"<Manifest.ID>","organization_id":"<stamped organisation>"}`,
 `Authorization: Bearer <projected token>`, and `X-Codefly-Internal-Token`. The
 prefix is the declared solution ID, separate from the frozen SPIFFE principal.
 
@@ -90,17 +91,11 @@ the CLI hands it — as it already did for modules — and the frontend travels 
 the same document, read by the CLI from the file this runtime embeds. A
 process cannot declare what the composition did not.
 
-A host that admits this workload but has not been asked to install it anywhere
-answers `412`. That is not a refusal. The runtime serves holding no credential:
-`/health` answers `200`, and the [install step](#install-step) runs, because it
-acts under the capability the host carries in and the host issues this
-execution's credential only after that step is acknowledged. Neither asks the
-host again. An acknowledged install step triggers a bounded sequence of up to
-six attempts to bridge the host's activation-after-acknowledgement race. After
-that sequence the runtime remains idle; an actual viewer operation can acquire
-through the same controller. There is no periodic polling while uninstalled.
-A `401`/`403`
-stays what it was: a judgement, which fails the boot and is never retried.
+The install step runs under the capability carried by the host. It can acknowledge
+before any workload credential exists, and acknowledgement triggers no mint.
+The host activates consent afterwards; a later module operation acquires against
+that live consent. HTTP `412` means a required precondition is unmet; it does not
+uniquely mean that the solution is installed nowhere.
 
 The answer carries `token`, `expiresAt`,
 `principalId`, and `tenant`. Core alone reads the returned capability, through
@@ -212,7 +207,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Gateway URL (auth-gateway `workload`) | resolved by role — the single module owning the `auth-gateway` `workload`/`http` endpoint, discovered from the injected carriers (or the workspace, run locally, where core's endpoint visibility applies: an endpoint private to the host's module is refused, not resolved, for a solution in another module). The workload endpoint serves the gateway's whole handler, the mint included; the public `rest` endpoint does not resolve it. Held to the SDK's transport rule: `https` anywhere; `http` only to a loopback host on a local run, or to an in-cluster Service address (`<svc>.<ns>.svc[.<domain>]`) when the composition asserts `internal-transport/mesh-protected=true` | `GATEWAY_URL` |
 | Credential mint URL | the host's published broker route, `/modules/_work-context`, on the resolved gateway. Derived, with no override: the gateway's workload endpoint serves it, and a second address would be a second destination for the projected service-account token. A 404 there means the host does not serve its gateway's full handler on that endpoint, which is terminal | — |
 | Mesh assertion | `codefly.For(ctx).WorkspaceValueIfSet("internal-transport", "mesh-protected")` — read once at boot and handed to the SDK's rule above; exactly `true` asserts that every in-cluster hop is carried by a mutually authenticated mesh, unset or `false` keeps plaintext refused, any other value is a boot refusal. The same setting the composed modules apply to their own gateway value | — (declared configuration) |
-| Broker perimeter credential | `codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")`, required at boot. Sent only to the execution broker as `X-Codefly-Internal-Token`; it does not replace the projected token | — (declared workspace secret, no legacy env fallback) |
+| Broker perimeter credential | `codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")`, required at boot for authority-consuming declarations. Sent only to the execution broker as `X-Codefly-Internal-Token`; it does not replace the projected token | — (declared workspace secret, no legacy env fallback) |
 | Projected service-account token | a **path**, re-read at every mint; `/var/run/secrets/codefly/token`, the CLI projection, which every Codefly-managed deployment mounts | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
@@ -361,78 +356,50 @@ the in-cell SVID world this replaces.
 
 ## One credential per execution
 
-`Serve` obtains this execution's credential once, before the listener exists,
-through the native module broker client: the projected
-service-account token is presented to the host's mint endpoint, and the host —
-which establishes the principal, the installation and the build from that token
-and its own records, never from anything this process reports — answers with a
-credential sealed to this build incarnation and this installation.
+A shared process holds a separate workload credential for each organisation and
+installation. `ForModule` checks the published ceiling before asking the broker.
+The request uses the host-stamped organisation selector; the returned credential
+must match both that organisation and the stamped installation. Core reads the
+capability; the host remains responsible for authenticating it and enforcing
+live consent, workload admission and approved build.
 
-An idle runtime makes **no credential acquisition or renewal requests** after
-boot and installation processing. Health probes read process state only. Real
-viewer operations acquire on demand through the existing single-flight controller:
-it returns a held current credential, and renews only when work needs a credential
-inside its renewal lead. Renewal rereads the rotated projection and checks the
-frozen authority before sending. A transient failure backs off while a held,
-unexpired credential remains usable; an expired one is never used.
+`Serve`, health, HTTP/MCP route entry, viewer-only forwarding and install
+acknowledgement make **no credential acquisition or renewal requests**. A
+component with no authority-consuming declaration does not require broker
+credentials. Host-driven installation uses its incoming installation capability.
 
-Presence and build admission belong to delivered declarations and installation
-transitions. A short-lived Work Context authorizes actual work; it does not
-register this process or extend registry presence. The host still checks live
-installation consent, revisions and revocation on protected requests.
+Each scope has one bounded acquisition flight and its own held credential and
+backoff. Request waits are bounded by cancellation and 500ms; an acquisition
+continues on its own bounded context so one cancelled waiter does not cancel
+other callers. At most 256 scopes are retained. Idle scopes may be evicted;
+scopes with active callers or acquisitions cannot be evicted. A shared projection
+read slot prevents blocked token reads accumulating across replaced scopes.
 
-**A refused first mint fails the boot and is never retried. An unavailable one
-is waited for, within a bound.** The two are different answers:
+Actual work reuses the credential before its renewal lead. Renewal rereads the
+projection, rechecks frozen authority before and after the mint, and preserves
+the execution's image digest/build incarnation across all scopes. Broker expiry
+may shorten, never extend, the signed lifetime. A transient failure permits a
+held unexpired credential; expiry or a refusal prevents use. The host continues
+to enforce revocation on each protected operation.
 
-- A **refusal** (`401` or `403`, wrapping `ErrMintRefused`) is terminal and
-  retained. It is never retried.
-- An **unavailable** mint (`503`, timeout, connection refused or connection
-  reset, or a projected token that is not there yet, wrapping
-  `ErrMintUnavailable`) is retried with backoff inside the
-  **two-minute** boot deadline. Renewal uses the same classification and keeps
-  an unexpired held credential available during transient failures.
-- Every other HTTP status, including `400`, `404`, `429`, `500`, and redirects,
-  is a **terminal error**. TLS, permanent DNS, cancellation, unclassified
-  transport failures, invalid responses and a projection that is present but
-  unusable are terminal too. They stop renewal and fail health. Status, status class and transport
-  category survive; raw body, headers, parser diagnostics and causes do not.
+`401`/`403` are refusals; `412`, `503`, missing projection and transient transport
+failures are unavailable conditions. Other protocol/configuration failures are
+retained as errors. Every failed acquisition starts bounded backoff. A refused
+scope can re-open its source when later work arrives after that backoff, so
+changed organisation consent can recover. No background timer retries. One
+scope's refusal never stops the shared listener or another installation.
 
-Every mint is one plain-HTTP request to the host's broker route on the
-gateway's workload endpoint, over a connection dialled for it and closed after
-it, pinned to that one origin. The mesh carries the hop and names this workload
-to the host; the projected token attests which workload asks, and the
-perimeter secret travels beside it. Redirects, proxies and connection reuse are
-disabled, and the URL is held to the SDK's transport rule before anything is
-sent. The SDK owns authority resolution. `CredentialSource` remains
-SDK-compatible for consumers supplying their own issuer.
+The host-owned SDK's uncached `MintModuleWorkContext` owns the wire contract;
+this runtime owns acquisition policy and its admitted, origin-pinned transport.
+Redirects and proxies are disabled. `CredentialSource` retains its SDK-compatible
+signature; a supplied source must return a credential matching the requested
+scope and frozen execution. No public per-organisation factory is introduced.
 
-The bound is what keeps the second case from being the heartbeat again: it is a
-boot waiting for a dependency, with no steady state, nothing minted on success
-beyond the one credential, and an exit — the orchestrator's cue to restart —
-when it is spent.
-
-The credential is also what this runtime presents on the mint it runs **for a
-viewer** (see [Reading a Work-Context-authenticated
-module](#reading-a-work-context-authenticated-module)): the viewer's bearer says
-on whose behalf, and this credential says which module is asking, so the issuer
-can hold that mint to the installation and binding the credential is sealed to
-instead of seeing only that somebody holding a viewer's bearer asked.
-
-**A mint this runtime cannot attest for is not sent.** If the credential cannot
-be obtained — no source, a refused renewal, authority that drifted, a capability
-that cannot be attached — the call is refused with `ErrNotAttested` and the page
-sees `unavailable`: the viewer's own authority is not in question and one
-renewal fixes it.
-
-It used to log and carry on, and that was wrong in the one case the attestation
-exists for. The issuer stops renewing precisely when the installation has moved,
-the build is no longer approved, or the principal's epoch has advanced — so a
-workload in exactly that state kept minting viewer capabilities with no
-execution binding on any of them. "The host does not require the attestation
-yet" is a statement about the counterpart's current state, and boot-time
-approval is not authorization at use. The refusal is logged once per distinct
-failure rather than once per request, and once more when it recovers; what a
-caller gets is not throttled, because every affected call is refused.
+A viewer mint this runtime cannot attest is not sent. HTTP callers receive a
+sanitized unavailable response; MCP tool errors are sanitized before delivery.
+Broker status/class/category survive internally, but response bodies, parser
+messages and transport causes do not. A Work Context authorizes work; it never
+registers a process or establishes its presence.
 
 **Nothing is inferred from a module's 409.** A capability is held until its own
 expiry, whatever a callee answers. A 409 means "the state you were sealed to
@@ -614,12 +581,9 @@ solution present to nobody: the host builds its registry entry from the
 delivered presence document and its own constants, never from this route.
 
 `/health` reports process health without acquiring or renewing a credential.
-It answers 200 while idle, including when installed nowhere or a held credential
-has expired. This is not an authorization verdict: every actual viewer operation
-passes the credential gate and the host's live consent and revocation checks.
-A terminal refusal observed during actual work is retained, makes health answer
-503 and ends the process. A transient mint outage refuses work that has no
-usable credential but does not turn health probes into repeated mint attempts.
+It answers 200 while idle, when installed nowhere, and after a scoped refusal.
+It makes no authorization claim: each module operation uses its scope's
+credential and remains subject to the host's live consent and revocation checks.
 
 The manifest declares the majors it is built against rather than leaving a
 reader to assume them — `schemaVersion: 1`, this runtime's manifest schema, and
@@ -1349,20 +1313,12 @@ source of what is served and what is published, and an operation missing its
 documentation is refused. A `Message[T]` field is described from its
 descriptor, with protobuf JSON names.
 
-> **Note on pins.** SDK in-process endpoint resolution for a solution composed
-> on an out-of-repo host depends on codefly-core accepting the composed module
-> path in its workspace loader (codefly-dev/core#365, merged); the
-> configuration-profile rule and `core/workcontext` come from core; and the
-> certificate reloader, the authority reader and the mint client come from
-> sdk-go. The `core` and `sdk-go` pins in `go.mod` carry all of it, and there is
-> **no `replace` directive** — every one is an ordinary `require` of a released
-> tag, so this module builds from its own tag for anyone.
->
-> The pins are `core v0.19.1`, `sdk-go v0.3.2` and the `sdk-go/workcontext` leaf
-> at its first tag, `workcontext/v0.1.0` (it was a `main` pseudo-version until
-> that leaf was tagged). Every capability's format changed in the v0.9.0
-> cutover, so verifiers upgrade before minters or calls fail closed in the
-> window — which is a statement about the rollout order, not about these pins.
+> **Dependency pins.** `go.mod` records the exact Core, SDK and SaaS SDK
+> revisions used by this runtime, including unreleased commit pseudo-versions.
+> No local `replace` directive is shipped. Core owns capability decoding and
+> frontend validation; sdk-go owns resolution, authority reading and endpoint
+> admission; saas-sdk-go owns the broker wire client. Local source composition
+> does not require publishing a release.
 
 ### Shared frontend validation and headless components
 

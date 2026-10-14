@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,7 +70,9 @@ func productionMintSource(t *testing.T, mint *hostMint, tokenFile string) *broke
 	}
 	s.principal = testPrincipal
 	s.authority = authorityFor(t, context.Background())
-	source, err := s.platformCredentialSource()
+	options := s.mintOptions("accounts")
+	options.OrganizationID = testOrganization
+	source, err := newBrokerCredentialSource(options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +149,9 @@ func TestCredentialRefusalNeverLogsDiagnosticsOrRetries(t *testing.T) {
 	source := &reflectedCredentialSource{}
 	server := New(Manifest{ID: testSolutionID}).Credential(source)
 	for range 3 {
-		err := server.actingForAViewer(context.Background())
+		err := attestWorkloadReporting(t.Context(), func(ctx context.Context) (executionCredential, error) {
+			return server.acquireForInstallation(ctx, testOrganization, testInstallation)
+		}, &attestationReport{}, httptest.NewRequest("POST", "http://gateway.example", nil), testSolutionID)
 		if !errors.Is(err, ErrCredentialRefused) || strings.Contains(err.Error(), "broker-reflected-credential") {
 			t.Fatalf("credential refusal lost its class or exposed diagnostics: %v", err)
 		}

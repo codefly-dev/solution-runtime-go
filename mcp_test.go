@@ -19,7 +19,6 @@ import (
 	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
-	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -827,7 +826,6 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 		audience  atomic.Bool
 		acquirer  atomic.Bool
 		reporting atomic.Bool
-		terminal  atomic.Bool
 	)
 	register := func(srv *mcp.Server) {
 		mcp.AddTool(srv, &mcp.Tool{Name: "inspect", Description: "reports its own viewer"},
@@ -842,7 +840,6 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 				audience.Store(declared)
 				acquirer.Store(gw.workload != nil)
 				reporting.Store(gw.report != nil)
-				terminal.Store(gw.terminal != nil)
 				return nil, askOutput{Status: 200}, nil
 			})
 	}
@@ -890,9 +887,6 @@ func TestAnMCPToolCallIsHeldToThePublishedCeiling(t *testing.T) {
 	}
 	if !reporting.Load() {
 		t.Error("the gateway has no attestation report, so a refused mint is reported by nothing")
-	}
-	if !terminal.Load() {
-		t.Error("the gateway has no terminal hook, so a refusal that should end the process does not")
 	}
 }
 
@@ -1164,131 +1158,51 @@ func TestDeployedMCPRefusalsNameTheConfigurationThroughTheSDK(t *testing.T) {
 // connects and lists tools it can never call is worse served than one told to
 // back off. The method-layer gate stays as well, for anything reaching the
 // method middleware another way.
-func TestAnMCPToolDoesNotRunWhileThisExecutionHoldsNoCredential(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{
-		{"a terminal refusal", workcontext.ErrMintRefused},
-		{"a transient unavailability", workcontext.ErrMintUnavailable},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var ran atomic.Bool
+func TestMCPModuleWorkRequiresScopedCredential(t *testing.T) {
+	for _, failure := range []error{workcontext.ErrMintRefused, workcontext.ErrMintUnavailable} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			var calls atomic.Int32
+			source := credentialSourceFunc(func(context.Context) (workcontext.Credential, error) {
+				calls.Add(1)
+				return workcontext.Credential{}, fmt.Errorf("broker-reflected-credential: %w", failure)
+			})
+			reached := false
 			register := func(srv *mcp.Server) {
-				mcp.AddTool(srv, &mcp.Tool{Name: "act", Description: "must not run"},
-					func(ctx context.Context, _ *mcp.CallToolRequest, _ askInput) (*mcp.CallToolResult, askOutput, error) {
-						ran.Store(true)
-						return nil, askOutput{Status: 200}, nil
-					})
+				mcp.AddTool(srv, &mcp.Tool{Name: "act", Description: "Read declared module"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ askInput) (*mcp.CallToolResult, askOutput, error) {
+					gw, err := ViewerFromContext(ctx)
+					if err != nil {
+						return nil, askOutput{}, err
+					}
+					if _, err := gw.ForModule(ctx, "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
+						return nil, askOutput{}, err
+					}
+					reached = true
+					return nil, askOutput{Status: 200}, nil
+				})
 			}
-			server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
-				ServeMCP(mcpServerName, "v1.2.3", register).
-				Credential(refusingSource{err: fmt.Errorf("%w: the issuer said so, at https://mint.internal.example/modules/_work-context (dial tcp 10.4.1.9:8443: connection refused)", tc.err)})
-
+			server := declaredWorkServer(t).ServeMCP(mcpServerName, "v1.2.3", register).Credential(source)
 			handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
 			if err != nil {
-				t.Fatalf("mount MCP: %v", err)
+				t.Fatal(err)
 			}
 			host := httptest.NewServer(handler)
-			t.Cleanup(host.Close)
-
-			// A tools/call the way a client sends it, by hand: the SDK's
-			// client cannot complete its handshake against a surface that is
-			// refusing, which is the point.
-			body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"act","arguments":{"question":"anything"}}}`
-			req, err := http.NewRequest(http.MethodPost, host.URL+MCPPath, strings.NewReader(body))
+			defer host.Close()
+			session := connectMCP(t, host, viewerStamp())
+			if calls.Load() != 0 {
+				t.Fatal("MCP handshake minted")
+			}
+			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "act", Arguments: map[string]any{"question": "anything"}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			req.Header.Set("content-type", "application/json")
-			stamp := viewerStamp()
-			req.Header.Set("authorization", stamp.bearer)
-			req.Header.Set(userHeader, stamp.userID)
-			req.Header.Set(orgHeader, stamp.orgID)
-			req.Header.Set(sessionHeader, stamp.sessionID)
-			req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("post a tool call: %v", err)
+			if !result.IsError || reached || calls.Load() != 1 {
+				t.Fatal("unattested module work escaped")
 			}
-			defer drainAndClose(resp)
-
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Errorf("a tool call answered %d while this execution held no usable credential, want 503: the viewer's bearer would otherwise reach author code under authority this process does not have", resp.StatusCode)
-			}
-			if ran.Load() {
-				t.Error("the tool ran: the gate has to refuse before anything author-written executes")
-			}
-			said, err := io.ReadAll(resp.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, leak := range []string{"mint.internal.example", "_credential", "10.4.1.9", "connection refused"} {
-				if strings.Contains(string(said), leak) {
-					t.Errorf("the refusal discloses %q to an MCP client: %s", leak, said)
-				}
+			if strings.Contains(toolErrorText(result), "broker-reflected-credential") {
+				t.Fatal("source error leaked")
 			}
 		})
 	}
-
-	t.Run("the refusal is 503 and not 404", func(t *testing.T) {
-		// A withdrawn credential must not read as "this solution serves no
-		// MCP": one is a back-off, the other sends a client looking for an
-		// endpoint that does not exist.
-		server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
-			ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
-			Credential(refusingSource{err: workcontext.ErrMintRefused})
-		handler, err := server.mcpHandler(MCPEnvironment{IssuerURL: testIssuer})
-		if err != nil {
-			t.Fatalf("mount MCP: %v", err)
-		}
-		host := httptest.NewServer(handler)
-		t.Cleanup(host.Close)
-
-		req, err := http.NewRequest(http.MethodPost, host.URL+MCPPath, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("content-type", "application/json")
-		stamp := viewerStamp()
-		req.Header.Set("authorization", stamp.bearer)
-		req.Header.Set(orgHeader, stamp.orgID)
-		req.Header.Set(sessionHeader, stamp.sessionID)
-		req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer drainAndClose(resp)
-		if resp.StatusCode == http.StatusNotFound {
-			t.Error("a withdrawn credential answered 404: an MCP client cannot tell that from a solution that serves no MCP at all")
-		}
-		if resp.StatusCode != http.StatusServiceUnavailable {
-			t.Errorf("status = %d, want 503", resp.StatusCode)
-		}
-	})
-
-	t.Run("every method that is not allowlisted is gated at the method layer too", func(t *testing.T) {
-		// The method-layer gate's property, not an enumeration: a method this
-		// file has never heard of is held to the credential. A denylist over
-		// the SDK's method set is the mistake the TLS posture made three times.
-		for _, method := range []string{"tools/call", "resources/read", "prompts/get", "completion/complete", "some/method-added-next-release",
-			// The namespace that used to be exempted by prefix. It is open —
-			// the SDK's extension API lets author code register under it — so
-			// a method nobody here named must be gated, not waved through for
-			// looking like a notification.
-			"notifications/anything-an-author-registers", "notifications/tools/call"} {
-			if actsForNobody(method) {
-				t.Errorf("%q is treated as acting for nobody, so a viewer action on it would skip the credential gate", method)
-			}
-		}
-		for _, method := range []string{"initialize", "ping", "tools/list", "prompts/list", "resources/list",
-			"notifications/initialized", "notifications/cancelled", "notifications/progress", "notifications/roots/list_changed"} {
-			if !actsForNobody(method) {
-				t.Errorf("%q is gated at the method layer though it runs nothing for a viewer", method)
-			}
-		}
-	})
 }
 
 // TestAToolsOwnFailureIsSanitizedOnTheWayOut is the other half of R8-1, and
@@ -1372,54 +1286,23 @@ func TestAToolsOwnFailureIsSanitizedOnTheWayOut(t *testing.T) {
 // It is not redundant. It is what holds a method dispatched without passing
 // through that handler — and it is the layer that knows the method name, so it
 // is where the allowlist lives.
-func TestTheMethodLayerGateRefusesOnItsOwn(t *testing.T) {
-	server := New(Manifest{ID: mcpServerName, Frontend: []byte(wikiFrontend)}).
-		ServeMCP(mcpServerName, "v1.2.3", readCollectionTool).
-		Credential(refusingSource{err: fmt.Errorf("%w: at https://mint.internal.example/modules/_work-context", workcontext.ErrMintUnavailable)})
-
-	var reached atomic.Bool
-	next := func(context.Context, string, mcp.Request) (mcp.Result, error) {
-		reached.Store(true)
-		return nil, nil
+func TestMCPMethodEntryNeverAcquires(t *testing.T) {
+	var calls atomic.Int32
+	server := New(Manifest{ID: mcpServerName}).Credential(countingIdleSource{calls: &calls})
+	reached := 0
+	next := func(ctx context.Context, _ string, _ mcp.Request) (mcp.Result, error) {
+		reached++
+		_, err := ViewerFromContext(ctx)
+		return nil, err
 	}
-	gated := server.mcpViewer(next)
-
-	t.Run("a method that acts for a viewer is refused", func(t *testing.T) {
-		reached.Store(false)
-		_, err := gated(context.Background(), "tools/call", &mcp.CallToolRequest{})
-		if err == nil {
-			t.Fatal("the method middleware admitted a tool call while this execution held no usable credential: it is what holds a method dispatched without the HTTP handler in front of it")
+	for _, method := range []string{"tools/call", "tools/list", "initialize", "notifications/custom"} {
+		if _, err := server.mcpViewer(next)(t.Context(), method, &mcp.CallToolRequest{}); err != nil {
+			t.Fatal(err)
 		}
-		if reached.Load() {
-			t.Error("the call reached the next handler, so nothing was gated")
-		}
-		for _, leak := range []string{"mint.internal.example", "_credential"} {
-			if strings.Contains(err.Error(), leak) {
-				t.Errorf("the refusal discloses %q: %s", leak, err)
-			}
-		}
-		// And it carries the CODE, which is the whole point of item 8: a
-		// client that gets a generic protocol error cannot tell "this solution
-		// cannot act right now" from a broken tool, so it cannot back off.
-		// The mutation that drops the typed error survived until this.
-		var wire *jsonrpc.Error
-		if !errors.As(err, &wire) {
-			t.Fatalf("the refusal is %T, not a *jsonrpc.Error: without a code an MCP client cannot distinguish this from any other server error", err)
-		}
-		if wire.Code != mcpCredentialUnavailableCode {
-			t.Errorf("the refusal carries code %d, want %d", wire.Code, mcpCredentialUnavailableCode)
-		}
-	})
-
-	t.Run("a method that acts for nobody passes", func(t *testing.T) {
-		reached.Store(false)
-		if _, err := gated(context.Background(), "tools/list", &mcp.ListToolsRequest{}); err != nil {
-			t.Errorf("the method middleware refused tools/list, which runs nothing for a viewer: %v", err)
-		}
-		if !reached.Load() {
-			t.Error("tools/list never reached the next handler")
-		}
-	})
+	}
+	if calls.Load() != 0 || reached != 4 {
+		t.Fatalf("methods=%d mints=%d", reached, calls.Load())
+	}
 }
 
 // TestNoMCPRefusalEverPrintsASecret is item 4, as a property rather than an

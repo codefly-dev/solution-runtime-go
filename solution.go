@@ -57,7 +57,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -182,37 +181,15 @@ type Server struct {
 	// credential is the optional consumer-supplied SDK source. The native
 	// broker is opened at boot when no consumer source was supplied. Both
 	// feed the same controller through nextCredential.
-	credential       CredentialSource
-	brokerCredential *brokerCredentialSource
+	credential CredentialSource
 	// authority is the frozen set of authority-bearing values this process runs
 	// under, read once at boot and rechecked before every credential renewal.
-	authority *codefly.Authority
-	// terminal is closed the first time the issuer answers a renewal with a
-	// judgement no retry can change. It makes health fail and serve return,
-	// because a process holding a credential the host has stopped honouring
-	// cannot act for anyone and nothing it does locally changes that.
-	terminal     chan struct{}
-	terminalOnce sync.Once
-	// installed signals awaitInstallation that an install step was just
-	// acknowledged. One slot: a pending signal is as good as several.
-	installed chan struct{}
-	// awaiting is set once the host has answered that nothing has installed
-	// this solution, and cleared when a credential is held. It is what keeps
-	// installation-triggered retries going through a transient answer; whether
-	// the process may SERVE uninstalled is a stricter question (uninstalled).
-	awaiting    atomic.Bool
-	terminalErr atomic.Pointer[error]
-	// The one in-flight credential ask and what it last produced. See askOnce:
-	// without single-flight, a credential entering its renewal window turns
-	// every concurrent viewer request into its own audited mint.
-	credentialMu         sync.Mutex
-	credentialAsk        *credentialFlight
-	credentialAskErr     error
-	credentialHeld       executionCredential
-	credentialQuietUntil time.Time
-	// credentialAskFailures counts consecutive failed acquisitions, which is
-	// what the backoff grows on and a success resets.
-	credentialAskFailures int
+	authority      *codefly.Authority
+	projectionRead brokerProjectionReader
+	scopedMu       sync.Mutex
+	scoped         map[credentialScope]*scopedCredential
+	executionMu    sync.Mutex
+	execution      sealedIdentity
 	// boundListener is a listener this process was handed instead of binding
 	// one itself. Nil in every deployment: the port comes from the SDK and
 	// listen() binds it.
@@ -231,12 +208,6 @@ type Server struct {
 	// outbound is the client this boot makes platform requests with (see
 	// outboundClient). Nil until the boot builds it.
 	outbound *http.Client
-	// firstMintWindow bounds how long the boot waits for a credential the
-	// issuer says is not available yet. Zero means firstMintWait. Per-server
-	// rather than a package value so a test can spend the window in
-	// milliseconds without every other server in the process reading the same
-	// variable.
-	firstMintWindow time.Duration
 	// principal is the principal this workload runs as, as the authority-bearing
 	// values the platform provisioned name it. It is what the published
 	// contract reports and what a delivered authority document grants to.
@@ -244,9 +215,10 @@ type Server struct {
 }
 
 type config struct {
-	listenHost string
-	port       string
-	gatewayURL string
+	requiresAuthority bool
+	listenHost        string
+	port              string
+	gatewayURL        string
 	// dialled is every address this process talks to, assembled at boot.
 	//
 	// It exists so nothing has to re-read the configuration to ask "is this
@@ -713,7 +685,7 @@ func (c config) validate() error {
 		return fmt.Errorf("gateway URL %q is not a destination the projected service-account token, the viewer's bearer and the capability minted for them may travel to: %w — set GATEWAY_URL, or the composition's gateway endpoint, to one that is",
 			redactedURL(c.gatewayURL), err)
 	}
-	if c.brokerInternalToken == "" {
+	if c.requiresAuthority && c.brokerInternalToken == "" {
 		return fmt.Errorf("missing module-authority/INTERNAL_TOKEN: provision the broker perimeter credential as a workspace secret")
 	}
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
@@ -830,7 +802,8 @@ func New(manifest Manifest) *Server {
 		// unset announced that product's capability contract to the host.
 		manifest.Contract = manifest.ID
 	}
-	return &Server{manifest: manifest, handlers: make(map[string]RequestHandler), terminal: make(chan struct{}), installed: make(chan struct{}, 1)}
+	s := &Server{manifest: manifest, handlers: make(map[string]RequestHandler)}
+	return s
 }
 
 // Handle registers a solution endpoint. Chainable.
@@ -905,11 +878,14 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// solution serving no MCP is unaffected by a host whose issuer does not
 	// resolve.
 	s.cfg.mcp = s.mcp != nil
+	s.cfg.requiresAuthority = mintsAuthority(s.consumed)
 	if err := s.cfg.validate(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
-	if err := s.validateSources(); err != nil {
-		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	if s.cfg.requiresAuthority {
+		if err := s.validateSources(); err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+		}
 	}
 	// After the environment is loaded: the declaration is checked against the
 	// api.consumes projection Codefly injected.
@@ -921,8 +897,10 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// The authority-bearing values first: the principal is part of what the
 	// contract publishes, and a value the platform never provisioned is named
 	// here rather than discovered when a mint is refused.
-	if err := s.openAuthority(ctx); err != nil {
-		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	if s.cfg.requiresAuthority {
+		if err := s.openAuthority(ctx); err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+		}
 	}
 	// The client every platform request goes out on: non-proxied, pinned to
 	// the gateway's origin, following no redirect. Built before the first
@@ -937,16 +915,9 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	}
 	s.contract = contract
 	s.contractResolved = true
-	// One mint per execution, before the listener is up. A runtime that cannot
-	// obtain its credential has no authority to serve anything with, and the
-	// model it serves under has nothing for it to retry against: its presence
-	// was declared by a document it did not write, and a refusal here says that
-	// document does not name this build. So it reports the refusal and exits
-	// non-zero, for the orchestrator to restart or the delivery to be fixed —
-	// it never loops, and it never comes up serving without one.
-	if err := s.openCredential(ctx); err != nil {
-		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
-	}
+	// Boot exposes the host-driven install endpoint without acquiring work
+	// authority. Actual authority-bearing work selects its organisation and
+	// installation before the first broker request.
 	ln, err := s.listen()
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
@@ -987,28 +958,15 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 		IdleTimeout:       inboundIdleTimeout,
 	}
 	go func() {
-		select {
-		case <-ctx.Done():
-		case <-s.credentialRefusedC():
-		}
+		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	// For as long as this server serves, and no longer: Serve hands this
-	// function a context nothing cancels.
-	serving, stopped := context.WithCancel(ctx)
-	defer stopped()
-	go s.awaitInstallation(serving)
 
 	log.Printf("solution %q listening on %s (gateway=%s, profile=%s)", s.manifest.ID, ln.Addr(), redactedURL(s.cfg.gatewayURL), s.cfg.profile)
 	if serveErr := srv.Serve(ln); !errors.Is(serveErr, http.ErrServerClosed) {
 		return serveErr
 	}
-	// A terminal credential failure is reported as the reason this process
-	// ended, so the orchestrator's restart is against a judgement rather than
-	// an unexplained exit.
-	if err := s.terminalErr.Load(); err != nil && ctx.Err() == nil {
-		return fmt.Errorf("solution %q stopped serving: %w", s.manifest.ID, *err)
-	}
+
 	return nil
 }
 
@@ -1050,269 +1008,10 @@ const (
 	inboundIdleTimeout   = 30 * time.Second
 )
 
-// handleHealth reports process health without acquiring a credential. An idle
-// process must not renew merely because an orchestrator probes it. Every real
-// viewer operation still passes actingForAViewer and the host's live checks.
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	if err := s.terminalErr.Load(); err != nil {
-		http.Error(w, "this execution's credential has been refused and will not be renewed; this process is ending", http.StatusServiceUnavailable)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-}
+// handleHealth reports process health without acquiring work authority.
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
 
 const routeCredentialTimeout = 500 * time.Millisecond
-
-// actingForAViewer refuses to act on a viewer's behalf while this process holds
-// no credential the issuer still approves.
-//
-// Every route that does anything for a viewer asks this first, and that was the
-// hole: the *probe* asked the credential and the routes did not. The reasoning
-// is written out at handleHealth — renewal is lazy, so a solution serving only
-// plain handlers and ViewerBearer routes never asks and never learns the issuer
-// has stopped approving this build — and it was applied to the one caller that
-// reports health rather than to the callers that act. A booted server whose
-// credential had been refused kept answering 200 and kept forwarding the
-// viewer's bearer to the gateway, with the credential consulted zero times.
-//
-// A plain handler looks like it needs no credential, which is the trap. What
-// authorises this process to act for a viewer at all *is* the credential: it is
-// what the host approved for this build. Forwarding a viewer's bearer under a
-// credential the issuer has withdrawn is acting without authority, whether or
-// not a capability is minted on the way.
-//
-// Cheap, and not a heartbeat: the client holds one credential and hands the
-// same one back until its own renewal point, so this is a mutex and a
-// comparison except at the renewal the credential's expiry dictates.
-func (s *Server) actingForAViewer(ctx context.Context) error {
-	if err := s.terminalErr.Load(); err != nil {
-		return fmt.Errorf("%w: %w", ErrCredentialRefused, *err)
-	}
-	if s.credential == nil && s.brokerCredential == nil {
-		return nil
-	}
-	_, err := s.credentialWithin(ctx, routeCredentialTimeout)
-	return err
-}
-
-// credentialWithin asks for this execution's credential and never waits longer
-// than d, whatever the source does.
-//
-// The bound has to be imposed here, because a context does not reach the thing
-// that blocks. The SDK's mint client takes a sync.Mutex and holds it across the
-// network mint (workcontext/mint.go, Credential), and sync.Mutex.Lock ignores
-// contexts — so a caller arriving during a slow renewal waits on the lock for
-// as long as the renewal takes, and the deadline it passed in bounds nothing.
-// That made the two-second health deadline advisory, and it would have made
-// every route's credential check park behind one slow issuer, which is a worse
-// failure than the one the check was added for.
-//
-// The ask runs on a context detached from the caller's, deliberately: a request
-// that gives up should not cancel a mint that other callers are waiting for,
-// and the SDK caches the result, so the work is not wasted. It is bounded by
-// its own deadline rather than by the caller's.
-//
-// On a timeout, the credential this process already holds decides. Refusing
-// outright would turn a slow renewal — which happens while a perfectly valid
-// credential is still in hand, since renewal starts inside a lead before expiry
-// — into a 503 for every viewer.
-func (s *Server) credentialWithin(ctx context.Context, d time.Duration) (executionCredential, error) {
-	// Held and unexpired is the answer whenever the issuer is not answering,
-	// and this is the branch that was missing.
-	//
-	// The timeout path below already served on a held credential, and the
-	// error path refused outright — so with the credential inside its renewal
-	// window and the issuer answering 503, every viewer request asked, every
-	// ask minted, and every request got a 503 while a perfectly valid
-	// credential sat in hand. Forty requests, forty audited mints. That is not
-	// a smaller version of the heartbeat this runtime deleted, it is a larger
-	// one: the heartbeat minted on a timer, this minted on traffic.
-	//
-	// So a failed ask starts a backoff, and inside it nothing asks again. The
-	// renewal the credential's own expiry dictates still happens, because the
-	// backoff is shorter than the renewal lead; what cannot happen is one mint
-	// per request.
-	// The quiet window applies whether or not anything is held, which is the
-	// half that was missing: it was consulted only when a credential WAS in
-	// hand, so the one state that should ask least — nothing held, the issuer
-	// failing — was the state that asked on every single request. The branch
-	// meant to back off was the branch that hammered.
-	// A recorded judgement first, on every path. The quiet branch below would
-	// otherwise re-wrap a terminal refusal as "cannot currently be obtained",
-	// which is the one distinction the boot and the run must not disagree on.
-	if err := s.terminalErr.Load(); err != nil {
-		return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialRefused, *err)
-	}
-	if held, quiet, last := s.credentialState(); quiet {
-		if held.Token() != "" {
-			return held, nil
-		}
-		if terminalCredentialFailure(last) {
-			return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialRefused, last)
-		}
-		return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialUnavailable, last)
-	}
-	credential, err := s.askOnce(ctx, d)
-	if err == nil {
-		return credential, nil
-	}
-	if errors.Is(err, ErrCredentialRefused) {
-		return credential, err
-	}
-	// Unavailable, for any reason including the ask not answering in time. A
-	// credential already in hand decides, because renewal begins inside a lead
-	// before expiry and refusing here would 503 every viewer over a slow
-	// issuer this process does not yet need.
-	if held, ok := s.heldCredential(); ok {
-		return held, nil
-	}
-	return credential, err
-}
-
-// holdCredential records a credential the controller did not itself acquire —
-// the boot's — so the first caller after boot sees a process that holds one.
-func (s *Server) holdCredential(credential executionCredential) {
-	s.awaiting.Store(false)
-	s.credentialMu.Lock()
-	s.credentialHeld = credential
-	s.credentialQuietUntil = time.Time{}
-	s.credentialMu.Unlock()
-}
-
-// heldCredential is the credential this process last obtained, if it has not
-// expired. The zero credential never counts as held: a source that hands back
-// nothing has given this process no authority, which is the case a wrapper
-// keyed on the token's *value* could not see.
-func (s *Server) heldCredential() (executionCredential, bool) {
-	s.credentialMu.Lock()
-	defer s.credentialMu.Unlock()
-	if s.credentialHeld == nil || s.credentialHeld.Token() == "" {
-		return workcontext.Credential{}, false
-	}
-	if !time.Now().Before(s.credentialHeld.ExpiresAt()) {
-		return workcontext.Credential{}, false
-	}
-	return s.credentialHeld, true
-}
-
-// credentialState is what this process holds, whether a recent ask failed
-// recently enough that nobody should ask again, and that ask's error.
-//
-// All three under one lock, because a caller that reads them separately can act
-// on a mixture of two different moments.
-func (s *Server) credentialState() (held executionCredential, quiet bool, last error) {
-	s.credentialMu.Lock()
-	defer s.credentialMu.Unlock()
-	held = s.credentialHeld
-	if held == nil || held.Token() == "" || !time.Now().Before(held.ExpiresAt()) {
-		held = workcontext.Credential{}
-	}
-	last = s.credentialAskErr
-	if last == nil {
-		last = fmt.Errorf("the credential source has not answered yet")
-	}
-	return held, time.Now().Before(s.credentialQuietUntil), last
-}
-
-// askOnce asks the source for the credential, at most one ask at a time, and
-// never waits longer than d.
-//
-// Single-flight, because the alternative is one mint per concurrent caller the
-// moment the credential enters its renewal window. The bound is imposed here
-// rather than passed down, because a context does not reach what blocks: the
-// SDK's client holds a sync.Mutex across the network mint and sync.Mutex.Lock
-// ignores contexts (see the drafted sdk-go issue, which is the durable half of
-// this).
-func (s *Server) askOnce(ctx context.Context, d time.Duration) (executionCredential, error) {
-	s.credentialMu.Lock()
-	inflight := s.credentialAsk
-	if inflight == nil {
-		inflight = &credentialFlight{done: make(chan struct{})}
-		s.credentialAsk = inflight
-		go s.resolveCredential(ctx, inflight)
-	}
-	s.credentialMu.Unlock()
-
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-inflight.done:
-	case <-timer.C:
-		return workcontext.Credential{}, fmt.Errorf("%w: it did not answer within %s", ErrCredentialUnavailable, d)
-	}
-
-	// From the flight this caller actually waited on, not from the server's
-	// current state. Reading the shared fields let a waiter observe a *later*
-	// flight's answer — or none at all, if the next flight had already started
-	// and cleared them — so the credential a caller acted on was not
-	// necessarily the one its own ask produced. A flight's result is written
-	// once, before its channel closes, and never again.
-	credential, err := inflight.credential, inflight.err
-	if err != nil {
-		if terminalCredentialFailure(err) {
-			// Records it, which also ends the process: the first caller to
-			// discover a refused build is as good a place to learn it as the
-			// probe, and better than the next one.
-			s.credentialRefused(err)
-			return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialRefused, err)
-		}
-		return workcontext.Credential{}, fmt.Errorf("%w: %w", ErrCredentialUnavailable, err)
-	}
-	return credential, nil
-}
-
-// resolveCredential performs the one in-flight ask and records its outcome.
-//
-// On a context detached from the caller's, deliberately: a request that gives
-// up must not cancel an ask other callers are waiting on, and the SDK caches
-// the result so the work is not wasted.
-func (s *Server) resolveCredential(ctx context.Context, flight *credentialFlight) {
-	asked, cancel := context.WithTimeout(context.WithoutCancel(ctx), platformRequestTimeout)
-	defer cancel()
-	credential, err := s.nextCredential(asked)
-	if err == nil {
-		err = usableCredential(credential)
-	}
-
-	// Recorded HERE, where the answer lands, and not only where a caller
-	// happens to be waiting for it.
-	//
-	// This ask runs on a detached context so a request that gives up does not
-	// cancel it — which means its answer can arrive after every caller has
-	// gone. A terminal refusal classified only by the waiting caller was
-	// therefore discarded whenever acquisition outlived its caller: the route
-	// served on the held credential, nothing called credentialRefused, and the
-	// process went on acting for viewers after its own source had reported
-	// this execution refused. The classification belongs to the answer, not to
-	// whoever was still listening.
-	if err != nil && terminalCredentialFailure(err) {
-		s.credentialRefused(err)
-	}
-
-	// The flight's own result first, then the shared state. A waiter reads the
-	// former and never the latter.
-	flight.credential, flight.err = credential, err
-
-	switch {
-	case err == nil:
-		s.awaiting.Store(false)
-	case awaitingInstallation(err):
-		s.awaiting.Store(true)
-	}
-	s.credentialMu.Lock()
-	s.credentialAskErr = err
-	if err != nil {
-		s.credentialAskFailures++
-		s.credentialQuietUntil = time.Now().Add(credentialAskQuiet(s.credentialAskFailures))
-	} else {
-		s.credentialHeld = credential
-		s.credentialQuietUntil = time.Time{}
-		s.credentialAskFailures = 0
-	}
-	s.credentialAsk = nil
-	s.credentialMu.Unlock()
-	close(flight.done)
-}
 
 // credentialFlight is one acquisition and the answer it produced.
 type credentialFlight struct {
@@ -1436,37 +1135,14 @@ func usableCredential(credential executionCredential) error {
 	return nil
 }
 
-// routeCredentialTimeout bounds what a route acting for a viewer will wait for
-// the credential. Short, because the answer is almost always a comparison
-// against one already held, and a route is not the place to wait out a mint.
-
-// acquireCredential is the one way anything in this process obtains the
-// execution credential, including a viewer's mint.
-//
-// Nil when no source was supplied, so attestWorkloadReporting still refuses a
-// mint rather than treating an absent source as nothing to attest with.
-func (s *Server) acquireCredential(ctx context.Context) (executionCredential, error) {
-	return s.credentialWithin(ctx, routeCredentialTimeout)
-}
-
-// credentialRefusalForAViewer is what a viewer is told when this process will
-// not act for them: which of the two conditions it is, and nothing about the
-// issuer, the destination or the source's own words.
-func credentialRefusalForAViewer(err error) string {
-	if errors.Is(err, ErrCredentialRefused) {
-		return "this solution's authority for this execution has been refused and will not be renewed"
-	}
-	return "this solution cannot currently obtain the authority it needs to act for you"
-}
-
 // ErrCredentialRefused and ErrCredentialUnavailable are why a route refused to
 // act for a viewer: a judgement about this build, or an issuer that cannot
 // answer right now. Both are 503 — this process cannot act either way — and
 // they stay distinguishable because conflating them was a review blocker in
 // both directions.
 var (
-	ErrCredentialRefused     = errors.New("this execution's credential has been refused and will not be renewed, so this process will not act for a viewer")
-	ErrCredentialUnavailable = errors.New("this execution's credential cannot currently be obtained, so this process will not act for a viewer")
+	ErrCredentialRefused     = errors.New("this installation's workload credential has been refused")
+	ErrCredentialUnavailable = errors.New("this installation's workload credential is currently unavailable")
 )
 
 // Why this runtime infers nothing from a conflict on a viewer's mint.
@@ -1493,21 +1169,6 @@ var (
 // repository's to add. Until then a superseded credential is refused call by
 // call by the far end, which is correct if noisy, and the renewal that replaces
 // it happens on the credential's own schedule.
-
-// credentialRefused records a judgement the issuer will not reverse.
-func (s *Server) credentialRefused(err error) {
-	s.terminalOnce.Do(func() {
-		s.terminalErr.Store(&err)
-		log.Printf("solution %q: this execution's credential was refused and will not be renewed, so this process is ending for the orchestrator to restart against the delivery as it stands: %v",
-			s.manifest.ID, err)
-		close(s.terminal)
-	})
-}
-
-// credentialRefusedC is the channel serve waits on. Created in New, never
-// lazily: a request goroutine reporting a refusal and serve reading it would
-// otherwise race on the field itself.
-func (s *Server) credentialRefusedC() <-chan struct{} { return s.terminal }
 
 // HealthPath is where this runtime answers a health probe. It is a plain 200 on
 // the listener the presence document names, which is the whole of this
@@ -1638,22 +1299,6 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		// Before the handler, because the handler is what acts. See
-		// actingForAViewer: a plain handler that mints nothing still receives a
-		// gateway carrying the viewer's bearer, and sending that anywhere under
-		// a credential the issuer has withdrawn is acting without authority.
-		if err := s.actingForAViewer(r.Context()); err != nil {
-			// The sanitized sentence, not the error. The error wraps whatever
-			// the source said — a mint URL, an issuer's own text, a dial
-			// failure naming an internal address — and this route gate wrote
-			// it straight into the viewer's response and the log, which is the
-			// disclosure handlerErrorResponse exists to prevent. Adding a gate
-			// in front of the handler put a new path around the sanitization
-			// rather than through it.
-			log.Printf("solution %q: refusing to act for a viewer: %v", s.manifest.ID, err)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": credentialRefusalForAViewer(err)})
-			return
-		}
 		result, err := handler(r, s.gatewayFor(r.Header))
 		if err != nil {
 			status, message := handlerErrorResponse(err)
@@ -1727,9 +1372,7 @@ type Gateway struct {
 	// transport is what this gateway dials with: the boot's authenticated
 	// client, or nil on a gateway built outside a boot.
 	transport http.RoundTripper
-	// terminal reports a credential failure the issuer will not reverse, so the
-	// process can stop claiming to be healthy. Nil outside a boot.
-	terminal func(error)
+
 	// ceilings is the published contract's ceiling per audience, which every
 	// ForModule ask is held to. Non-nil exactly when a contract was resolved,
 	// which only a boot does; a derived gateway inherits it, so chaining
@@ -1756,12 +1399,11 @@ func (s *Server) gatewayFor(header http.Header) *Gateway {
 	// is absent.
 	gw.installationID, gw.installationErr = viewerInstallation(header)
 	gw.id, gw.report = s.manifest.ID, &s.attestation
-	// Left nil when no source was supplied, so a mint is refused for want of
-	// one rather than panicking inside the controller.
-	if s.credential != nil || s.brokerCredential != nil {
-		gw.workload = s.acquireCredential
+	gw.workload = func(ctx context.Context) (executionCredential, error) {
+		return s.acquireForInstallation(ctx, gw.orgID, gw.installationID)
 	}
-	gw.terminal = s.credentialRefused
+	// Broker denials can concern one organisation. They must not terminate
+	// unrelated installations or turn into a process-wide health failure.
 	// The ceiling this process published, carried onto the gateway a handler
 	// gets, so what it mints is held to what the contract claims. Resolved
 	// contracts only, read off the flag the boot sets — see contractResolved
@@ -2437,7 +2079,7 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 	// request — the capability being minted is what the answer carries, and the
 	// viewer has none yet — so attesting here collides with nothing the module
 	// call later presents.
-	if err := attestWorkloadReporting(ctx, g.workload, g.report, post, g.id, g.terminal); err != nil {
+	if err := attestWorkloadReporting(ctx, g.workload, g.report, post, g.id); err != nil {
 		return "", time.Time{}, err
 	}
 	resp, err := g.bearerClient().Do(post)

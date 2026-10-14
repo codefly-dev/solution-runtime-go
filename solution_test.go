@@ -53,7 +53,7 @@ func capability(seed string) string {
 		OwnerPrincipalKind: "human",
 		TaskID:             seed,
 		Audience:           corework.FixtureAudience,
-		OrganizationID:     corework.FixtureOrganization,
+		OrganizationID:     testOrganization,
 		InstallationID:     corework.FixtureInstallation,
 		TTL:                10 * time.Minute,
 		Execution: corework.Execution{

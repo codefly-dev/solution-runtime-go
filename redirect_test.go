@@ -87,7 +87,7 @@ func TestACredentialBearingRequestIsNeverRedirected(t *testing.T) {
 				}
 				if r.URL.Path == workContextStartTaskProcedure {
 					writeJSON(w, http.StatusOK, map[string]any{
-						"token": capability("context-things.1"), "orgId": "org-1",
+						"token": capability("context-things.1"), "orgId": testOrganization,
 						"expiresAt": "2099-01-01T00:00:00Z",
 					})
 					return
@@ -104,7 +104,7 @@ func TestACredentialBearingRequestIsNeverRedirected(t *testing.T) {
 
 			header := http.Header{}
 			header.Set("authorization", viewerBearer())
-			header.Set(orgHeader, "org-1")
+			header.Set(orgHeader, testOrganization)
 			header.Set(sessionHeader, "session-1")
 			header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 
@@ -148,7 +148,7 @@ func TestEveryGatewayClientRefusesAForeignDestination(t *testing.T) {
 	server.cfg.gatewayURL = gw.URL
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	gateway := server.gatewayFor(header)
@@ -214,7 +214,7 @@ func TestASameOriginRedirectIsNotFollowedEither(t *testing.T) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"token": capability("context-things.1"), "orgId": "org-1",
+			"token": capability("context-things.1"), "orgId": testOrganization,
 			"expiresAt": "2099-01-01T00:00:00Z",
 		})
 	}))
@@ -228,7 +228,7 @@ func TestASameOriginRedirectIsNotFollowedEither(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, "org-1")
+	header.Set(orgHeader, testOrganization)
 	header.Set(sessionHeader, "session-1")
 	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
 	if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
