@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/solution/manifest"
@@ -543,6 +545,8 @@ func relayedError(err error) error {
 		message := http.StatusText(gatewayErr.StatusCode)
 		if len(detail) > 0 && len(detail) <= relayedMessageLimit && json.Valid(detail) {
 			message = string(detail)
+		} else if plain, ok := plainRefusal(gatewayErr.StatusCode, detail); ok {
+			message = plain
 		}
 		return connect.NewError(codeForStatus(gatewayErr.StatusCode), errors.New(message))
 	}
@@ -589,6 +593,47 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeInternal, errors.New("this solution could not present a usable credential for the module"))
 	}
 	return connect.NewError(connect.CodeUnavailable, errors.New("the module call failed"))
+}
+
+// plainRefusal is a refusal body that is short plain text, as the host gateway
+// writes one: `text/plain`, one line, naming the rule that refused — "module is
+// not installed for this organization", "no organization in this session". It
+// is not JSON, so the relay above skipped it and the page was told only
+// "Forbidden": the status word, never the reason. A viewer who needs a grant on
+// the module's installation then has nothing to act on, and neither has the
+// operator reading the page's report.
+//
+// Only a 4xx. That is the line between a refusal ABOUT THE CALLER'S OWN REQUEST,
+// which the gateway writes itself and the caller is entitled to read, and a 5xx,
+// whose body may be written by an intermediary and carry what the caller must
+// never see — `upstream connect error: 10.0.0.7:8080 refused` names an internal
+// address, and TestPassthroughRelaysTheModulesRefusal holds that case to its
+// status word. A 5xx stays reported by kind, exactly as before.
+//
+// Bounded the same way the JSON relay is, and admitted only when the body is a
+// single line of printable runes. An accidental body — a stack trace, an HTML
+// error page, a proxy's debug dump — is multi-line or carries control
+// characters, so it is refused here and reported by kind.
+func plainRefusal(status int, detail []byte) (string, bool) {
+	if status < 400 || status >= 500 {
+		return "", false
+	}
+	if len(detail) == 0 || len(detail) > relayedMessageLimit {
+		return "", false
+	}
+	if !utf8.Valid(detail) {
+		return "", false
+	}
+	text := strings.TrimSpace(string(detail))
+	if text == "" {
+		return "", false
+	}
+	for _, r := range text {
+		if !unicode.IsPrint(r) {
+			return "", false
+		}
+	}
+	return text, true
 }
 
 func truncated(s string) string {
