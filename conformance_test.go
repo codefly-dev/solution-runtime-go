@@ -49,8 +49,8 @@ func TestCoreConformanceFixturesThroughTheCarrier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("core conformance fixtures: %v", err)
 	}
-	if len(fixtures) < 40 {
-		t.Fatalf("core published %d fixtures; the kit is 40 at core v0.19.1, so this test is reading a trimmed set", len(fixtures))
+	if len(fixtures) < 35 {
+		t.Fatalf("core published %d fixtures; the kit is 35 at core b81d92e6 (core #812 removed the five build-seal fixtures), so this test is reading a trimmed set", len(fixtures))
 	}
 
 	var carriedCount, refusedCount int

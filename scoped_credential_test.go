@@ -52,7 +52,7 @@ func TestSharedCredentialsSelectOrganisationAndInstallation(t *testing.T) {
 			TenantID: corework.FixtureTenant, OwnerPrincipalID: corework.FixturePrincipal,
 			OwnerPrincipalKind: "human", TaskID: fmt.Sprintf("scoped-%s-%d", org, n),
 			Audience: testAudience, OrganizationID: org, InstallationID: installations[org],
-			TTL: time.Minute, Execution: issuers[org].execution(),
+			TTL: time.Minute,
 		})
 		if err != nil {
 			t.Errorf("fixture mint: %v", err)

@@ -1247,7 +1247,7 @@ func fixtureConcreteDecoder(raw []byte, dst *wc.SealedValues) error {
 
 // The supported read, which must stay unflagged: a concrete parameter, and no
 // decoder in sight.
-func fixtureSpellingAccessor(seal *wc.SealedValues) string { return seal.GetImageDigest() }
+func fixtureSpellingAccessor(seal *wc.SealedValues) string { return seal.GetInstallationId() }
 `
 	found := gateFindings(t, fixture, source, reportCapabilityShapes)
 	for _, want := range []string{

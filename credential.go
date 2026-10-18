@@ -186,11 +186,7 @@ func (a *authorityHeldSource) Credential(ctx context.Context) (workcontext.Crede
 //
 // Read through the SDK's own accessor on the verified seal. No decoder here.
 func (a *authorityHeldSource) holdSealedIdentity(seal *workcontext.SealedValues) error {
-	held := sealedIdentity{
-		installation: seal.GetInstallationId(),
-		digest:       seal.GetImageDigest(),
-		incarnation:  seal.GetBuildIncarnation(),
-	}
+	held := sealedIdentity{installation: seal.GetInstallationId()}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.sealed == (sealedIdentity{}) {
@@ -200,19 +196,14 @@ func (a *authorityHeldSource) holdSealedIdentity(seal *workcontext.SealedValues)
 	if a.sealed == held {
 		return nil
 	}
-	return fmt.Errorf("%w: this execution has been acting under installation %s, image %s, build incarnation %d, and its credential renewed sealed to installation %s, image %s, build incarnation %d. That is a different execution, not a renewal: every work context this process mints for a viewer is attested by this credential, so the mints before and after this point would name a different deployment or a different build — including one the host's approved-build ceiling was never applied to",
-		workcontext.ErrMintRefused,
-		a.sealed.installation, a.sealed.digest, a.sealed.incarnation,
-		held.installation, held.digest, held.incarnation)
+	return fmt.Errorf("%w: this execution has been acting under installation %s, and its credential renewed sealed to installation %s. That is a different deployment, not a renewal: every work context this process mints for a viewer is attested by this credential, so the mints before and after this point would name a different deployment",
+		workcontext.ErrMintRefused, a.sealed.installation, held.installation)
 }
 
-// sealedIdentity is what a credential is sealed to: which deployment, and
-// which build inside it. Compared as one value, because a renewal that changed
-// any part of it changed which execution is asking.
+// sealedIdentity is what a credential is sealed to: which deployment. The
+// build is no longer sealed (core #812): the host binds it at every mint.
 type sealedIdentity struct {
 	installation string
-	digest       string
-	incarnation  uint64
 }
 
 // mintOptions binds the declared prefix and perimeter credential to the frozen

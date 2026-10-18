@@ -4,10 +4,10 @@ go 1.27.0
 
 require (
 	connectrpc.com/connect v1.21.0
-	github.com/codefly-dev/core v0.19.5-0.20261013191419-d82010241d74
+	github.com/codefly-dev/core v0.19.6-0.20261018051341-b81d92e6feda
 	github.com/codefly-dev/saas-sdk-go v0.1.3-0.20261014043138-b7169d3c4095
-	github.com/codefly-dev/sdk-go v0.3.2
-	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261013172033-aabfb4cf5359
+	github.com/codefly-dev/sdk-go v0.4.1-0.20261018052022-70dc7a546458
+	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261018052022-70dc7a546458
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	golang.org/x/tools v0.52.0

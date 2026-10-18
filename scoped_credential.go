@@ -141,16 +141,6 @@ func (s *Server) installationCredentialSource(scope credentialScope) (credential
 		if err := matchCredentialScope(credential, scope); err != nil {
 			return nil, err
 		}
-		seal := credential.Seal()
-		build := sealedIdentity{digest: seal.GetImageDigest(), incarnation: seal.GetBuildIncarnation()}
-		s.executionMu.Lock()
-		defer s.executionMu.Unlock()
-		if s.execution == (sealedIdentity{}) {
-			s.execution = build
-		}
-		if s.execution != build {
-			return nil, workcontext.ErrMintRefused
-		}
 		return credential, nil
 	}, nil
 }
