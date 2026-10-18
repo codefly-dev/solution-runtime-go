@@ -242,10 +242,6 @@ func (h *Host) mintWorkload(w http.ResponseWriter, r *http.Request) {
 		OrganizationID:     corework.FixtureOrganization,
 		InstallationID:     corework.FixtureInstallation,
 		TTL:                10 * time.Minute,
-		Execution: corework.Execution{
-			ImageDigest:      corework.FixtureImageDigest,
-			BuildIncarnation: corework.FixtureBuildIncarnation,
-		},
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": 13, "message": err.Error()})
@@ -544,10 +540,6 @@ func capability(seed string) string {
 		OrganizationID:     corework.FixtureOrganization,
 		InstallationID:     corework.FixtureInstallation,
 		TTL:                10 * time.Minute,
-		Execution: corework.Execution{
-			ImageDigest:      corework.FixtureImageDigest,
-			BuildIncarnation: corework.FixtureBuildIncarnation,
-		},
 	})
 	if err != nil {
 		panic("stand-in capability: " + err.Error())

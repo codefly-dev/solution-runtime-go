@@ -53,8 +53,7 @@ const testFrontend = "title: " + testSolutionTitle + "\norder: 1\nexposed_module
 // identities, so the seal this runtime logs and a test asserts is the live one
 // that authority holds rather than a number invented here.
 const (
-	testInstallation     = corework.FixtureInstallation
-	testBuildIncarnation = uint64(corework.FixtureBuildIncarnation)
+	testInstallation = corework.FixtureInstallation
 )
 
 // authorityValues provisions the module-authority group the way the platform
@@ -105,17 +104,6 @@ type hostMint struct {
 	// through the real client rather than by calling the wrapper directly.
 	switchTo    *hostMint
 	switchAfter int64
-	// digest and incarnation override the build this host attests, so a test
-	// can have a RENEWAL seal a different execution than the first credential.
-	digest      string
-	incarnation uint64
-	// executionFree makes this host mint a credential sealing NO execution,
-	// which core allows: the sealed execution became optional because a
-	// principal that bears no approved build — a person at a terminal — must
-	// not have one invented for it. It is the shape of core's own
-	// execution-missing fixture, and it is not a shape a WORKLOAD credential
-	// may have.
-	executionFree bool
 	// installation overrides the installation it seals credentials to, so a
 	// test can have a renewal answer about a different one. Empty means
 	// testInstallation.
@@ -146,62 +134,6 @@ type hostMint struct {
 func (mint *hostMint) prepareAuthority(t *testing.T) {
 	t.Helper()
 	mint.authority = standInAuthority()
-	if mint.executionFree {
-		// An issuer that mints a credential sealing NO execution, which core
-		// permits only for a principal bearing no approved build — a person at
-		// a terminal. Built by taking core's fixture seal source and recording
-		// the installation seal and epoch WITHOUT an approved build, which is
-		// the shape of core's own execution-missing fixture.
-		//
-		// Core refuses to mint execution-free for a principal that does bear
-		// one, which is why this cannot be done by simply omitting the field.
-		seals := corework.NewMemorySealSource()
-		if err := seals.Put(corework.FixturePrincipal, corework.Seal{
-			InstallationID:       testInstallation,
-			InstallationRevision: corework.FixtureInstallationRevision,
-		}); err != nil {
-			t.Fatalf("seal an execution-free issuer: %v", err)
-		}
-		if err := seals.PutEpoch(corework.FixturePrincipal, corework.FixturePrincipalEpoch); err != nil {
-			t.Fatalf("record the principal's epoch: %v", err)
-		}
-		// Explicitly bearing no execution, which is core's own distinction:
-		// a principal with an approved build MUST attest it, one recorded as
-		// bearing none legitimately carries no execution, and one core knows
-		// nothing about is refused. This is the middle case — a person at a
-		// terminal — and it is the shape a WORKLOAD credential must never have.
-		if err := seals.PutBearsNoExecution(corework.FixturePrincipal); err != nil {
-			t.Fatalf("record the principal as bearing no execution: %v", err)
-		}
-		_, key := corework.FixtureKeyPair()
-		mint.authority = &corework.Authority{
-			Issuer:    corework.FixtureIssuer,
-			KeyID:     corework.FixtureKeyID,
-			Key:       key,
-			Revisions: corework.FixtureRevisions(),
-			Seals:     seals,
-		}
-	}
-	if mint.digest != "" || mint.incarnation != 0 {
-		// An issuer whose APPROVED BUILD has moved, which is the only way it
-		// can attest a different one: core refuses to seal an execution the
-		// issuer does not approve for that principal. Built from core's own
-		// fixture seal source with the approved build overridden.
-		seals := corework.FixtureSeals()
-		if err := seals.PutApprovedBuild(corework.FixturePrincipal,
-			cmp.Or(mint.digest, corework.FixtureImageDigest),
-			cmp.Or(mint.incarnation, uint64(corework.FixtureBuildIncarnation))); err != nil {
-			t.Fatalf("move the issuer's approved build: %v", err)
-		}
-		_, key := corework.FixtureKeyPair()
-		mint.authority = &corework.Authority{
-			Issuer:    corework.FixtureIssuer,
-			KeyID:     corework.FixtureKeyID,
-			Key:       key,
-			Revisions: corework.FixtureRevisions(),
-			Seals:     seals,
-		}
-	}
 	if mint.installation != "" {
 		// An issuer that seals to a different installation, for the renewal
 		// refusal. Built from CORE's fixture seal source with one entry
@@ -253,24 +185,12 @@ func newHostMint(t *testing.T, mint *hostMint) *hostMint {
 	return mint
 }
 
-// execution is the build this host attests for the credential it mints, or
-// nothing at all when the test asks for an execution-free one.
 // installationFor is the installation the shape in force seals to.
 func (m *hostMint) installationFor() string {
 	if m.switchTo != nil && atomic.LoadInt64(&m.mints) > m.switchAfter {
 		return m.switchTo.installation
 	}
 	return m.installation
-}
-
-func (m *hostMint) execution() corework.Execution {
-	if m.executionFree {
-		return corework.Execution{}
-	}
-	return corework.Execution{
-		ImageDigest:      cmp.Or(m.digest, corework.FixtureImageDigest),
-		BuildIncarnation: cmp.Or(m.incarnation, uint64(corework.FixtureBuildIncarnation)),
-	}
 }
 
 func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
@@ -316,9 +236,9 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(m.status)
 		return
 	}
-	issuer, execution := m.authority, m.execution()
+	issuer := m.authority
 	if m.switchTo != nil && atomic.LoadInt64(&m.mints) > m.switchAfter {
-		issuer, execution = m.switchTo.authority, m.switchTo.execution()
+		issuer = m.switchTo.authority
 	}
 	token, _, err := issuer.Start(r.Context(), corework.StartInput{
 		TenantID:           corework.FixtureTenant,
@@ -329,13 +249,6 @@ func (m *hostMint) serve(w http.ResponseWriter, r *http.Request) {
 		OrganizationID:     organization,
 		InstallationID:     cmp.Or(m.installationFor(), testInstallation),
 		TTL:                m.ttl,
-		// Core v0.9.0 requires the caller to attest the build it is running:
-		// a principal that exercises an approved execution must name the image
-		// digest and incarnation, and the issuer checks them against the
-		// approved build it holds for that principal. The execution moved off
-		// the installation seal, where it described the OWNER's workload
-		// however many delegation hops had been added.
-		Execution: execution,
 	})
 	if err != nil {
 		m.signErr = err
@@ -945,45 +858,6 @@ func takeListener(server *Server) *Server {
 		server.manifest.Frontend = []byte(testFrontend)
 	}
 	return server
-}
-
-func TestABootedWorkRefusesARenewalToAnotherExecution(t *testing.T) {
-	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
-	mint := newHostMint(t, &hostMint{ttl: 2 * time.Second, switchAfter: 1, switchTo: &hostMint{incarnation: 99, ttl: 2 * time.Second}})
-	server := New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
-		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
-	}}).Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
-		_, err := gw.ForModule(ctx, "things", Scope{ResourceKind: "things", Actions: []string{"read"}})
-		return map[string]string{"ok": "yes"}, err
-	})
-	solution := boot(t, server, mint)
-	request := func() int {
-		r, _ := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
-		r.Header.Set("authorization", viewerBearer())
-		r.Header.Set(orgHeader, testOrganization)
-		r.Header.Set(sessionHeader, "session")
-		r.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-		response, err := solution.client.Do(r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer response.Body.Close()
-		if response.StatusCode != 200 {
-			body, _ := io.ReadAll(response.Body)
-			t.Logf("work response: %s", body)
-		}
-		return response.StatusCode
-	}
-	if got := request(); got != 200 {
-		t.Fatalf("initial work = %d", got)
-	}
-	time.Sleep(2100 * time.Millisecond)
-	if got := request(); got != 503 {
-		t.Fatalf("changed execution = %d", got)
-	}
-	if getStatus(t, solution.client, solution.base+HealthPath) != 200 {
-		t.Fatal("scoped refusal ended process")
-	}
 }
 
 // localRun is the SDK's transport source for a test: a local run that asserts

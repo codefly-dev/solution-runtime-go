@@ -407,8 +407,10 @@ func TestBrokerHoldsAuthorityAndExecutionAcrossRenewals(t *testing.T) {
 		name  string
 		after *hostMint
 	}{
-		{"execution missing", &hostMint{executionFree: true}},
-		{"execution changed", &hostMint{incarnation: 99}},
+		// A renewal sealed to another installation is another deployment: the one
+		// identity a credential still seals since the host stopped sealing a build
+		// (core #812) and binds it at every mint instead.
+		{"installation changed", &hostMint{installation: "installation-somewhere-else"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, host, _ := brokerFixture(t)
@@ -421,18 +423,18 @@ func TestBrokerHoldsAuthorityAndExecutionAcrossRenewals(t *testing.T) {
 			s.brokerCredential.renewAt = time.Time{}
 			for range 2 {
 				if _, err := s.acquireCredential(context.Background()); !errors.Is(err, workcontext.ErrMintRefused) || !errors.Is(err, ErrCredentialRefused) {
-					t.Fatalf("execution change accepted or not terminal: %v", err)
+					t.Fatalf("installation change accepted or not terminal: %v", err)
 				}
 			}
 			if host.count() != 2 {
-				t.Fatalf("execution change retried: %d", host.count())
+				t.Fatalf("installation change retried: %d", host.count())
 			}
 			// Exercise the native broker through the controller without a
 			// socket. The booted test separately proves serve observes this
 			// signal and returns without cancellation by the test.
 
 			if terminal := s.controller.terminalErr.Load(); terminal == nil || !errors.Is(*terminal, workcontext.ErrMintRefused) {
-				t.Fatal("the execution refusal was not recorded for serve")
+				t.Fatal("the installation refusal was not recorded for serve")
 			}
 		})
 	}
