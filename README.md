@@ -957,8 +957,11 @@ the page's, so a filter clause the module ANDs stays in force whatever the page
 sends.
 A module's refusal reaches the page in the Connect error: a `google.rpc.Status`
 body keeps its code and message, any other small JSON refusal is the message
-verbatim under the code its HTTP status maps to, and anything else is reported
-by kind only. `PassthroughOperations` renders the declaration for the interface
+verbatim under the code its HTTP status maps to, and a **4xx** refusal written
+as short, single-line plain text — the shape the host gateway writes, "module is
+not installed for this organization" — is the message too. A 5xx body is
+reported by kind only: it may be written by an intermediary and name an internal
+address, which the caller must never read. `PassthroughOperations` renders the declaration for the interface
 artifact, and `InterfaceArtifact(dir, info, ops, modules...)` renders a
 backend's whole artifact — its own operations and the passthrough — at the
 version its `service.codefly.yaml` declares.

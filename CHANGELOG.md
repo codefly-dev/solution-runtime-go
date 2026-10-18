@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — a 4xx refusal reaches the page with its reason
+
+The host gateway refuses a module route in `text/plain`, one line naming the
+rule — "module is not installed for this organization". The relay only read
+JSON, so the page was told the status word alone, "Forbidden", and a viewer who
+needed a grant on the module's installation had nothing to act on. A 4xx body
+that is short, single-line printable text is now the message.
+
+A 5xx body is still reported by kind: `upstream connect error: 10.0.0.7:8080
+refused` is written by an intermediary and names an internal address.
+
 ## Unreleased — the mint reports the registration's dynamic half; the runtime serves uninstalled
 
 The mint body carries `upstream` (the advertised https origin, never the listen
