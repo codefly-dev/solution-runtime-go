@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — `Gateway.InstallationID` exposes the stamped installation
+
+`Gateway` exposed `OrgID()` but not the installation beside it, so a handler
+that needed the installation it serves either re-parsed
+`x-codefly-installation-id` itself or took an id from the browser.
+`Gateway.InstallationID()` returns the installation the gateway stamped, as the
+runtime accepted it — the same value every `ForModule` mint names. It is empty
+when the request carries none or the header is blank (which the runtime
+refuses), and on an install step's gateway. Additive; no signature changes.
+
 ## Unreleased — a 4xx refusal reaches the page with its reason
 
 The host gateway refuses a module route in `text/plain`, one line naming the

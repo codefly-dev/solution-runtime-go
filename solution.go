@@ -1405,6 +1405,20 @@ func (g *Gateway) BaseURL() string { return g.baseURL }
 // a module read to a tenant names this one rather than resolving another.
 func (g *Gateway) OrgID() string { return g.orgID }
 
+// InstallationID is the installation the gateway stamped for this request: the
+// x-codefly-installation-id identity header it sets from the same verified
+// claims as x-org-id, the installation that admitted the viewer, never anything
+// the browser sent. It is the value this runtime accepted, the one every
+// ForModule mint names, so a handler placing a resource under an installation
+// names this one rather than taking an id from the page.
+//
+// It is empty when the request carries none — an org-less caller, or a host
+// that does not confine solution traffic by installation — and when the header
+// is blank, which this runtime refuses rather than mints under; a refused value
+// is never handed back. It is empty on the gateway an install step receives as
+// well, whose installation is the Installation that step is given.
+func (g *Gateway) InstallationID() string { return g.installationID }
+
 // HTTPClient returns an http.Client that injects the caller's bearer — and, on
 // a gateway derived by ForModule, the viewer's Work Context — on every request.
 // During an install step it carries the supplied installation Work Context.

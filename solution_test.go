@@ -1936,3 +1936,89 @@ func TestFrontendReaderRetainsCoreLimitsAndExtensibleClientKinds(t *testing.T) {
 		}
 	}
 }
+
+// TestGatewayExposesTheStampedInstallation: a handler reads the installation
+// the gateway stamped through Gateway.InstallationID, so it never re-parses the
+// header or takes one from the page — and gets back only what this runtime
+// accepted, the same value every ForModule mint names.
+func TestGatewayExposesTheStampedInstallation(t *testing.T) {
+	mint := newHostMint(t, &hostMint{})
+	solution := boot(t, New(Manifest{ID: testSolutionID}).
+		Handle("/installation", func(_ context.Context, gw *Gateway) (any, error) {
+			return map[string]string{"installation": gw.InstallationID()}, nil
+		}), mint)
+
+	served := func(t *testing.T, stamp func(http.Header)) string {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, solution.base+"/installation", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("authorization", viewerBearer())
+		request.Header.Set(orgHeader, testOrganization)
+		request.Header.Set(sessionHeader, "session-1")
+		stamp(request.Header)
+		resp, err := solution.client.Do(request)
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("handler answered %d, want 200", resp.StatusCode)
+		}
+		var body map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body["installation"]
+	}
+
+	t.Run("a stamped installation is exposed", func(t *testing.T) {
+		got := served(t, func(h http.Header) { h.Set(workcontext.InstallationIDHeaderName, testInstallation) })
+		if got != testInstallation {
+			t.Errorf("InstallationID() = %q, want the stamped %q", got, testInstallation)
+		}
+	})
+
+	t.Run("an unstamped request exposes none", func(t *testing.T) {
+		if got := served(t, func(http.Header) {}); got != "" {
+			t.Errorf("InstallationID() = %q for a request the gateway stamped no installation on, want empty", got)
+		}
+	})
+
+	t.Run("a caller-supplied capability does not name it", func(t *testing.T) {
+		// The capability carrier is caller-controlled inbound; with no stamped
+		// header there is no installation, whatever the capability says.
+		got := served(t, func(h http.Header) { h.Set(workcontext.HeaderName, capability("forged-by-the-caller")) })
+		if got != "" {
+			t.Errorf("InstallationID() = %q from a caller-supplied capability, want empty", got)
+		}
+	})
+
+	t.Run("a refused header is never handed back", func(t *testing.T) {
+		// Straight to gatewayFor: the HTTP server trims a blank value to
+		// nothing before a handler sees it, so only this reaches the refusal.
+		for _, raw := range []string{"   ", "\t"} {
+			header := http.Header{}
+			header.Set("authorization", viewerBearer())
+			header.Set(orgHeader, testOrganization)
+			header.Set(sessionHeader, "session-1")
+			header.Set(workcontext.InstallationIDHeaderName, raw)
+			gw := solution.server.gatewayFor(header)
+			if gw.installationErr == nil {
+				t.Fatalf("the blank installation %q was accepted, so this case does not exercise the refusal", raw)
+			}
+			if got := gw.InstallationID(); got != "" {
+				t.Errorf("InstallationID() = %q for the refused header %q, want empty", got, raw)
+			}
+		}
+	})
+
+	t.Run("it is the value accepted, not the raw header", func(t *testing.T) {
+		header := http.Header{}
+		header.Set(workcontext.InstallationIDHeaderName, " "+testInstallation+" ")
+		if got := solution.server.gatewayFor(header).InstallationID(); got != testInstallation {
+			t.Errorf("InstallationID() = %q, want the accepted %q", got, testInstallation)
+		}
+	})
+}
