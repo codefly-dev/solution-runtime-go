@@ -886,6 +886,15 @@ non-2xx answer is a `*GatewayError` carrying the status.
 `Gateway.OrgID` is the viewer's active organization, the same one `ForModule`
 mints in. A handler scoping a module read to a tenant names this one.
 
+`Gateway.InstallationID` is the installation the gateway stamped for the
+request (`x-codefly-installation-id`), the one that admitted the viewer and the
+one every `ForModule` mint names. A handler placing a resource under an
+installation — asking the host for it and using its scope — names this one
+rather than reading the header itself or taking an id from the page. It is
+empty when the request carries none, and when the header is blank, which the
+runtime refuses: a refused value is never handed back. An install step's
+gateway has none either; that step is given its `Installation`.
+
 `Gateway.WorkContextPrincipals` reports whom a `ForModule` capability was
 issued for — the organization, the Task's owner and its current actor, as
 accounts answered the mint — so a handler compares a claimed owner against
