@@ -161,6 +161,8 @@ type Server struct {
 	mcp           *mcpSurface
 	mcpRedeclared bool
 	cfg           config
+	// host is the authority interface, when the composition names one.
+	host *hostAuthority
 	// declaredContract is the authority contract the author declared
 	// (Contract); contract is that contract resolved for the profile this
 	// process runs under, which is what it publishes.
@@ -219,6 +221,10 @@ type config struct {
 	listenHost        string
 	port              string
 	gatewayURL        string
+	// authorityEndpoint is the authority interface the composition names
+	// (authority/endpoint). When set, the runtime asks it instead of the saas
+	// gateway (authority.go), and no gateway is required.
+	authorityEndpoint string
 	// dialled is every address this process talks to, assembled at boot.
 	//
 	// It exists so nothing has to re-read the configuration to ask "is this
@@ -542,11 +548,13 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 	transport.value, transport.set, transport.err = query.WorkspaceValueIfSet(workcontext.MeshTransportGroup, workcontext.MeshTransportKey)
 
 	internalToken, _ := query.WorkspaceSecret("module-authority", "INTERNAL_TOKEN")
+	authorityEndpoint, _ := query.WorkspaceConfiguration(AuthorityInterfaceGroup, AuthorityEndpointKey)
 	cfg := config{
 		brokerInternalToken: strings.TrimSpace(internalToken),
 		port:                port,
 		listenHost:          listenHost(self),
 		gatewayURL:          gatewayURL,
+		authorityEndpoint:   strings.TrimSpace(authorityEndpoint),
 		assetsDir:           env("ASSETS_DIR", "../fe-remote/dist"),
 		dialled:             dialledAddresses(gatewayURL),
 		projectedTokenPath:  strings.TrimSpace(env(ProjectedTokenFileEnvironmentVariable, DefaultProjectedTokenFile)),
@@ -663,7 +671,10 @@ func (c config) validate() error {
 	// that attests which workload this process is, and every viewer call
 	// carries the viewer's bearer and the capability minted for them. So it
 	// has to be resolved, and it has to be a destination those may travel to.
-	if u, err := url.Parse(c.gatewayURL); err != nil || !u.IsAbs() || u.Host == "" {
+	if c.authorityEndpoint != "" {
+		// The authority answers who a viewer is and issues every Work
+		// Context; there is no gateway to resolve and no broker to reach.
+	} else if u, err := url.Parse(c.gatewayURL); err != nil || !u.IsAbs() || u.Host == "" {
 		if c.environmentLoadErr != nil {
 			return fmt.Errorf("unresolved gateway URL %q, and loading Codefly's injected environment failed first: %w — nothing the SDK resolves can be trusted to be absent until that is fixed",
 				redactedURL(c.gatewayURL), c.environmentLoadErr)
@@ -681,11 +692,12 @@ func (c config) validate() error {
 	// Userinfo, a query and a fragment are refused by it too: a credential in
 	// a URL is a secret this runtime would log at boot and net/http would
 	// strip from the request, so it is disclosed and never used.
-	if _, err := workcontext.AdmitEndpoint(c.gatewayURL, c.transport, "gateway"); err != nil {
+	if c.authorityEndpoint != "" {
+	} else if _, err := workcontext.AdmitEndpoint(c.gatewayURL, c.transport, "gateway"); err != nil {
 		return fmt.Errorf("gateway URL %q is not a destination the projected service-account token, the viewer's bearer and the capability minted for them may travel to: %w — set GATEWAY_URL, or the composition's gateway endpoint, to one that is",
 			redactedURL(c.gatewayURL), err)
 	}
-	if c.requiresAuthority && c.brokerInternalToken == "" {
+	if c.requiresAuthority && c.authorityEndpoint == "" && c.brokerInternalToken == "" {
 		return fmt.Errorf("missing module-authority/INTERNAL_TOKEN: provision the broker perimeter credential as a workspace secret")
 	}
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
@@ -897,7 +909,20 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// The authority-bearing values first: the principal is part of what the
 	// contract publishes, and a value the platform never provisioned is named
 	// here rather than discovered when a mint is refused.
-	if s.cfg.requiresAuthority {
+	if s.cfg.authorityEndpoint != "" {
+		authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.projectedTokenPath)
+		if err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+		}
+		s.host = authority
+		if len(s.consumed) > 0 {
+			// Passthrough relays a page's call to a consumed module through the
+			// saas gateway. Under the authority there is no such gateway: a
+			// page reaches a module through the hop with ForModule's Work
+			// Context, and nothing passes through this process.
+			return nil, fmt.Errorf("solution %q consumes modules through the gateway passthrough, which the authority interface has no gateway for: call each module through the hop with Gateway.ForModule and Gateway.WorkContext", s.manifest.ID)
+		}
+	} else if s.cfg.requiresAuthority {
 		if err := s.openAuthority(ctx); err != nil {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
@@ -1270,7 +1295,18 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
 			return
 		}
-		result, err := handler(r, s.gatewayFor(r.Header))
+		gw := s.gatewayFor(r.Header)
+		if s.host != nil {
+			// Who the request is for is the authority's answer about the
+			// bearer, never a header the request wrote.
+			viewer, err := s.host.viewer(r.Context(), bearer)
+			if err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "the authority knows no session for this bearer"})
+				return
+			}
+			gw.orgID, gw.sessionID, gw.installationID, gw.installationErr = viewer.GetOrganizationId(), viewer.GetSessionId(), "", nil
+		}
+		result, err := handler(r, gw)
 		if err != nil {
 			status, message := handlerErrorResponse(err)
 			writeJSON(w, status, map[string]string{"error": message})
@@ -1328,6 +1364,9 @@ type Gateway struct {
 	// is given. It holds the ask rather than a capability: see delegation.
 	delegation *delegation
 	contexts   *workContextCache
+	// host, when set, is the authority interface that issues this gateway's
+	// Work Contexts (authority.go).
+	host *hostAuthority
 	// workload is this execution's own credential, presented on the mint this
 	// runtime runs for a viewer so the issuer knows which module is asking and
 	// can hold the mint to the installation and binding that credential is
@@ -1370,6 +1409,7 @@ func (s *Server) gatewayFor(header http.Header) *Gateway {
 	// is absent.
 	gw.installationID, gw.installationErr = viewerInstallation(header)
 	gw.id, gw.report = s.manifest.ID, &s.attestation
+	gw.host = s.host
 	gw.workload = func(ctx context.Context) (executionCredential, error) {
 		return s.acquireForInstallation(ctx, gw.orgID, gw.installationID)
 	}
@@ -1827,7 +1867,7 @@ func (g *Gateway) ForModule(ctx context.Context, audience string, scopes ...Scop
 			"cannot mint a work context for %q: %s is absent or empty — the gateway injects it from the verified session and stamps it empty for any caller that authenticates without one: %w",
 			audience, sessionHeader, &ClientError{StatusCode: http.StatusForbidden, Message: "a user session is required to read composed modules"})
 	}
-	if g.installationID == "" {
+	if g.installationID == "" && g.host == nil {
 		if g.installationErr != nil {
 			return nil, g.surfaced(fmt.Errorf("cannot mint a work context for %q: %w. The host requires an installation on every mint and refuses one naming none, and an organization is not an installation — one org may hold several",
 				audience, g.installationErr))
@@ -2045,9 +2085,29 @@ type startTaskRequest struct {
 	SessionID       string             `json:"sessionId"`
 	Audience        string             `json:"audience"`
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
+	// Binding, under the authority, asks for this module's own Work Context
+	// through one of its declared bindings (ForBinding). The saas route has no
+	// such ask, so it is never sent there.
+	Binding string `json:"-"`
 }
 
 func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.Time, error) {
+	if g.host != nil {
+		var token string
+		var renew time.Time
+		var principals WorkContextPrincipals
+		var err error
+		if ask.Binding != "" {
+			token, renew, principals, err = g.host.issueForBinding(ctx, ask.OrgID, ask.Binding)
+		} else {
+			token, renew, principals, err = g.host.issueForViewer(ctx, g.bearer, ask)
+		}
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		g.contexts.remember(token, principals)
+		return token, renew, nil
+	}
 	body, err := json.Marshal(ask)
 	if err != nil {
 		return "", time.Time{}, err

@@ -180,6 +180,31 @@ after fixing the cause — runs the step again, and at most
 must therefore converge: it may run again for an installation it already set
 up, after a retry, an eviction or a restart.
 
+## Under the authority interface
+
+When the composition names the authority interface (workspace configuration
+`authority/endpoint`: the authority gateway on a laptop, the host in a cell; see
+codefly-dev/authority), the runtime asks it what it otherwise asks the saas
+gateway, and needs neither the gateway nor the broker credential:
+
+- **Who a request is for**: the authority's `session.Current` for the request's
+  bearer. `OrgID` is that session's organization; `x-org-id`, `x-session-id` and
+  the installation header a request wrote are ignored, and a bearer the
+  authority does not know is answered 401 before the handler runs.
+- **`ForModule(audience, scopes...)`**: the viewer's Work Context, issued by
+  `authority.Issue` for the person with the viewer's bearer, held until it is due
+  for renewal.
+- **`ForBinding(binding)`** (authority only): this module's own Work Context
+  through one of its declared bindings, in the viewer's organization, issued with
+  the workload credential the run attests (`CODEFLY__WORKLOAD_TOKEN_FILE`).
+- **`WorkContext(ctx)`**: the token either gateway acts under, for a caller that
+  reaches a module itself — over gRPC through the hop.
+
+Gateway passthrough (`Consumes`) has no gateway to relay through and is refused
+at boot; a page calls each module through the hop instead. Without
+`authority/endpoint` nothing changes: the runtime runs against the saas host as
+before, so a composition can still run saas locally.
+
 ## Configuration
 
 On boot `Serve` calls `codefly.Init(ctx)`, which loads Codefly's injected
