@@ -910,7 +910,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// contract publishes, and a value the platform never provisioned is named
 	// here rather than discovered when a mint is refused.
 	if s.cfg.authorityEndpoint != "" {
-		authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.projectedTokenPath)
+		authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.projectedTokenPath, s.manifest.ID)
 		if err != nil {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
@@ -1290,21 +1290,31 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		bearer := r.Header.Get("authorization")
-		if bearer == "" {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
-			return
-		}
-		gw := s.gatewayFor(r.Header)
+		var gw *Gateway
 		if s.host != nil {
-			// Who the request is for is the authority's answer about the
-			// bearer, never a header the request wrote.
-			viewer, err := s.host.viewer(r.Context(), bearer)
-			if err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "the authority knows no session for this bearer"})
+			// Under the authority the edge sends the request on with the
+			// person's Work Context for this module, and who it is for is the
+			// authority's Check of that context, never a header the request
+			// wrote about itself. No session bearer reaches this process.
+			carried := r.Header.Get(WorkContextHeader)
+			if carried == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no Work Context: this page is reached through the authority's edge, which signs the person in"})
 				return
 			}
-			gw.orgID, gw.sessionID, gw.installationID, gw.installationErr = viewer.GetOrganizationId(), viewer.GetSessionId(), "", nil
+			viewer, err := s.host.viewer(r.Context(), carried)
+			if err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+				return
+			}
+			gw = s.gatewayFor(http.Header{})
+			gw.parentContext = carried
+			gw.orgID, gw.sessionID, gw.installationID, gw.installationErr = viewer.GetTenantId(), viewer.GetSessionId(), "", nil
+		} else {
+			if r.Header.Get("authorization") == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
+				return
+			}
+			gw = s.gatewayFor(r.Header)
 		}
 		result, err := handler(r, gw)
 		if err != nil {
@@ -1337,6 +1347,10 @@ func drainAndClose(resp *http.Response) {
 type Gateway struct {
 	baseURL string
 	bearer  string
+	// parentContext is, under the authority, the person's Work Context the
+	// edge sent the request with: the parent every ForParent child is issued
+	// from. Never forwarded as it is.
+	parentContext string
 	// carriedContext is the install call's opaque bearer, carried unchanged
 	// to the host for verification. Viewer gateways never inherit an inbound
 	// capability: their Work Context is minted through ForModule instead.
@@ -1973,14 +1987,14 @@ func (g *Gateway) withinPublishedCeiling(audience string, scopes []Scope) error 
 			return fmt.Errorf("this solution asked %q for resource kind %q with no actions: an action-less scope states no authority and is inside every ceiling by construction: %w",
 				audience, scope.ResourceKind, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution asked for a scope with no actions"})
 		}
-	// Under the authority interface, a solution that publishes no ceiling — a
-	// module page, which consumes nothing through passthrough and so has no
-	// ceiling it could publish here — is bounded by the authority alone: what
-	// the viewer holds, cut to what the audience serves. One that publishes
-	// ceilings is still held to them below.
-	if g.host != nil && len(g.ceilings) == 0 {
-		return nil
-	}
+		// Under the authority interface, a solution that publishes no ceiling — a
+		// module page, which consumes nothing through passthrough and so has no
+		// ceiling it could publish here — is bounded by the authority alone: what
+		// the viewer holds, cut to what the audience serves. One that publishes
+		// ceilings is still held to them below.
+		if g.host != nil && len(g.ceilings) == 0 {
+			return nil
+		}
 	}
 	ceiling, declared := g.ceilings[audience]
 	// A declared audience with an empty ceiling is a module this solution
@@ -2099,9 +2113,11 @@ type startTaskRequest struct {
 	Audience        string             `json:"audience"`
 	AuthorityScopes []workContextScope `json:"authorityScopes"`
 	// Binding, under the authority, asks for this module's own Work Context
-	// through one of its declared bindings (ForBinding). The saas route has no
-	// such ask, so it is never sent there.
+	// through one of its declared bindings (ForBinding), or with child, for a
+	// child of the viewer's through it (ForParent). The saas route has no such
+	// ask, so neither is ever sent there.
 	Binding string `json:"-"`
+	child   bool
 }
 
 func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.Time, error) {
@@ -2110,10 +2126,15 @@ func (g *Gateway) mint(ctx context.Context, ask startTaskRequest) (string, time.
 		var renew time.Time
 		var principals WorkContextPrincipals
 		var err error
-		if ask.Binding != "" {
+		switch {
+		case ask.child:
+			token, renew, principals, err = g.host.issueChild(ctx, g.parentContext, ask.Binding, ask.AuthorityScopes)
+		case ask.Binding != "":
 			token, renew, principals, err = g.host.issueForBinding(ctx, ask.OrgID, ask.Binding)
-		} else {
-			token, renew, principals, err = g.host.issueForViewer(ctx, g.bearer, ask)
+		default:
+			// A person's call reaches a module as a child of the context the
+			// edge sent, through a binding: ForParent.
+			err = &ClientError{StatusCode: http.StatusInternalServerError, Message: "under the authority a page calls a module through one of its bindings: Gateway.ForParent"}
 		}
 		if err != nil {
 			return "", time.Time{}, err

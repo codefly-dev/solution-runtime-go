@@ -2,6 +2,9 @@ package solution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,19 +16,19 @@ import (
 	"google.golang.org/grpc/status"
 
 	authorityv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/authority/v1"
-	sessionv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/session/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	grpcmetadata "google.golang.org/grpc/metadata"
 )
 
 // The authority interface (codefly-dev/authority): the authority gateway on a
 // laptop, the host in a cell. When the composition names one
-// (authority/endpoint), the runtime asks it everything it otherwise asks the
-// saas gateway: who a request's bearer is (session Current) and the Work
-// Context a call to a module carries (authority Issue). No gateway stands in
-// front of the page, so nothing is read from a header the request wrote, and
-// the runtime mints nothing.
+// (authority/endpoint), the page is reached through the authority's edge (the
+// auth gateway's role), which signs the person in and sends each request on
+// with the person's Work Context addressed to this module. The runtime holds
+// no session bearer: it asks the authority's Check who that context is for,
+// and every call it makes to a module is issued by the authority as a child of
+// that context through one of this module's bindings (ForParent), or as this
+// module's own work (ForBinding). The runtime mints nothing.
 const (
 	// AuthorityInterfaceGroup and AuthorityEndpointKey name where the
 	// composition says which authority answers.
@@ -35,14 +38,20 @@ const (
 	authorityCallTimeout = 10 * time.Second
 )
 
-// ErrNoViewer is a request whose bearer the authority does not know.
-var ErrNoViewer = errors.New("the authority knows no session for this bearer")
+// WorkContextHeader carries the person's Work Context the edge sends a request
+// on with.
+const WorkContextHeader = "x-codefly-work-context"
+
+// ErrNoViewer is a request whose Work Context the authority does not check.
+var ErrNoViewer = errors.New("the authority does not check the Work Context this request carries for this module")
 
 // hostAuthority is the runtime's connection to the authority interface.
 type hostAuthority struct {
 	conn      *grpc.ClientConn
 	authority authorityv1.AuthorityServiceClient
-	session   sessionv1.SessionServiceClient
+	// principal is this module's: the audience a context the edge sends it is
+	// addressed to.
+	principal string
 	// credential is this workload's credential as the run attests it, read on
 	// every call so a rotation takes effect.
 	credential func() (string, error)
@@ -51,7 +60,7 @@ type hostAuthority struct {
 // dialAuthority connects to the authority at endpoint. The connection is
 // in-cell transport, which the mesh carries; the runtime terminates no TLS to
 // it.
-func dialAuthority(endpoint, tokenFile string) (*hostAuthority, error) {
+func dialAuthority(endpoint, tokenFile, principal string) (*hostAuthority, error) {
 	target := strings.TrimSpace(endpoint)
 	for _, scheme := range []string{"grpc://", "http://", "tcp://"} {
 		target = strings.TrimPrefix(target, scheme)
@@ -66,7 +75,7 @@ func dialAuthority(endpoint, tokenFile string) (*hostAuthority, error) {
 	return &hostAuthority{
 		conn:      conn,
 		authority: authorityv1.NewAuthorityServiceClient(conn),
-		session:   sessionv1.NewSessionServiceClient(conn),
+		principal: principal,
 		credential: func() (string, error) {
 			raw, err := os.ReadFile(tokenFile)
 			if err != nil || strings.TrimSpace(string(raw)) == "" {
@@ -77,33 +86,37 @@ func dialAuthority(endpoint, tokenFile string) (*hostAuthority, error) {
 	}, nil
 }
 
-// withBearer carries the request's bearer on a call to the authority.
-func withBearer(ctx context.Context, bearer string) context.Context {
-	return grpcmetadata.AppendToOutgoingContext(ctx, "authorization", bearer)
-}
-
-// viewer asks the authority who bearer is.
-func (h *hostAuthority) viewer(ctx context.Context, bearer string) (*sessionv1.Session, error) {
+// viewer asks the authority's Check whose the Work Context a request carries
+// is, addressed to this module. A context the authority does not check is no
+// viewer, whatever it claims.
+func (h *hostAuthority) viewer(ctx context.Context, workContext string) (*authorityv1.WorkContextV1, error) {
 	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
 	defer cancel()
-	sess, err := h.session.Current(withBearer(ctx, bearer), &sessionv1.CurrentRequest{})
-	if err != nil || sess.GetOrganizationId() == "" {
+	checked, err := h.authority.Check(ctx, &authorityv1.CheckRequest{Token: workContext, Audience: h.principal})
+	if err != nil || checked.GetContext().GetTenantId() == "" {
 		return nil, ErrNoViewer
 	}
-	return sess, nil
+	return checked.GetContext(), nil
 }
 
-// issueForViewer asks the authority for the viewer's Work Context at one
-// audience, within the scopes asked: what ForModule's gateway carries.
-func (h *hostAuthority) issueForViewer(ctx context.Context, bearer string, ask startTaskRequest) (string, time.Time, WorkContextPrincipals, error) {
+// issueChild asks the authority for a child of the viewer's Work Context
+// through one of this module's bindings: the audience is the binding's, and the
+// scopes the binding's invoke ceiling narrowed to what was asked and to what
+// the person holds there.
+func (h *hostAuthority) issueChild(ctx context.Context, parent, binding string, scopes []workContextScope) (string, time.Time, WorkContextPrincipals, error) {
+	credential, err := h.credential()
+	if err != nil {
+		return "", time.Time{}, WorkContextPrincipals{}, err
+	}
 	req := &authorityv1.IssueRequest{
-		As:       &authorityv1.IssueRequest_Person{Person: &authorityv1.PersonSession{}},
-		Audience: ask.Audience,
+		As:                 &authorityv1.IssueRequest_ParentToken{ParentToken: parent},
+		Actor:              &authorityv1.WorkloadCredential{Credential: credential},
+		OperationBindingId: binding,
 	}
-	for _, scope := range ask.AuthorityScopes {
-		req.Scopes = append(req.Scopes, &authorityv1.WorkScopeV1{ResourceKind: scope.ResourceKind, Actions: scope.Actions})
+	for _, scope := range scopes {
+		req.Scopes = append(req.Scopes, &authorityv1.WorkScopeV1{ResourceKind: scope.ResourceKind, Actions: scope.Actions, ResourceIds: scope.ResourceIDs})
 	}
-	return h.issue(withBearer(ctx, bearer), req)
+	return h.issue(ctx, req)
 }
 
 // issueForBinding asks the authority for this module's own Work Context
@@ -160,12 +173,35 @@ func refusalStatus(err error) int {
 	return http.StatusBadGateway
 }
 
+// ForParent is the viewer's own call to a module, under the authority: a child
+// of the Work Context the edge sent this request with, through one of this
+// module's declared bindings. The authority derives the audience from the
+// binding and grants within the binding's invoke ceiling and what the person
+// holds there; scopes narrow it further.
+func (g *Gateway) ForParent(ctx context.Context, binding string, scopes ...Scope) (*Gateway, error) {
+	if g.host == nil || g.parentContext == "" {
+		return nil, errors.New("ForParent is issued by the authority interface, as a child of the Work Context the edge sends a request with; this request carries none")
+	}
+	acting := *g
+	wire := make([]workContextScope, len(scopes))
+	for i, scope := range scopes {
+		wire[i] = workContextScope{ResourceKind: scope.ResourceKind, Actions: append([]string(nil), scope.Actions...), ResourceIDs: append([]string(nil), scope.ResourceIDs...)}
+	}
+	sum := sha256.Sum256([]byte(g.parentContext))
+	key, _ := json.Marshal(wire)
+	acting.delegation = &delegation{key: "parent\x00" + hex.EncodeToString(sum[:]) + "\x00" + binding + "\x00" + string(key), ask: startTaskRequest{OrgID: g.orgID, Binding: binding, AuthorityScopes: wire, child: true}}
+	if _, err := acting.workContext(ctx); err != nil {
+		return nil, g.surfaced(err)
+	}
+	return &acting, nil
+}
+
 // WorkContext is the Work Context this gateway acts under, issued (and renewed)
 // for ForModule's or ForBinding's ask: what a caller presents to a module it
 // reaches itself, over gRPC through the hop for example.
 func (g *Gateway) WorkContext(ctx context.Context) (string, error) {
 	if g.delegation == nil && g.carriedContext == "" {
-		return "", errors.New("this gateway acts under no Work Context: call ForModule or ForBinding first")
+		return "", errors.New("this gateway acts under no Work Context: call ForParent, ForModule or ForBinding first")
 	}
 	return g.workContext(ctx)
 }

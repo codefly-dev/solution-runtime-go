@@ -184,20 +184,28 @@ up, after a retry, an eviction or a restart.
 
 When the composition names the authority interface (workspace configuration
 `authority/endpoint`: the authority gateway on a laptop, the host in a cell; see
-codefly-dev/authority), the runtime asks it what it otherwise asks the saas
-gateway, and needs neither the gateway nor the broker credential:
+codefly-dev/authority), the page is reached through the authority's **edge**,
+the auth gateway's role: the browser's one origin, which signs the person in and
+sends each request on with the person's Work Context addressed to this module
+(`x-codefly-work-context`). The runtime needs neither the saas gateway nor the
+broker credential, and holds no session bearer:
 
-- **Who a request is for**: the authority's `session.Current` for the request's
-  bearer. `OrgID` is that session's organization; `x-org-id`, `x-session-id` and
-  the installation header a request wrote are ignored, and a bearer the
-  authority does not know is answered 401 before the handler runs.
-- **`ForModule(audience, scopes...)`**: the viewer's Work Context, issued by
-  `authority.Issue` for the person with the viewer's bearer, held until it is due
-  for renewal.
+- **Who a request is for**: the authority's `Check` of that Work Context,
+  addressed to this module. `OrgID` is its organization; a header the request
+  wrote about itself is ignored, and a request with no context, or one the
+  authority does not check, is answered 401 before the handler runs.
+- **`ForParent(binding, scopes...)`** (authority only): the viewer's own call to
+  a module, a child of the edge's Work Context through one of this module's
+  declared bindings, issued by `authority.Issue` with the workload credential the
+  run attests as the actor. The authority derives the audience from the binding
+  and grants within its invoke ceiling and what the person holds there; held
+  until it is due for renewal.
 - **`ForBinding(binding)`** (authority only): this module's own Work Context
-  through one of its declared bindings, in the viewer's organization, issued with
-  the workload credential the run attests (`CODEFLY__WORKLOAD_TOKEN_FILE`).
-- **`WorkContext(ctx)`**: the token either gateway acts under, for a caller that
+  through one of its declared bindings, in the viewer's organization, with no
+  person in it.
+- **`ForModule`** is the saas route; under the authority it is refused, naming
+  `ForParent`.
+- **`WorkContext(ctx)`**: the token a gateway acts under, for a caller that
   reaches a module itself — over gRPC through the hop.
 
 Gateway passthrough (`Consumes`) has no gateway to relay through and is refused
