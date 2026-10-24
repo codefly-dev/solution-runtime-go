@@ -198,3 +198,29 @@ func TestForBindingWithoutTheAuthorityIsRefused(t *testing.T) {
 		t.Fatalf("ForBinding without the authority: %v", err)
 	}
 }
+
+// Under the authority, a solution that publishes no ceiling (a module page) is
+// bounded by the authority alone; an empty ask is still refused before it
+// reaches the authority, and a solution that publishes ceilings stays held to
+// them.
+func TestUnderTheAuthorityAnUnpublishedCeilingIsTheAuthoritys(t *testing.T) {
+	s, stand := authorityServer(t)
+	gw := s.gatewayFor(http.Header{"Authorization": {sessionBearer}})
+	gw.orgID, gw.sessionID = "org-from-the-authority", "session-1"
+	gw.ceilings = map[string][]Scope{}
+	ctx := context.Background()
+	viewer, err := gw.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}})
+	if err != nil {
+		t.Fatalf("a page's viewer read was refused locally: %v", err)
+	}
+	if token, err := viewer.WorkContext(ctx); err != nil || token != "issued-documents" || len(stand.asked()) != 1 {
+		t.Fatalf("the authority was not asked: %q, %v", token, err)
+	}
+	if _, err := gw.ForModule(ctx, "documents"); err == nil {
+		t.Fatal("an ask for nothing reached the authority")
+	}
+	gw.ceilings = map[string][]Scope{"records": {{ResourceKind: "records.types", Actions: []string{"read"}}}}
+	if _, err := gw.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}}); err == nil {
+		t.Fatal("a solution publishing ceilings asked outside them")
+	}
+}

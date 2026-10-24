@@ -1973,6 +1973,14 @@ func (g *Gateway) withinPublishedCeiling(audience string, scopes []Scope) error 
 			return fmt.Errorf("this solution asked %q for resource kind %q with no actions: an action-less scope states no authority and is inside every ceiling by construction: %w",
 				audience, scope.ResourceKind, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution asked for a scope with no actions"})
 		}
+	// Under the authority interface, a solution that publishes no ceiling — a
+	// module page, which consumes nothing through passthrough and so has no
+	// ceiling it could publish here — is bounded by the authority alone: what
+	// the viewer holds, cut to what the audience serves. One that publishes
+	// ceilings is still held to them below.
+	if g.host != nil && len(g.ceilings) == 0 {
+		return nil
+	}
 	}
 	ceiling, declared := g.ceilings[audience]
 	// A declared audience with an empty ceiling is a module this solution
