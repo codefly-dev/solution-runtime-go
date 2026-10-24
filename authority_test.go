@@ -152,6 +152,12 @@ func TestUnderTheAuthorityEveryWorkContextIsIssued(t *testing.T) {
 		t.Fatalf("viewer issue asked %v with bearer %q", asked, stand.bearer[0])
 	}
 
+	// The published contract's ceilings govern what a viewer is asked for; a
+	// binding ask names no scopes and is held to the binding by the authority.
+	gw.ceilings = map[string][]Scope{
+		"records": {{ResourceKind: "records.types", Actions: []string{"read"}}},
+		"refused": {{ResourceKind: "documents", Actions: []string{"read"}}},
+	}
 	own, err := gw.ForBinding(ctx, "records-types")
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +170,7 @@ func TestUnderTheAuthorityEveryWorkContextIsIssued(t *testing.T) {
 		t.Fatalf("binding issue asked %v", asked)
 	}
 
-	if _, err := gw.ForModule(ctx, "refused"); err == nil || !strings.Contains(err.Error(), "403") {
+	if _, err := gw.ForModule(ctx, "refused", Scope{ResourceKind: "documents", Actions: []string{"read"}}); err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("a refused issue was not a refusal: %v", err)
 	}
 	if _, err := gw.WorkContext(ctx); err == nil {

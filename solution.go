@@ -2026,8 +2026,13 @@ func (g *Gateway) workContext(ctx context.Context) (string, error) {
 		// a delegation reaching it by some future path would otherwise carry
 		// an unchecked ask, and the cost is a comparison against a declaration
 		// already in memory.
-		if err := g.withinPublishedCeiling(ask.Audience, scopesOfAsk(ask.AuthorityScopes)); err != nil {
-			return "", time.Time{}, err
+		// A binding ask (ForBinding) names no scopes: the authority issues the
+		// binding's declared headless scopes and nothing else, so the binding
+		// is its ceiling and there is no asked scope to hold to this one.
+		if ask.Binding == "" {
+			if err := g.withinPublishedCeiling(ask.Audience, scopesOfAsk(ask.AuthorityScopes)); err != nil {
+				return "", time.Time{}, err
+			}
 		}
 		ask.TaskID = uuid.NewString()
 		return g.mint(ctx, ask)
