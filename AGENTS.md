@@ -32,23 +32,17 @@ workspace, manifest and presence/authority document types to `codefly-dev/core`;
 running a composition, provisioning its secrets and rendering the authority
 document to `codefly-dev/cli`. Everything here is a library — one Go package at
 the repository root, consumed as the Go module
-`github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag, plus
-`passthroughtest`, the test seam a consumer runs the root package's passthrough
-under against a fake host. It holds no runtime behaviour of its own: it builds
-on the handler `Serve` mounts, reached through `internal/seam`.
+`github.com/codefly-dev/solution-runtime-go` at a `vX.Y.Z` tag.
 
-**That seam is not public API, and must not become one again.**
+**No exported path hands out the passthrough's handler.**
 `Server.PassthroughHandler` was exported, and a deployment calling it completed
 a viewer mint and a module call over plaintext, 200, having skipped
-`validate()`, the boot, the ceiling and the origin-pinned outbound client —
-with the viewer's bearer and this workload's own credential sent wherever it
-was mounted, and supplying a credential source defeated the "no
-source, nothing to mint with" mitigation it relied on. Go's internal-package
-rule is the gate, which is a compiler rather than a naming convention;
-`TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot` fails if an
-exported path reappears.
+`validate()`, the boot, the ceiling and the origin-pinned outbound client. The
+passthrough is mounted by `serve` alone, under the authority. The saas-host
+test seam that replaced the export (`passthroughtest`, through `internal/seam`)
+went with the saas passthrough it faked.
 
-Beside it, the handler-export, capability-decoder and seal-construction gates
+The handler-export, capability-decoder and seal-construction gates
 are **built on `go/types`**, in `typed_boundary_test.go`, and the fixtures that
 drive them are **compiled** into this package through a `packages.Load`
 overlay. Two rules follow from resolution that no list could express:
@@ -137,19 +131,7 @@ suite fail?", and a gate only fails when the counterexample it exists to refuse
 is in the tree — so its acceptance criterion is the compiled fixture set,
 driving the rule itself rather than a copy of it. A copy is not evidence: the
 signing-relaxation test checked its own copy of the condition and survived the
-real condition being removed. The same applies to the seam's refusal: the
-defeat check (`recover()`, a branch that cannot be taken) ran only where
-`mustBeATest()` was called directly, so the identical defeat one hop away was
-*inherited* as a refusal and passed.
-
-`passthroughtest` is itself importable by any module, so that rule alone did not
-close this: `passthroughtest.Handler` was an exported, production-importable
-path to the same handler, and the gate skipped the package by path while
-matching only receiver methods named `*Passthrough*`. Its constructors now panic
-outside a test binary (`testing.Testing()`), and the gate reads every caller of
-the seam in the module and requires that refusal. A `testing.TB` parameter is
-not a gate: the unexported method stops a type declaring the interface, not one
-embedding it.
+real condition being removed.
 
 ## Boundaries
 
@@ -198,19 +180,15 @@ embedding it.
   that beat an earlier version.
 - Resolving a value in `loadConfig` is half the rule; the other half is a
   refusal in `validate()` that fires **whether or not the feature using it is
-  switched on**. The `api.consumes` projection was resolved at boot and decoded
-  only by the code that consumes it, which returns early for a solution
-  declaring no `Consumes` — so one undecodable projection had two answers:
-  refused for a solution with a passthrough, accepted and served for one
-  without. It is decoded now in `loadConfig` (`parseAPIConsumes`) and refused by
-  `validate()` either way, naming the variable it arrived in, since it is the
-  composition's output and no override repairs it. `projection_boundary_test.go`
-  pins that, including that unset and whitespace mean "consumes nothing" rather
-  than "malformed".
+  switched on**, and a value nothing consumes is not read at all. The
+  `api.consumes` projection was decoded and judged here only for the saas
+  passthrough's agreement check; the authority's relay reads its address and
+  binding from the slots each module's declaration names, so the projection is
+  no longer read.
 - A solution claims no module's facade route and holds no credential that would
   let it: a route for a module is claimed by the module that serves it, under a
-  credential bound to that module (#51, SA-F-GWREGISTRY). The passthrough and
-  the gateway client *read* a consumed module at `/v1/<as>/*`; nothing here
+  credential bound to that module (#51, SA-F-GWREGISTRY). The gateway client
+  *reads* a consumed module at `/v1/<as>/*`; nothing here
   decides that the prefix points there. `facade_claim_test.go` evaluates the
   package's constant string expressions and fails on any that is one of those
   wire shapes — folded, so a shape split across a concatenation, parenthesised,
@@ -422,8 +400,8 @@ embedding it.
   posts `{audience, projection_audience}` and reads `{work_context}`, where
   the host takes `{prefix, organization_id}` and answers `{token, expiresAt, principalId,
   tenant}`; this runtime replaced it with the native client in #59 for that
-  reason, and the two places that still construct one — `credential_test.go`
-  and `passthroughtest` — do so against fakes that speak the SDK's shape, which
+  reason, and the one place that still constructs one — `credential_test.go` —
+  does so against fakes that speak the SDK's shape, which
   is a finding for the audit and not something a deployment exercises. Core's
   `Decode` is the only structural reader of the returned token; no signed
   message is constructed or decoded here, and that read verifies no signature.

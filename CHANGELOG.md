@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — the passthrough relays only through the authority, by each module's own procedure (breaking)
+
+The passthrough relays every declared method over gRPC to the module's own
+procedure — the Connect/gRPC face the module serves behind the authority's
+hop — so a module whose protos carry no `google.api.http` binding is consumed
+as it is. No binding is read: the boot no longer requires one under
+`/v1/<as>` for every declared method, which refused every solution pinned to a
+module that serves only behind the hop. A server-streaming method is relayed
+as a gRPC stream, bounded and masked as before.
+
+The saas-host passthrough is deleted, with its configuration, tests and docs:
+forwarding a method over its REST binding through the saas gateway (`forward`,
+the NDJSON stream reader and `Gateway.TranscodedStream`, `StreamError`,
+`ErrStreamMessageTooLarge`, `StreamOption`), `ConsumedModule.ViewerBearer`,
+the check of the declaration against the `CODEFLY__API_CONSUMES` projection
+(which is no longer read), the plain-text gateway refusal relay, and the test
+seam that faked the saas host (`passthroughtest`, `internal/seam`).
+
+- `ConsumedModule.Authority` is required on every consumed module, naming all
+  three of its group, endpoint slot and binding slot.
+- A solution that declares consumed modules and has no `authority/endpoint`
+  refuses to boot, naming it — before the gateway, which its page's calls
+  never reach. The `module-authority/INTERNAL_TOKEN` refusal it replaces is
+  gone, and so is the boot's broker credential for a consuming solution in
+  saas mode, which this made unreachable.
+- `GatewayError` keeps only its status: the refusal body it carried was read
+  by the saas passthrough alone.
+
 ## Unreleased — every documented operation declares its authority policy (breaking)
 
 `Operation.Policy` is what a call to the route must hold —

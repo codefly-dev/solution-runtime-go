@@ -220,15 +220,16 @@ broker credential, and holds no session bearer:
 
 - **The passthrough** (`Consumes`) is served from the same declaration, at
   `/v1/<id>/modules/<as>/<package.Service>/<Method>` (the edge routes a solution
-  at `/v1/<id>` and forwards requests unchanged). A consumed module whose
+  at `/v1/<id>` and forwards requests unchanged). Every consumed module's
   `Authority` names its configuration slots — the module's gRPC address, the
-  hop in front of it, and the id of this solution's binding for it — is relayed
-  over gRPC as the viewer: a child of the edge's Work Context through that
+  hop in front of it, and the id of this solution's binding for it — and each
+  call, unary or server-streaming, is relayed over gRPC to the module's own
+  procedure as the viewer: a child of the edge's Work Context through that
   binding with the method's declared scopes, the pin merged in and the
-  response allowlist applied. A module that names no slots is not relayed, and
-  its routes are the solution's. A missing slot, a ViewerBearer or a
-  server-streaming relayed method refuses the boot. A solution that publishes
-  no ceiling is bounded by the authority.
+  response allowlist applied. No `google.api.http` binding is needed. A
+  missing slot refuses the boot, and so does a solution that consumes modules
+  with no `authority/endpoint`. A solution that publishes no ceiling is bounded
+  by the authority.
 - **Every refusal names its reason.** The authority's reason for refusing an
   issue is kept (`WorkContextRefusal.Reason`), and a refusal reaches a Connect
   or gRPC caller as a Connect error with the authority's code — a Connect
@@ -265,7 +266,7 @@ identifier and the issuer](#the-resource-identifier-and-the-issuer).
 | Gateway URL (auth-gateway `workload`) | resolved by role — the single module owning the `auth-gateway` `workload`/`http` endpoint, discovered from the injected carriers (or the workspace, run locally, where core's endpoint visibility applies: an endpoint private to the host's module is refused, not resolved, for a solution in another module). The workload endpoint serves the gateway's whole handler, the mint included; the public `rest` endpoint does not resolve it. Held to the SDK's transport rule: `https` anywhere; `http` only to a loopback host on a local run, or to an in-cluster Service address (`<svc>.<ns>.svc[.<domain>]`) when the composition asserts `internal-transport/mesh-protected=true` | `GATEWAY_URL` |
 | Credential mint URL | the host's published broker route, `/modules/_work-context`, on the resolved gateway. Derived, with no override: the gateway's workload endpoint serves it, and a second address would be a second destination for the projected service-account token. A 404 there means the host does not serve its gateway's full handler on that endpoint, which is terminal | — |
 | Mesh assertion | `codefly.For(ctx).WorkspaceValueIfSet("internal-transport", "mesh-protected")` — read once at boot and handed to the SDK's rule above; exactly `true` asserts that every in-cluster hop is carried by a mutually authenticated mesh, unset or `false` keeps plaintext refused, any other value is a boot refusal. The same setting the composed modules apply to their own gateway value | — (declared configuration) |
-| Broker perimeter credential | `codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")`, required at boot for authority-consuming declarations. Sent only to the execution broker as `X-Codefly-Internal-Token`; it does not replace the projected token | — (declared workspace secret, no legacy env fallback) |
+| Broker perimeter credential | `codefly.For(ctx).WorkspaceSecret("module-authority", "INTERNAL_TOKEN")`, read at boot and no longer required by it: a solution that consumes modules runs under the authority interface, which needs no broker. Sent only to the execution broker as `X-Codefly-Internal-Token`; it does not replace the projected token | — (declared workspace secret, no legacy env fallback) |
 | Projected service-account token | a **path**, re-read at every mint; `/var/run/secrets/codefly/token`, the CLI projection, which every Codefly-managed deployment mounts | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
 | Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
@@ -594,7 +595,6 @@ Every one of these is a boot failure naming the value:
 | a ceiling for an audience nothing consumes | the ceiling governs a call that cannot happen, and whoever wrote it believes otherwise |
 | an ask outside its ceiling (action, or resource id) | the ceiling is what a reviewer approved; widening it is an edit, not an inference |
 | an ask across a whole resource kind under a ceiling naming resources | "every document" is not inside "these two documents" |
-| a ceiling on a `ViewerBearer` module | it mints nothing, so the ceiling governs nothing — and whoever wrote it believes it does |
 | no profile at all, for a solution that mints authority | a deployed process would have no profile to resolve its ceiling from |
 | a profile name that is not a single path component | profile names select directories wherever one is read |
 
@@ -725,27 +725,6 @@ documents, and this runtime registers no upstream for them. The three
 heartbeats that used to — one per consumed module, each brokering a signed
 prefix-bound token through the gateway, plus the two self-registrations — are
 deleted, along with the credentials they carried.
-
-Codefly still projects the targets into `CODEFLY__API_CONSUMES`, and that
-projection is still what the passthrough declaration is checked against — at
-boot, resolved like every other value, so a malformed one is a refusal rather
-than a log line. It used to be read at serve time: a malformed projection
-disabled the whole federation with one log line while the solution served on,
-so every consumed facade 404'd at the gateway and the solution looked healthy.
-
-The refusal fires **whether or not the solution declares a passthrough**. Being
-resolved at boot is not the same as being judged there, and for a release it
-was only the first: the projection was decoded by the code that consumes it,
-which returns early when there is no `Consumes` declaration, so the same
-undecodable value was refused for one solution and served for another. It is
-decoded once at boot now and refused either way, naming `CODEFLY__API_CONSUMES`
-— the projection is the composition's output, so no override an operator can
-set repairs it, and `codefly run solution` is where it is fixed.
-
-Unset is not malformed. A solution that consumes nothing leaves the variable
-empty, and whitespace alone counts as empty, so a render emitting a bare
-newline for it does not fail a boot.
-
 
 ### Reading a Work-Context-authenticated module
 
@@ -961,11 +940,10 @@ capability rather than minting again.
 
 ### Letting the page call a consumed module: the passthrough
 
-The host proxy forwards a solution's page only to the solution's own backend,
-so a page cannot reach a composed module's `/v1/<as>/*` prefix, and a module
-that authenticates by Work Context would refuse its bearer anyway. Instead of a
+A page reaches only its own backend, through the authority's edge, and a module
+authenticates every call by a Work Context addressed to it. Instead of a
 handler per module operation, a solution declares which operations its page
-may call:
+may call, and where the composition says each module is:
 
 ```go
 solution.New(manifest).Consumes(solution.ConsumedModule{
@@ -975,21 +953,34 @@ solution.New(manifest).Consumes(solution.ConsumedModule{
         Name:     documentsv1.DocumentsService_GetDocument_FullMethodName,
         Response: solution.MustFieldMask(&documentsv1.GetDocumentResponse{}, "document.entry"),
     }},
+    // Workspace configuration slots: the hop's gRPC address
+    // (${endpoint:authority/hop/grpc}) and this solution's binding for the module.
+    Authority: solution.AuthorityRelay{Group: "wiki", EndpointKey: "DOCUMENTS_ENDPOINT", BindingKey: "DOCUMENTS_BINDING"},
 })
 ```
 
-Each declared method is served as a Connect unary procedure at
-`/modules/<as>/<package.Service>/<Method>`, so the page uses the module's own
-generated client (connect-es) unmodified, with the base URL
-`<apiBase>/modules/<as>`. A call is answered by the module as the viewer: the
-runtime mints the viewer's Work Context with the declared scopes (`ForModule`),
-or, with `ViewerBearer`, forwards only the bearer to a module that
-authenticates the viewer itself, and forwards the request over the method's
-binding (`Transcoded`). The page names a procedure and a request message,
-never a path, a prefix, an audience or an authority, and authorization stays at
-the module.
+Each declared method is served as a Connect procedure at
+`/v1/<id>/modules/<as>/<package.Service>/<Method>` — the edge routes a solution
+at `/v1/<id>` and forwards requests unchanged — so the page uses the module's
+own generated client (connect-es) unmodified, with the base URL
+`<apiBase>/modules/<as>`. Each call is relayed over gRPC to the module's own
+procedure, the face it serves behind the hop, as the viewer: a child of the
+edge's Work Context issued by the authority through the module's binding
+(`ForParent`) with the method's declared scopes, the pin merged in and only the
+declared response fields returned. No `google.api.http` binding is read or
+needed. The page names a procedure and a request message, never an address, a
+binding or an authority, and authorization stays at the module, whose hop holds
+each call to the module's own method policy.
 
-Authority is minted per method. A method may declare its own `Scopes`, which
+**The authority is the only way a call reaches a module.** A solution that
+declares consumed modules and has no `authority/endpoint` refuses to boot,
+naming it; a module whose slots name no address or no binding refuses the boot
+naming the slot; and an address the viewer's Work Context may not travel to (a
+cleartext host off the machine that the mesh does not carry) is refused by the
+SDK's endpoint rule. A solution that publishes no ceiling is bounded by the
+authority.
+
+Authority is asked per method. A method may declare its own `Scopes`, which
 replace the module's for a call to that method — never add to them — so one
 module's methods that need different authority are declared under one `as`:
 
@@ -1000,47 +991,43 @@ solution.ConsumedModule{
         {Name: ownListMethod, Scopes: []solution.Scope{{ResourceKind: "tasks", Actions: []string{"list"}}}, WholeResponse: true},
         {Name: orgListMethod, Scopes: []solution.Scope{{ResourceKind: "tasks", Actions: []string{"inspect"}}}, WholeResponse: true},
     },
+    Authority: tasksRelay,
 }
 ```
 
-Each call mints only its own method's authority. A viewer who lacks one
-method's authority is refused that method as `permission_denied`, with the
-fixed refusal message, and is still served
-every other method; the mint is never widened or retried with less. Every
-method of a module that is not `ViewerBearer` needs scopes, its own or the
-module's, and `ViewerBearer` takes none at either level.
+Each call asks only its own method's authority, and a viewer refused one
+method is still served every other. Every method needs scopes, its own or the
+module's.
 
 Least privilege by default. A method that is not declared is `not_found`. At
-boot, `Serve` refuses a module whose `as` is not in the solution's api.consumes,
-a method missing from the registry or with no binding under `/v1/<as>`, a
-client-streaming method, stream bounds on a unary method or out of range, a method with no declared response fields, a method with no
-scopes of its own or its module's (unless the module is `ViewerBearer`), scopes
-on a `ViewerBearer` module or method, and a scope with no resource kind, no
-action, or a blank or repeated action. `Response`
-names the fields returned to the page; `WholeResponse` must be said explicitly.
-`Pin` fixes part of every request server-side (merged with `proto.Merge`): a
-pinned scalar replaces the page's value and a pinned repeated value is added to
-the page's, so a filter clause the module ANDs stays in force whatever the page
-sends.
-A module's refusal reaches the page in the Connect error: a `google.rpc.Status`
-body keeps its code and message, any other small JSON refusal is the message
-verbatim under the code its HTTP status maps to, and a **4xx** refusal written
-as short, single-line plain text — the shape the host gateway writes, "module is
-not installed for this organization" — is the message too. A 5xx body is
-reported by kind only: it may be written by an intermediary and name an internal
-address, which the caller must never read. `PassthroughOperations` renders the declaration for the interface
-artifact, and `InterfaceArtifact(dir, info, ops, modules...)` renders a
-backend's whole artifact — its own operations and the passthrough — at the
-version its `service.codefly.yaml` declares.
+boot, `Serve` refuses a module with no authority relay (or one naming fewer
+than all three of its group, endpoint slot and binding slot), a method missing
+from the registry, a client-streaming method, stream bounds on a unary method
+or out of range, a method with no declared response fields, a method with no
+scopes of its own or its module's, and a scope with no resource kind, no
+action, or a blank or repeated action. `Response` names the fields returned to
+the page; `WholeResponse` must be said explicitly. `Pin` fixes part of every
+request server-side (merged with `proto.Merge`): a pinned scalar replaces the
+page's value and a pinned repeated value is added to the page's, so a filter
+clause the module ANDs stays in force whatever the page sends.
+
+The authority's refusal reaches the page with the authority's code and reason.
+A module's refusal of the page's own request (`invalid_argument`, `not_found`,
+`permission_denied`, `failed_precondition`, …) keeps its code and message; any
+other failure is reported by kind only and logged where an operator reads it,
+since its text may name an internal address. `PassthroughOperations` renders
+the declaration for the interface artifact, and
+`InterfaceArtifact(dir, info, ops, modules...)` renders a backend's whole
+artifact — its own operations and the passthrough — at the version its
+`service.codefly.yaml` declares.
 
 #### Streamed methods
 
 A server-streaming method passes through too, as a Connect server-streaming
-procedure at the same path, so connect-es's generated client consumes it
-unmodified. It takes the same authority as a unary call — the viewer's Work
-Context minted for that method, or the bearer alone for a `ViewerBearer`
-module — and the declared response fields (`Response`, or `WholeResponse`)
-apply to **every** message of the stream.
+procedure at the same path, relayed as a gRPC stream to the module's own
+procedure under the same authority as a unary call. The declared response
+fields (`Response`, or `WholeResponse`) apply to **every** message of the
+stream.
 
 Every stream is bounded, and both bounds are declared per method:
 
@@ -1050,83 +1037,15 @@ Every stream is bounded, and both bounds are declared per method:
 | `MaxStreamMessageBytes` | `DefaultStreamMessageLimit` (1 MiB) | negative |
 
 A stream that reaches its duration ends with `deadline_exceeded`; a message
-over its bound ends it with `resource_exhausted` and is never truncated. For a
-streaming method `Timeout` bounds only the mint and the module's first answer
-(status line and headers), and `MaxResponseBytes` is refused (bound each
-message instead). The page disconnecting cancels the module request at once.
-
-**The wire a module answers a streamed method with** is grpc-gateway's for a
-server-streaming method, over the method's `google.api.http` binding: a 2xx
-response with content type `application/x-ndjson` (`application/json` is
-accepted too), one JSON object per line, each flushed as it is ready:
-
-```
-{"result": <the message, in protobuf JSON>}
-{"error": {"code": <google.rpc.Code number>, "message": "<text>"}}
-```
-
-Blank lines are ignored, so a module may send them to keep an idle connection
-open. An error line ends the stream with that code and message; the end of the
-body ends it normally. A non-2xx answer before the stream starts is the
-module's refusal, relayed like a unary one. `Gateway.TranscodedStream` is the
-same call for a handler of the solution's own.
+over its bound ends it with `resource_exhausted` and is never truncated; the
+module ending its stream with a status ends the page's with that code. For a
+streaming method `Timeout` bounds only the issue of the viewer's Work Context,
+and `MaxResponseBytes` is refused (bound each message instead). The page
+disconnecting cancels the module's stream at once.
 
 In the interface artifact a streamed operation says so in its behaviour and
 carries `x-streaming: server` (Swagger 2 has no stream; its 200 schema is one
 message of it).
-
-#### Testing the passthrough: `passthroughtest`
-
-`Serve` resolves the gateway and api.consumes from the composition, mints this
-execution's credential and listens on the resolved port, so a solution
-cannot run its own passthrough in a test through it. Package
-`github.com/codefly-dev/solution-runtime-go/passthroughtest` serves the real
-passthrough — the handler `Serve` mounts, behind
-the same boot check — over an `httptest` server, against a fake host:
-
-```go
-upstream := httptest.NewServer(fakeWidgets) // the test's stand-in for the module's binding
-host := passthroughtest.NewHost(t).Module("widgets", upstream.URL)
-page := passthroughtest.Start(t, host, declaration...) // the solution's Consumes
-client := widgetsv1connect.NewWidgetsClient(page.Client(), page.BaseURL("widgets"))
-```
-
-| API | What it is |
-| --- | --- |
-| `NewHost(t)` | The fake host gateway: it mints the viewer's Work Context (the accounts `StartTask` procedure) and forwards `/v1/<as>/*` to each routed module, streams included, flushed as they arrive. |
-| `Host.Module(as, upstream)` | Routes a consumed module to the test's own server, path unchanged. Every routed module is also in the solution's api.consumes; one the declaration names but the host does not route is refused as `Serve` refuses it. |
-| `Host.RefuseMints(func(Mint) *Refusal)` | Decides each mint: a non-nil `Refusal` refuses it as accounts would (default status 403), so the page sees `permission_denied` with a fixed refusal message. |
-| `Host.Mints()`, `Host.Calls()` | Every mint asked for (audience, scopes, org, session, bearer, the token answered), and every call forwarded to a module, each with the `Mint` whose capability it presented — how a test asserts the authority each method was called under. |
-| `Start(t, host, consumes...)` / `Handler(host, consumes...)` | The passthrough served for the declaration, or the bare handler and the error `Serve` would refuse the declaration with. |
-| `Solution.Client()`, `ClientAs(Viewer)`, `BaseURL(as)` | A client that calls as `DefaultViewer` (or the viewer given), setting the bearer and the `x-org-id` / `x-session-id` headers the gateway stamps; and the base URL a module's generated client takes. |
-
-What a green test there proves is the solution's side: the declaration, the
-authority each method mints, the fields that reach the page, stream bounds and
-cancellation. It never proves that a real host admits the solution, that
-accounts grants the scopes, or that the real module answers its binding the way
-the test's stand-in does.
-
-**This seam is reachable only from here.** `Server.PassthroughHandler` was
-exported until this change, and that made it a production bypass: a solution
-could build a usable, credential-bearing handler that had skipped `validate()`,
-the boot, the published ceiling and the origin-pinned outbound client — a
-deployment calling it completed a viewer mint and a module call and answered
-200, with the viewer's bearer and this workload's own credential sent wherever
-it was mounted. Supplying a credential source, which a deployment does,
-defeated the "no source, nothing to mint with" mitigation. It is reached
-through `internal/seam` now, which Go's internal-package rule keeps inside this
-module. The fake host is still plaintext and still has no contract, and those
-are now properties of this module's own tests rather than of an API. A consumer
-that called `PassthroughHandler` directly uses `passthroughtest.Handler`
-instead.
-
-`passthroughtest` itself is importable by any module, so its own constructors
-**panic outside a test binary** (`testing.Testing()`). Taking a `testing.TB` is
-not the gate it resembles: `testing.TB`'s unexported method stops a type
-*declaring* the interface, not a type that embeds it, so a few lines of
-production code satisfy it. `testing.Testing()` is wrong for the root package —
-where the legitimate caller is production code — and exactly right here, where
-every legitimate caller is a test.
 
 ### Exposing an MCP server
 
@@ -1322,39 +1241,10 @@ fails if it comes back. So the example is removed rather than repaired, and
 restoring the export to make it compile is the one fix that is not available.
 
 What a consumer can do today is drive their tools as ordinary functions and
-test the authority each one asks for. What is missing is the MCP equivalent of
-`passthroughtest` — a seam reached through `internal/seam`, whose constructors
+test the authority each one asks for. What is missing is a seam, whose constructors
 panic outside a test binary, that runs the real MCP surface against a fake
 host. That is a follow-up on #45, not a capability this README should describe
 as existing.
-
-What a green test there proves is the solution's side: the declaration, the
-authority each method mints, the fields that reach the page, stream bounds and
-cancellation. It never proves that a real host admits the solution, that
-accounts grants the scopes, or that the real module answers its binding the way
-the test's stand-in does.
-
-**This seam is reachable only from here.** `Server.PassthroughHandler` was
-exported until this change, and that made it a production bypass: a solution
-could build a usable, credential-bearing handler that had skipped `validate()`,
-the boot, the published ceiling and the origin-pinned outbound client — a
-deployment calling it completed a viewer mint and a module call and answered
-200, with the viewer's bearer and this workload's own credential sent wherever
-it was mounted. Supplying a credential source, which a deployment does,
-defeated the "no source, nothing to mint with" mitigation. It is reached
-through `internal/seam` now, which Go's internal-package rule keeps inside this
-module. The fake host is still plaintext and still has no contract, and those
-are now properties of this module's own tests rather than of an API. A consumer
-that called `PassthroughHandler` directly uses `passthroughtest.Handler`
-instead.
-
-`passthroughtest` itself is importable by any module, so its own constructors
-**panic outside a test binary** (`testing.Testing()`). Taking a `testing.TB` is
-not the gate it resembles: `testing.TB`'s unexported method stops a type
-*declaring* the interface, not a type that embeds it, so a few lines of
-production code satisfy it. `testing.Testing()` is wrong for the root package —
-where the legitimate caller is production code — and exactly right here, where
-every legitimate caller is a test.
 
 > **This whole section was duplicated.** Two near-identical copies of
 > "Exposing an MCP server" sat 200 lines apart, which is why correcting one

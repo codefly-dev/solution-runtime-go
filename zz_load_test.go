@@ -9,7 +9,7 @@ import (
 
 func TestZZLoad(t *testing.T) {
 	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedImports}
-	pkgs, err := packages.Load(cfg, ".", "./passthroughtest")
+	pkgs, err := packages.Load(cfg, ".")
 	if err != nil {
 		t.Fatal(err)
 	}

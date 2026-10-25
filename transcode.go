@@ -91,8 +91,7 @@ func (g *Gateway) Transcoded(ctx context.Context, prefix, method string, req, re
 	}
 	defer drainAndClose(httpResp)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode > 299 {
-		detail, _ := io.ReadAll(io.LimitReader(httpResp.Body, gatewayErrorDetailLimit))
-		return fmt.Errorf("%s %s: %w", call.verb, call.template, &GatewayError{StatusCode: httpResp.StatusCode, detail: detail})
+		return fmt.Errorf("%s %s: %w", call.verb, call.template, &GatewayError{StatusCode: httpResp.StatusCode})
 	}
 	raw, err := io.ReadAll(io.LimitReader(httpResp.Body, options.maxResponseBytes+1))
 	if err != nil {

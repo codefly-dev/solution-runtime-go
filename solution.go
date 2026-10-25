@@ -62,7 +62,6 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/codefly-dev/core/resources"
-	"github.com/codefly-dev/core/solution/manifest"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
 	"github.com/google/uuid"
@@ -281,15 +280,6 @@ type config struct {
 	// pin, so validate() refuses it whether or not anything below came from an
 	// override.
 	consumerIdentityErr error
-	// consumes is the api.consumes projection Codefly injected, decoded once at
-	// the boundary it enters by. There is no raw string beside it: the two were
-	// separate fields, and a config could then be built with only the raw one —
-	// which validate() passed, because the decoded pair was empty and an empty
-	// projection is a legitimate one, and the passthrough then refused every
-	// declared module as if the composition projected nothing. A second
-	// representation of one value is a second thing to get wrong, so there is
-	// one, and newProjection is the only way to make it.
-	consumes projection
 	// mcp says the solution declared an MCP surface (ServeMCP), which is what
 	// makes the two values below load-bearing: validate() checks them only
 	// then, so a solution that serves no MCP is unaffected by a host whose
@@ -468,32 +458,6 @@ func resolveGateway(ctx context.Context, module, gateway string) string {
 	return hostAddress(ctx, module, gateway, "workload", "http")
 }
 
-// projection is the api.consumes projection as this runtime holds it: the
-// decoded targets and the error decoding produced, together, because they are
-// one answer about one value. It is constructed only by newProjection, so
-// nothing can hold targets that disagree with the text they came from.
-type projection struct {
-	targets []manifest.ConsumedAPI
-	err     error
-}
-
-// newProjection decodes the projection at the boundary it arrives on — the
-// environment, for a boot, or the test seam's own argument.
-//
-// Whitespace alone is not a projection, and not a defect either: a render that
-// emits a bare newline for a value this solution does not set means "consumes
-// nothing", so it decodes to no entries rather than to a JSON error. Refusing
-// that would fail a boot over a newline. Anything else that will not decode is
-// a defect in what the composition projected, and the error is kept for
-// validate() to refuse by name.
-func newProjection(raw string) projection {
-	if strings.TrimSpace(raw) == "" {
-		return projection{}
-	}
-	targets, err := manifest.ParseConsumedAPIs(raw)
-	return projection{targets: targets, err: err}
-}
-
 // loadConfig resolves every address, port, and path through the Codefly SDK so
 // nothing is hardcoded. The host it plugs into is named by Codefly-convention
 // roles (overridable), and their concrete addresses are resolved from the SDK —
@@ -593,7 +557,6 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 	// in-cluster address in a deployment, where no public client could reach
 	// it: that is what the declared configuration is for. The public MCP URL
 	// needs no declaration at all, being derived from the two values above it.
-	cfg.consumes = newProjection(env(manifest.APIConsumesEnvironmentVariable, ""))
 	cfg.mcpIssuerURL, cfg.mcpIssuerExplicit = resolveMCPIssuer(ctx, frontendURL)
 	cfg.mcpPublicURL, cfg.mcpPublicExplicit = resolveMCPPublicURL(ctx, public, id)
 	return cfg
@@ -676,6 +639,13 @@ func (c config) validate() error {
 	if p, err := strconv.Atoi(c.port); err != nil || p < 1 || p > 65535 {
 		return fmt.Errorf("unresolved listen port %q: set PORT or ensure the SDK resolves this service's http endpoint", c.port)
 	}
+	// Before the gateway: a solution that consumes modules reaches them only
+	// through the authority's hop, so the authority is what it is missing, not
+	// a gateway it would never call for them.
+	if c.requiresAuthority && c.authorityEndpoint == "" {
+		return fmt.Errorf("this solution declares consumed modules (Consumes) and no authority interface is configured: the passthrough relays every declared method through the authority's hop, as a child of the edge's Work Context — the composition names the authority in workspace configuration %s/%s",
+			AuthorityInterfaceGroup, AuthorityEndpointKey)
+	}
 	// The gateway carries credentials: the mint presents the projected token
 	// that attests which workload this process is, and every viewer call
 	// carries the viewer's bearer and the capability minted for them. So it
@@ -706,20 +676,9 @@ func (c config) validate() error {
 		return fmt.Errorf("gateway URL %q is not a destination the projected service-account token, the viewer's bearer and the capability minted for them may travel to: %w — set GATEWAY_URL, or the composition's gateway endpoint, to one that is",
 			redactedURL(c.gatewayURL), err)
 	}
-	if c.requiresAuthority && c.authorityEndpoint == "" && c.brokerInternalToken == "" {
-		return fmt.Errorf("missing module-authority/INTERNAL_TOKEN: provision the broker perimeter credential as a workspace secret")
-	}
 	if err := resources.ValidateConfigurationProfileName(c.profile); err != nil {
 		return fmt.Errorf("unusable contract profile %q: %w — it is the Codefly environment's own name unless %s overrides it",
 			c.profile, err, ContractProfileEnvironmentVariable)
-	}
-	// Judged whether or not this solution declares a passthrough. The
-	// projection is the composition's output, so no override an operator can
-	// set repairs it, and the variable it arrived in is the only handle a
-	// refusal has.
-	if c.consumes.err != nil {
-		return fmt.Errorf("the api.consumes projection in %s cannot be decoded: %w — it is projected by the composition (`codefly run solution`), so it is fixed there; a solution that consumes nothing leaves it unset",
-			manifest.APIConsumesEnvironmentVariable, c.consumes.err)
 	}
 	// The MCP surface's own configuration, checked here because that is where
 	// boot configuration is checked. It is a no-op for a solution that declared
@@ -908,9 +867,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
 	}
-	// After the environment is loaded: the declaration is checked against the
-	// api.consumes projection Codefly injected.
-	routes, err := s.validatePassthrough()
+	routes, err := resolvePassthrough(s.consumed)
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -924,13 +881,9 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
 		s.host = authority
-		// The passthrough relays each consumed module the composition names a
-		// hop and a binding for, as the viewer, through the authority.
-		if s.relays, err = s.openRelays(routes, codefly.For(ctx).WorkspaceConfiguration); err != nil {
-			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
-		}
-	} else if s.cfg.requiresAuthority {
-		if err := s.openAuthority(ctx); err != nil {
+		// The passthrough relays each consumed module, as the viewer, through
+		// the hop and the binding the composition names for it.
+		if s.relays, err = s.openRelays(codefly.For(ctx).WorkspaceConfiguration); err != nil {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
 	}
@@ -1567,7 +1520,7 @@ func (g *Gateway) platformClient(transport http.RoundTripper, timeout time.Durat
 //
 // A gateway built by a boot carries the transport that boot configured
 // (outboundClient): non-proxied, with its pooled connections bounded. One
-// built outside a boot — the passthrough test seam, a unit test — falls back
+// built outside a boot — a unit test — falls back
 // to the non-proxied default transport, and that is the only place it is used.
 func (g *Gateway) roundTripper() http.RoundTripper {
 	var base http.RoundTripper = unauthenticatedTransport
@@ -1969,8 +1922,7 @@ func (g *Gateway) surfaced(err error) error {
 // actually asked for.
 //
 // A gateway with no resolved contract carries no ceilings and is not held to
-// one. That is a gateway built outside a boot — a unit test, the passthrough
-// seam — reachable only through this package's unexported constructors, never
+// one. That is a gateway built outside a boot — a unit test — reachable only through this package's unexported constructors, never
 // by a deployed runtime: start() resolves the contract before it serves, so
 // every gateway a handler is handed carries it.
 func (g *Gateway) withinPublishedCeiling(audience string, scopes []Scope) error {
@@ -2005,15 +1957,6 @@ func (g *Gateway) withinPublishedCeiling(audience string, scopes []Scope) error 
 		}
 	}
 	ceiling, declared := g.ceilings[audience]
-	// A declared audience with an empty ceiling is a module this solution
-	// publishes as minting nothing — a ViewerBearer binding carries a nil
-	// ceiling and still sat in this map, so ForModule minted real authority for
-	// the one kind of module the contract says mints none. The contract and the
-	// mint disagreeing is the whole defect class this check exists for.
-	if declared && len(ceiling) == 0 {
-		return fmt.Errorf("this solution asked %q for authority, and its published contract declares that module with no ceiling at all — it is called with the viewer's bearer and mints nothing, so there is no authority to ask for: %w",
-			audience, &ClientError{StatusCode: http.StatusForbidden, Message: "that module is called with the viewer's bearer and holds no minted authority"})
-	}
 	if !declared {
 		return fmt.Errorf("this solution asked %q for authority, and its published contract names no binding for that audience: declare it — the contract is what the host derives this solution's authority from, so an audience missing from it is authority nobody approved: %w",
 			audience, &ClientError{StatusCode: http.StatusForbidden, Message: "this solution holds no binding for that module"})

@@ -16,15 +16,7 @@ import (
 // may wrap it; only a generic status message reaches the browser.
 type GatewayError struct {
 	StatusCode int
-	// detail is the head of a module's refusal body (Transcoded keeps at most
-	// gatewayErrorDetailLimit bytes). Only the consumed-module passthrough reads
-	// it, to relay the module's own refusal to the page that made the call; a
-	// handler's error never exposes it.
-	detail []byte
 }
-
-// gatewayErrorDetailLimit bounds the refusal body a GatewayError keeps.
-const gatewayErrorDetailLimit = 4 << 10
 
 func (e *GatewayError) Error() string {
 	return fmt.Sprintf("gateway returned HTTP %d", e.StatusCode)
@@ -84,7 +76,7 @@ func handlerErrorResponse(err error) (int, string) {
 	// ForModule fails — answered the browser 502 with that text verbatim.
 	//
 	// The status was wrong in the same breath as the disclosure. The passthrough
-	// path already maps these through relayedError, where ErrNotAttested is
+	// maps these through relayedError, where ErrNotAttested is
 	// unavailable because the condition is this process's and one renewal fixes
 	// it; a 502 told the page a module was broken. The two paths now agree, and
 	// the message says whose problem it is and nothing about where.

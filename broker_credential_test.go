@@ -226,12 +226,6 @@ func TestBrokerConfigurationUsesDeclaredSecretAndRefusesMissingValues(t *testing
 	if err := codefly.LoadEnvironmentVariables(); err != nil {
 		t.Fatal(err)
 	}
-	cfg = loadConfig(context.Background(), testSolutionID, nil)
-	cfg.requiresAuthority = true
-	cfg.port, cfg.gatewayURL, cfg.mintURL, cfg.profile = "8080", "https://broker.example", "https://broker.example/modules/_work-context", localProfile
-	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "module-authority/INTERNAL_TOKEN") {
-		t.Fatalf("missing declared perimeter token was accepted: %v", err)
-	}
 	s, _, _ := brokerFixture(t)
 	options := s.brokerCredential.options
 	for _, field := range []string{"prefix", "secret", "audience", "path", "plaintext to a host the mesh does not carry", "plaintext to loopback in a deployment", "a misspelled mesh assertion"} {

@@ -67,9 +67,8 @@ const ContractPath = "/.well-known/module-contract"
 // disagreeing is a boot failure naming the scope.
 //
 // What *is* derived is the binding set: the audiences are the `as` of the
-// solution's api.consumes entries, which Codefly projects and the passthrough
-// declaration is already checked against. Restating them here would be a second
-// source for one fact.
+// solution's consumed modules, which the passthrough declaration (Consumes)
+// already names. Restating them here would be a second source for one fact.
 type ModuleContract struct {
 	// Ceilings is the most authority this solution may ever ask a consumed
 	// module for, keyed by configuration profile and then by the audience it is
@@ -221,19 +220,6 @@ func checkContract(modules []ConsumedModule, contract ModuleContract, profile st
 	var bindings []contractBinding
 	for _, module := range modules {
 		ceiling, declared := ceilings[module.As]
-		if module.ViewerBearer {
-			// A ViewerBearer module is called with the viewer's bearer and no
-			// minted capability, so there is no authority to cap — and a
-			// ceiling declared for one would describe authority nothing asks
-			// for. Refused rather than ignored: a reviewer who wrote it down
-			// believes it governs something.
-			if declared {
-				return nil, fmt.Errorf("the published contract declares a scope ceiling for %q in the %q profile, but that module is declared ViewerBearer: it mints no authority, so the ceiling governs nothing",
-					module.As, profile)
-			}
-			bindings = append(bindings, contractBinding{Audience: module.As})
-			continue
-		}
 		if !declared {
 			return nil, fmt.Errorf("the published contract declares no scope ceiling for %q in the %q profile: every consumed module this solution mints authority for needs one, and this runtime refuses an ask it cannot check against a declared ceiling",
 				module.As, profile)
@@ -279,12 +265,12 @@ func declaredProfiles(contract ModuleContract) string {
 	return strings.Join(names, ", ")
 }
 
-// mintsAuthority reports whether any consumed module has authority to cap. A
-// solution whose every module is ViewerBearer mints nothing, and a solution
-// that consumes none mints nothing either: requiring a profile from them would
-// be requiring a declaration about authority that does not exist.
+// mintsAuthority reports whether any consumed module has authority to cap: every
+// consumed module asks for some. A solution that consumes none asks for
+// nothing, and requiring a profile from it would be requiring a declaration
+// about authority that does not exist.
 func mintsAuthority(modules []ConsumedModule) bool {
-	return slices.ContainsFunc(modules, func(m ConsumedModule) bool { return !m.ViewerBearer })
+	return len(modules) > 0
 }
 
 // askedScopes is every scope this solution's declaration asks of one module:
@@ -403,7 +389,7 @@ func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedMod
 	}{Schema: ContractSchema, Solution: id, Profiles: map[string]map[string][]Scope{}}
 
 	for _, module := range modules {
-		document.Bindings = append(document.Bindings, artifactBinding{Audience: module.As, ViewerBearer: module.ViewerBearer})
+		document.Bindings = append(document.Bindings, artifactBinding{Audience: module.As})
 	}
 	sort.Slice(document.Bindings, func(i, j int) bool { return document.Bindings[i].Audience < document.Bindings[j].Audience })
 
@@ -439,16 +425,9 @@ func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedMod
 	return json.MarshalIndent(document, "", "  ")
 }
 
-// artifactBinding is one audience the solution holds a binding for. A
-// ViewerBearer module is reported as one, with the flag set: this solution mints
-// no authority for it, and a binding simply missing from the document would read
-// as a module the solution does not consume. (The renderer's own shape takes the
-// opposite convention — a binding it derives no authority for is one you do not
-// declare, so absence there means "asks for nothing" — which is one more reason
-// these two documents do not share a schema string.)
+// artifactBinding is one audience the solution holds a binding for.
 type artifactBinding struct {
-	Audience     string `json:"audience"`
-	ViewerBearer bool   `json:"viewerBearer,omitempty"`
+	Audience string `json:"audience"`
 }
 
 // localProfile is the profile a local run resolves to: the local environment's

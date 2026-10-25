@@ -14,7 +14,6 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/codefly-dev/core/solution/manifest"
 	corework "github.com/codefly-dev/core/workcontext"
 	"github.com/codefly-dev/sdk-go/workcontext"
 )
@@ -172,7 +171,6 @@ func testWorkCredential(s *Server, ctx context.Context) error {
 }
 func declaredWorkServer(t *testing.T) *Server {
 	t.Helper()
-	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
 	s := New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 		localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 	}})

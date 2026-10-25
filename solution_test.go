@@ -1798,7 +1798,7 @@ func TestAnAskCannotBeEditedAfterItsCeilingIsChecked(t *testing.T) {
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
 		}})
-	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gw.URL, profile: localProfile, consumes: newProjection(consumesThings)}
+	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gw.URL, profile: localProfile}
 	server.principal = testPrincipal
 	contract, err := server.resolveContract()
 	if err != nil {

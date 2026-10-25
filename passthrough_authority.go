@@ -20,20 +20,19 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// --- The passthrough under the authority interface ---
+// --- The relay ---
 //
-// Under the authority there is no saas gateway to transcode through. The same
-// declaration (Consumes) is served instead by relaying each declared method
-// over gRPC to the module, through the hop in front of it, as the viewer: a
+// The passthrough (Consumes) relays each declared method over gRPC to the
+// module's own procedure, through the hop in front of it, as the viewer: a
 // child of the Work Context the edge sent the request with, issued by the
 // authority through one of this solution's bindings (ForParent) and carrying
-// the method's declared scopes. The pin and the response allowlist apply
-// exactly as they do under the gateway, and the module authorizes every call.
+// the method's declared scopes. The pin and the response allowlist apply to
+// every call, and the module authorizes it.
 //
 // Where the module is and which binding the child is issued through are the
 // composition's to say, in two workspace configuration slots the module's
-// declaration names (AuthorityRelay). A consumed module that names none is not
-// relayed under the authority: its routes are left to the solution.
+// declaration names (AuthorityRelay): the endpoint slot holds the hop's gRPC
+// address, an ${endpoint:authority/hop/grpc} reference the run resolves.
 //
 // The page reaches this backend through the edge, which routes a solution at
 // /v1/<id> and forwards each request unchanged, so the passthrough is served at
@@ -41,17 +40,14 @@ import (
 // generated client already calls with the base URL `<apiBase>/modules/<as>`.
 
 // AuthorityRelay names, for one consumed module, the workspace configuration
-// slots the composition fills under the authority interface: the module's gRPC
-// address (the hop in front of it, an ${endpoint:…} reference the run
-// resolves) and the id this solution's binding for the module is installed
-// under. All three are set, or none.
+// slots the composition fills: the module's gRPC address (the hop in front of
+// it, an ${endpoint:…} reference the run resolves) and the id this solution's
+// binding for the module is installed under. All three are set.
 type AuthorityRelay struct {
 	Group       string
 	EndpointKey string
 	BindingKey  string
 }
-
-func (a AuthorityRelay) declared() bool { return a != AuthorityRelay{} }
 
 // moduleRelay is one relayed module: the binding its children are issued
 // through and its connection.
@@ -63,31 +59,17 @@ type moduleRelay struct {
 // authorityRoute is where the authority's edge routes this solution.
 func (s *Server) authorityRoute() string { return "/v1/" + s.manifest.ID }
 
-// openRelays reads every relayed module's slots and opens its connection, or
+// openRelays reads every consumed module's slots and opens its connection, or
 // refuses the boot naming what is missing: a backend that cannot name a
 // binding cannot be issued a capability, and that belongs at start-up.
-func (s *Server) openRelays(routes map[string]passthroughRoute, lookup func(group, key string) (string, error)) (map[string]*moduleRelay, error) {
+func (s *Server) openRelays(lookup func(group, key string) (string, error)) (map[string]*moduleRelay, error) {
 	relays := map[string]*moduleRelay{}
 	for _, module := range s.consumed {
 		a := module.Authority
-		if !a.declared() {
-			continue
-		}
-		if a.Group == "" || a.EndpointKey == "" || a.BindingKey == "" {
-			return nil, fmt.Errorf("consumed module %q: its authority relay names a group, an endpoint slot and a binding slot, all three", module.As)
-		}
-		if module.ViewerBearer {
-			return nil, fmt.Errorf("consumed module %q is ViewerBearer: under the authority interface no bearer reaches this process, so it cannot be relayed", module.As)
-		}
-		for _, route := range routes {
-			if route.module.As == module.As && route.md.IsStreamingServer() {
-				return nil, fmt.Errorf("consumed module %q: %s streams its answer, which is not relayed under the authority interface", module.As, route.md.FullName())
-			}
-		}
 		slot := func(key, what string) (string, error) {
 			value, err := lookup(a.Group, key)
 			if err != nil || strings.TrimSpace(value) == "" {
-				return "", fmt.Errorf("consumed module %q: %s/%s names no %s; the composition supplies it under the authority interface", module.As, a.Group, key, what)
+				return "", fmt.Errorf("consumed module %q: %s/%s names no %s; the composition supplies it", module.As, a.Group, key, what)
 			}
 			return strings.TrimSpace(value), nil
 		}
@@ -130,18 +112,6 @@ func dialModule(endpoint string, transport workcontext.TransportSource, what str
 	return grpc.NewClient(admitted.Host, grpc.WithTransportCredentials(creds))
 }
 
-// relayedRoutes is the passthrough under the authority: the routes of the
-// modules that are relayed.
-func relayedRoutes(routes map[string]passthroughRoute, relays map[string]*moduleRelay) map[string]passthroughRoute {
-	relayed := map[string]passthroughRoute{}
-	for path, route := range routes {
-		if relays[route.module.As] != nil {
-			relayed[path] = route
-		}
-	}
-	return relayed
-}
-
 // viewerGateway is the gateway for the person whose Work Context a request
 // carries — the edge's for the page, or a module's child of it for a tool call:
 // who it is for, and which module acts for them, is the authority's Check of
@@ -164,36 +134,42 @@ func (s *Server) viewerGateway(ctx context.Context, carried, route string) (*Gat
 	return gw, nil
 }
 
-// relay answers one call as the viewer under the authority: the child Work
-// Context issued through the module's binding with the declared scopes, the
-// pin merged in, the module called over gRPC, and only the declared response
-// fields returned.
-func (s *Server) relay(ctx context.Context, route passthroughRoute, req *connect.Request[dynamicpb.Message]) (*dynamicpb.Message, error) {
+// asTheViewer prepares one relayed call: the module's connection, the child
+// Work Context issued through its binding with the method's declared scopes,
+// and the pin merged into the request.
+func (s *Server) asTheViewer(ctx context.Context, route passthroughRoute, req *connect.Request[dynamicpb.Message]) (*moduleRelay, string, error) {
 	relay := s.relays[route.module.As]
 	if relay == nil {
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("no such operation"))
+		return nil, "", connect.NewError(connect.CodeNotFound, errors.New("no such operation"))
 	}
 	// No route is named: the relayed call is held to the module's own method
 	// policy, which its hop applies to the child issued through the binding.
 	gw, err := s.viewerGateway(ctx, req.Header().Get(WorkContextHeader), "")
 	if err != nil {
-		return nil, connect.NewError(connect.CodeUnauthenticated, err)
+		return nil, "", connect.NewError(connect.CodeUnauthenticated, err)
 	}
-	timeout := route.method.Timeout
-	if timeout <= 0 {
-		timeout = DefaultPassthroughTimeout
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 	acting, err := gw.ForParent(ctx, relay.binding, route.scopes()...)
 	if err != nil {
-		return nil, relayedError(err)
+		return nil, "", relayedError(err)
 	}
 	token, err := acting.WorkContext(ctx)
 	if err != nil {
-		return nil, relayedError(err)
+		return nil, "", relayedError(err)
 	}
 	if err := applyPin(route, req.Msg); err != nil {
+		return nil, "", err
+	}
+	return relay, token, nil
+}
+
+// relay answers one unary call as the viewer: the module's own procedure
+// called over gRPC with the child Work Context, and only the declared response
+// fields returned.
+func (s *Server) relay(ctx context.Context, route passthroughRoute, req *connect.Request[dynamicpb.Message]) (*dynamicpb.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, route.timeout())
+	defer cancel()
+	relay, token, err := s.asTheViewer(ctx, route, req)
+	if err != nil {
 		return nil, err
 	}
 	limit := route.method.MaxResponseBytes
@@ -201,20 +177,15 @@ func (s *Server) relay(ctx context.Context, route passthroughRoute, req *connect
 		limit = DefaultTranscodedResponseLimit
 	}
 	out := dynamicpb.NewMessage(route.md.Output())
-	procedure := "/" + string(route.md.Parent().FullName()) + "/" + string(route.md.Name())
 	calling := grpcmetadata.AppendToOutgoingContext(ctx, WorkContextHeader, token)
-	if err := relay.conn.Invoke(calling, procedure, req.Msg, out, grpc.MaxCallRecvMsgSize(int(limit))); err != nil {
+	if err := relay.conn.Invoke(calling, route.procedure(), req.Msg, out, grpc.MaxCallRecvMsgSize(int(limit))); err != nil {
 		return nil, s.moduleRefusal(route, err)
 	}
-	if !route.method.WholeResponse {
-		out = Apply(route.method.Response, out)
-	}
-	return out, nil
+	return route.answer(out), nil
 }
 
 // moduleRefusal turns a module's gRPC answer into the Connect error the page
-// receives, on the line relayedError draws for the gateway: a refusal of the
-// page's own request keeps its code and the module's reason; anything else —
+// receives: a refusal of the page's own request keeps its code and the module's reason; anything else —
 // unavailable, internal, a transport failure — is reported by kind and logged
 // where an operator reads it, since its text may name what the page must not.
 func (s *Server) moduleRefusal(route passthroughRoute, err error) error {

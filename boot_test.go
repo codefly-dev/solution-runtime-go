@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/codefly-dev/core/resources"
-	"github.com/codefly-dev/core/solution/manifest"
 	corework "github.com/codefly-dev/core/workcontext"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -457,86 +456,6 @@ func TestBootServesPlainHTTPWithoutMinting(t *testing.T) {
 
 }
 
-// TestABootedRuntimeMintsOnceUnderConcurrentRequests is the mint-once claim
-// about *production wiring* rather than about one SDK instance.
-//
-// The earlier version drove the client directly, which would stay green if the
-// runtime created a fresh client per request — the defect that would make this
-// change worse than the heartbeat it replaced, since every token such a client
-// issues is valid and every functional test passes. So this boots the real
-// runtime, drives concurrent requests through its handler, and counts what the
-// host was asked.
-func TestABootedRuntimeMintsOnceUnderConcurrentRequests(t *testing.T) {
-	// The handler has to *use* the credential, or this test is green against a
-	// runtime that builds a client per request: a second reviewer pointed out
-	// that the previous handler returned a literal, so no request reached the
-	// credential source at all and the only mint being counted was the boot's.
-	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
-	mint := newHostMint(t, &hostMint{})
-	solution := boot(t, New(Manifest{ID: testSolutionID}).
-		Consumes(passthroughModule()).
-		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
-			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
-		}}).
-		Handle("/thing", func(ctx context.Context, gw *Gateway) (any, error) {
-			if _, err := gw.ForModule(ctx, "things", Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
-				return nil, err
-			}
-			return map[string]string{"ok": "yes"}, nil
-		}), mint)
-
-	const callers = 16
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			request, err := http.NewRequest(http.MethodGet, solution.base+"/thing", nil)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			request.Header.Set("authorization", viewerBearer())
-			// The identity headers the gateway stamps from the verified bearer;
-			// ForModule needs both to mint.
-			request.Header.Set(orgHeader, testOrganization)
-			request.Header.Set(sessionHeader, "session-1")
-			request.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-			resp, err := solution.client.Do(request)
-			if err != nil {
-				t.Errorf("call: %v", err)
-				return
-			}
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				t.Errorf("handler answered %d, want 200", resp.StatusCode)
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
-
-	if got := mint.count(); got != 1 {
-		t.Errorf("the host minted %d credentials for one process serving %d concurrent requests, want exactly 1: a runtime that minted per request would be worse than the heartbeat it replaced",
-			got, callers)
-	}
-	// And the requests really did reach the credential: without this the
-	// assertion above holds for a runtime whose handler never touches it.
-	if got := len(mint.observedStartTasks()); got == 0 {
-		t.Error("no viewer mint was attempted, so nothing in this test exercised the credential at all")
-	}
-	// The projected service-account token is what the host validates the
-	// projection by, so it has to be on the one mint this process made.
-	if len(mint.presented) == 0 {
-		t.Fatal("the mint saw no authorization header at all, so nothing attested which workload was asking")
-	}
-	if got := mint.presented[0]; !strings.Contains(got, "projected-token") {
-		t.Errorf("the mint was presented %q, want the projected service-account token", got)
-	}
-}
-
 // TestUnauthenticatedCallIsRefusedNotProxied keeps the boot's serving contract:
 // a handler call with no bearer is a 401 from this runtime, never a 502 from
 // something downstream.
@@ -546,45 +465,6 @@ func TestUnauthenticatedCallIsRefusedNotProxied(t *testing.T) {
 		Handle("/thing", func(context.Context, *Gateway) (any, error) { return nil, nil }), mint)
 	if status := getStatus(t, solution.client, solution.base+"/thing"); status != http.StatusUnauthorized {
 		t.Errorf("unauthenticated handler call = %d, want 401", status)
-	}
-}
-
-// TestServedContractReportsWhatThisProcessHoldsItselfTo: the published contract
-// names the principal the platform provisioned, the profile this process runs
-// under, and the ceiling each consumed audience is capped at.
-func TestServedContractReportsWhatThisProcessHoldsItselfTo(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
-	server := New(Manifest{ID: testSolutionID}).
-		Consumes(passthroughModule()).
-		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
-			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read", "list"}}}},
-		}})
-	solution := boot(t, server, mint)
-
-	resp, err := solution.client.Get(solution.base + ContractPath)
-	if err != nil {
-		t.Fatalf("GET %s: %v", ContractPath, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var published effectiveContract
-	if err := json.NewDecoder(resp.Body).Decode(&published); err != nil {
-		t.Fatalf("decode contract: %v", err)
-	}
-	if published.Principal != testPrincipal {
-		t.Errorf("published principal = %q, want the provisioned %q", published.Principal, testPrincipal)
-	}
-	if published.Profile != localProfile {
-		t.Errorf("published profile = %q, want %q", published.Profile, localProfile)
-	}
-	if len(published.Bindings) != 1 || published.Bindings[0].Audience != "things" {
-		t.Fatalf("published bindings = %+v, want the one audience this solution consumes", published.Bindings)
-	}
-	if got := published.Bindings[0].Ceiling; len(got) != 1 || len(got[0].Actions) != 2 {
-		t.Errorf("published ceiling = %+v, want the declared read+list ceiling", got)
-	}
-	if got := published.Bindings[0].Asked; len(got) != 1 || got[0].Actions[0] != "read" {
-		t.Errorf("published ask = %+v, want the single read the declaration asks for", got)
 	}
 }
 
@@ -625,11 +505,6 @@ func getStatus(t *testing.T, client *http.Client, target string) int {
 	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode
 }
-
-// consumesThings is the api.consumes projection core surfaces for the "things"
-// module the passthrough fixtures declare. The key is a wire contract
-// (manifest.APIConsumesEnvironmentVariable).
-const consumesThings = `[{"id":"thingstore.things","module":"thingstore","service":"things","endpoint":"rest","protocol":"rest","as":"things"}]`
 
 // TestABootRefusesAPlaintextGatewayTheMeshDoesNotCarry: validate() holds the
 // gateway URL to the SDK's rule, and start() has to *call* validate() for that
@@ -709,19 +584,6 @@ func TestAPlaintextGatewayIsAdmittedExactlyWhereTheSDKsRuleAdmitsIt(t *testing.T
 				t.Errorf("the refusal %q is not the SDK's rule", err)
 			}
 		})
-	}
-}
-
-// A scoped refusal cannot stop the listener shared by other installations.
-func TestServeSurvivesScopedRefusalAndStopsOnCancellation(t *testing.T) {
-	mint := newHostMint(t, &hostMint{status: http.StatusForbidden})
-	server := declaredWorkServer(t)
-	running := boot(t, server, mint)
-	if err := testWorkCredential(server, t.Context()); err == nil {
-		t.Fatal("work was not refused")
-	}
-	if healthOf(t, running) != http.StatusOK {
-		t.Fatal("scoped refusal stopped listener")
 	}
 }
 

@@ -117,9 +117,9 @@ func (a *interfaceAuthority) asked() []*authorityv1.IssueRequest {
 	return append([]*authorityv1.IssueRequest(nil), a.issued...)
 }
 
-// authorityServer is a Server composed with the stand-in authority, as a
-// composition naming authority/endpoint composes it.
-func authorityServer(t *testing.T) (*Server, *interfaceAuthority) {
+// interfaceAuthorityAt serves the stand-in authority on loopback and returns its
+// address, as a composition names it in authority/endpoint.
+func interfaceAuthorityAt(t *testing.T) (*interfaceAuthority, string) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -130,11 +130,19 @@ func authorityServer(t *testing.T) (*Server, *interfaceAuthority) {
 	authorityv1.RegisterAuthorityServiceServer(g, stand)
 	go func() { _ = g.Serve(l) }()
 	t.Cleanup(g.Stop)
+	return stand, l.Addr().String()
+}
+
+// authorityServer is a Server composed with the stand-in authority, as a
+// composition naming authority/endpoint composes it.
+func authorityServer(t *testing.T) (*Server, *interfaceAuthority) {
+	t.Helper()
+	stand, address := interfaceAuthorityAt(t)
 	credential := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(credential, []byte("workload-credential"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	host, err := dialAuthority("grpc://"+l.Addr().String(), credential, "page", false)
+	host, err := dialAuthority("grpc://"+address, credential, "page", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,13 +241,20 @@ func TestUnderTheAuthorityEveryWorkContextIsIssued(t *testing.T) {
 }
 
 // A composition that names the authority needs no saas gateway and no broker
-// credential; one that names neither still refuses to start.
+// credential. A solution that consumes modules and names no authority is
+// refused for the authority, the one way its calls reach a module — never for
+// a gateway it would not call; one that consumes nothing and names neither is
+// refused for the gateway.
 func TestAConfigNamingTheAuthorityNeedsNoGateway(t *testing.T) {
 	cfg := config{port: "8080", profile: "local", authorityEndpoint: "127.0.0.1:1", requiresAuthority: true}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("a composition naming the authority was refused: %v", err)
 	}
 	cfg.authorityEndpoint = ""
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "authority/endpoint") || strings.Contains(err.Error(), "gateway") {
+		t.Fatalf("a consuming solution with no authority: %v", err)
+	}
+	cfg.requiresAuthority = false
 	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "gateway") {
 		t.Fatalf("a composition naming neither started: %v", err)
 	}

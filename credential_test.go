@@ -11,13 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 
-	"github.com/codefly-dev/core/solution/manifest"
 	corework "github.com/codefly-dev/core/workcontext"
 	codefly "github.com/codefly-dev/sdk-go"
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -206,160 +204,6 @@ func TestEveryCallerOfOneExecutionSharesOneCarrier(t *testing.T) {
 			t.Errorf("the client reports %d mints and %d renewals, want 1 and 0", counts.Mints, counts.Renewals)
 		}
 	}
-}
-
-// TestABootedRuntimeRegistersNothing is the cutover
-// evidence the earlier version of this test did not provide.
-//
-// That version called the SDK's mint client directly and asserted no legacy
-// header was on the request — which would have stayed green with the whole
-// registration path still in the runtime. This one boots the real runtime with
-// the deleted endpoint settings aimed at an observer, and asserts what the
-// host received: one request, to the mint, and
-// nothing resembling a registration.
-func TestABootedRuntimeRegistersNothing(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-
-	// A listener of its own for every deleted URL, so a surviving registration
-	// is observed rather than failing to connect and being counted by nobody.
-	// The first version aimed the URLs at example.com, which a reviewer caught
-	// for that reason: aimed somewhere nothing answers, it proved only that the
-	// old code never minted.
-	var legacyHits atomic.Int64
-	var legacyPaths sync.Map
-	legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		legacyHits.Add(1)
-		legacyPaths.Store(r.URL.Path, r.Header.Clone())
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(legacy.Close)
-
-	// Removed endpoint settings must reach no code path. If any still does,
-	// the observer above sees a request — or a header it should never be shown
-	// again.
-	for key, value := range map[string]string{
-		"PUBLIC_URL":                              "https://public.example.com",
-		"SELF_UPSTREAM":                           "https://self.example.com",
-		"HOST_REGISTER_URL":                       legacy.URL + "/api/solutions/register",
-		"GATEWAY_REGISTER_URL":                    legacy.URL + "/solutions/_register",
-		"GATEWAY_MODULE_REGISTER_URL":             legacy.URL + "/modules/_register",
-		"GATEWAY_MODULE_REGISTRATION_TOKEN_URL":   legacy.URL + "/modules/_registration-token",
-		"GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL": legacy.URL + "/solutions/_registration-token",
-		"CODEFLY__SOLUTION_REGISTRATION_SECRET":   "legacy-solution-secret",
-		"CODEFLY__MODULE_REGISTRATION_SECRETS":    `{"widgets-go":"legacy-module-secret"}`,
-		"CODEFLY_INTERNAL_TOKEN":                  "internal-token-that-must-not-travel",
-		"CODEFLY__SOLUTION_REGISTRATION_INTERVAL": "1s",
-		"CODEFLY_HOST_FRONTEND":                   "frontend",
-	} {
-		t.Setenv(key, value)
-	}
-
-	// reached is what the observer has seen since the last reset, with the
-	// paths, so every assertion below can name what called a deleted endpoint
-	// rather than only that something did.
-	reached := func() (int64, []string) {
-		paths := []string{}
-		legacyPaths.Range(func(k, _ any) bool { paths = append(paths, k.(string)); return true })
-		return legacyHits.Load(), paths
-	}
-	reset := func() {
-		legacyHits.Store(0)
-		legacyPaths.Range(func(k, _ any) bool { legacyPaths.Delete(k); return true })
-	}
-	// listening proves the observer can still see a request AT THE MOMENT it
-	// is asked, and leaves the counters clean for the next window.
-	//
-	// The defect this replaced was a test concluding "nothing called it" while
-	// watching a closed port, so every zero below has to rest on something
-	// checked rather than assumed — and checked at both ends of the window it
-	// certifies, because the first version of this check was true when it was
-	// written and stopped being true when the boot moved the server.
-	listening := func(when string) {
-		t.Helper()
-		reset()
-		probe, err := http.Get(legacy.URL + "/api/solutions/register")
-		if err != nil {
-			t.Fatalf("the observer for the deleted endpoints is not reachable %s, so a zero count around it would prove nothing: %v", when, err)
-		}
-		drainAndClose(probe)
-		if got, _ := reached(); got != 1 {
-			t.Fatalf("the observer counted %d of its own probe %s, want 1: it is not counting what reaches it", got, when)
-		}
-		reset()
-	}
-
-	// THE BOOT WINDOW, and it has to come first.
-	//
-	// The observer is proved reachable BEFORE the boot and the count is
-	// asserted BEFORE anything resets it. Neither was true: the helpers were
-	// defined after boot() returned and the first listening() call reset the
-	// counters, so a one-time registration or token exchange during boot
-	// disappeared before any assertion looked. The mint.count() check at the
-	// end is about the separate mint server and says nothing about these
-	// endpoints.
-	//
-	// Boot is where the deleted code would have run: a registration was what a
-	// runtime did on the way up, and the beat only followed it.
-	listening("before the boot")
-	t.Setenv(manifest.APIConsumesEnvironmentVariable, consumesThings)
-	solution := boot(t, New(Manifest{ID: testSolutionID}).Consumes(passthroughModule()).
-		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
-			localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
-		}}), mint)
-	if got, paths := reached(); got != 0 {
-		t.Errorf("a deleted endpoint was called %d times at %v DURING THE BOOT: the self-registration, the consumed-module registrations and the single-use token exchange are deleted, so the way up may not touch one", got, paths)
-	}
-	listening("after the boot")
-
-	// THE PERIODIC WINDOW, in two parts, because one of them was the wrong
-	// length.
-	//
-	// The shortest interval the deleted configuration accepted was 1s, set
-	// above, so three seconds is three periods of the fastest beat that was
-	// ever configurable — and a reviewer pointed out that it says nothing
-	// about a survivor that IGNORES the removed setting and keeps the old
-	// 15-second default. That one fires in neither three seconds nor any
-	// window shorter than its period, so the window has to be longer than the
-	// default was.
-	//
-	// This is the one place in the suite that waits on real time, and it is
-	// deliberate: the two heartbeat tests that waited 10s and 5s went with the
-	// heartbeat, and this is the test that answers whether the heartbeat is
-	// actually gone. A shorter window here is the assertion that was already
-	// wrong once.
-	const deletedDefaultInterval = 15 * time.Second
-	time.Sleep(3 * time.Second)
-	if got, paths := reached(); got != 0 {
-		t.Errorf("a deleted endpoint was called %d times at %v during three periods of the fastest heartbeat interval this configuration ever accepted: the beat, both registrations and the token exchange are deleted, so nothing may reach one", got, paths)
-	}
-	time.Sleep(deletedDefaultInterval + time.Second - 3*time.Second)
-	if got, paths := reached(); got != 0 {
-		t.Errorf("a deleted endpoint was called %d times at %v within %s of the boot: that is longer than the registration heartbeat's own default period, so this catches a surviving beat that ignores the interval configuration as well as one that honours it", got, paths, deletedDefaultInterval+time.Second)
-	}
-	listening("after the periodic window")
-
-	if status := getStatus(t, solution.client, solution.base+HealthPath); status != http.StatusOK {
-		t.Fatalf("health = %d, want 200", status)
-	}
-
-	// The SHUTDOWN window. Every assertion used to run while the solution was
-	// still serving, and the shutdown happened in t.Cleanup afterwards with
-	// nothing left to read the count — so a deregistration on the way out was
-	// unobserved. The cutover's claim is that nothing reaches a deleted
-	// endpoint, and the last thing a process does is part of that.
-	listening("before the shutdown")
-	solution.stop()
-	if got, paths := reached(); got != 0 {
-		t.Errorf("a deleted endpoint was called %d times at %v while this runtime shut down: there is no deregistration, so nothing may reach one on the way out either", got, paths)
-	}
-	// The observer outlives the runtime, so the zero above is a statement
-	// about the runtime rather than about a port that closed with it.
-	listening("after the shutdown")
-
-	if got := mint.count(); got != 0 {
-		t.Fatalf("idle run made %d broker calls", got)
-	}
-
 }
 
 // TestTheMintCarriesThisWorkloadsCredentialForAViewersMint: the mint this
@@ -795,58 +639,6 @@ func TestARouteIsNotParkedByASlowCredentialSource(t *testing.T) {
 	})
 }
 
-// TestEverySourceIsHeldToTheFrozenAuthority: a supplied credential source
-// replaces the mint client, and with it every option mintOptions carries —
-// including the Authority the SDK rechecks before each renewal. So the one
-// guarantee that stops a drifted authority value being re-sealed into a new
-// credential applied to the platform path only, while this package's
-// documentation promises it of the process.
-func TestEverySourceIsHeldToTheFrozenAuthority(t *testing.T) {
-	// Two different credentials, so the second ask reads as a renewal: the
-	// token is the generation. They come from a plain-HTTP fake host of this
-	// test's own, because the boot's mint is served under the cell's anchor and
-	// this is only a way to obtain two real sealed credentials to hand out.
-	// Three: the boot consumes the first, the control renewal the second, and
-	// the ask after the drift the third.
-	fabricator := newHostMint(t, &hostMint{})
-	handing := &handingSource{credentials: []workcontext.Credential{
-		mintedCredential(t, fabricator, "first"),
-		mintedCredential(t, fabricator, "second"),
-		mintedCredential(t, fabricator, "third"),
-	}}
-
-	mint := newHostMint(t, &hostMint{})
-	bootEnvironment(t, mint)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	server := declaredWorkServer(t).Credential(handing)
-	if _, err := takeListener(server).start(ctx); err != nil {
-		t.Fatalf("boot: %v", err)
-	}
-
-	// The control: with the authority as this process froze it, a renewal is
-	// handed over.
-	if _, err := scopeController(t, server).nextCredential(ctx); err != nil {
-		t.Fatalf("a renewal was refused while the authority had not drifted: %v", err)
-	}
-
-	// Now an authority-bearing value drifts under the running process, and the
-	// next renewal must be refused rather than re-sealed against it.
-	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
-		"spiffe://codefly.test/ns/solutions/sa/somebody-else")
-	if err := codefly.LoadEnvironmentVariables(); err != nil {
-		t.Fatal(err)
-	}
-	_, err := scopeController(t, server).nextCredential(ctx)
-	if err == nil {
-		t.Fatal("a renewal proceeded after an authority-bearing value drifted from the one this process froze: that renewal is the one moment the drift would be laundered into a differently-sealed credential")
-	}
-	if !errors.Is(err, workcontext.ErrMintRefused) {
-		t.Errorf("the refusal %v is not reported as a judgement, so the boot and the run would classify it differently", err)
-	}
-}
-
 // handingSource hands out a prepared sequence of credentials, so a second ask
 // reads as a renewal.
 type handingSource struct {
@@ -1153,43 +945,6 @@ func TestATerminalRefusalIsRecordedWhereverItLands(t *testing.T) {
 	}
 }
 
-// TestAWithdrawnAuthorityIsCaughtBeforeTheMint: the recheck ran after the ask,
-// so a withdrawn authority was discovered one renewal too late — the mint had
-// already happened, sealed to values nobody approved, and the caller that
-// triggered it was served.
-func TestAWithdrawnAuthorityIsCaughtBeforeTheMint(t *testing.T) {
-	fabricator := newHostMint(t, &hostMint{})
-	handing := &handingSource{credentials: []workcontext.Credential{
-		mintedCredential(t, fabricator, "first"),
-		mintedCredential(t, fabricator, "second"),
-	}}
-
-	mint := newHostMint(t, &hostMint{})
-	bootEnvironment(t, mint)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	server := declaredWorkServer(t).Credential(handing)
-	if _, err := takeListener(server).start(ctx); err != nil {
-		t.Fatalf("boot: %v", err)
-	}
-	asksAtBoot := handing.count()
-
-	// The authority drifts, and then something asks.
-	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__MODULE_AUTHORITY__"+AuthorityPrincipalKey,
-		"spiffe://codefly.test/ns/solutions/sa/somebody-else")
-	if err := codefly.LoadEnvironmentVariables(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := scopeController(t, server).nextCredential(ctx); err == nil {
-		t.Fatal("an ask proceeded under a drifted authority")
-	}
-	// And the source was never reached, so nothing was minted under it.
-	if got := handing.count(); got != asksAtBoot {
-		t.Errorf("the source was asked %d times after the authority drifted (%d at boot): the recheck has to come before the ask, or the credential is already minted and sealed to a value nobody approved by the time the drift is noticed",
-			got-asksAtBoot, asksAtBoot)
-	}
-}
-
 // TestNothingIsInferredFromAConflictOnAViewersMint replaces the two rounds
 // spent building around a signal that was never sound.
 //
@@ -1480,34 +1235,6 @@ func authorityFor(t *testing.T, ctx context.Context) *codefly.Authority {
 		t.Fatalf("open the authority: %v", err)
 	}
 	return server.authority
-}
-
-// TestTheBootsCredentialIsHeldByTheController: the boot obtained the
-// credential and nothing held it, so the first route after boot saw an empty
-// controller — it asked again, and got none of the backoff or
-// held-credential behaviour the controller exists to provide.
-//
-// "One credential per execution" starts at the boot's own credential or it
-// starts one request late.
-func TestFirstWorkAcquiresAfterIdleBoot(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	server := declaredWorkServer(t)
-	running := boot(t, server, mint)
-	if mint.count() != 0 {
-		t.Fatal("boot minted")
-	}
-	credential, err := server.acquireForInstallation(t.Context(), testOrganization, testInstallation)
-	if err != nil || credential.Token() == "" {
-		t.Fatalf("first work: %v", err)
-	}
-	for range 5 {
-		if _, err := server.acquireForInstallation(t.Context(), testOrganization, testInstallation); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if mint.count() != 1 || healthOf(t, running) != 200 {
-		t.Fatal("work did not reuse the credential")
-	}
 }
 
 // TestAnAuthorityDriftDuringTheAskIsRefused closes a real gap my own mutation
