@@ -35,6 +35,11 @@ func handlerErrorResponse(err error) (int, string) {
 	if errors.As(err, &clientErr) && clientErr != nil && clientErr.StatusCode >= 400 && clientErr.StatusCode <= 499 {
 		return clientErr.StatusCode, clientErr.Message
 	}
+	// The authority's refusal of the ask names its reason (WorkContextRefusal).
+	var refusal *WorkContextRefusal
+	if errors.As(err, &refusal) && refusal != nil && refusal.Reason != "" && refusal.StatusCode >= 400 && refusal.StatusCode <= 499 {
+		return refusal.StatusCode, "the authority refused this call: " + refusal.Reason
+	}
 	var gatewayErr *GatewayError
 	if errors.As(err, &gatewayErr) && gatewayErr != nil {
 		status := gatewayErr.StatusCode
@@ -109,4 +114,31 @@ func handlerErrorResponse(err error) (int, string) {
 	// Preserve the existing untyped-handler contract. Callers must not put
 	// private details in ordinary errors returned to the runtime.
 	return http.StatusBadGateway, err.Error()
+}
+
+// connectRefusals recognises a Connect or gRPC caller. A Connect unary request
+// is told apart from a plain REST POST by its protocol header, which every
+// Connect client sends; the kit's REST helpers do not.
+var connectRefusals = connect.NewErrorWriter(connect.WithRequireConnectProtocolHeader())
+
+// writeRefusal answers a refused request in the caller's protocol: a Connect
+// error — code and message — to a Connect or gRPC client, which reads nothing
+// else, and {"error": message} to a plain REST caller. The code is the
+// authority's own when the refusal is the authority's, a module's when a
+// handler relayed one, and otherwise the one the status maps to.
+func writeRefusal(w http.ResponseWriter, r *http.Request, status int, message string, err error) {
+	if !connectRefusals.IsSupported(r) {
+		writeJSON(w, status, map[string]string{"error": message})
+		return
+	}
+	code := codeForStatus(status)
+	var refusal *WorkContextRefusal
+	var rpc *connect.Error
+	switch {
+	case errors.As(err, &refusal) && refusal != nil && refusal.code != 0:
+		code = refusal.code
+	case errors.As(err, &rpc) && rpc != nil:
+		code = rpc.Code()
+	}
+	_ = connectRefusals.Write(w, r, connect.NewError(code, errors.New(message)))
 }

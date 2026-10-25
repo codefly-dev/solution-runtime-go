@@ -208,8 +208,23 @@ broker credential, and holds no session bearer:
 - **`WorkContext(ctx)`**: the token a gateway acts under, for a caller that
   reaches a module itself — over gRPC through the hop.
 
-Gateway passthrough (`Consumes`) has no gateway to relay through and is refused
-at boot; a page calls each module through the hop instead. Without
+- **The passthrough** (`Consumes`) is served from the same declaration, at
+  `/v1/<id>/modules/<as>/<package.Service>/<Method>` (the edge routes a solution
+  at `/v1/<id>` and forwards requests unchanged). A consumed module whose
+  `Authority` names its configuration slots — the module's gRPC address, the
+  hop in front of it, and the id of this solution's binding for it — is relayed
+  over gRPC as the viewer: a child of the edge's Work Context through that
+  binding with the method's declared scopes, the pin merged in and the
+  response allowlist applied. A module that names no slots is not relayed, and
+  its routes are the solution's. A missing slot, a ViewerBearer or a
+  server-streaming relayed method refuses the boot. A solution that publishes
+  no ceiling is bounded by the authority.
+- **Every refusal names its reason.** The authority's reason for refusing an
+  issue is kept (`WorkContextRefusal.Reason`), and a refusal reaches a Connect
+  or gRPC caller as a Connect error with the authority's code — a Connect
+  client reads nothing else — and a plain REST caller as `{"error": …}`.
+
+Without
 `authority/endpoint` nothing changes: the runtime runs against the saas host as
 before, so a composition can still run saas locally.
 

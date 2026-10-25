@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"connectrpc.com/connect"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -93,6 +94,9 @@ func (h *hostAuthority) viewer(ctx context.Context, workContext string) (*author
 	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
 	defer cancel()
 	checked, err := h.authority.Check(ctx, &authorityv1.CheckRequest{Token: workContext, Audience: h.principal})
+	if err != nil && refusalStatus(err) < http.StatusInternalServerError {
+		return nil, fmt.Errorf("%w: %s", ErrNoViewer, status.Convert(err).Message())
+	}
 	if err != nil || checked.GetContext().GetTenantId() == "" {
 		return nil, ErrNoViewer
 	}
@@ -139,7 +143,14 @@ func (h *hostAuthority) issue(ctx context.Context, req *authorityv1.IssueRequest
 	defer cancel()
 	issued, err := h.authority.Issue(ctx, req)
 	if err != nil {
-		return "", time.Time{}, WorkContextPrincipals{}, &WorkContextRefusal{Audience: req.GetAudience(), StatusCode: refusalStatus(err)}
+		refusal := &WorkContextRefusal{Audience: req.GetAudience(), StatusCode: refusalStatus(err), code: connect.Code(status.Code(err))}
+		// The authority's reason for refusing the ask is the refusal's; a
+		// failure to reach it is nobody's refusal, and its text, which can name
+		// an address, is not kept.
+		if refusal.StatusCode < http.StatusInternalServerError {
+			refusal.Reason = status.Convert(err).Message()
+		}
+		return "", time.Time{}, WorkContextPrincipals{}, refusal
 	}
 	wc := issued.GetContext()
 	principals := WorkContextPrincipals{OrgID: wc.GetTenantId(), OwnerPrincipalID: wc.GetOwnerPrincipalId(), CurrentActorPrincipalID: wc.GetOwnerPrincipalId()}

@@ -155,6 +155,9 @@ type Server struct {
 	// resolved routes, checked by Serve before it listens.
 	consumed    []ConsumedModule
 	passthrough map[string]passthroughRoute
+	// relays is, under the authority interface, each relayed consumed module's
+	// binding and connection (passthrough_authority.go).
+	relays map[string]*moduleRelay
 	// mcp is the MCP server the solution declared with ServeMCP, nil when it
 	// declared none; mcpRedeclared records a second ServeMCP, which the boot
 	// refuses rather than letting the last call quietly be the only surface.
@@ -915,12 +918,10 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
 		s.host = authority
-		if len(s.consumed) > 0 {
-			// Passthrough relays a page's call to a consumed module through the
-			// saas gateway. Under the authority there is no such gateway: a
-			// page reaches a module through the hop with ForModule's Work
-			// Context, and nothing passes through this process.
-			return nil, fmt.Errorf("solution %q consumes modules through the gateway passthrough, which the authority interface has no gateway for: call each module through the hop with Gateway.ForModule and Gateway.WorkContext", s.manifest.ID)
+		// The passthrough relays each consumed module the composition names a
+		// hop and a binding for, as the viewer, through the authority.
+		if s.relays, err = s.openRelays(routes, codefly.For(ctx).WorkspaceConfiguration); err != nil {
+			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
 	} else if s.cfg.requiresAuthority {
 		if err := s.openAuthority(ctx); err != nil {
@@ -1294,24 +1295,16 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 		if s.host != nil {
 			// Under the authority the edge sends the request on with the
 			// person's Work Context for this module, and who it is for is the
-			// authority's Check of that context, never a header the request
-			// wrote about itself. No session bearer reaches this process.
-			carried := r.Header.Get(WorkContextHeader)
-			if carried == "" {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no Work Context: this page is reached through the authority's edge, which signs the person in"})
+			// authority's Check of that context. No session bearer reaches this
+			// process.
+			var err error
+			if gw, err = s.viewerGateway(r.Context(), r.Header.Get(WorkContextHeader)); err != nil {
+				writeRefusal(w, r, http.StatusUnauthorized, err.Error(), err)
 				return
 			}
-			viewer, err := s.host.viewer(r.Context(), carried)
-			if err != nil {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
-				return
-			}
-			gw = s.gatewayFor(http.Header{})
-			gw.parentContext = carried
-			gw.orgID, gw.sessionID, gw.installationID, gw.installationErr = viewer.GetTenantId(), viewer.GetSessionId(), "", nil
 		} else {
 			if r.Header.Get("authorization") == "" {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing bearer"})
+				writeRefusal(w, r, http.StatusUnauthorized, "missing bearer", nil)
 				return
 			}
 			gw = s.gatewayFor(r.Header)
@@ -1319,7 +1312,7 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 		result, err := handler(r, gw)
 		if err != nil {
 			status, message := handlerErrorResponse(err)
-			writeJSON(w, status, map[string]string{"error": message})
+			writeRefusal(w, r, status, message, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -2061,20 +2054,30 @@ func (g *Gateway) workContext(ctx context.Context) (string, error) {
 	})
 }
 
-// WorkContextRefusal carries only the HTTP status and the locally requested
+// WorkContextRefusal carries the HTTP status and the locally requested
 // audience. Broker response diagnostics are never retained or returned.
 // Code and Message were removed; consumers should inspect StatusCode.
 type WorkContextRefusal struct {
 	Audience   string
 	StatusCode int
+	// Reason is the authority interface's own reason for a refusal ("the
+	// owner holds nothing at this audience"), kept so the refusal names it.
+	// Only the authority's refusals of the ask carry one; a saas broker's body
+	// is never retained, and neither is a transport failure's text.
+	Reason string
+	// code is the authority's gRPC status, which a Connect caller is answered
+	// with rather than a code re-derived from StatusCode.
+	code connect.Code
 }
 
 func (e *WorkContextRefusal) Error() string {
 	message := "request failed"
-	switch e.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
+	switch {
+	case e.Reason != "":
+		message = e.Reason
+	case e.StatusCode == http.StatusUnauthorized, e.StatusCode == http.StatusForbidden:
 		message = "request refused"
-	case http.StatusServiceUnavailable:
+	case e.StatusCode == http.StatusServiceUnavailable:
 		message = "execution not established"
 	}
 	return fmt.Sprintf("work context mint: HTTP %d: %s", e.StatusCode, message)

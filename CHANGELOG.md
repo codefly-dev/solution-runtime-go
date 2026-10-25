@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — the passthrough under the authority; refusals keep their reason
+
+Under the authority interface the passthrough is no longer refused at boot: a
+consumed module whose new `ConsumedModule.Authority` names its configuration
+slots (gRPC address, binding id) is relayed over gRPC as the viewer, a child
+of the edge's Work Context issued through that binding, pinned and masked as
+declared, at `/v1/<id>/modules/…`. The copies solutions carried of this relay
+can be deleted.
+
+`WorkContextRefusal.Reason` carries the authority interface's reason for a
+refusal (a transport failure keeps none, and the saas broker's body is still
+never retained); handlers and the passthrough relay it. A refusal from a
+solution's own route reaches a Connect or gRPC client as a Connect error, code
+and message, instead of `{"error": …}`, which Connect clients ignore; a plain
+REST caller (no `Connect-Protocol-Version`) still gets `{"error": …}`.
+
 ## Unreleased — `Gateway.InstallationID` exposes the stamped installation
 
 `Gateway` exposed `OrgID()` but not the installation beside it, so a handler

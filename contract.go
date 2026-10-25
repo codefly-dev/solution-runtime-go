@@ -189,6 +189,12 @@ func (s *Server) resolveContract() (effectiveContract, error) {
 		// disagreed would be this one.
 		Principal: s.principal,
 	}
+	// Under the authority, a solution that publishes no ceiling is bounded by
+	// the authority: each call is issued through one of its bindings, within
+	// that binding's ceiling and what the person holds.
+	if s.host != nil && len(s.declaredContract.Ceilings) == 0 {
+		return contract, nil
+	}
 	bindings, err := checkContract(s.consumed, s.declaredContract, s.cfg.profile)
 	if err != nil {
 		return contract, err

@@ -75,6 +75,11 @@ type ConsumedModule struct {
 	ViewerBearer bool
 	// Methods is the allowlist. Nothing else of the module is reachable.
 	Methods []ConsumedMethod
+	// Authority, under the authority interface, names the configuration
+	// slots that say where the module is and which of this solution's
+	// bindings the viewer's calls are issued through (passthrough_authority.go).
+	// A module that names none is not relayed there. Ignored under the gateway.
+	Authority AuthorityRelay
 }
 
 // ConsumedMethod is one operation of a consumed module the page may call.
@@ -306,6 +311,12 @@ func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
 	if s.cfg.consumes.err != nil {
 		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", s.cfg.consumes.err)
 	}
+	// Under the authority nothing goes through the gateway's federation, so
+	// there is no /v1/<as> prefix to check for: a relayed module is reached
+	// through the hop its slots name, and openRelays checks those.
+	if s.cfg.authorityEndpoint != "" {
+		return routes, nil
+	}
 	return routes, checkConsumed(s.consumed, s.cfg.consumes.targets)
 }
 
@@ -327,6 +338,14 @@ func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 		if routes, err = resolvePassthrough(s.consumed); err != nil {
 			return err
 		}
+	}
+	if s.host != nil {
+		// Under the authority: the relayed modules, at the route the edge
+		// forwards this solution's requests on unchanged.
+		if routes = relayedRoutes(routes, s.relays); len(routes) > 0 {
+			mux.Handle(s.authorityRoute()+PassthroughPathPrefix, http.StripPrefix(s.authorityRoute(), s.passthroughHandler(routes)))
+		}
+		return nil
 	}
 	mux.Handle(PassthroughPathPrefix, s.passthroughHandler(routes))
 	return nil
@@ -434,8 +453,12 @@ func (s *Server) passthroughRoute(route passthroughRoute) http.Handler {
 		)
 		return http.StripPrefix(PassthroughPathPrefix+route.module.As, handler)
 	}
+	forward := s.forward
+	if s.host != nil {
+		forward = s.relay
+	}
 	handler := connect.NewUnaryHandler(procedure, func(ctx context.Context, req *connect.Request[dynamicpb.Message]) (*connect.Response[dynamicpb.Message], error) {
-		resp, err := s.forward(ctx, route, req)
+		resp, err := forward(ctx, route, req)
 		if err != nil {
 			return nil, err
 		}
@@ -492,18 +515,27 @@ func (s *Server) authorize(ctx context.Context, route passthroughRoute, header h
 		}
 		gw = acting
 	}
-	if route.method.Pin != nil {
-		// Merged through the wire form: the pin is the generated type, the
-		// request a dynamic message over the same descriptor.
-		pinned, err := proto.Marshal(route.method.Pin)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
-		}
-		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, msg); err != nil {
-			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
-		}
+	if err := applyPin(route, msg); err != nil {
+		return nil, err
 	}
 	return gw, nil
+}
+
+// applyPin merges the declared pin into the request. It is merged through the
+// wire form: the pin is the generated type, the request a dynamic message over
+// the same descriptor.
+func applyPin(route passthroughRoute, msg *dynamicpb.Message) error {
+	if route.method.Pin == nil {
+		return nil
+	}
+	pinned, err := proto.Marshal(route.method.Pin)
+	if err != nil {
+		return connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
+	}
+	if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, msg); err != nil {
+		return connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
+	}
+	return nil
 }
 
 // relayedError turns a failed call into the Connect error the page receives.
@@ -515,7 +547,14 @@ func (s *Server) authorize(ctx context.Context, route passthroughRoute, header h
 func relayedError(err error) error {
 	var refusal *WorkContextRefusal
 	if errors.As(err, &refusal) && refusal != nil && refusal.StatusCode >= 400 && refusal.StatusCode < 500 {
-		return connect.NewError(codeForStatus(refusal.StatusCode), errors.New("the viewer's authority for this module was refused"))
+		code, message := codeForStatus(refusal.StatusCode), "the viewer's authority for this module was refused"
+		if refusal.code != 0 {
+			code = refusal.code
+		}
+		if refusal.Reason != "" {
+			message += ": " + truncated(refusal.Reason)
+		}
+		return connect.NewError(code, errors.New(message))
 	}
 	var streamErr *StreamError
 	if errors.As(err, &streamErr) && streamErr != nil {
