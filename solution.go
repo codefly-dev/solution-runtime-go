@@ -782,14 +782,24 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 // for is the authority's Check of that context, which also applies this
 // module's delivered policy for the route. No session bearer reaches this
 // process, and no header a request wrote about itself is read.
-func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
+//
+// route is the operation the mux dispatched to, "<VERB> <template>" exactly as
+// its row is published (servedRoute), never the request's own path. The mux
+// matches the escaped path while the request's decoded path can read as a
+// different route ("/pages/a%2Fhistory" runs "/pages/{id}" but decodes to
+// "/pages/a/history"), and two templates the mux tells apart by specificity
+// can both match one path, which the authority refuses as ambiguous. Naming
+// the dispatched row makes the operation checked the operation run.
+func (s *Server) wrapRequest(route string, handler RequestHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		gw, err := s.viewerGateway(r.Context(), r.Header.Get(WorkContextHeader), r.Method+" "+r.URL.Path)
+		gw, err := s.viewerGateway(r.Context(), r.Header.Get(WorkContextHeader), route)
 		if err != nil {
 			code := http.StatusUnauthorized
 			switch {
 			case errors.Is(err, ErrRequestRefused):
 				code = http.StatusForbidden
+			case errors.Is(err, ErrRequestInvalid):
+				code = http.StatusBadRequest
 			case errors.Is(err, ErrAuthorityUnavailable):
 				code = http.StatusServiceUnavailable
 			}

@@ -37,7 +37,7 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 			req.Header.Set(WorkContextHeader, workContext)
 		}
 		rec := httptest.NewRecorder()
-		s.wrapRequest(ask)(rec, req)
+		s.wrapRequest("POST /ask", ask)(rec, req)
 		want := http.StatusOK
 		if workContext == "" {
 			want = http.StatusUnauthorized
@@ -86,7 +86,7 @@ func TestRequestHandlerRejectsInvalidInput(t *testing.T) {
 			req := httptest.NewRequest("POST", "/ask", strings.NewReader(tc.body))
 			req.Header.Set(WorkContextHeader, edgeContext)
 			rec := httptest.NewRecorder()
-			withCORS(s.wrapRequest(ask))(rec, req)
+			withCORS(s.wrapRequest("POST /ask", ask))(rec, req)
 			if rec.Code != tc.status {
 				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 			}
@@ -131,7 +131,7 @@ func TestHandlerErrorStatusContract(t *testing.T) {
 				req := httptest.NewRequest("POST", path, nil)
 				req.Header.Set(WorkContextHeader, edgeContext)
 				rec := httptest.NewRecorder()
-				s.wrapRequest(op.requestHandler())(rec, req)
+				s.wrapRequest("POST "+path, op.requestHandler())(rec, req)
 				if rec.Code != tc.status {
 					t.Fatalf("%s: status %d: %s", path, rec.Code, rec.Body.String())
 				}

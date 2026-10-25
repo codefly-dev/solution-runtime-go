@@ -294,6 +294,21 @@ func TestAStreamEndsAsTheModuleOrItsBoundsSay(t *testing.T) {
 	if got, err := watch(t, page.URL, edgeContext); len(got) != 1 || connect.CodeOf(err) != connect.CodeDeadlineExceeded || !strings.Contains(err.Error(), "declared duration") {
 		t.Fatalf("a held stream: received %d, then %v", len(got), err)
 	}
+	// r1 F6: a module that accepts the stream and never sends is cut off at
+	// the method's Timeout, its first-answer bound, not at the whole
+	// duration; once it has answered, only the duration bounds it.
+	start := time.Now()
+	page, _ = relayedPage(t, watchModule(ConsumedMethod{Timeout: 200 * time.Millisecond, MaxStreamDuration: time.Minute}), &relayedModule{hold: true}, "things-binding")
+	if got, err := watch(t, page.URL, edgeContext); len(got) != 0 || connect.CodeOf(err) != connect.CodeDeadlineExceeded || !strings.Contains(err.Error(), "did not start its stream within 200ms") {
+		t.Fatalf("a silent stream: received %d, then %v", len(got), err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("a silent stream was cut off after %s, not at its 200ms first-answer bound", elapsed)
+	}
+	page, _ = relayedPage(t, watchModule(ConsumedMethod{Timeout: 200 * time.Millisecond, MaxStreamDuration: 700 * time.Millisecond}), &relayedModule{streamed: 1, hold: true}, "things-binding")
+	if got, err := watch(t, page.URL, edgeContext); len(got) != 1 || connect.CodeOf(err) != connect.CodeDeadlineExceeded || !strings.Contains(err.Error(), "declared duration") {
+		t.Fatalf("a stream that answered within its first-answer bound: received %d, then %v", len(got), err)
+	}
 }
 
 // A relay the composition cannot complete refuses the boot, naming the slot;
@@ -353,7 +368,7 @@ func TestABootedPassthroughRelaysProceduresThatCarryNoHTTPBinding(t *testing.T) 
 // an authority refusal a handler returns keeps the authority's code and reason.
 func TestARefusalIsWrittenInTheCallersProtocol(t *testing.T) {
 	s, _ := authorityServer(t)
-	handler := s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
+	handler := s.wrapRequest("POST /v1/page/things", func(r *http.Request, gw *Gateway) (any, error) {
 		_, err := gw.ForParent(r.Context(), "refused", Scope{ResourceKind: "things", Actions: []string{"read"}})
 		return nil, err
 	})

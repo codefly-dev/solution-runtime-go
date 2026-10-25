@@ -90,6 +90,113 @@ func TestTheOperationCheckedIsTheOperationRun(t *testing.T) {
 	}
 }
 
+// The reviewer's reproduction (r1 F1): the mux matches the escaped path, so
+// "/pages/secret%2Fhistory" runs the "/pages/{id}" operation with id
+// "secret/history", while its decoded path reads as "/pages/{id}/history".
+// The authority used to be asked about that decoded path and so applied the
+// history row's weaker policy to the page handler. It is asked about the
+// operation dispatched now: a caller holding only the history row is refused
+// before the page handler runs.
+func TestAnEncodedSlashIsCheckedAsTheOperationItRuns(t *testing.T) {
+	ran := []string{}
+	handler := func(name string) Handler {
+		return func(context.Context, *Gateway) (any, error) {
+			ran = append(ran, name)
+			return map[string]string{"ran": name}, nil
+		}
+	}
+	page, history := "/v1/page/pages/{id}", "/v1/page/pages/{id}/history"
+	server := New(Manifest{ID: "page", Frontend: []byte(testFrontend)}).Operations(
+		Operation{Path: page, Method: "get", Summary: "Read a page", Callers: "Readers.", Behavior: "The page.",
+			Response: map[string]string{}, Policy: Requires("page.page", "read"), Handler: handler("page-handler")},
+		Operation{Path: history, Method: "get", Summary: "Read a page's history", Callers: "Anyone checked.", Behavior: "Its revisions.",
+			Response: map[string]string{}, Policy: AnyCheckedCaller(), Handler: handler("history-handler")},
+	)
+	b := boot(t, server)
+	b.authority.mu.Lock()
+	b.authority.held = []string{"GET " + history}
+	b.authority.mu.Unlock()
+
+	get := func(path string) (int, string) {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, b.base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(WorkContextHeader, edgeContext)
+		response, err := b.client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+
+	if code, body := get("/v1/page/pages/secret%2Fhistory"); code != http.StatusForbidden {
+		t.Fatalf("an encoded slash answered %d %s: the page handler ran under the history row's policy", code, body)
+	}
+	if len(ran) != 0 {
+		t.Fatalf("a refused request ran %v", ran)
+	}
+	if checks := b.authority.checks(); len(checks) != 1 || checks[0].GetMethod() != "GET "+page {
+		t.Fatalf("the authority was asked %v, want the dispatched operation %q", checks, "GET "+page)
+	}
+
+	// The history route itself is what the caller holds, and it runs.
+	if code, body := get("/v1/page/pages/secret/history"); code != http.StatusOK || !strings.Contains(body, "history-handler") {
+		t.Fatalf("the held history route answered %d %s", code, body)
+	}
+	if checks := b.authority.checks(); len(checks) != 2 || checks[1].GetMethod() != "GET "+history {
+		t.Fatalf("the authority was asked %v", checks)
+	}
+}
+
+// r1 F2: a subtree pattern and a "{id}" route under the same prefix are legal
+// for the mux, which runs the more specific one, but a request path matches
+// both templates, and the authority refuses a path that matches two declared
+// routes as ambiguous. The runtime names the dispatched operation's own row,
+// which the authority finds exactly, so each request is checked against one
+// row and the overlap is never ambiguous.
+func TestOverlappingRoutesAreEachCheckedAgainstTheirOwnRow(t *testing.T) {
+	answer := func(name string) Handler {
+		return func(context.Context, *Gateway) (any, error) { return map[string]string{"ran": name}, nil }
+	}
+	subtree, item := "/v1/page/pages/", "/v1/page/pages/{id}"
+	server := New(Manifest{ID: "page", Frontend: []byte(testFrontend)}).Operations(
+		served("get", subtree, answer("subtree-handler")),
+		served("get", item, answer("item-handler")),
+	)
+	b := boot(t, server)
+	b.authority.mu.Lock()
+	b.authority.held = []string{"GET " + servedRoute(subtree), "GET " + item}
+	b.authority.mu.Unlock()
+
+	for path, want := range map[string]struct{ handler, row string }{
+		"/v1/page/pages/p-1":         {"item-handler", "GET " + item},
+		"/v1/page/pages/p-1/history": {"subtree-handler", "GET /v1/page/pages/{path=**}"},
+	} {
+		before := len(b.authority.checks())
+		request, err := http.NewRequest(http.MethodGet, b.base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(WorkContextHeader, edgeContext)
+		response, err := b.client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || !strings.Contains(string(body), want.handler) {
+			t.Errorf("%s answered %d %s, want %s", path, response.StatusCode, body, want.handler)
+		}
+		if checks := b.authority.checks(); len(checks) != before+1 || checks[before].GetMethod() != want.row {
+			t.Errorf("%s was checked as %v, want %q", path, checks[before:], want.row)
+		}
+	}
+}
+
 // served is one documented operation any checked caller may make, for a test
 // that is about something other than the operation's documentation.
 func served(method, path string, handler Handler) Operation {

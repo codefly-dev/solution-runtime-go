@@ -103,8 +103,8 @@ type ConsumedMethod struct {
 	MaxResponseBytes int64
 	// Timeout bounds one call, the issue of the viewer's Work Context
 	// included; zero is DefaultPassthroughTimeout. For a server-streaming
-	// method it bounds the issue alone; the stream itself is bounded by
-	// MaxStreamDuration.
+	// method it bounds the issue, and then the module's first message; the
+	// stream after that is bounded by MaxStreamDuration.
 	Timeout time.Duration
 	// MaxStreamDuration bounds how long one stream of a server-streaming
 	// method stays open, from the call to its last message; zero is

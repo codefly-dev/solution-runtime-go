@@ -119,18 +119,23 @@ nothing:
   calling a route as a tool sends the child the authority issued it through
   its binding: `WorkContextPrincipals` names the person as owner and the module
   as current actor, and `ActorChain()` the whole chain.
-- **Which routes it reaches**: the `Check` names the route, `"<VERB> <path>"`
-  as this module serves it, and the authority applies this module's delivered
-  route policy (the `"<VERB> <template>"` rows the CLI derives from the
-  published contract's `x-codefly-authority-policy`). A route the call does
+- **Which routes it reaches**: the `Check` names the operation the request was
+  dispatched to, `"<VERB> <template>"` exactly as its row is published, and
+  the authority applies this module's delivered route policy (the
+  `"<VERB> <template>"` rows the CLI derives from the published contract's
+  `x-codefly-authority-policy`). The request's own path is never what is
+  asked about: an encoded `/` in a segment (`/pages/a%2Fhistory`) runs the
+  `/pages/{id}` operation while its decoded path reads as `/pages/{id}/history`,
+  and a subtree and a `{id}` route the mux tells apart would both match it. A route the call does
   not hold, one that declares nothing, and one not served are answered 403
   with the authority's reason. Under `hop/ENFORCEMENT=warn` the check is
   advisory: the route goes through and the refusal is logged. An authority
   that cannot be reached refused nobody: the request is answered 503, naming
   that, never 401.
 - **The operation checked is the operation run.** A request is served by the
-  operation declared for its method on its path, so the `"<VERB> <path>"` the
-  authority is asked about is the operation whose handler runs. A method the
+  operation declared for its method on its path, and the `"<VERB> <template>"`
+  the authority is asked about is that operation's, so it is the operation
+  whose handler runs. A method the
   path does not declare is answered 405, naming the methods it serves (and
   `Allow`), before the authority is asked or any handler runs. The boot
   refuses an operation with no policy, an undocumented one, one method
@@ -642,9 +647,10 @@ hold: `solution.Requires(kind, actions...)` or `solution.AnyCheckedCaller()`,
 the same shape as the authority's `authority.hop.v1.Policy`. The artifact
 writes it as the operation's `x-codefly-authority-policy`, the extension the
 CLI derives the solution's route rows from, and an operation that declares
-none, or both, is refused at generation by name. A backend renders its artifact with no `BasePath`: its operations already
-carry the `/v1/<id>` the edge forwards them on, so each route is written as
-served and matches the `"<VERB> <path>"` the runtime's `Check` names. A path
+none, or both, is refused at generation by name. The artifact has no base path
+(`InterfaceInfo` has no `BasePath`): the edge forwards a solution's requests on
+`/v1/<id>`, which its operations already carry, so each route is written as
+served and is the `"<VERB> <template>"` the runtime's `Check` names. A path
 ending in `/` serves its subtree and is written `/…/{path=**}`. The passthrough
 routes `InterfaceArtifact` publishes beside the solution's own are any checked
 caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
@@ -655,6 +661,14 @@ caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
 > decoding and frontend validation; sdk-go owns resolution and endpoint
 > admission; the authority client owns the authority's wire. Local source
 > composition does not require publishing a release.
+>
+> **Open: the authority pins.** `codefly-dev/authority/libraries/authority-client/go`
+> and `.../hop/go` are pinned at commits that are, today, only on the unmerged
+> `authority/vision` branch of `codefly-dev/authority`. The module is private
+> and fetched direct, so a squash merge and a branch deletion would orphan both
+> commits. This closes when authority#1 merges **with a merge commit** (which
+> keeps both commits reachable from `main`) and this runtime re-pins to that
+> merge or a tag; no runtime release is cut before then.
 ### Shared frontend validation and headless components
 
 `Manifest.Frontend == nil` declares a headless component: it boots normally and

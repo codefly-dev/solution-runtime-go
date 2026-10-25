@@ -38,7 +38,7 @@ func documentedOperations() []Operation {
 }
 
 func TestInterfaceDocumentDescribesGeneratedMessagesFromTheirDescriptor(t *testing.T) {
-	raw, err := InterfaceDocument(InterfaceInfo{Title: "example backend", Version: "1.2.3", BasePath: "/solutions/example", OperationPrefix: "Example", Tag: "example"}, documentedOperations())
+	raw, err := InterfaceDocument(InterfaceInfo{Title: "example backend", Version: "1.2.3", OperationPrefix: "Example", Tag: "example"}, documentedOperations())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestInterfaceDocumentDescribesGeneratedMessagesFromTheirDescriptor(t *testi
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.BasePath != "/solutions/example" || doc.Paths["/nodes/tree"]["get"]["operationId"] != "Example_Get_Nodes_Tree" {
+	if doc.BasePath != "" || doc.Paths["/nodes/tree"]["get"]["operationId"] != "Example_Get_Nodes_Tree" {
 		t.Fatalf("document = %s", raw)
 	}
 	rule, ok := doc.Definitions["GoogleApiHttpRule"]
@@ -135,7 +135,8 @@ func authorityOperations() []Operation {
 // TestInterfaceDocumentWritesEachOperationsPolicyAtTheRouteAsServed: the row
 // the CLI derives is "<VERB> <basePath><path>" with the operation's
 // x-codefly-authority-policy, and the runtime asks the authority's Check for
-// "<VERB> <path>" as served, so an authority-served document has no base path,
+// the dispatched operation's "<VERB> <template>" as served, so the document
+// has no base path (InterfaceInfo has none to give),
 // every route its full served path, a subtree its "{path=**}" template, and
 // each policy in the authority.hop.v1.Policy JSON the CLI decodes.
 func TestInterfaceDocumentWritesEachOperationsPolicyAtTheRouteAsServed(t *testing.T) {
