@@ -254,6 +254,17 @@ func TestInterfaceDocumentGivesEveryOperationItsOwnID(t *testing.T) {
 		t.Fatalf("POST /v1/example/upload-access is %v", id)
 	}
 
+	// A path and the subtree under it are two operations, with two ids.
+	path, subtree := refused, refused
+	path.Path, subtree.Path = "/v1/example/mcp", "/v1/example/mcp/"
+	raw, err = InterfaceDocument(InterfaceInfo{OperationPrefix: "Example"}, []Operation{path, subtree})
+	if err != nil {
+		t.Fatalf("a path and its subtree: %v", err)
+	}
+	if !strings.Contains(string(raw), `"Example_Get_V1_Example_Mcp"`) || !strings.Contains(string(raw), `"Example_Get_V1_Example_Mcp_Path"`) {
+		t.Fatalf("a path and its subtree are not two ids: %s", raw)
+	}
+
 	// "/A/b" and "/a/b" are two routes the derivation spells alike.
 	upper, lower := refused, refused
 	upper.Path, lower.Path = "/A/b", "/a/b"

@@ -207,7 +207,7 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		if _, taken := paths[route][method]; taken {
 			return nil, fmt.Errorf("operation %s %s is declared twice", strings.ToUpper(method), route)
 		}
-		id := operationID(info.OperationPrefix, method, op.Path)
+		id := operationID(info.OperationPrefix, method, route)
 		if other, taken := ids[id]; taken {
 			return nil, fmt.Errorf("operations %s and %s %s share the operationId %q", other, strings.ToUpper(method), route, id)
 		}
@@ -333,13 +333,19 @@ func (o Operation) validate() error {
 	return nil
 }
 
-// operationID renders GET "/sources" as "<prefix>_Get_Sources"; a nested
-// path contributes one segment per level rather than carrying a slash into an
-// identifier. The method is part of it because two methods on one path are
-// two operations, and an operationId names exactly one.
-func operationID(prefix, method, path string) string {
+// operationID renders GET "/sources" as "<prefix>_Get_Sources" from the
+// method and the route as served (servedRoute); a nested path contributes one
+// segment per level rather than carrying a slash into an identifier, and a
+// wildcard its name ("/x/{path=**}" ends "_X_Path"), so a path and the
+// subtree under it are two ids. The method is part of it because two methods
+// on one path are two operations, and an operationId names exactly one.
+func operationID(prefix, method, route string) string {
 	id := prefix + "_" + title(strings.ToLower(method))
-	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
+	for _, segment := range strings.Split(strings.Trim(route, "/"), "/") {
+		if name, ok := strings.CutPrefix(segment, "{"); ok {
+			name, _, _ = strings.Cut(strings.TrimSuffix(name, "}"), "=")
+			segment = name
+		}
 		id += "_" + title(segment)
 	}
 	return id

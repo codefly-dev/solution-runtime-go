@@ -18,9 +18,10 @@ one path are both kept (the second used to replace the first); one declared
 twice is refused. The passthrough's documented routes carry no policy: the
 module they relay to applies its own.
 
-Each `operationId` is derived from the method and the path
-(`<prefix>_<Method>_<Path…>`, GET `/sources` is `Notes_Get_Sources`), so the
-methods of one path no longer share one; two operations the derivation would
+Each `operationId` is derived from the method and the route as served
+(`<prefix>_<Method>_<Path…>`, GET `/sources` is `Notes_Get_Sources`, a
+subtree `/x/` ends `_X_Path`), so the methods of one path, and a path and the
+subtree under it, no longer share one; two operations the derivation would
 spell alike are refused at generation.
 
 ## Unreleased — under the authority, a route is held to the solution's delivered policy; a module's tool call acts for the person
