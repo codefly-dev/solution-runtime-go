@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/genproto/googleapis/api/annotations"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -331,37 +332,48 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 	if err := os.WriteFile(filepath.Join(dir, "service.codefly.yaml"), []byte("kind: service\nname: backend\nversion: 1.2.3\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	own := Operation{Path: "/own", Summary: "s", Callers: "c", Behavior: "b", Response: map[string]string{},
-		Policy: AnyCheckedCaller(), Handler: func(context.Context, *Gateway) (any, error) { return nil, nil }}
-	doc, err := InterfaceArtifact(dir, InterfaceInfo{Title: "t", BasePath: "/v1/test", OperationPrefix: "Test", Tag: "test"}, []Operation{own}, passthroughModule())
+	server := New(Manifest{ID: "test"}).
+		Operations(served("get", "/v1/test/own", func(context.Context, *Gateway) (any, error) { return nil, nil })).
+		Consumes(passthroughModule()).
+		ServeMCP("tools", "v1", Requires("test.tools", "call"), func(*mcp.Server) {})
+	doc, err := server.InterfaceArtifact(dir, InterfaceInfo{Title: "t", OperationPrefix: "Test", Tag: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var parsed struct {
-		Info  struct{ Version string } `json:"info"`
-		Paths map[string]any           `json:"paths"`
+		Info  struct{ Version string }             `json:"info"`
+		Paths map[string]map[string]map[string]any `json:"paths"`
 	}
 	if err := json.Unmarshal(doc, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Info.Version != "1.2.3" || parsed.Paths["/own"] == nil || parsed.Paths[searchPath] == nil {
+	policyAt := func(method, path string) string {
+		t.Helper()
+		policy, ok := parsed.Paths[path][method][PolicyExtension]
+		if !ok {
+			t.Fatalf("%s %s is not published with a policy: %v", method, path, parsed.Paths[path])
+		}
+		out, _ := json.Marshal(policy)
+		return string(out)
+	}
+	if parsed.Info.Version != "1.2.3" || len(parsed.Paths) != 3 {
 		t.Fatalf("artifact: version %q, paths %v", parsed.Info.Version, parsed.Paths)
 	}
-	// A relayed route is held to its module's own method policy, by the hop
-	// in front of the module: it carries none of the solution's.
-	relayed, _ := json.Marshal(parsed.Paths[searchPath])
-	if strings.Contains(string(relayed), PolicyExtension) {
-		t.Fatalf("a relayed route declares a solution policy: %s", relayed)
+	// Every served route is published at the path it is served at, with the
+	// policy a call to it must hold: the solution's own operation, the MCP
+	// route with the policy ServeMCP declared, and each relayed route with
+	// any checked caller, the child issued through the binding and the
+	// module's own method policy being what gates the call.
+	for route, want := range map[[2]string]string{
+		{"get", "/v1/test/own"}:           `{"any_checked_caller":true}`,
+		{"post", "/v1/test/mcp"}:          `{"requires":[{"actions":["call"],"resource_kind":"test.tools"}]}`,
+		{"post", "/v1/test" + searchPath}: `{"any_checked_caller":true}`,
+	} {
+		if got := policyAt(route[0], route[1]); got != want {
+			t.Errorf("%s %s publishes %s, want %s", route[0], route[1], got, want)
+		}
 	}
-	ops, err := PassthroughOperations(passthroughModule())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ops[0].Policy = AnyCheckedCaller()
-	if _, err := InterfaceDocument(InterfaceInfo{}, ops); err == nil {
-		t.Fatal("a relayed route rendered with a solution policy")
-	}
-	if _, err := InterfaceArtifact(t.TempDir(), InterfaceInfo{}, nil); err == nil {
+	if _, err := New(Manifest{ID: "test"}).InterfaceArtifact(t.TempDir(), InterfaceInfo{}); err == nil {
 		t.Fatal("a backend with no service manifest rendered a version")
 	}
 }

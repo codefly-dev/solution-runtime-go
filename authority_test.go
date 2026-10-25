@@ -142,7 +142,7 @@ func authorityServer(t *testing.T) (*Server, *interfaceAuthority) {
 	if err := os.WriteFile(credential, []byte("workload-credential"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	host, err := dialAuthority("grpc://"+address, credential, "page", false)
+	host, err := dialAuthority("grpc://"+address, meshTransport{local: true}, credential, "page", false)
 	if err != nil {
 		t.Fatal(err)
 	}

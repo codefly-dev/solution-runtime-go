@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -18,8 +17,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	authorityv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/authority/v1"
+	hop "github.com/codefly-dev/authority/libraries/hop/go"
+	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // The authority interface (codefly-dev/authority): the authority gateway on a
@@ -59,6 +59,12 @@ var ErrNoViewer = errors.New("the authority does not check the Work Context this
 // the authority's reason.
 var ErrRequestRefused = errors.New("the authority refuses this request")
 
+// ErrAuthorityUnavailable is a request the authority could not be asked about:
+// it did not answer, or failed. Nobody refused it, so it is not answered as a
+// sign-in (401) but 503, by this name; the transport's own text, which can
+// name an address, goes to the log.
+var ErrAuthorityUnavailable = errors.New("the authority could not be reached to check this request; try again")
+
 // hostAuthority is the runtime's connection to the authority interface.
 type hostAuthority struct {
 	conn      *grpc.ClientConn
@@ -66,9 +72,11 @@ type hostAuthority struct {
 	// principal is this module's: the audience a context the edge sends it is
 	// addressed to.
 	principal string
-	// credential is this workload's credential as the run attests it, read on
-	// every call so a rotation takes effect.
-	credential func() (string, error)
+	// outbound is the hop library's issue, over the authority's generated
+	// client, with this workload's credential as the run attests it, read on
+	// every call so a rotation takes effect. Every Work Context this runtime
+	// acts under is asked through it.
+	outbound hop.Outbound
 	// advisory is hop/ENFORCEMENT=warn: the route check is asked as advice,
 	// and a route the call does not hold is let through with the authority's
 	// reason logged. A Work Context the authority does not check is refused
@@ -76,33 +84,30 @@ type hostAuthority struct {
 	advisory bool
 }
 
-// dialAuthority connects to the authority at endpoint. The connection is
-// in-cell transport, which the mesh carries; the runtime terminates no TLS to
-// it.
-func dialAuthority(endpoint, tokenFile, principal string, advisory bool) (*hostAuthority, error) {
+// dialAuthority connects to the authority at endpoint. Every person's Work
+// Context and this workload's credential travel on it, so where it may go is
+// the SDK's one rule for a credential's destination, as for every relayed
+// module (dialModule): https anywhere; cleartext to a loopback host on a local
+// run, or to an in-cluster address the mesh carries.
+func dialAuthority(endpoint string, transport workcontext.TransportSource, tokenFile, principal string, advisory bool) (*hostAuthority, error) {
 	target := strings.TrimSpace(endpoint)
-	for _, scheme := range []string{"grpc://", "http://", "tcp://"} {
+	for _, scheme := range []string{"http://", "tcp://"} {
 		target = strings.TrimPrefix(target, scheme)
 	}
 	if target == "" {
 		return nil, fmt.Errorf("%s/%s names no address", AuthorityInterfaceGroup, AuthorityEndpointKey)
 	}
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := dialModule(target, transport, AuthorityInterfaceGroup+"/"+AuthorityEndpointKey)
 	if err != nil {
 		return nil, fmt.Errorf("%s/%s: %w", AuthorityInterfaceGroup, AuthorityEndpointKey, err)
 	}
+	authority := authorityv1.NewAuthorityServiceClient(conn)
 	return &hostAuthority{
 		conn:      conn,
-		authority: authorityv1.NewAuthorityServiceClient(conn),
+		authority: authority,
 		principal: principal,
 		advisory:  advisory,
-		credential: func() (string, error) {
-			raw, err := os.ReadFile(tokenFile)
-			if err != nil || strings.TrimSpace(string(raw)) == "" {
-				return "", fmt.Errorf("this workload's credential at %s is missing or empty (declare module-identity)", tokenFile)
-			}
-			return strings.TrimSpace(string(raw)), nil
-		},
+		outbound:  hop.Outbound{Authority: authority, Credential: hop.FileCredential(tokenFile)},
 	}, nil
 }
 
@@ -122,8 +127,12 @@ func (h *hostAuthority) viewer(ctx context.Context, workContext, route string) (
 		}
 		return nil, fmt.Errorf("%w: %s", ErrRequestRefused, status.Convert(err).Message())
 	}
-	if err != nil || checked.GetContext().GetTenantId() == "" {
-		return nil, ErrNoViewer
+	if err != nil {
+		log.Printf("the authority's Check of %q failed: %v", route, err)
+		return nil, ErrAuthorityUnavailable
+	}
+	if checked.GetContext().GetTenantId() == "" {
+		return nil, fmt.Errorf("%w: the authority named no organization for it", ErrNoViewer)
 	}
 	if advice := checked.GetRefusal(); advice != "" {
 		log.Printf("PERMISSIVE (%s/%s=warn): let through %s, which the authority refused: %s", EnforcementGroup, EnforcementKey, route, advice)
@@ -146,66 +155,60 @@ func principalsOf(wc *authorityv1.WorkContextV1) (WorkContextPrincipals, []strin
 	return principals, actors
 }
 
-// issueChild asks the authority for a child of the viewer's Work Context
-// through one of this module's bindings: the audience is the binding's, and the
-// scopes the binding's invoke ceiling narrowed to what was asked and to what
-// the person holds there.
+// issueChild asks the authority, through the hop library's Outbound, for a
+// child of the viewer's Work Context through one of this module's bindings:
+// the audience is the binding's, and the scopes the binding's invoke ceiling
+// narrowed to what was asked and to what the person holds there.
 func (h *hostAuthority) issueChild(ctx context.Context, parent, binding string, scopes []workContextScope) (string, time.Time, WorkContextPrincipals, error) {
-	credential, err := h.credential()
-	if err != nil {
-		return "", time.Time{}, WorkContextPrincipals{}, err
-	}
-	req := &authorityv1.IssueRequest{
-		As:                 &authorityv1.IssueRequest_ParentToken{ParentToken: parent},
-		Actor:              &authorityv1.WorkloadCredential{Credential: credential},
-		OperationBindingId: binding,
-	}
+	asked := make([]*authorityv1.WorkScopeV1, 0, len(scopes))
 	for _, scope := range scopes {
-		req.Scopes = append(req.Scopes, &authorityv1.WorkScopeV1{ResourceKind: scope.ResourceKind, Actions: scope.Actions, ResourceIds: scope.ResourceIDs})
+		asked = append(asked, &authorityv1.WorkScopeV1{ResourceKind: scope.ResourceKind, Actions: scope.Actions, ResourceIds: scope.ResourceIDs})
 	}
-	return h.issue(ctx, req)
-}
-
-// issueForBinding asks the authority for this module's own Work Context
-// through one of its declared bindings, in the viewer's organization: the
-// binding's headless scopes, with no person in it.
-func (h *hostAuthority) issueForBinding(ctx context.Context, organization, binding string) (string, time.Time, WorkContextPrincipals, error) {
-	credential, err := h.credential()
-	if err != nil {
-		return "", time.Time{}, WorkContextPrincipals{}, err
-	}
-	return h.issue(ctx, &authorityv1.IssueRequest{
-		As:                 &authorityv1.IssueRequest_Workload{Workload: &authorityv1.WorkloadCredential{Credential: credential}},
-		OrganizationId:     organization,
-		OperationBindingId: binding,
-	})
-}
-
-func (h *hostAuthority) issue(ctx context.Context, req *authorityv1.IssueRequest) (string, time.Time, WorkContextPrincipals, error) {
 	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
 	defer cancel()
-	issued, err := h.authority.Issue(ctx, req)
+	return held(h.outbound.IssueForParent(ctx, parent, binding, hop.Scopes(asked...)))
+}
+
+// issueForBinding asks the authority, through Outbound, for this module's own
+// Work Context through one of its declared bindings, in the viewer's
+// organization: the binding's headless scopes, with no person in it.
+func (h *hostAuthority) issueForBinding(ctx context.Context, organization, binding string) (string, time.Time, WorkContextPrincipals, error) {
+	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
+	defer cancel()
+	return held(h.outbound.IssueForModule(ctx, organization, binding))
+}
+
+// held is an issue as the gateway's cache holds it: the token, the instant to
+// renew it by, and whom the authority issued it for; or the authority's
+// refusal, answered with its status and reason.
+func held(issued hop.Issued, err error) (string, time.Time, WorkContextPrincipals, error) {
 	if err != nil {
-		refusal := &WorkContextRefusal{Audience: req.GetAudience(), StatusCode: refusalStatus(err), code: connect.Code(status.Code(err))}
+		var carrier interface{ GRPCStatus() *status.Status }
+		if !errors.As(err, &carrier) {
+			// Not the authority's answer: the credential could not be read,
+			// which names its own cause.
+			return "", time.Time{}, WorkContextPrincipals{}, err
+		}
+		st := carrier.GRPCStatus()
+		refusal := &WorkContextRefusal{StatusCode: refusalStatus(st.Err()), code: connect.Code(st.Code())}
 		// The authority's reason for refusing the ask is the refusal's; a
 		// failure to reach it is nobody's refusal, and its text, which can name
 		// an address, is not kept.
 		if refusal.StatusCode < http.StatusInternalServerError {
-			refusal.Reason = status.Convert(err).Message()
+			refusal.Reason = st.Message()
 		}
 		return "", time.Time{}, WorkContextPrincipals{}, refusal
 	}
-	principals, _ := principalsOf(issued.GetContext())
-	expires := time.Unix(issued.GetExpiresAtUnix(), 0)
-	lifetime := time.Until(expires)
-	if issued.GetToken() == "" || lifetime < workContextMinimumLifetime {
-		return "", time.Time{}, WorkContextPrincipals{}, fmt.Errorf("the authority issued no usable Work Context for %q", req.GetAudience())
+	principals, _ := principalsOf(issued.Context)
+	lifetime := time.Until(issued.ExpiresAt)
+	if issued.Token == "" || lifetime < workContextMinimumLifetime {
+		return "", time.Time{}, WorkContextPrincipals{}, errors.New("the authority issued no usable Work Context")
 	}
 	lead := workContextRenewal
 	if half := lifetime / 2; half < lead {
 		lead = half
 	}
-	return issued.GetToken(), expires.Add(-lead), principals, nil
+	return issued.Token, issued.ExpiresAt.Add(-lead), principals, nil
 }
 
 func (h *hostAuthority) Close() error { return h.conn.Close() }

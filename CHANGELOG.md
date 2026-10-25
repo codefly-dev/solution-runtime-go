@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased — the operation checked is the operation run; every served route publishes its policy (breaking)
+
+From the independent review of 2026-10-25 (F1–F4, F10, F11):
+
+- **Dispatch by method and path (F1, security).** The runtime picked a
+  handler by path alone, so with a GET (read policy) and a POST (write policy)
+  on one path, a GET checked against the read row ran the POST handler. A
+  request is now answered by the operation declared for its method on its
+  path, which is the operation the authority's `Check` names; a method the
+  path does not declare is answered 405, naming the methods it serves (and
+  `Allow`), before the authority is asked or any handler runs. The boot
+  refuses an operation that declares no policy, is undocumented, declares one
+  method twice on a path, or names a method that is not an operation's.
+  `Server.Handle` and `Server.HandleRequest`, which registered a route with
+  no method and no policy, are deleted: `Operations` is the one way a backend
+  serves a route of its own.
+- **Issues go through the authority's hop library (F2).** `ForParent` and
+  `ForBinding` ask through `hop.Outbound.IssueForParent` / `IssueForModule`
+  (codefly-dev/authority `libraries/hop/go`, extended for it) with
+  `hop.FileCredential` at the projected path; the runtime builds no
+  `IssueRequest` and reads no credential file of its own.
+- **The MCP route publishes its policy (F3).** `ServeMCP(name, version,
+  policy, register)` takes the policy a call to `POST /v1/<id>/mcp` must hold,
+  and the interface artifact publishes it there, so the CLI's rows include the
+  route and an enforcing authority admits it. Only POST is served.
+- **Relayed routes are any checked caller's (F4).** Every relayed
+  `/v1/<id>/modules/<as>/...` route is published with
+  `{"any_checked_caller": true}` and the passthrough's `Check` names it as
+  served; the gate on a relayed call is the per-call child issued through the
+  solution's binding (the person's current grants ∩ the binding) and the
+  module's own method policy at its hop. The README says why. A route refusal
+  reaches the page as `permission_denied`.
+- **`InterfaceArtifact` is the server's (breaking).** `Server.InterfaceArtifact(dir,
+  info)` renders the artifact from what the server serves — its operations,
+  its MCP route and the passthrough at the paths they are served at — so a
+  route cannot be served without a row. The free `InterfaceArtifact(dir, info,
+  ops, modules...)` is deleted.
+- **An authority outage is named (F10).** A `Check` the authority did not
+  answer is 503 `ErrAuthorityUnavailable` (Connect `unavailable`), never a
+  401 that reads as "sign in".
+- **The authority endpoint passes the SDK's credential-destination rule
+  (F11).** It is dialled through the same `workcontext.AdmitEndpoint` rule as
+  every relayed module.
+
 ## Unreleased — the runtime runs only under the authority; the saas-host mode is deleted (breaking)
 
 Since the passthrough relays only through the authority, nothing a consuming

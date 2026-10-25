@@ -495,7 +495,17 @@ func codeForStatus(status int) connect.Code {
 
 // PassthroughOperations documents the declared methods for the interface
 // artifact, in path order, so a solution's committed description of what its
-// page may call is rendered from the same declaration the runtime serves.
+// page may call is rendered from the same declaration the runtime serves. Each
+// path is relative to the solution's route (/modules/<as>/...); the server's
+// InterfaceArtifact publishes them under it, as served.
+//
+// Every relayed route declares that any checked caller may make it. The gate on
+// a relayed call is not a row of the solution's: it is the child the authority
+// issues for the call through the solution's binding for the module (the
+// person's current grants there, within the binding's ceiling) and the
+// module's own method policy, which its hop applies to that child. The route's
+// row says so, so an enforcing authority admits the route for what it is
+// rather than refusing it for declaring nothing.
 func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 	routes, err := resolvePassthrough(modules)
 	if err != nil {
@@ -540,9 +550,9 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			// Documentation only: InterfaceDocument requires a handler, and the
 			// passthrough, not Operations, serves these routes.
 			Handler: func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the passthrough") },
-			// The module holds each call to its own method policy: the route
-			// declares none of the solution's.
-			relayed: true,
+			// Any checked caller: the child issued through the binding and the
+			// module's own method policy gate the call (see above).
+			Policy: AnyCheckedCaller(),
 		})
 	}
 	return ops, nil
@@ -563,12 +573,19 @@ type describedMessage struct {
 
 func (d describedMessage) messageDescriptor() protoreflect.MessageDescriptor { return d.md }
 
-// InterfaceArtifact renders the interface artifact of the solution backend
-// rooted at dir: its own operations and the consumed-module operations its
-// page may call, at the version its service.codefly.yaml declares. The
-// artifact carries the version the platform ships, never a second number kept
-// in step by hand. An empty info.Version is read from the manifest.
-func InterfaceArtifact(dir string, info InterfaceInfo, ops []Operation, modules ...ConsumedModule) ([]byte, error) {
+// InterfaceArtifact renders the interface artifact of this solution backend,
+// rooted at dir, from the declaration it serves: every route it serves, each
+// with the policy a call to it must hold — its operations, its MCP route when
+// it declares one, and the relayed module routes its page may call, at the
+// path each is served at — at the version its service.codefly.yaml declares.
+// The artifact carries the version the platform ships, never a second number
+// kept in step by hand. An empty info.Version is read from the manifest.
+//
+// It is the document `codefly generate contracts` publishes as the http
+// endpoint's contract, from which the CLI derives the route rows the
+// authority's Check applies. Rendered from the server itself, a route cannot
+// be served without a row, nor published without being served.
+func (s *Server) InterfaceArtifact(dir string, info InterfaceInfo) ([]byte, error) {
 	if info.Version == "" {
 		version, err := ServiceVersion(dir)
 		if err != nil {
@@ -576,11 +593,22 @@ func InterfaceArtifact(dir string, info InterfaceInfo, ops []Operation, modules 
 		}
 		info.Version = version
 	}
-	consumed, err := PassthroughOperations(modules...)
+	ops := append([]Operation{}, s.operations...)
+	if s.mcp != nil {
+		if err := s.validateMCPDeclaration(); err != nil {
+			return nil, err
+		}
+		ops = append(ops, s.mcpOperation())
+	}
+	consumed, err := PassthroughOperations(s.consumed...)
 	if err != nil {
 		return nil, err
 	}
-	return InterfaceDocument(info, append(append([]Operation{}, ops...), consumed...))
+	for _, op := range consumed {
+		op.Path = s.authorityRoute() + op.Path
+		ops = append(ops, op)
+	}
+	return InterfaceDocument(info, ops)
 }
 
 // ServiceVersion is the version the service manifest (service.codefly.yaml)

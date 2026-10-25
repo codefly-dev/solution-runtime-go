@@ -14,8 +14,7 @@ import (
 
 func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 	s, _ := authorityServer(t)
-	s.handlers = map[string]RequestHandler{}
-	s.HandleRequest("/ask", func(r *http.Request, gw *Gateway) (any, error) {
+	ask := func(r *http.Request, gw *Gateway) (any, error) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			return nil, err
@@ -30,7 +29,7 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 			t.Errorf("the viewer's organization is %q, not the authority's answer", gw.OrgID())
 		}
 		return map[string]string{"answer": "ok"}, nil
-	})
+	}
 	for _, workContext := range []string{"", edgeContext} {
 		req := httptest.NewRequest("POST", "/ask?mode=notes", strings.NewReader(`{"question":"why?"}`))
 		req = req.WithContext(context.WithValue(req.Context(), requestTestKey{}, "request-context"))
@@ -38,7 +37,7 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 			req.Header.Set(WorkContextHeader, workContext)
 		}
 		rec := httptest.NewRecorder()
-		s.wrapRequest(s.handlers["/ask"])(rec, req)
+		s.wrapRequest(ask)(rec, req)
 		want := http.StatusOK
 		if workContext == "" {
 			want = http.StatusUnauthorized
@@ -53,8 +52,7 @@ type requestTestKey struct{}
 
 func TestRequestHandlerRejectsInvalidInput(t *testing.T) {
 	s, _ := authorityServer(t)
-	s.handlers = map[string]RequestHandler{}
-	s.HandleRequest("/ask", func(r *http.Request, _ *Gateway) (any, error) {
+	ask := func(r *http.Request, _ *Gateway) (any, error) {
 		body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 32))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
@@ -73,7 +71,7 @@ func TestRequestHandlerRejectsInvalidInput(t *testing.T) {
 			return nil, fmt.Errorf("private validation context: %w", &ClientError{StatusCode: http.StatusUnprocessableEntity, Message: "question required"})
 		}
 		return map[string]string{"answer": input.Question}, nil
-	})
+	}
 	for _, tc := range []struct {
 		name, body string
 		status     int
@@ -88,7 +86,7 @@ func TestRequestHandlerRejectsInvalidInput(t *testing.T) {
 			req := httptest.NewRequest("POST", "/ask", strings.NewReader(tc.body))
 			req.Header.Set(WorkContextHeader, edgeContext)
 			rec := httptest.NewRecorder()
-			withCORS(s.wrapRequest(s.handlers["/ask"]))(rec, req)
+			withCORS(s.wrapRequest(ask))(rec, req)
 			if rec.Code != tc.status {
 				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 			}
@@ -126,14 +124,14 @@ func TestHandlerErrorStatusContract(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _ := authorityServer(t)
-			s.handlers = map[string]RequestHandler{}
-			s.Handle("/legacy", func(context.Context, *Gateway) (any, error) { return nil, tc.err })
-			s.HandleRequest("/request", func(*http.Request, *Gateway) (any, error) { return nil, tc.err })
-			for _, path := range []string{"/legacy", "/request"} {
+			for path, op := range map[string]Operation{
+				"/handler": {Handler: func(context.Context, *Gateway) (any, error) { return nil, tc.err }},
+				"/request": {RequestHandler: func(*http.Request, *Gateway) (any, error) { return nil, tc.err }},
+			} {
 				req := httptest.NewRequest("POST", path, nil)
 				req.Header.Set(WorkContextHeader, edgeContext)
 				rec := httptest.NewRecorder()
-				s.wrapRequest(s.handlers[path])(rec, req)
+				s.wrapRequest(op.requestHandler())(rec, req)
 				if rec.Code != tc.status {
 					t.Fatalf("%s: status %d: %s", path, rec.Code, rec.Body.String())
 				}

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -68,10 +70,6 @@ type Operation struct {
 	// Exactly one of Handler and RequestHandler answers the route.
 	Handler        Handler
 	RequestHandler RequestHandler
-	// relayed marks a passthrough route documented beside the solution's own
-	// (PassthroughOperations): the module it relays to holds each call to its
-	// own method policy, so it declares none here and carries none.
-	relayed bool
 }
 
 // Policy is what a call to an operation must hold: the authority's
@@ -138,16 +136,90 @@ type QueryParameter struct {
 	Required bool
 }
 
-// Operations registers each operation's handler at its path.
+// Operations declares the routes this backend serves itself. Chainable. Each
+// is served for its own method only: a request is answered by the operation
+// declared for its method on its path, which is the operation the authority's
+// Check is asked about ("<VERB> <path>"), and a method the path does not
+// declare is refused by name before the authority is asked or any handler
+// runs. The boot refuses an operation that is undocumented, declares no
+// policy, names a method twice on one path, or takes the MCP route.
 func (s *Server) Operations(ops ...Operation) *Server {
-	for _, op := range ops {
-		if op.RequestHandler != nil {
-			s.HandleRequest(op.Path, op.RequestHandler)
-		} else {
-			s.Handle(op.Path, op.Handler)
-		}
-	}
+	s.operations = append(s.operations, ops...)
 	return s
+}
+
+// servedMethods are the methods an operation may declare. OPTIONS is the CORS
+// preflight the runtime answers on every declared path, never an operation.
+var servedMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+
+// verb is the operation's method as a request spells it.
+func (o Operation) verb() string { return strings.ToUpper(cmp.Or(o.Method, "get")) }
+
+// requestHandler is whichever of the operation's two handler shapes it set.
+func (o Operation) requestHandler() RequestHandler {
+	if o.RequestHandler != nil {
+		return o.RequestHandler
+	}
+	handler := o.Handler
+	return func(r *http.Request, gw *Gateway) (any, error) { return handler(r.Context(), gw) }
+}
+
+// operationTable is the declared operations by path and then by method, or the
+// refusal of the first that cannot be served as declared.
+func (s *Server) operationTable() (map[string]map[string]RequestHandler, error) {
+	table := map[string]map[string]RequestHandler{}
+	for _, op := range s.operations {
+		if err := op.validate(); err != nil {
+			return nil, err
+		}
+		if table[op.Path] == nil {
+			table[op.Path] = map[string]RequestHandler{}
+		}
+		if _, taken := table[op.Path][op.verb()]; taken {
+			return nil, fmt.Errorf("operation %s %s is declared twice: one request would have two handlers", op.verb(), op.Path)
+		}
+		table[op.Path][op.verb()] = op.requestHandler()
+	}
+	return table, nil
+}
+
+// mountOperations serves each declared path on mux, dispatching on the
+// request's method to the operation declared for it.
+func (s *Server) mountOperations(mux *http.ServeMux) error {
+	table, err := s.operationTable()
+	if err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	for path, methods := range table {
+		served := make(map[string]http.HandlerFunc, len(methods))
+		for method, handler := range methods {
+			served[method] = s.wrapRequest(handler)
+		}
+		mux.HandleFunc(path, withCORS(byMethod(path, served)))
+	}
+	return nil
+}
+
+// byMethod answers a request with the handler declared for its method on
+// path, or refuses a method path does not declare, by name, with the methods
+// it does (405, and Allow).
+func byMethod(path string, served map[string]http.HandlerFunc) http.HandlerFunc {
+	methods := make([]string, 0, len(served))
+	for method := range served {
+		methods = append(methods, method)
+	}
+	slices.Sort(methods)
+	allowed := strings.Join(methods, ", ")
+	return func(w http.ResponseWriter, r *http.Request) {
+		handler, ok := served[r.Method]
+		if !ok {
+			w.Header().Set("Allow", allowed)
+			message := fmt.Sprintf("%s is not an operation of %s: it serves %s", r.Method, path, allowed)
+			writeRefusal(w, r, http.StatusMethodNotAllowed, message, nil)
+			return
+		}
+		handler(w, r)
+	}
 }
 
 // InterfaceInfo is the document-level description of a solution's interface
@@ -322,13 +394,11 @@ func (o Operation) validate() error {
 		return fmt.Errorf("operation %s has no handler", o.Path)
 	case o.Handler != nil && o.RequestHandler != nil:
 		return fmt.Errorf("operation %s declares two handlers", o.Path)
-	case o.relayed && o.Policy != nil:
-		return fmt.Errorf("operation %s is relayed to a module, which holds each call to its own method policy; it declares none", o.Path)
+	case !slices.Contains(servedMethods, o.verb()):
+		return fmt.Errorf("operation %s declares the method %q: an operation is one of %s", o.Path, o.Method, strings.Join(servedMethods, ", "))
 	}
-	if !o.relayed {
-		if err := o.Policy.validate(); err != nil {
-			return fmt.Errorf("operation %s %s %w", strings.ToUpper(cmp.Or(o.Method, "get")), o.Path, err)
-		}
+	if err := o.Policy.validate(); err != nil {
+		return fmt.Errorf("operation %s %s %w", o.verb(), o.Path, err)
 	}
 	return nil
 }

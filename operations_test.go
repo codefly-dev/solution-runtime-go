@@ -101,13 +101,12 @@ func TestInterfaceDocumentRefusesAnUndocumentedOperation(t *testing.T) {
 
 func TestOperationsServesEachDeclaredRoute(t *testing.T) {
 	s, _ := authorityServer(t)
-	s.handlers = map[string]RequestHandler{}
 	s.Operations(documentedOperations()...)
-	handler, ok := s.handlers["/nodes/tree"]
-	if !ok {
-		t.Fatalf("the declared route was not registered: %v", s.handlers)
+	mux := http.NewServeMux()
+	if err := s.mountOperations(mux); err != nil {
+		t.Fatal(err)
 	}
-	srv := httptest.NewServer(s.wrapRequest(handler))
+	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/nodes/tree", nil)
 	req.Header.Set(WorkContextHeader, edgeContext)

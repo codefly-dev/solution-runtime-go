@@ -38,8 +38,7 @@ type askOutput struct {
 func mcpPage(t *testing.T, register func(*mcp.Server)) (*httptest.Server, *Server, *interfaceAuthority) {
 	t.Helper()
 	s, stand := authorityServer(t)
-	s.handlers = map[string]RequestHandler{}
-	s.ServeMCP("page", "v1", register)
+	s.ServeMCP("page", "v1", AnyCheckedCaller(), register)
 	mux := http.NewServeMux()
 	if err := s.mountMCP(mux); err != nil {
 		t.Fatal(err)
@@ -49,11 +48,11 @@ func mcpPage(t *testing.T, register func(*mcp.Server)) (*httptest.Server, *Serve
 	return page, s, stand
 }
 
-func connectMCP(t *testing.T, page *httptest.Server, workContext string) (*mcp.ClientSession, error) {
+func connectMCP(t *testing.T, base string, workContext string) (*mcp.ClientSession, error) {
 	t.Helper()
 	client := mcp.NewClient(&mcp.Implementation{Name: "agent", Version: "v0"}, nil)
 	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
-		Endpoint:   page.URL + "/v1/page" + MCPPath,
+		Endpoint:   base + "/v1/page" + MCPPath,
 		HTTPClient: &http.Client{Transport: edgeTransport{workContext: workContext}},
 	}, nil)
 	if err == nil {
@@ -85,7 +84,7 @@ func TestAnMCPToolCallRunsAsTheViewer(t *testing.T) {
 				return nil, askOutput{Owner: principals.OwnerPrincipalID, Token: token}, err
 			})
 	})
-	session, err := connectMCP(t, page, edgeContext)
+	session, err := connectMCP(t, page.URL, edgeContext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +125,7 @@ func TestAnMCPCallTheAuthorityDoesNotAdmitRunsNoTool(t *testing.T) {
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("a request with no Work Context answered %d", response.StatusCode)
 	}
-	if session, err := connectMCP(t, page, "forged"); err == nil {
+	if session, err := connectMCP(t, page.URL, "forged"); err == nil {
 		if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "ask", Arguments: map[string]any{}}); err == nil {
 			t.Fatal("a forged Work Context reached a tool")
 		}
@@ -147,7 +146,7 @@ func TestAnMCPErrorResultNeverNamesAnAddressThisRuntimeDialled(t *testing.T) {
 			})
 	})
 	s.cfg.dialled = dialledAddresses("hop.internal:9090")
-	session, err := connectMCP(t, page, edgeContext)
+	session, err := connectMCP(t, page.URL, edgeContext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,12 +166,14 @@ func TestAnMCPErrorResultNeverNamesAnAddressThisRuntimeDialled(t *testing.T) {
 func TestAnMCPDeclarationIsRefusedForWhatItLacks(t *testing.T) {
 	register := func(*mcp.Server) {}
 	for name, s := range map[string]*Server{
-		"twice":      New(Manifest{ID: "page"}).ServeMCP("page", "v1", register).ServeMCP("page", "v1", register),
-		"no name":    New(Manifest{ID: "page"}).ServeMCP("", "v1", register),
-		"no version": New(Manifest{ID: "page"}).ServeMCP("page", "", register),
-		"no tools":   New(Manifest{ID: "page"}).ServeMCP("page", "v1", nil),
-		"a handler on its route": New(Manifest{ID: "page"}).ServeMCP("page", "v1", register).
-			Handle("/v1/page/mcp", func(context.Context, *Gateway) (any, error) { return nil, nil }),
+		"twice":        New(Manifest{ID: "page"}).ServeMCP("page", "v1", AnyCheckedCaller(), register).ServeMCP("page", "v1", AnyCheckedCaller(), register),
+		"no name":      New(Manifest{ID: "page"}).ServeMCP("", "v1", AnyCheckedCaller(), register),
+		"no version":   New(Manifest{ID: "page"}).ServeMCP("page", "", AnyCheckedCaller(), register),
+		"no tools":     New(Manifest{ID: "page"}).ServeMCP("page", "v1", AnyCheckedCaller(), nil),
+		"no policy":    New(Manifest{ID: "page"}).ServeMCP("page", "v1", nil, register),
+		"empty policy": New(Manifest{ID: "page"}).ServeMCP("page", "v1", &Policy{}, register),
+		"an operation on its route": New(Manifest{ID: "page"}).ServeMCP("page", "v1", AnyCheckedCaller(), register).
+			Operations(served("get", "/v1/page/mcp", func(context.Context, *Gateway) (any, error) { return nil, nil })),
 	} {
 		if err := s.validateMCPDeclaration(); err == nil {
 			t.Errorf("%s: accepted", name)

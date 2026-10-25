@@ -24,7 +24,10 @@ import (
 // middleware that binds each call to its viewer — and nothing else. A tool
 // call is admitted exactly as a handler route is: the authority's Check of the
 // Work Context the request carries, addressed to this module, naming the route
-// ("POST /v1/<id>/mcp") so the solution's delivered route policy applies. No
+// ("POST /v1/<id>/mcp") so the solution's delivered route policy applies. The
+// policy is declared with the surface (ServeMCP) and published in the
+// interface artifact like every operation's (Server.InterfaceArtifact), so the
+// CLI derives the route's row from the same document. No
 // token is verified here, no identity header is read, and the OAuth discovery
 // the saas host's gateway used to authenticate agent clients against is gone
 // with that host: how an agent client obtains a Work Context for a solution
@@ -39,7 +42,10 @@ const MCPPath = "/mcp"
 // mcpSurface is the MCP server a solution declared with ServeMCP.
 type mcpSurface struct {
 	name, version string
-	register      func(*mcp.Server)
+	// policy is what a call to the MCP route must hold, as every operation
+	// declares it.
+	policy   *Policy
+	register func(*mcp.Server)
 }
 
 // validate rejects a declaration that cannot serve anything. Both mistakes are
@@ -55,13 +61,19 @@ func (m *mcpSurface) validate() error {
 	if m.register == nil {
 		return fmt.Errorf("ServeMCP server %q was given no register function: the solution owns its tool surface, and a server with no tools answers tools/list with nothing", m.name)
 	}
+	if err := m.policy.validate(); err != nil {
+		return fmt.Errorf("ServeMCP server %q %w", m.name, err)
+	}
 	return nil
 }
 
 // ServeMCP exposes the solution as an MCP server over stateless Streamable HTTP
-// at MCPPath under the solution's route. Chainable, like Handle.
+// at MCPPath under the solution's route. Chainable, like Operations.
 //
-// name and version identify the server to a client. register adds the tools,
+// name and version identify the server to a client. policy is what a call to
+// the route must hold, which the authority applies to every MCP request as it
+// does to every operation's, and which the interface artifact publishes for
+// the route (POST /v1/<id>/mcp). register adds the tools,
 // prompts and resources the solution offers, on the official SDK's own
 // *mcp.Server — the solution's tool surface is its own, and this runtime adds
 // nothing to it.
@@ -75,7 +87,7 @@ func (m *mcpSurface) validate() error {
 // routing: a session held in one replica's memory is unreachable from the next
 // request, so the MCP session would break under any rollout or scale-out. Each
 // request carries its own Work Context, which is all a tool call needs.
-func (s *Server) ServeMCP(name, version string, register func(*mcp.Server)) *Server {
+func (s *Server) ServeMCP(name, version string, policy *Policy, register func(*mcp.Server)) *Server {
 	// A second call is not a second server — there is one MCP endpoint — so it
 	// replaces the first. Recorded rather than applied silently, and refused at
 	// boot by validateMCPDeclaration: a solution assembled from two places,
@@ -85,8 +97,28 @@ func (s *Server) ServeMCP(name, version string, register func(*mcp.Server)) *Ser
 	if s.mcp != nil {
 		s.mcpRedeclared = true
 	}
-	s.mcp = &mcpSurface{name: name, version: version, register: register}
+	s.mcp = &mcpSurface{name: name, version: version, policy: policy, register: register}
 	return s
+}
+
+// mcpOperation is the MCP route as the interface artifact publishes it: one
+// operation, POST at the route, with the declared policy. The MCP transport,
+// not an operation's handler, serves it (mountMCP).
+func (s *Server) mcpOperation() Operation {
+	return Operation{
+		Path:    s.mcpRoute(),
+		Method:  "post",
+		Summary: fmt.Sprintf("Call the %s MCP server's tools as the viewer", s.mcp.name),
+		Callers: "Agent clients, through the authority's edge, as the person whose Work Context the request carries; " +
+			"every call is held to this route's policy.",
+		Behavior: "The MCP Streamable HTTP transport, stateless: one JSON-RPC message per POST, answered with its result. " +
+			"Each tool runs as the viewer and reaches a module only through a child the authority issues through one of this solution's bindings. " +
+			"Any other method is refused.",
+		Request:  json.RawMessage{},
+		Response: json.RawMessage{},
+		Policy:   s.mcp.policy,
+		Handler:  func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the MCP transport") },
+	}
 }
 
 // mcpRoute is where the MCP endpoint is served: under the route the edge
@@ -109,8 +141,10 @@ func (s *Server) validateMCPDeclaration() error {
 	if err := s.mcp.validate(); err != nil {
 		return err
 	}
-	if _, taken := s.handlers[s.mcpRoute()]; taken {
-		return fmt.Errorf("a handler is registered at %q, which ServeMCP serves: one of the two would have to win, and the solution would serve either its own handler with no MCP endpoint or an MCP endpoint with the handler unreachable. Move the handler to another path", s.mcpRoute())
+	for _, op := range s.operations {
+		if op.Path == s.mcpRoute() {
+			return fmt.Errorf("an operation is declared at %q, which ServeMCP serves: one of the two would have to win, and the solution would serve either its own handler with no MCP endpoint or an MCP endpoint with the handler unreachable. Move the operation to another path", s.mcpRoute())
+		}
 	}
 	return nil
 }
@@ -137,8 +171,13 @@ func (s *Server) mountMCP(mux *http.ServeMux) error {
 	)
 	// No CORS on the MCP endpoint: an MCP client is not a browser page, and the
 	// runtime's permissive policy (any origin) would be handing a page the one
-	// route that acts with the viewer's full authority.
-	mux.Handle(s.mcpRoute(), s.requireWorkContext(handler))
+	// route that acts with the viewer's full authority. POST is the one method
+	// published for the route, so it is the one served: the stateless
+	// transport answers nothing else, and any other method is refused by name
+	// before the transport reads it.
+	mux.Handle(s.mcpRoute(), byMethod(s.mcpRoute(), map[string]http.HandlerFunc{
+		http.MethodPost: s.requireWorkContext(handler).ServeHTTP,
+	}))
 	return nil
 }
 

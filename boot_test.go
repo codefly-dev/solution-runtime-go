@@ -156,7 +156,7 @@ func bootFails(t *testing.T, server *Server, edit func()) error {
 // resolved port, and none of that asks the authority anything.
 func TestBootServesPlainHTTPWithoutAskingTheAuthority(t *testing.T) {
 	solution := boot(t, New(Manifest{ID: testSolutionID}).
-		Handle("/thing", func(context.Context, *Gateway) (any, error) { return map[string]string{"ok": "yes"}, nil }))
+		Operations(served("get", "/thing", func(context.Context, *Gateway) (any, error) { return map[string]string{"ok": "yes"}, nil })))
 
 	for range 5 {
 		if status := getStatus(t, solution.client, solution.base+HealthPath); status != http.StatusOK {
@@ -177,7 +177,7 @@ func TestBootServesPlainHTTPWithoutAskingTheAuthority(t *testing.T) {
 func TestACallWithNoWorkContextIsRefusedNotProxied(t *testing.T) {
 	ran := false
 	solution := boot(t, New(Manifest{ID: testSolutionID}).
-		Handle("/thing", func(context.Context, *Gateway) (any, error) { ran = true; return nil, nil }))
+		Operations(served("get", "/thing", func(context.Context, *Gateway) (any, error) { ran = true; return nil, nil })))
 	if status := getStatus(t, solution.client, solution.base+"/thing"); status != http.StatusUnauthorized || ran {
 		t.Errorf("a call with no Work Context = %d (handler ran: %v), want 401", status, ran)
 	}

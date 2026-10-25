@@ -6,8 +6,9 @@
 // the published contract, the connection to the authority interface, the
 // passthrough that relays a page's module calls as the viewer, and serving the
 // solution's MCP server to agent clients. A solution author supplies a
-// manifest and one or more handlers; each handler receives a Gateway bound to
-// the person the authority says the request is for.
+// manifest and its operations (Operations): each a method and a path, the
+// policy a call to it must hold, and its handler, which receives a Gateway
+// bound to the person the authority says the request is for.
 //
 // # The runtime runs under the authority interface
 //
@@ -123,7 +124,7 @@ type RequestHandler func(r *http.Request, gw *Gateway) (any, error)
 // ClientError rejects a request with StatusCode (400–499) and a public Message.
 // Handlers may wrap it with %w; only Message is sent to the caller, so wrapping
 // context stays private. An invalid StatusCode is treated as a handler error
-// and returns 502 instead. Both Handle and HandleRequest support ClientError.
+// and returns 502 instead. Both Handler and RequestHandler support ClientError.
 type ClientError struct {
 	StatusCode int
 	Message    string
@@ -131,13 +132,16 @@ type ClientError struct {
 
 func (e *ClientError) Error() string { return e.Message }
 
-// Server wires a manifest and handlers into a running solution.
+// Server wires a manifest and operations into a running solution.
 type Server struct {
 	manifest Manifest
 	// frontend is the declared file decoded at boot (parseFrontend), which the
 	// manifest route serves from.
 	frontend frontendDeclaration
-	handlers map[string]RequestHandler
+	// operations is every route this backend serves itself (Operations), each
+	// one method on one path: what the authority is asked about a request is
+	// the operation that answers it.
+	operations []Operation
 	// consumed is the passthrough declaration (Consumes); passthrough is its
 	// resolved routes, checked by Serve before it listens.
 	consumed    []ConsumedModule
@@ -475,22 +479,7 @@ func New(manifest Manifest) *Server {
 		// unset announced that product's capability contract to the host.
 		manifest.Contract = manifest.ID
 	}
-	s := &Server{manifest: manifest, handlers: make(map[string]RequestHandler)}
-	return s
-}
-
-// Handle registers a solution endpoint. Chainable.
-func (s *Server) Handle(path string, handler Handler) *Server {
-	return s.HandleRequest(path, func(r *http.Request, gw *Gateway) (any, error) {
-		return handler(r.Context(), gw)
-	})
-}
-
-// HandleRequest registers an endpoint that consumes request input. It uses the
-// same viewer check and CORS as Handle.
-func (s *Server) HandleRequest(path string, handler RequestHandler) *Server {
-	s.handlers[path] = handler
-	return s
+	return &Server{manifest: manifest}
 }
 
 // Serve resolves this process's configuration, connects to the authority, and
@@ -528,6 +517,9 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 		}
 		s.frontend = frontend
 	}
+	if _, err := s.operationTable(); err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
 	if err := s.validateMCPDeclaration(); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -554,7 +546,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
 	s.passthrough = routes
-	authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.projectedTokenPath, s.manifest.ID, s.cfg.routeAdvisory)
+	authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.transport, s.cfg.projectedTokenPath, s.manifest.ID, s.cfg.routeAdvisory)
 	if err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
@@ -591,8 +583,8 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	// presence document names; this process does not report its liveness
 	// anywhere, and has no way to make itself present by answering.
 	mux.HandleFunc(HealthPath, s.handleHealth)
-	for path, handler := range s.handlers {
-		mux.HandleFunc(path, withCORS(s.wrapRequest(handler)))
+	if err := s.mountOperations(mux); err != nil {
+		return err
 	}
 	mux.Handle("/assets/", http.StripPrefix("/assets/", withCORSHandler(s.assetsHandler())))
 	if err := s.mountPassthrough(mux); err != nil {
@@ -795,8 +787,11 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 		gw, err := s.viewerGateway(r.Context(), r.Header.Get(WorkContextHeader), r.Method+" "+r.URL.Path)
 		if err != nil {
 			code := http.StatusUnauthorized
-			if errors.Is(err, ErrRequestRefused) {
+			switch {
+			case errors.Is(err, ErrRequestRefused):
 				code = http.StatusForbidden
+			case errors.Is(err, ErrAuthorityUnavailable):
+				code = http.StatusServiceUnavailable
 			}
 			writeRefusal(w, r, code, err.Error(), err)
 			return

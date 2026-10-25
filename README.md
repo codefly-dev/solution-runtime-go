@@ -9,21 +9,27 @@ the declared frontend file, the published contract, the connection to the
 the viewer, and serving the solution's MCP server to agent clients.
 
 A component author writes a manifest, optionally embeds a frontend, and
-writes one handler:
+declares its operations — each one method on one path, the policy a call to it
+must hold, and its handler:
 
 ```go
 //go:embed solution.frontend.codefly.yaml
 var frontend []byte
 
 solution.New(solution.Manifest{ID: "my-solution", Frontend: frontend}).
-    Handle("/v1/my-solution/thing", func(ctx context.Context, gw *solution.Gateway) (any, error) {
-        docs, err := gw.ForParent(ctx, "documents-read",
-            solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
-        if err != nil {
-            return nil, err
-        }
-        token, err := docs.WorkContext(ctx) // present it to the module, over gRPC through the hop
-        ...
+    Operations(solution.Operation{
+        Method: "get", Path: "/v1/my-solution/thing",
+        Summary: "Read the thing", Callers: "Readers.", Behavior: "The thing.", Response: thing{},
+        Policy: solution.Requires("my-solution.thing", "read"),
+        Handler: func(ctx context.Context, gw *solution.Gateway) (any, error) {
+            docs, err := gw.ForParent(ctx, "documents-read",
+                solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
+            if err != nil {
+                return nil, err
+            }
+            token, err := docs.WorkContext(ctx) // present it to the module, over gRPC through the hop
+            ...
+        },
     }).
     Serve()
 ```
@@ -119,16 +125,30 @@ nothing:
   published contract's `x-codefly-authority-policy`). A route the call does
   not hold, one that declares nothing, and one not served are answered 403
   with the authority's reason. Under `hop/ENFORCEMENT=warn` the check is
-  advisory: the route goes through and the refusal is logged.
+  advisory: the route goes through and the refusal is logged. An authority
+  that cannot be reached refused nobody: the request is answered 503, naming
+  that, never 401.
+- **The operation checked is the operation run.** A request is served by the
+  operation declared for its method on its path, so the `"<VERB> <path>"` the
+  authority is asked about is the operation whose handler runs. A method the
+  path does not declare is answered 405, naming the methods it serves (and
+  `Allow`), before the authority is asked or any handler runs. The boot
+  refuses an operation with no policy, an undocumented one, one method
+  declared twice on a path, or a method that is not an operation's
+  (`OPTIONS` is the CORS preflight the runtime answers).
 - **`ForParent(binding, scopes...)`**: the viewer's own call to
   a module, a child of the edge's Work Context through one of this module's
-  declared bindings, issued by `authority.Issue` with the workload credential the
-  run attests as the actor. The authority derives the audience from the binding
+  declared bindings, issued through the authority's hop library
+  (`hop.Outbound.IssueForParent`, over the authority's generated client) with
+  the workload credential the run attests as the actor. The authority derives the audience from the binding
   and grants within its invoke ceiling and what the person holds there; held
   until it is due for renewal.
 - **`ForBinding(binding)`**: this module's own Work Context
   through one of its declared bindings, in the viewer's organization, with no
-  person in it.
+  person in it (`hop.Outbound.IssueForModule`). The runtime builds no issue
+  request of its own: every Work Context it acts under is asked through the
+  hop library, which reads the credential from the projected path on every
+  call (`hop.FileCredential`).
 - **`WorkContext(ctx)`**: the token a gateway acts under, for a caller that
   reaches a module itself — over gRPC through the hop.
 
@@ -448,6 +468,23 @@ needed. The page names a procedure and a request message, never an address, a
 binding or an authority, and authorization stays at the module, whose hop holds
 each call to the module's own method policy.
 
+**Why a relayed route is any checked caller's.** Every relayed route is
+published in the interface artifact with `x-codefly-authority-policy:
+{"any_checked_caller": true}`, and the runtime's `Check` names it as served
+(`POST /v1/<id>/modules/<as>/<package.Service>/<Method>`), so an enforcing
+authority admits it for what it declares rather than refusing it for declaring
+nothing. The route row is not the gate, by design: the gate on a relayed call
+is the per-call child the authority issues through the solution's declared
+binding for the module — the person's current grants at the module (which
+include what the solution's roles grant there) intersected with the binding's
+invoke ceiling, narrowed to the method's declared scopes — and the module's
+own method policy, which its hop applies to that child. A second route policy
+of the solution's would restate, in the solution's vocabulary, what the binding
+and the module's policy already decide, and could only disagree with them. The
+child is issued per call (the passthrough builds a fresh gateway for each), and
+each relayed call costs the authority three round trips: the `Check` of the
+edge's context, the `Issue` of the child, and the hop's `Check` of the child.
+
 **The authority is the only way a call reaches a module.** A solution that
 declares consumed modules and has no `authority/endpoint` refuses to boot,
 naming it; a module whose slots name no address or no binding refuses the boot
@@ -492,10 +529,11 @@ A module's refusal of the page's own request (`invalid_argument`, `not_found`,
 `permission_denied`, `failed_precondition`, …) keeps its code and message; any
 other failure is reported by kind only and logged where an operator reads it,
 since its text may name an internal address. `PassthroughOperations` renders
-the declaration for the interface artifact, and
-`InterfaceArtifact(dir, info, ops, modules...)` renders a backend's whole
-artifact — its own operations and the passthrough — at the version its
-`service.codefly.yaml` declares.
+the declaration for the interface artifact (paths relative to the solution's
+route), and `Server.InterfaceArtifact(dir, info)` renders a backend's whole
+artifact from the server it serves — its operations, its MCP route, and the
+passthrough at the paths they are served at, each with its policy — at the
+version its `service.codefly.yaml` declares.
 
 #### Streamed methods
 
@@ -530,9 +568,9 @@ a browser: as the person the authority says the request is for, with the same
 authority. The solution owns its tool surface; this runtime owns serving it:
 
 ```go
-solution.New(solution.Manifest{ID: "wiki", Frontend: frontend}).
-    ServeMCP("wiki", "v1.0.0", func(srv *mcp.Server) {
-        mcp.AddTool(srv, &mcp.Tool{Name: "ask_wiki", Description: "ask the wiki a question"}, askWiki)
+solution.New(solution.Manifest{ID: "notes", Frontend: frontend}).
+    ServeMCP("notes", "v1.0.0", solution.Requires("notes.page", "read"), func(srv *mcp.Server) {
+        mcp.AddTool(srv, &mcp.Tool{Name: "ask_notes", Description: "ask the notes a question"}, askNotes)
     }).
     Serve()
 ```
@@ -542,13 +580,17 @@ The endpoint is stateless Streamable HTTP (the official
 the route the edge forwards). A tool call is admitted exactly as a handler
 route is: the authority's `Check` of the Work Context the request carries,
 naming the route `POST /v1/<id>/mcp`, so the solution's delivered route policy
-applies to it. A request with no Work Context is answered 401 before the MCP
+applies to it. That policy is the one `ServeMCP` declares, and
+`Server.InterfaceArtifact` publishes it for `POST /v1/<id>/mcp` like every
+operation's, so the CLI derives the route's row from the same document and an
+enforcing authority admits it. POST is the one method served; any other is
+refused by name before the transport reads it. A request with no Work Context is answered 401 before the MCP
 handler reads it; one the authority does not check runs no tool.
 `ViewerFromContext(ctx)` returns the same viewer-bound `Gateway` a `Handler`
 is given, so a tool reaches a module through `ForParent`:
 
 ```go
-func askWiki(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
+func askNotes(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
     gw, err := solution.ViewerFromContext(ctx)
     if err != nil {
         return nil, askOut{}, err
@@ -584,12 +626,14 @@ named, and a path naming no field fails at declaration.
 
 ### Documented operations
 
-`Server.Operations` registers a list of `solution.Operation`s — each a route,
-its handler, and the documentation a reader needs (summary, callers, behaviour,
-query parameters, request and response types). `solution.InterfaceDocument`
-renders the same list as a Swagger 2.0 artifact, so one declaration is the
-source of what is served and what is published, and an operation missing its
-documentation is refused. A `Message[T]` field is described from its
+`Server.Operations` declares a list of `solution.Operation`s — each a method and
+a route, its handler, its policy, and the documentation a reader needs
+(summary, callers, behaviour, query parameters, request and response types).
+It is the one way a backend serves a route of its own. `Server.InterfaceArtifact`
+renders the same declaration as a Swagger 2.0 artifact (`InterfaceDocument`
+renders any list), so one declaration is the source of what is served and what
+is published, and an operation missing its documentation or its policy is
+refused, at generation and at boot. A `Message[T]` field is described from its
 descriptor, with protobuf JSON names.
 
 The artifact's security scheme is the `x-codefly-work-context` header the edge
@@ -602,8 +646,8 @@ none, or both, is refused at generation by name. A backend renders its artifact 
 carry the `/v1/<id>` the edge forwards them on, so each route is written as
 served and matches the `"<VERB> <path>"` the runtime's `Check` names. A path
 ending in `/` serves its subtree and is written `/…/{path=**}`. The passthrough
-routes `InterfaceArtifact` documents beside the solution's own carry no policy:
-the module they relay to holds each call to its own method policy.
+routes `InterfaceArtifact` publishes beside the solution's own are any checked
+caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
 
 > **Dependency pins.** `go.mod` records the exact Core, SDK and authority
 > client revisions used by this runtime, including unreleased commit

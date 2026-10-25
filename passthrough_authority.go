@@ -143,11 +143,20 @@ func (s *Server) asTheViewer(ctx context.Context, route passthroughRoute, req *c
 	if relay == nil {
 		return nil, "", connect.NewError(connect.CodeNotFound, errors.New("no such operation"))
 	}
-	// No route is named: the relayed call is held to the module's own method
-	// policy, which its hop applies to the child issued through the binding.
-	gw, err := s.viewerGateway(ctx, req.Header().Get(WorkContextHeader), "")
+	// The route is named as served, so the authority applies the row the
+	// interface artifact publishes for it: any checked caller. What the call
+	// may do is the child issued below through the binding, and the module's
+	// own method policy, which its hop applies to that child.
+	gw, err := s.viewerGateway(ctx, req.Header().Get(WorkContextHeader), req.HTTPMethod()+" "+s.authorityRoute()+route.path)
 	if err != nil {
-		return nil, "", connect.NewError(connect.CodeUnauthenticated, err)
+		code := connect.CodeUnauthenticated
+		switch {
+		case errors.Is(err, ErrRequestRefused):
+			code = connect.CodePermissionDenied
+		case errors.Is(err, ErrAuthorityUnavailable):
+			code = connect.CodeUnavailable
+		}
+		return nil, "", connect.NewError(code, err)
 	}
 	acting, err := gw.ForParent(ctx, relay.binding, route.scopes()...)
 	if err != nil {
