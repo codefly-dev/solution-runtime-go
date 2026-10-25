@@ -55,7 +55,7 @@ func TestInterfaceDocumentDescribesGeneratedMessagesFromTheirDescriptor(t *testi
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.BasePath != "/solutions/example" || doc.Paths["/nodes/tree"]["get"]["operationId"] != "Example_Nodes_Tree" {
+	if doc.BasePath != "/solutions/example" || doc.Paths["/nodes/tree"]["get"]["operationId"] != "Example_Get_Nodes_Tree" {
 		t.Fatalf("document = %s", raw)
 	}
 	rule, ok := doc.Definitions["GoogleApiHttpRule"]
@@ -213,6 +213,52 @@ func TestInterfaceDocumentKeepsEveryMethodOfOnePath(t *testing.T) {
 	}
 	if _, err := InterfaceDocument(InterfaceInfo{}, append(ops, ops[0])); err == nil || !strings.Contains(err.Error(), "declared twice") {
 		t.Fatalf("a route declared twice rendered: %v", err)
+	}
+}
+
+// TestInterfaceDocumentGivesEveryOperationItsOwnID: an operationId names one
+// operation, so each method on one path has its own, and two operations the
+// derivation would give one id are refused rather than written ambiguous.
+func TestInterfaceDocumentGivesEveryOperationItsOwnID(t *testing.T) {
+	refused := authorityOperations()[0]
+	var ops []Operation
+	for _, method := range []string{"get", "head", "post", "put", "patch", "delete"} {
+		op := refused
+		op.Method = method
+		ops = append(ops, op)
+	}
+	raw, err := InterfaceDocument(InterfaceInfo{OperationPrefix: "Example"}, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Paths map[string]map[string]map[string]any `json:"paths"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]string{}
+	for path, operations := range doc.Paths {
+		for method, operation := range operations {
+			id, _ := operation["operationId"].(string)
+			if other, taken := seen[id]; taken {
+				t.Errorf("%s %s and %s share the operationId %q", method, path, other, id)
+			}
+			seen[id] = method + " " + path
+		}
+	}
+	if len(seen) != len(ops) {
+		t.Fatalf("%d operations, %d distinct ids: %v", len(ops), len(seen), seen)
+	}
+	if id := doc.Paths["/v1/example/upload-access"]["post"]["operationId"]; id != "Example_Post_V1_Example_Upload-access" {
+		t.Fatalf("POST /v1/example/upload-access is %v", id)
+	}
+
+	// "/A/b" and "/a/b" are two routes the derivation spells alike.
+	upper, lower := refused, refused
+	upper.Path, lower.Path = "/A/b", "/a/b"
+	if _, err := InterfaceDocument(InterfaceInfo{OperationPrefix: "Example"}, []Operation{upper, lower}); err == nil || !strings.Contains(err.Error(), "share the operationId") {
+		t.Fatalf("two operations with one operationId rendered: %v", err)
 	}
 }
 

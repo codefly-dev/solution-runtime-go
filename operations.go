@@ -162,8 +162,8 @@ type InterfaceInfo struct {
 	// "/solutions/<id>": the backend serves them at its own root, but a caller
 	// only ever reaches them prefixed.
 	BasePath string
-	// OperationPrefix starts every operationId ("Notes" renders "/sources" as
-	// "Notes_Sources"); Tag is the one tag every operation carries.
+	// OperationPrefix starts every operationId ("Notes" renders GET "/sources"
+	// as "Notes_Get_Sources"); Tag is the one tag every operation carries.
 	OperationPrefix string
 	Tag             string
 }
@@ -191,6 +191,7 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		},
 	}
 	paths := map[string]map[string]any{}
+	ids := map[string]string{}
 	for _, op := range ops {
 		if err := op.validate(); err != nil {
 			return nil, err
@@ -206,8 +207,13 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		if _, taken := paths[route][method]; taken {
 			return nil, fmt.Errorf("operation %s %s is declared twice", strings.ToUpper(method), route)
 		}
+		id := operationID(info.OperationPrefix, method, op.Path)
+		if other, taken := ids[id]; taken {
+			return nil, fmt.Errorf("operations %s and %s %s share the operationId %q", other, strings.ToUpper(method), route, id)
+		}
+		ids[id] = strings.ToUpper(method) + " " + route
 		endpoint := map[string]any{
-			"operationId": operationID(info.OperationPrefix, op.Path),
+			"operationId": id,
 			"summary":     op.Summary,
 			"description": op.Callers + "\n\n" + op.Behavior,
 			"tags":        []string{info.Tag},
@@ -327,11 +333,12 @@ func (o Operation) validate() error {
 	return nil
 }
 
-// operationID renders "/sources" as "<prefix>_Sources"; a nested path
-// contributes one segment per level rather than carrying a slash into an
-// identifier.
-func operationID(prefix, path string) string {
-	id := prefix
+// operationID renders GET "/sources" as "<prefix>_Get_Sources"; a nested
+// path contributes one segment per level rather than carrying a slash into an
+// identifier. The method is part of it because two methods on one path are
+// two operations, and an operationId names exactly one.
+func operationID(prefix, method, path string) string {
+	id := prefix + "_" + title(strings.ToLower(method))
 	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
 		id += "_" + title(segment)
 	}
