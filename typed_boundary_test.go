@@ -1282,7 +1282,7 @@ func TestTheTypedGatesFollowValuesNotShapes(t *testing.T) {
 import "net/http"
 
 func (s *Server) FixtureOpaqueField() struct{ H any } {
-	return struct{ H any }{H: s.wrapRequest(func(*http.Request, *Gateway) (any, error) { return nil, nil })}
+	return struct{ H any }{H: s.wrapRequest("GET /x", func(*http.Request, *Gateway) (any, error) { return nil, nil })}
 }
 
 func (s *Server) FixtureCallableResult() struct{ H func() http.Handler } {
@@ -1407,7 +1407,7 @@ import "net/http"
 
 func (s *Server) FixtureCallableOpaque() func() any {
 	return func() any {
-		return s.wrapRequest(func(*http.Request, *Gateway) (any, error) { return nil, nil })
+		return s.wrapRequest("GET /x", func(*http.Request, *Gateway) (any, error) { return nil, nil })
 	}
 }
 

@@ -59,6 +59,12 @@ var ErrNoViewer = errors.New("the authority does not check the Work Context this
 // the authority's reason.
 var ErrRequestRefused = errors.New("the authority refuses this request")
 
+// ErrRequestInvalid is a request the authority refuses as malformed: the Work
+// Context or the route it was asked about is not one it can read. The refusal
+// is permanent, so it is answered 400 with the authority's reason, never as
+// an outage a retry would get past.
+var ErrRequestInvalid = errors.New("the authority refuses this request as malformed")
+
 // ErrAuthorityUnavailable is a request the authority could not be asked about:
 // it did not answer, or failed. Nobody refused it, so it is not answered as a
 // sign-in (401) but 503, by this name; the transport's own text, which can
@@ -113,17 +119,21 @@ func dialAuthority(endpoint string, transport workcontext.TransportSource, token
 
 // viewer asks the authority's Check whose the Work Context a request carries
 // is, addressed to this module, and, when route is named, whether it holds
-// what this module's delivery declares for that route: "<VERB> <path>", the
-// request as this module serves it, which the authority matches against the
-// "<VERB> <template>" rows the CLI derives from the published contract. A
+// what this module's delivery declares for that route: "<VERB> <template>",
+// the operation the request was dispatched to, spelled exactly as one of the
+// rows the CLI derives from the published contract, so the authority finds
+// that row by name rather than by matching a path against every template. A
 // context the authority does not check is no viewer, whatever it claims.
 func (h *hostAuthority) viewer(ctx context.Context, workContext, route string) (*authorityv1.WorkContextV1, error) {
 	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
 	defer cancel()
 	checked, err := h.authority.Check(ctx, &authorityv1.CheckRequest{Token: workContext, Audience: h.principal, Method: route, Advisory: h.advisory && route != ""})
 	if err != nil && refusalStatus(err) < http.StatusInternalServerError {
-		if status.Code(err) == codes.Unauthenticated {
+		switch refusalStatus(err) {
+		case http.StatusUnauthorized:
 			return nil, fmt.Errorf("%w: %s", ErrNoViewer, status.Convert(err).Message())
+		case http.StatusBadRequest:
+			return nil, fmt.Errorf("%w: %s", ErrRequestInvalid, status.Convert(err).Message())
 		}
 		return nil, fmt.Errorf("%w: %s", ErrRequestRefused, status.Convert(err).Message())
 	}
@@ -218,6 +228,8 @@ func refusalStatus(err error) int {
 	switch status.Code(err) {
 	case codes.Unauthenticated:
 		return http.StatusUnauthorized
+	case codes.InvalidArgument, codes.OutOfRange:
+		return http.StatusBadRequest
 	case codes.PermissionDenied, codes.NotFound, codes.FailedPrecondition:
 		return http.StatusForbidden
 	case codes.Unavailable, codes.DeadlineExceeded:

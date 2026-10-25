@@ -2,6 +2,7 @@ package solution
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -40,6 +41,10 @@ type interfaceAuthority struct {
 // edgeContext is the person's Work Context the edge sends the page.
 const edgeContext = "edge-context-for-the-page"
 
+// malformedContext is a Work Context the authority refuses as malformed
+// (InvalidArgument).
+const malformedContext = "malformed-context"
+
 // robinChild is a module's tool call to the page: Maya's Work Context, issued
 // by the authority as a child through robin's declared binding, robin acting,
 // addressed to the page.
@@ -50,6 +55,9 @@ func (a *interfaceAuthority) Check(_ context.Context, r *authorityv1.CheckReques
 	a.checked = append(a.checked, proto.Clone(r).(*authorityv1.CheckRequest))
 	held := a.held
 	a.mu.Unlock()
+	if r.GetToken() == malformedContext {
+		return nil, status.Error(codes.InvalidArgument, "the Work Context is not a token the authority can read")
+	}
 	var wc *authorityv1.WorkContextV1
 	switch {
 	case r.GetAudience() != "page":
@@ -62,7 +70,14 @@ func (a *interfaceAuthority) Check(_ context.Context, r *authorityv1.CheckReques
 	if wc == nil {
 		return nil, status.Error(codes.Unauthenticated, "not a context for this audience")
 	}
-	if r.GetMethod() != "" && held != nil && !slices.ContainsFunc(held, func(row string) bool { return routeRowMatches(row, r.GetMethod()) }) {
+	if r.GetMethod() != "" && held != nil {
+		matched, ambiguous := heldRoute(held, r.GetMethod())
+		if ambiguous != "" {
+			return nil, status.Error(codes.PermissionDenied, ambiguous)
+		}
+		if matched {
+			return &authorityv1.CheckResponse{Context: wc}, nil
+		}
 		refusal := "page requires pages:write for " + r.GetMethod() + ", which the call does not hold (it holds pages:read)"
 		if !r.GetAdvisory() {
 			return nil, status.Error(codes.PermissionDenied, refusal)
@@ -72,15 +87,46 @@ func (a *interfaceAuthority) Check(_ context.Context, r *authorityv1.CheckReques
 	return &authorityv1.CheckResponse{Context: wc}, nil
 }
 
-// routeRowMatches is the authority's reading of a request "<VERB> <path>"
-// against a declared row "<VERB> <template>", "{name}" standing for one
-// segment: enough of it to prove the runtime spells the request the way the
-// rows are matched.
+// heldRoute is the authority's reading (state.admitMethod) of a checked
+// method against the held rows: a row named exactly is that row; otherwise a
+// request "<VERB> <path>" is matched against every "<VERB> <template>",
+// "{name}" standing for one segment and a trailing "{name=**}" for the rest
+// of the path, and two templates matching one path is refused as ambiguous,
+// never guessed between. matched reports a held row; ambiguous, when set, is
+// the authority's refusal.
+func heldRoute(held []string, method string) (matched bool, ambiguous string) {
+	if slices.Contains(held, method) {
+		return true, ""
+	}
+	var found []string
+	for _, row := range held {
+		if routeRowMatches(row, method) {
+			found = append(found, row)
+		}
+	}
+	if len(found) > 1 {
+		return false, method + " matches more than one declared route (" + strings.Join(found, ", ") + ")"
+	}
+	return len(found) == 1, ""
+}
+
+// routeRowMatches is the authority's routeOf for one row: a request "<VERB>
+// <path>" against a declared row "<VERB> <template>", "{name}" standing for
+// one non-empty segment and a last "{name=**}" for the rest of the path.
 func routeRowMatches(row, request string) bool {
 	verb, template, _ := strings.Cut(row, " ")
 	got, path, _ := strings.Cut(request, " ")
+	if verb != got {
+		return false
+	}
 	want, have := strings.Split(template, "/"), strings.Split(path, "/")
-	if verb != got || len(want) != len(have) {
+	if last := want[len(want)-1]; strings.HasPrefix(last, "{") && strings.HasSuffix(last, "=**}") {
+		if len(have) < len(want) || strings.Join(have[len(want)-1:], "/") == "" {
+			return false
+		}
+		want, have = want[:len(want)-1], have[:len(want)-1]
+	}
+	if len(want) != len(have) {
 		return false
 	}
 	for i, segment := range want {
@@ -157,7 +203,7 @@ func authorityServer(t *testing.T) (*Server, *interfaceAuthority) {
 func TestUnderTheAuthorityTheViewerIsTheEdgesWorkContext(t *testing.T) {
 	s, _ := authorityServer(t)
 	var seen *Gateway
-	handler := s.wrapRequest(func(_ *http.Request, gw *Gateway) (any, error) {
+	handler := s.wrapRequest("GET /v1/page/types", func(_ *http.Request, gw *Gateway) (any, error) {
 		seen = gw
 		return map[string]string{"ok": "yes"}, nil
 	})
@@ -279,7 +325,7 @@ func TestUnderTheAuthorityAModulesToolCallActsForThePerson(t *testing.T) {
 	var principals WorkContextPrincipals
 	var actors []string
 	ran := 0
-	handler := s.wrapRequest(func(r *http.Request, gw *Gateway) (any, error) {
+	handler := s.wrapRequest("GET /v1/page/pages/{page_id}", func(r *http.Request, gw *Gateway) (any, error) {
 		ran++
 		var err error
 		principals, err = gw.WorkContextPrincipals(r.Context())
@@ -324,36 +370,39 @@ func TestUnderTheAuthorityAModulesToolCallActsForThePerson(t *testing.T) {
 	}
 }
 
-// Row 7: the Check names the route a request calls, "<VERB> <path>" as the
-// page serves it, the spelling the CLI's route-policy rows ("<VERB>
-// <template>") are matched against, so the authority applies the page's
-// delivered per-route policy. A route the call does not hold is refused with
-// the authority's own reason, before the handler runs.
+// Row 7: the Check names the operation a request was dispatched to, "<VERB>
+// <template>" exactly as the CLI's route-policy row for it is spelled, so the
+// authority applies the page's delivered per-route policy to the operation
+// that runs, whatever the request's own path reads as. A route the call does
+// not hold is refused with the authority's own reason, before the handler
+// runs.
 func TestUnderTheAuthorityTheCheckNamesTheRoute(t *testing.T) {
 	s, stand := authorityServer(t)
 	stand.held = []string{"GET /v1/page/pages/{page_id}"}
 	ran := 0
-	handler := s.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+	handler := func(*http.Request, *Gateway) (any, error) {
 		ran++
 		return map[string]string{"ok": "yes"}, nil
-	})
+	}
+	read := s.wrapRequest("GET /v1/page/pages/{page_id}", handler)
+	write := s.wrapRequest("POST /v1/page/pages", handler)
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/page/pages/p-1?revision=3", nil)
 	request.Header.Set(WorkContextHeader, robinChild)
 	answer := httptest.NewRecorder()
-	handler(answer, request)
+	read(answer, request)
 	if answer.Code != http.StatusOK || ran != 1 {
 		t.Fatalf("a held route answered %d (%s)", answer.Code, answer.Body)
 	}
 	checked := stand.checks()
-	if len(checked) != 1 || checked[0].GetMethod() != "GET /v1/page/pages/p-1" || checked[0].GetAudience() != "page" || checked[0].GetAdvisory() {
+	if len(checked) != 1 || checked[0].GetMethod() != "GET /v1/page/pages/{page_id}" || checked[0].GetAudience() != "page" || checked[0].GetAdvisory() {
 		t.Fatalf("the check asked %v", checked)
 	}
 
 	request = httptest.NewRequest(http.MethodPost, "/v1/page/pages", strings.NewReader(`{}`))
 	request.Header.Set(WorkContextHeader, robinChild)
 	answer = httptest.NewRecorder()
-	handler(answer, request)
+	write(answer, request)
 	if answer.Code != http.StatusForbidden || ran != 1 || !strings.Contains(answer.Body.String(), "page requires pages:write for POST /v1/page/pages") {
 		t.Fatalf("a route the call does not hold answered %d (%s), handler ran %d times", answer.Code, answer.Body, ran)
 	}
@@ -370,7 +419,7 @@ func TestUnderAdvisoryEnforcementARefusedRouteIsLoggedAndLetThrough(t *testing.T
 	logged := &strings.Builder{}
 	log.SetOutput(logged)
 	defer log.SetOutput(os.Stderr)
-	handler := s.wrapRequest(func(*http.Request, *Gateway) (any, error) {
+	handler := s.wrapRequest("POST /v1/page/pages", func(*http.Request, *Gateway) (any, error) {
 		return map[string]string{"ok": "yes"}, nil
 	})
 
@@ -411,4 +460,28 @@ func TestHopEnforcementWarnMakesTheRouteCheckAdvisory(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
+}
+
+// r1 F5: an authority status outside the sign-in and permission classes was
+// answered 503 "try again" with its reason only in the log. A malformed
+// request (InvalidArgument) is a permanent refusal: it is answered 400 with
+// the authority's reason, to a REST caller and a relayed Connect call alike,
+// and an outage is still 503.
+func TestAMalformedRequestIsRefusedWithTheAuthoritysReason(t *testing.T) {
+	s, _ := authorityServer(t)
+	ran := false
+	handler := s.wrapRequest("GET /v1/page/types", func(*http.Request, *Gateway) (any, error) { ran = true; return nil, nil })
+	request := httptest.NewRequest(http.MethodGet, "/v1/page/types", nil)
+	request.Header.Set(WorkContextHeader, malformedContext)
+	answer := httptest.NewRecorder()
+	handler(answer, request)
+	if answer.Code != http.StatusBadRequest || ran || !strings.Contains(answer.Body.String(), "not a token the authority can read") {
+		t.Fatalf("a malformed request answered %d %s (handler ran: %v)", answer.Code, answer.Body, ran)
+	}
+	if _, err := s.viewerGateway(context.Background(), malformedContext, "GET /v1/page/types"); !errors.Is(err, ErrRequestInvalid) || errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("viewerGateway = %v, want ErrRequestInvalid", err)
+	}
+	if got := refusalStatus(status.Error(codes.Unavailable, "down")); got != http.StatusServiceUnavailable {
+		t.Fatalf("an outage maps to %d, want 503", got)
+	}
 }

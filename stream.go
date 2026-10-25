@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -22,8 +23,10 @@ import (
 // child Work Context issued for that method, and the declared response fields
 // applied to every message before it reaches the page.
 //
-// Every stream is bounded: its duration by the method's MaxStreamDuration, and
-// each message by MaxStreamMessageBytes. The page disconnecting cancels the
+// Every stream is bounded: the module's first message by the method's Timeout
+// (a module that accepts the stream and sends nothing is cut off then, not at
+// the end of the whole duration), its duration by the method's
+// MaxStreamDuration, and each message by MaxStreamMessageBytes. The page disconnecting cancels the
 // module's stream at once; the module ending it with a status ends the page's
 // with the same code, by moduleRefusal's rule.
 
@@ -85,7 +88,16 @@ func (s *Server) relayStream(ctx context.Context, route passthroughRoute, req *c
 	if err != nil {
 		return err
 	}
-	calling := grpcmetadata.AppendToOutgoingContext(ctx, WorkContextHeader, token)
+	// The module's first answer is bounded like a unary call (route.timeout):
+	// until it arrives, a timer cancels the stream, so a module that accepts
+	// it and sends nothing holds the page's request, a goroutine and an HTTP/2
+	// stream for that long and no longer.
+	streaming, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	var late atomic.Bool
+	firstAnswer := time.AfterFunc(route.timeout(), func() { late.Store(true); cancelStream() })
+	defer firstAnswer.Stop()
+	calling := grpcmetadata.AppendToOutgoingContext(streaming, WorkContextHeader, token)
 	module, err := relay.conn.NewStream(calling, &grpc.StreamDesc{StreamName: string(route.md.Name()), ServerStreams: true}, route.procedure(),
 		grpc.MaxCallRecvMsgSize(int(route.streamMessageLimit())))
 	if err == nil {
@@ -96,7 +108,9 @@ func (s *Server) relayStream(ctx context.Context, route passthroughRoute, req *c
 	}
 	for err == nil {
 		out := dynamicpb.NewMessage(route.md.Output())
-		if err = module.RecvMsg(out); err != nil {
+		err = module.RecvMsg(out)
+		firstAnswer.Stop()
+		if err != nil || late.Load() {
 			break
 		}
 		if sendErr := stream.Send(route.answer(out)); sendErr != nil {
@@ -105,6 +119,8 @@ func (s *Server) relayStream(ctx context.Context, route passthroughRoute, req *c
 		}
 	}
 	switch {
+	case late.Load():
+		return connect.NewError(connect.CodeDeadlineExceeded, fmt.Errorf("the module did not start its stream within %s", route.timeout()))
 	case errors.Is(err, io.EOF):
 		return nil
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):

@@ -25,10 +25,10 @@ import (
 // be documented without being served.
 //
 // Each operation also declares what a call to it must hold (Policy). Under
-// the authority interface the runtime asks the authority's Check for every
-// request "<VERB> <path>" as served, and the authority holds it to the row the
-// CLI derives from this artifact: the operation's x-codefly-authority-policy
-// at its path. An operation that declares none is refused at generation, by
+// the authority interface the runtime asks the authority's Check, for every
+// request, about the operation it was dispatched to, "<VERB> <template>" as
+// served (servedRoute), and the authority holds it to the row the CLI derives
+// from this artifact: the operation's x-codefly-authority-policy at its path. An operation that declares none is refused at generation, by
 // name, so no served route reaches the artifact with nothing to be held to.
 
 // Operation is one public route of a solution backend.
@@ -139,7 +139,7 @@ type QueryParameter struct {
 // Operations declares the routes this backend serves itself. Chainable. Each
 // is served for its own method only: a request is answered by the operation
 // declared for its method on its path, which is the operation the authority's
-// Check is asked about ("<VERB> <path>"), and a method the path does not
+// Check is asked about ("<VERB> <template>"), and a method the path does not
 // declare is refused by name before the authority is asked or any handler
 // runs. The boot refuses an operation that is undocumented, declares no
 // policy, names a method twice on one path, or takes the MCP route.
@@ -184,7 +184,8 @@ func (s *Server) operationTable() (map[string]map[string]RequestHandler, error) 
 }
 
 // mountOperations serves each declared path on mux, dispatching on the
-// request's method to the operation declared for it.
+// request's method to the operation declared for it, and asking the authority
+// about that operation's own published row.
 func (s *Server) mountOperations(mux *http.ServeMux) error {
 	table, err := s.operationTable()
 	if err != nil {
@@ -193,7 +194,7 @@ func (s *Server) mountOperations(mux *http.ServeMux) error {
 	for path, methods := range table {
 		served := make(map[string]http.HandlerFunc, len(methods))
 		for method, handler := range methods {
-			served[method] = s.wrapRequest(handler)
+			served[method] = s.wrapRequest(method+" "+servedRoute(path), handler)
 		}
 		mux.HandleFunc(path, withCORS(byMethod(path, served)))
 	}
@@ -230,10 +231,10 @@ type InterfaceInfo struct {
 	Title       string
 	Version     string
 	Description string
-	// BasePath, when set, is a prefix a caller reaches every route under. An
-	// authority-served backend leaves it empty: its operations already carry
-	// the /v1/<id> the edge forwards them on.
-	BasePath string
+	// There is no base path. The authority's edge forwards a solution's
+	// requests on /v1/<id>, which its operations already carry, and the
+	// runtime asks the authority about each route as served; a base path
+	// prefixed every row the CLI derives and matched no request.
 	// OperationPrefix starts every operationId ("Notes" renders GET "/sources"
 	// as "Notes_Get_Sources"); Tag is the one tag every operation carries.
 	OperationPrefix string
@@ -330,11 +331,6 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		"security":    []any{map[string]any{"workContext": []string{}}},
 		"paths":       paths,
 		"definitions": definitions,
-	}
-	// No base path is the routes as served: an authority-served backend's
-	// operations already carry the /v1/<id> its edge forwards them on.
-	if info.BasePath != "" {
-		doc["basePath"] = info.BasePath
 	}
 	return doc, nil
 }

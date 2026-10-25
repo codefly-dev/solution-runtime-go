@@ -162,7 +162,7 @@ func TestAnAuthorityOutageIsNamedNotAnsweredAsASignIn(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/v1/page/types", nil)
 	request.Header.Set(WorkContextHeader, edgeContext)
 	answer := httptest.NewRecorder()
-	s.wrapRequest(func(*http.Request, *Gateway) (any, error) { ran = true; return nil, nil })(answer, request)
+	s.wrapRequest("GET /v1/page/types", func(*http.Request, *Gateway) (any, error) { ran = true; return nil, nil })(answer, request)
 	if answer.Code != http.StatusServiceUnavailable || ran || !strings.Contains(answer.Body.String(), ErrAuthorityUnavailable.Error()) || strings.Contains(answer.Body.String(), gone) {
 		t.Fatalf("an outage answered %d %s (handler ran: %v)", answer.Code, answer.Body.String(), ran)
 	}

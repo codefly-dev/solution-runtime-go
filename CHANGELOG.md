@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased — review fixes for #75: the authority is asked about the operation dispatched (breaking)
+
+From the independent review of #75 (r1):
+
+- **The route checked is the operation dispatched (F1, security; F2).** The
+  authority was asked about `r.Method + " " + r.URL.Path`, the decoded path,
+  while the mux dispatches on the escaped one: `GET /v1/page/pages/secret%2Fhistory`
+  ran the `/pages/{id}` operation and was checked against the
+  `/pages/{id}/history` row, so a caller holding only the weaker history row
+  ran the page handler. The same root made a subtree `/x/` beside `/x/{id}`
+  (legal for the mux) a path the authority refuses as matching two routes.
+  `wrapRequest` now asks about the dispatched operation's own row,
+  `"<VERB> " + servedRoute(path)`, which the authority finds by exact name.
+- **`InterfaceInfo.BasePath` is deleted (F4).** The CLI prefixes every route
+  row with the document's base path, while the edge forwards a solution's
+  requests on `/v1/<id>` and the runtime checks routes as served, so no
+  non-empty base path ever matched a request. A backend still setting it no
+  longer compiles, naming the field: drop it and carry `/v1/<id>` in each
+  operation's path, as the migrated solutions do.
+- **A malformed request is refused with its reason (F5).** An
+  `InvalidArgument` or `OutOfRange` from the authority's `Check` is answered
+  400 (`invalid_argument` on a relayed call) with the authority's reason,
+  `ErrRequestInvalid`, never 503 "try again"; an issue refused that way is a
+  `WorkContextRefusal` of 400 with its reason.
+- **A stream's first message is bounded again (F6).** A relayed
+  server-streaming call cuts off a module that accepts the stream and sends
+  nothing at the method's `Timeout`, as `StreamFirstAnswerWithin` did before
+  the authority move, instead of holding it for the whole `MaxStreamDuration`.
+- **Open (F3):** `go.mod` pins the authority client and hop libraries at
+  commits only on the unmerged `authority/vision` branch. This closes when
+  authority#1 merges with a merge commit and this runtime re-pins; no runtime
+  release before then.
+
 ## Unreleased — the operation checked is the operation run; every served route publishes its policy (breaking)
 
 From the independent review of 2026-10-25 (F1–F4, F10, F11):

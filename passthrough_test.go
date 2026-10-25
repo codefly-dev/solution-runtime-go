@@ -256,7 +256,7 @@ func TestPassthroughOperationsDocumentTheDeclaration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc, err := InterfaceDocument(InterfaceInfo{Title: "t", Version: "0.0.1", Description: "d", BasePath: "/v1/test", OperationPrefix: "Test", Tag: "test"}, ops)
+	doc, err := InterfaceDocument(InterfaceInfo{Title: "t", Version: "0.0.1", Description: "d", OperationPrefix: "Test", Tag: "test"}, ops)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -117,8 +117,9 @@ func dialModule(endpoint string, transport workcontext.TransportSource, what str
 // carries — the edge's for the page, or a module's child of it for a tool call:
 // who it is for, and which module acts for them, is the authority's Check of
 // that context, never a header the request wrote about itself. route, when
-// named, is the request "<VERB> <path>" the authority applies this module's
-// delivered route policy to.
+// named, is the dispatched operation "<VERB> <template>", spelled as its
+// published row, that the authority applies this module's delivered route
+// policy to.
 func (s *Server) viewerGateway(ctx context.Context, carried, route string) (*Gateway, error) {
 	if carried == "" {
 		return nil, errors.New("no Work Context: this page is reached through the authority's edge, which signs the person in")
@@ -153,6 +154,8 @@ func (s *Server) asTheViewer(ctx context.Context, route passthroughRoute, req *c
 		switch {
 		case errors.Is(err, ErrRequestRefused):
 			code = connect.CodePermissionDenied
+		case errors.Is(err, ErrRequestInvalid):
+			code = connect.CodeInvalidArgument
 		case errors.Is(err, ErrAuthorityUnavailable):
 			code = connect.CodeUnavailable
 		}
