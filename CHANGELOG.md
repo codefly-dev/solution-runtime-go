@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — every documented operation declares its authority policy (breaking)
+
+`Operation.Policy` is what a call to the route must hold —
+`Requires(kind, actions...)` or `AnyCheckedCaller()`, the shape of the
+authority's `authority.hop.v1.Policy` — and `InterfaceDocument` writes it as
+the operation's `x-codefly-authority-policy`, the extension the CLI derives
+the solution's `"<VERB> <template>"` route rows from. An operation that
+declares no policy, an empty one, or both, is refused at generation, by its
+route: the runtime's `Check` names every route a request calls, so a route
+with nothing to be held to would only ever be refused by the authority.
+
+The document is written as the backend serves it: an empty `BasePath` is
+omitted (an authority-served backend's operations already carry `/v1/<id>`),
+a subtree pattern ending in `/` is written `/…/{path=**}`, and two methods on
+one path are both kept (the second used to replace the first); one declared
+twice is refused. The passthrough's documented routes carry no policy: the
+module they relay to applies its own.
+
 ## Unreleased — under the authority, a route is held to the solution's delivered policy; a module's tool call acts for the person
 
 The authority's `Check` of the Work Context a request carries now names the

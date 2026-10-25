@@ -1383,6 +1383,19 @@ source of what is served and what is published, and an operation missing its
 documentation is refused. A `Message[T]` field is described from its
 descriptor, with protobuf JSON names.
 
+Every operation also declares its `Policy`, what a call to the route must
+hold: `solution.Requires(kind, actions...)` or `solution.AnyCheckedCaller()`,
+the same shape as the authority's `authority.hop.v1.Policy`. The artifact
+writes it as the operation's `x-codefly-authority-policy`, the extension the
+CLI derives the solution's route rows from, and an operation that declares
+none, or both, is refused at generation by name. A backend served under the
+authority renders its artifact with no `BasePath`: its operations already
+carry the `/v1/<id>` the edge forwards them on, so each route is written as
+served and matches the `"<VERB> <path>"` the runtime's `Check` names. A path
+ending in `/` serves its subtree and is written `/…/{path=**}`. The passthrough
+routes `InterfaceArtifact` documents beside the solution's own carry no policy:
+the module they relay to holds each call to its own method policy.
+
 > **Dependency pins.** `go.mod` records the exact Core, SDK and SaaS SDK
 > revisions used by this runtime, including unreleased commit pseudo-versions.
 > No local `replace` directive is shipped. Core owns capability decoding and

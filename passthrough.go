@@ -765,6 +765,9 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			// Documentation only: InterfaceDocument requires a handler, and the
 			// passthrough, not Operations, serves these routes.
 			Handler: func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the passthrough") },
+			// The module holds each call to its own method policy: the route
+			// declares none of the solution's.
+			relayed: true,
 		})
 	}
 	return ops, nil

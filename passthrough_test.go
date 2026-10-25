@@ -398,7 +398,7 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 		t.Fatal(err)
 	}
 	own := Operation{Path: "/own", Summary: "s", Callers: "c", Behavior: "b", Response: map[string]string{},
-		Handler: func(context.Context, *Gateway) (any, error) { return nil, nil }}
+		Policy: AnyCheckedCaller(), Handler: func(context.Context, *Gateway) (any, error) { return nil, nil }}
 	doc, err := InterfaceArtifact(dir, InterfaceInfo{Title: "t", BasePath: "/solutions/test", OperationPrefix: "Test", Tag: "test"}, []Operation{own}, passthroughModule())
 	if err != nil {
 		t.Fatal(err)
@@ -412,6 +412,20 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 	}
 	if parsed.Info.Version != "1.2.3" || parsed.Paths["/own"] == nil || parsed.Paths[searchPath] == nil {
 		t.Fatalf("artifact: version %q, paths %v", parsed.Info.Version, parsed.Paths)
+	}
+	// A relayed route is held to its module's own method policy, by the hop
+	// in front of the module: it carries none of the solution's.
+	relayed, _ := json.Marshal(parsed.Paths[searchPath])
+	if strings.Contains(string(relayed), PolicyExtension) {
+		t.Fatalf("a relayed route declares a solution policy: %s", relayed)
+	}
+	ops, err := PassthroughOperations(passthroughModule())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops[0].Policy = AnyCheckedCaller()
+	if _, err := InterfaceDocument(InterfaceInfo{}, ops); err == nil {
+		t.Fatal("a relayed route rendered with a solution policy")
 	}
 	if _, err := InterfaceArtifact(t.TempDir(), InterfaceInfo{}, nil); err == nil {
 		t.Fatal("a backend with no service manifest rendered a version")
