@@ -53,14 +53,14 @@ func TestLoadConfigPreservesNativeListenerHostWithAPortOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
-	c := loadConfig(context.Background(), testSolutionID, nil)
+	c := loadConfig(context.Background(), nil)
 	if !c.nativeListener() || c.listenHost != "127.0.0.1" || c.port != "41235" {
 		t.Fatalf("native endpoint was not preserved: host=%q port=%q", c.listenHost, c.port)
 	}
 }
 
 func TestNativeListenerRefusesAnUnresolvedOrNonLoopbackHost(t *testing.T) {
-	c := config{port: "8080", gatewayURL: "http://127.0.0.1:8081", brokerInternalToken: "perimeter", profile: "local", transport: meshTransport{local: true}}
+	c := config{port: "8080", authorityEndpoint: "127.0.0.1:8081", projectedTokenPath: "t", profile: "local", transport: meshTransport{local: true}}
 	for _, host := range []string{"", "0.0.0.0", "::", "192.0.2.10"} {
 		c.listenHost = host
 		if err := c.validate(); err == nil {

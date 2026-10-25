@@ -86,12 +86,12 @@ func loadGatePackages(overlay map[string][]byte) ([]*packages.Package, error) {
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedImports,
 		Overlay: overlay,
 	}
-	loaded, err := packages.Load(cfg, ".", "./passthroughtest")
+	loaded, err := packages.Load(cfg, ".")
 	if err != nil {
 		return nil, err
 	}
-	if len(loaded) < 2 {
-		return nil, fmt.Errorf("loaded %d packages, want at least the root and passthroughtest: a gate that reads nothing passes", len(loaded))
+	if len(loaded) < 1 {
+		return nil, fmt.Errorf("loaded %d packages, want at least the root: a gate that reads nothing passes", len(loaded))
 	}
 	for _, pkg := range loaded {
 		// A fixture that does not COMPILE cannot supply evidence. This is the
@@ -593,12 +593,6 @@ func (g typedGate) carriesCoreWire(t types.Type) (string, string) {
 // on resolved types.
 func TestNoExportedPathHandsOutAServableHandlerByType(t *testing.T) {
 	for _, pkg := range gatePackages(t, nil) {
-		if strings.HasSuffix(pkg.PkgPath, "/passthroughtest") {
-			// passthroughtest is where a consumer's TEST is supposed to get a
-			// handler; it refuses a non-test binary instead, which
-			// TestTheSeamRefusesANonTestBinary drives.
-			continue
-		}
 		for _, finding := range reportHandlerShapes(t, pkg) {
 			t.Error(finding)
 		}
@@ -1503,8 +1497,12 @@ import (
 
 // Holding a source whose method returns the SDK's credential — which is an
 // alias for one of core's wire messages — is not constructing one. The first
-// run of the fixed point reported authorityHeldSource for exactly this, and
-// the finding was mine, not the code's: a method RESULT is not an allocation.
+// run of the fixed point reported such a holder for exactly this, and the
+// finding was the gate's, not the code's: a method RESULT is not an allocation.
+type CredentialSource interface {
+	Credential(ctx context.Context) (workcontext.Credential, error)
+}
+
 type fixtureHolder struct {
 	inner  CredentialSource
 	anchor *workcontext.Credential

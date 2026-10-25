@@ -3,284 +3,163 @@ package solution
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/codefly-dev/core/solution/manifest"
-	"github.com/codefly-dev/sdk-go/workcontext"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"google.golang.org/genproto/googleapis/api/annotations"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
-// passthroughModule is the "things" module of transcodeTestFile as a solution
-// declares it: Search passes through, with only entry_id and big returned.
+// thingsTestFile is the messages of a module API, as its generated package
+// registers them.
+var thingsTestFile = func() protoreflect.FileDescriptor {
+	str := descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum()
+	i32 := descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum()
+	i64 := descriptorpb.FieldDescriptorProto_TYPE_INT64.Enum()
+	msg := descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum()
+	opt := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()
+	rep := descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+	field := func(name string, number int32, label *descriptorpb.FieldDescriptorProto_Label, typ *descriptorpb.FieldDescriptorProto_Type, typeName string) *descriptorpb.FieldDescriptorProto {
+		f := &descriptorpb.FieldDescriptorProto{Name: proto.String(name), Number: proto.Int32(number), Label: label, Type: typ, JsonName: proto.String(jsonName(name))}
+		if typeName != "" {
+			f.TypeName = proto.String(typeName)
+		}
+		return f
+	}
+	file := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("solution_runtime_test/things.proto"),
+		Package: proto.String("things.v1"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{
+			{Name: proto.String("Sub"), Field: []*descriptorpb.FieldDescriptorProto{field("name", 1, opt, str, "")}},
+			{Name: proto.String("GetThingRequest"), Field: []*descriptorpb.FieldDescriptorProto{
+				field("tenant", 1, opt, str, ""),
+				field("entry_id", 2, opt, str, ""),
+				field("page_size", 3, opt, i32, ""),
+				field("ids", 4, rep, str, ""),
+				field("filter", 5, opt, msg, ".things.v1.Sub"),
+			}},
+			{Name: proto.String("Thing"), Field: []*descriptorpb.FieldDescriptorProto{
+				field("entry_id", 1, opt, str, ""),
+				field("big", 2, opt, i64, ""),
+				field("secret", 3, opt, str, ""),
+				field("sub", 4, opt, msg, ".things.v1.Sub"),
+				field("subs", 5, rep, msg, ".things.v1.Sub"),
+			}},
+		},
+	}
+	fd, err := protodesc.NewFile(file, protoregistry.GlobalFiles)
+	if err != nil {
+		panic(err)
+	}
+	if err := protoregistry.GlobalFiles.RegisterFile(fd); err != nil {
+		panic(err)
+	}
+	return fd
+}()
+
+func thingMessage(name string) *dynamicpb.Message {
+	return dynamicpb.NewMessage(thingsTestFile.Messages().ByName(protoreflect.Name(name)))
+}
+
+func setField(m *dynamicpb.Message, name string, v protoreflect.Value) {
+	m.Set(m.Descriptor().Fields().ByName(protoreflect.Name(name)), v)
+}
+
+func jsonName(name string) string {
+	parts := strings.Split(name, "_")
+	for i := 1; i < len(parts); i++ {
+		parts[i] = title(parts[i])
+	}
+	return strings.Join(parts, "")
+}
+
+// relayedTestFile is a module API as the modules serve one behind the hop: a
+// service of Connect/gRPC procedures, none carrying a google.api.http binding.
+// Its messages are thingsTestFile's.
+var relayedTestFile = func() protoreflect.FileDescriptor {
+	things := thingsTestFile.Path()
+	method := func(name string, serverStreams, clientStreams bool) *descriptorpb.MethodDescriptorProto {
+		return &descriptorpb.MethodDescriptorProto{Name: proto.String(name), InputType: proto.String(".things.v1.GetThingRequest"), OutputType: proto.String(".things.v1.Thing"),
+			ServerStreaming: proto.Bool(serverStreams), ClientStreaming: proto.Bool(clientStreams)}
+	}
+	file := &descriptorpb.FileDescriptorProto{
+		Name:       proto.String("solution_runtime_test/relayed.proto"),
+		Package:    proto.String("relayed.v1"),
+		Syntax:     proto.String("proto3"),
+		Dependency: []string{things},
+		Service: []*descriptorpb.ServiceDescriptorProto{{
+			Name: proto.String("Things"),
+			Method: []*descriptorpb.MethodDescriptorProto{
+				method("Search", false, false), method("Get", false, false), method("Watch", true, false), method("Upload", false, true),
+			},
+		}},
+	}
+	fd, err := protodesc.NewFile(file, protoregistry.GlobalFiles)
+	if err != nil {
+		panic(err)
+	}
+	if err := protoregistry.GlobalFiles.RegisterFile(fd); err != nil {
+		panic(err)
+	}
+	return fd
+}()
+
+const (
+	searchName = "/relayed.v1.Things/Search"
+	getName    = "/relayed.v1.Things/Get"
+	watchName  = "/relayed.v1.Things/Watch"
+	searchPath = "/modules/things/relayed.v1.Things/Search"
+	getPath    = "/modules/things/relayed.v1.Things/Get"
+)
+
+// passthroughModule is the "things" module of relayedTestFile as a solution
+// declares it: Search passes through, with only entry_id and big returned,
+// relayed through the hop at the address and binding its slots name.
 func passthroughModule() ConsumedModule {
 	return ConsumedModule{
 		As:     "things",
 		Scopes: []Scope{{ResourceKind: "things", Actions: []string{"read"}}},
 		Methods: []ConsumedMethod{{
-			Name:     "/things.v1.Things/Search",
+			Name:     searchName,
 			Response: MustFieldMask(thingMessage("Thing"), "entry_id", "big"),
 		}},
+		Authority: AuthorityRelay{Group: "page", EndpointKey: "THINGS_ENDPOINT", BindingKey: "THINGS_BINDING"},
 	}
 }
 
-// moduleGateway stands in for the host gateway: the accounts mint, and the
-// module behind /v1/things.
-type moduleGateway struct {
-	*httptest.Server
-	status int
-	reply  string
-	// deny, when set, is an action the viewer does not hold: a mint asking for
-	// it is refused the way accounts refuses one — with 403.
-	deny string
-	// conflict, when set, is an action whose mint is answered with 409 rather
-	// than 403: the status that means "the state you were sealed to has moved"
-	// for a capability and "this viewer lacks that authority" for a viewer,
-	// which is the ambiguity nothing in this runtime may resolve by guessing.
-	//
-	// It exists because a test named after a CONFLICT was driving `deny` and
-	// therefore asserting against a 403. A 409-specific regression — inferring
-	// supersession and poisoning the process — would have survived it, which a
-	// reviewer caught twice before it was fixed.
-	conflict string
-
-	mu    sync.Mutex
-	mints []mintRequest
-	calls []*http.Request
-	bodys []string
-}
-
-func newModuleGateway(t *testing.T, status int, reply string) *moduleGateway {
-	t.Helper()
-	g := &moduleGateway{status: status, reply: reply}
-	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		body, _ := io.ReadAll(r.Body)
-		if r.URL.Path == workContextStartTaskProcedure {
-			var mint mintRequest
-			_ = json.Unmarshal(body, &mint)
-			mint.Bearer = r.Header.Get("authorization")
-			mint.WorkContext = r.Header.Get(workcontext.HeaderName)
-			g.mints = append(g.mints, mint)
-			for _, scope := range mint.AuthorityScopes {
-				for _, action := range scope.Actions {
-					if g.conflict != "" && action == g.conflict {
-						writeJSON(w, http.StatusConflict, map[string]any{
-							"code":    "aborted",
-							"message": "the state this capability was sealed to has moved",
-						})
-						return
-					}
-					if g.deny != "" && action == g.deny {
-						writeJSON(w, http.StatusForbidden, map[string]any{
-							"code":    "permission_denied",
-							"message": "owner is not allowed " + scope.ResourceKind + ":" + action + " at requested scope",
-						})
-						return
-					}
-				}
-			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"token": capability("context-" + mint.Audience + ".1"), "orgId": mint.OrgID,
-				"ownerPrincipalId": "viewer", "currentActorPrincipalId": "viewer",
-				"expiresAt": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
-			})
-			return
-		}
-		g.calls = append(g.calls, r.Clone(r.Context()))
-		g.bodys = append(g.bodys, string(body))
-		w.WriteHeader(g.status)
-		_, _ = io.WriteString(w, g.reply)
-	}))
-	t.Cleanup(g.Close)
-	return g
-}
-
-// observedMints is every mint this fake gateway was asked for.
-func (g *moduleGateway) observedMints() []mintRequest {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return append([]mintRequest{}, g.mints...)
-}
-
-// call sends one Connect unary JSON request, as connect-es does, to the
-// solution's passthrough and returns the status and decoded body.
-func call(t *testing.T, s *Server, path, bearer, body string) (int, map[string]any) {
-	t.Helper()
-	routes, err := resolvePassthrough(s.consumed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-	req.Header.Set("content-type", "application/json")
-	req.Header.Set("connect-protocol-version", "1")
-	if bearer != "" {
-		req.Header.Set("authorization", bearer)
-	}
-	req.Header.Set(orgHeader, testOrganization)
-	req.Header.Set(sessionHeader, "session-1")
-	req.Header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-	rec := httptest.NewRecorder()
-	s.passthroughHandler(routes).ServeHTTP(rec, req)
-	var out map[string]any
-	if rec.Body.Len() > 0 {
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatalf("status %d, body %q: %v", rec.Code, rec.Body.String(), err)
-		}
-	}
-	return rec.Code, out
-}
-
-// passthroughServer is a solution serving the passthrough against a fake
-// gateway, holding a real execution credential.
-//
-// The credential is not optional furniture here: minting for a viewer is
-// fail-closed, so a server without one refuses every call (see
-// TestAServerWithNoCredentialSourceMintsNothing). Every passthrough test
-// therefore stands up the same mint a booted runtime would.
-func passthroughServer(t *testing.T, gatewayURL string, modules ...ConsumedModule) *Server {
-	t.Helper()
-	s := New(Manifest{ID: "test"}).Consumes(modules...).Credential(attestingSource(t))
-	s.cfg.gatewayURL = gatewayURL
-	return s
-}
-
-// attestingSource is an execution credential from a fake host, for a test that
-// is about something other than the mint.
-func attestingSource(t *testing.T) CredentialSource {
-	t.Helper()
-	mint := newHostMint(t, &hostMint{})
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	writeFile(t, tokenFile, "projected")
-	return mintClientFor(t, mint, tokenFile)
-}
-
-const searchPath = "/modules/things/things.v1.Things/Search"
-
-func TestPassthroughAnswersADeclaredMethodAsTheViewer(t *testing.T) {
-	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1","big":"7","secret":"s3cret","sub":{"name":"x"}}`)
-	s := passthroughServer(t, gw.URL, passthroughModule())
-
-	status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1","pageSize":3}`)
-	if status != http.StatusOK {
-		t.Fatalf("status %d: %v", status, body)
-	}
-	// Only the declared response fields reach the page.
-	if body["entryId"] != "e1" || body["big"] != "7" || body["secret"] != nil || body["sub"] != nil {
-		t.Fatalf("response = %v, want only entryId and big", body)
-	}
-	// The module was called over its binding, with the viewer's capability.
-	if len(gw.calls) != 1 || gw.calls[0].Method != http.MethodPost || gw.calls[0].URL.Path != "/v1/things/search" {
-		t.Fatalf("module calls = %v", gw.calls)
-	}
-	var sent map[string]any
-	if err := json.Unmarshal([]byte(gw.bodys[0]), &sent); err != nil || sent["entryId"] != "e1" || sent["pageSize"] != float64(3) {
-		t.Fatalf("module received %q", gw.bodys[0])
-	}
-	if got := gw.calls[0].Header.Get(workcontext.HeaderName); got != capability("context-things.1") {
-		t.Fatalf("work context = %q, want the one minted for the module", got)
-	}
-	if gw.calls[0].Header.Get("authorization") != viewerBearer() {
-		t.Fatal("the viewer's bearer was not forwarded")
-	}
-	if len(gw.mints) != 1 || gw.mints[0].Audience != "things" || gw.mints[0].OrgID != testOrganization || gw.mints[0].SessionID != "session-1" ||
-		len(gw.mints[0].AuthorityScopes) != 1 || gw.mints[0].AuthorityScopes[0].ResourceKind != "things" {
-		t.Fatalf("mints = %+v, want one for the declared audience and scope, in the viewer's org and session", gw.mints)
-	}
-}
-
-func TestPassthroughForwardsOnlyTheBearerToAModuleThatAuthenticatesTheViewer(t *testing.T) {
-	gw := newModuleGateway(t, http.StatusOK, `{"entryId":"e1"}`)
+// watchModule is passthroughModule with its Watch stream declared beside
+// Search, bounded as watch says.
+func watchModule(watch ConsumedMethod) ConsumedModule {
 	module := passthroughModule()
-	module.Scopes, module.ViewerBearer = nil, true
-	s := passthroughServer(t, gw.URL, module)
-
-	if status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1"}`); status != http.StatusOK {
-		t.Fatalf("status %d: %v", status, body)
+	watch.Name = watchName
+	if !watch.WholeResponse {
+		watch.Response = MustFieldMask(thingMessage("Thing"), "entry_id", "big")
 	}
-	if len(gw.mints) != 0 {
-		t.Fatalf("minted %d capabilities for a module that reads the bearer", len(gw.mints))
-	}
-	if gw.calls[0].Header.Get(workcontext.HeaderName) != "" || gw.calls[0].Header.Get("authorization") != viewerBearer() {
-		t.Fatal("want the viewer's bearer and no capability")
-	}
+	module.Methods = append(module.Methods, watch)
+	return module
 }
 
-func TestPassthroughServesOnlyWhatIsDeclared(t *testing.T) {
-	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(t, gw.URL, passthroughModule())
-	for _, path := range []string{
-		"/modules/things/things.v1.Things/Get",     // the module's, but not declared
-		"/modules/other/things.v1.Things/Search",   // not a consumed module
-		"/modules/things/../things/x",              // not a procedure
-		"/modules/things/things.v1.Things/Search/", // not the procedure
-	} {
-		status, body := call(t, s, path, viewerBearer(), `{}`)
-		if status != http.StatusNotFound || body["code"] != "not_found" {
-			t.Errorf("%s: status %d %v, want not_found", path, status, body)
+// No method the passthrough relays needs a google.api.http binding: the
+// modules serve none behind the hop.
+func TestTheRelayedTestModuleCarriesNoHTTPBinding(t *testing.T) {
+	methods := relayedTestFile.Services().ByName("Things").Methods()
+	for i := 0; i < methods.Len(); i++ {
+		if proto.HasExtension(methods.Get(i).Options(), annotations.E_Http) {
+			t.Fatalf("%s carries an http binding", methods.Get(i).FullName())
 		}
 	}
-	if len(gw.calls) != 0 || len(gw.mints) != 0 {
-		t.Fatalf("an undeclared call reached the gateway: %d calls, %d mints", len(gw.calls), len(gw.mints))
-	}
-}
-
-func TestPassthroughRequiresTheViewersBearer(t *testing.T) {
-	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(t, gw.URL, passthroughModule())
-	status, body := call(t, s, searchPath, "", `{}`)
-	if status != http.StatusUnauthorized || body["code"] != "unauthenticated" {
-		t.Fatalf("status %d %v", status, body)
-	}
-	if len(gw.calls)+len(gw.mints) != 0 {
-		t.Fatal("an anonymous call reached the gateway")
-	}
-}
-
-func TestPassthroughForwardsOnlyTheMethodsOwnFields(t *testing.T) {
-	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	s := passthroughServer(t, gw.URL, passthroughModule())
-	// A field the method's request does not declare is not the page's to add:
-	// the request is re-encoded from the method's message, so it never reaches
-	// the module, and it can name no path or prefix of its own.
-	status, body := call(t, s, searchPath, viewerBearer(), `{"entryId":"e1","path":"/v1/other","prefix":"/v1/admin"}`)
-	if status != http.StatusOK {
-		t.Fatalf("status %d %v", status, body)
-	}
-	if gw.calls[0].URL.Path != "/v1/things/search" || strings.Contains(gw.bodys[0], "other") || strings.Contains(gw.bodys[0], "admin") {
-		t.Fatalf("module received %s %q", gw.calls[0].URL, gw.bodys[0])
-	}
-}
-
-func TestPassthroughRelaysTheModulesRefusal(t *testing.T) {
-	for _, tc := range []struct {
-		name, reply string
-		status      int
-		wantStatus  int
-		wantCode    string
-		wantMessage string
-	}{
-		{"a google.rpc.Status keeps its code and message", `{"code":5,"message":"document not found"}`, http.StatusNotFound, http.StatusNotFound, "not_found", "document not found"},
-		{"another JSON refusal is relayed verbatim", `{"failure":{"code":"HISTORY_UNAVAILABLE","admission":"unknown"}}`, http.StatusConflict, http.StatusConflict, "aborted", `{"failure":{"code":"HISTORY_UNAVAILABLE","admission":"unknown"}}`},
-		{"a non-JSON refusal says only its status", `upstream connect error: 10.0.0.7:8080 refused`, http.StatusBadGateway, http.StatusServiceUnavailable, "unavailable", "Bad Gateway"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			gw := newModuleGateway(t, tc.status, tc.reply)
-			s := passthroughServer(t, gw.URL, passthroughModule())
-			status, body := call(t, s, searchPath, viewerBearer(), `{}`)
-			if status != tc.wantStatus || body["code"] != tc.wantCode || body["message"] != tc.wantMessage {
-				t.Fatalf("status %d %v, want %d %s %q", status, body, tc.wantStatus, tc.wantCode, tc.wantMessage)
-			}
-		})
+	if _, err := resolvePassthrough([]ConsumedModule{watchModule(ConsumedMethod{})}); err != nil {
+		t.Fatalf("a module with no http binding was refused: %v", err)
 	}
 }
 
@@ -290,43 +169,85 @@ func TestPassthroughRefusesADeclarationItCannotServe(t *testing.T) {
 		module.Methods = []ConsumedMethod{m}
 		return module
 	}
-	mask := MustFieldMask(thingMessage("Thing"), "entry_id")
-	for name, modules := range map[string][]ConsumedModule{
-		"no as":                         {{Scopes: passthroughModule().Scopes, Methods: passthroughModule().Methods}},
-		"an as with a path":             {{As: "things/v2", Scopes: passthroughModule().Scopes, Methods: passthroughModule().Methods}},
-		"neither scopes nor bearer":     {{As: "things", Methods: passthroughModule().Methods}},
-		"both scopes and bearer":        {{As: "things", ViewerBearer: true, Scopes: passthroughModule().Scopes, Methods: passthroughModule().Methods}},
-		"no methods":                    {{As: "things", ViewerBearer: true}},
-		"a method not in the registry":  {search(ConsumedMethod{Name: "/things.v1.Things/Nope", Response: mask})},
-		"a method with no binding":      {search(ConsumedMethod{Name: "/things.v1.Things/Unbound", Response: mask})},
-		"no response fields":            {search(ConsumedMethod{Name: "/things.v1.Things/Search"})},
-		"a mask and the whole response": {search(ConsumedMethod{Name: "/things.v1.Things/Search", Response: mask, WholeResponse: true})},
-		"a mask over another message":   {search(ConsumedMethod{Name: "/things.v1.Things/Search", Response: MustFieldMask(thingMessage("Sub"), "name")})},
-		"a method twice":                {{As: "things", ViewerBearer: true, Methods: []ConsumedMethod{passthroughModule().Methods[0], passthroughModule().Methods[0]}}},
-		"a module twice":                {passthroughModule(), passthroughModule()},
-	} {
-		if _, err := resolvePassthrough(modules); err == nil {
-			t.Errorf("%s: accepted", name)
-		}
+	module := func(edit func(*ConsumedModule)) []ConsumedModule {
+		m := passthroughModule()
+		edit(&m)
+		return []ConsumedModule{m}
 	}
-	// A binding under another prefix is not a binding under the declared one.
-	module := passthroughModule()
-	module.As = "other"
-	if _, err := resolvePassthrough([]ConsumedModule{module}); err == nil || !strings.Contains(err.Error(), "no google.api.http binding under /v1/other") {
-		t.Errorf("a module whose methods have no binding under its prefix: %v", err)
+	mask := MustFieldMask(thingMessage("Thing"), "entry_id")
+	for name, c := range map[string]struct {
+		modules []ConsumedModule
+		want    string
+	}{
+		"no as":                         {module(func(m *ConsumedModule) { m.As = "" }), "one path segment"},
+		"an as with a path":             {module(func(m *ConsumedModule) { m.As = "things/v2" }), "one path segment"},
+		"no scopes":                     {module(func(m *ConsumedModule) { m.Scopes = nil }), "declares no Scopes"},
+		"no methods":                    {module(func(m *ConsumedModule) { m.Methods = nil }), "declares no methods"},
+		"no authority relay":            {module(func(m *ConsumedModule) { m.Authority = AuthorityRelay{} }), "authority's hop"},
+		"a relay missing its binding":   {module(func(m *ConsumedModule) { m.Authority.BindingKey = "" }), "all three"},
+		"a method not in the registry":  {[]ConsumedModule{search(ConsumedMethod{Name: "/relayed.v1.Things/Nope", Response: mask})}, "not in the protobuf registry"},
+		"no response fields":            {[]ConsumedModule{search(ConsumedMethod{Name: searchName})}, "declares no response fields"},
+		"a mask and the whole response": {[]ConsumedModule{search(ConsumedMethod{Name: searchName, Response: mask, WholeResponse: true})}, "both a response mask"},
+		"a mask over another message":   {[]ConsumedModule{search(ConsumedMethod{Name: searchName, Response: MustFieldMask(thingMessage("Sub"), "name")})}, "response mask is over"},
+		"a pin of another type":         {[]ConsumedModule{search(ConsumedMethod{Name: searchName, WholeResponse: true, Pin: thingMessage("Thing")})}, "its pin is a"},
+		"a method twice":                {module(func(m *ConsumedModule) { m.Methods = append(m.Methods, m.Methods[0]) }), "declared twice"},
+		"a module twice":                {[]ConsumedModule{passthroughModule(), passthroughModule()}, "declared twice"},
+	} {
+		if _, err := resolvePassthrough(c.modules); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want a refusal naming %q", name, err, c.want)
+		}
 	}
 }
 
-func TestPassthroughRefusesAModuleTheSolutionDoesNotConsume(t *testing.T) {
-	modules := []ConsumedModule{passthroughModule()}
-	if err := checkConsumed(modules, []manifest.ConsumedAPI{{ID: "things", Module: "things", As: "things"}}); err != nil {
-		t.Fatalf("a consumed module was refused: %v", err)
+func TestPassthroughRefusesAnUnservableScopeDeclarationAtBoot(t *testing.T) {
+	read := Scope{ResourceKind: "things", Actions: []string{"read"}}
+	module := func(moduleScopes []Scope, methodScopes ...Scope) ConsumedModule {
+		m := passthroughModule()
+		m.Scopes = moduleScopes
+		m.Methods = []ConsumedMethod{{Name: searchName, Scopes: methodScopes, WholeResponse: true}}
+		return m
 	}
-	if err := checkConsumed(modules, []manifest.ConsumedAPI{{ID: "things", Module: "things", As: "stuff"}}); err == nil {
-		t.Fatal("a module consumed under another name was accepted")
+	oneUnscoped := module(nil, read)
+	oneUnscoped.Methods = append(oneUnscoped.Methods, ConsumedMethod{Name: getName, WholeResponse: true})
+	for name, c := range map[string]struct {
+		module ConsumedModule
+		want   string
+	}{
+		"no scopes anywhere":                      {module(nil), "declares no Scopes"},
+		"one method without scopes and no module": {oneUnscoped, "Get declares no Scopes"},
+		"empty action list on a method":           {module(nil, Scope{ResourceKind: "things"}), "names no action"},
+		"empty action list on the module":         {module([]Scope{{ResourceKind: "things", Actions: []string{}}}), "names no action"},
+		"blank action":                            {module(nil, Scope{ResourceKind: "things", Actions: []string{" "}}), "blank action"},
+		"no resource kind":                        {module(nil, Scope{Actions: []string{"read"}}), "no resource kind"},
+		"duplicated action":                       {module(nil, Scope{ResourceKind: "things", Actions: []string{"read", "read"}}), "twice"},
+	} {
+		if _, err := resolvePassthrough([]ConsumedModule{c.module}); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want a refusal naming %q", name, err, c.want)
+		}
 	}
-	if err := checkConsumed(modules, nil); err == nil {
-		t.Fatal("a module the solution does not consume was accepted")
+}
+
+func TestPassthroughRefusesStreamBoundsItCannotKeep(t *testing.T) {
+	for name, module := range map[string]ConsumedModule{
+		"a client stream":             passthroughModule(),
+		"bounds on a unary method":    passthroughModule(),
+		"a negative duration":         watchModule(ConsumedMethod{MaxStreamDuration: -time.Second}),
+		"a duration over the limit":   watchModule(ConsumedMethod{MaxStreamDuration: MaxStreamDurationLimit + time.Second}),
+		"a negative message bound":    watchModule(ConsumedMethod{MaxStreamMessageBytes: -1}),
+		"a response bound on streams": watchModule(ConsumedMethod{MaxResponseBytes: 10}),
+	} {
+		switch name {
+		case "a client stream":
+			module.Methods = append(module.Methods, ConsumedMethod{Name: "/relayed.v1.Things/Upload", WholeResponse: true})
+		case "bounds on a unary method":
+			module.Methods[0].MaxStreamDuration = time.Minute
+		}
+		if _, err := resolvePassthrough([]ConsumedModule{module}); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := resolvePassthrough([]ConsumedModule{watchModule(ConsumedMethod{MaxStreamDuration: time.Minute, MaxStreamMessageBytes: 4096})}); err != nil {
+		t.Fatalf("a bounded stream: %v", err)
 	}
 }
 
@@ -335,7 +256,7 @@ func TestPassthroughOperationsDocumentTheDeclaration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	doc, err := InterfaceDocument(InterfaceInfo{Title: "t", Version: "0.0.1", Description: "d", BasePath: "/solutions/test", OperationPrefix: "Test", Tag: "test"}, ops)
+	doc, err := InterfaceDocument(InterfaceInfo{Title: "t", Version: "0.0.1", Description: "d", BasePath: "/v1/test", OperationPrefix: "Test", Tag: "test"}, ops)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +272,7 @@ func TestPassthroughOperationsDocumentTheDeclaration(t *testing.T) {
 		t.Fatalf("paths = %v", parsed.Paths)
 	}
 	description, _ := op["description"].(string)
-	if !strings.Contains(description, "POST /v1/things/search") || !strings.Contains(description, "big, entry_id") || !strings.Contains(description, "things:[read]") {
+	if !strings.Contains(description, "procedure "+searchName+" through the authority's hop") || !strings.Contains(description, "big, entry_id") || !strings.Contains(description, "things:[read]") {
 		t.Fatalf("description = %q", description)
 	}
 	if parsed.Definitions["ThingsV1Thing"] == nil || parsed.Definitions["ThingsV1GetThingRequest"] == nil {
@@ -359,36 +280,50 @@ func TestPassthroughOperationsDocumentTheDeclaration(t *testing.T) {
 	}
 }
 
-func TestPassthroughMergesTheDeclaredPinIntoEveryRequest(t *testing.T) {
-	gw := newModuleGateway(t, http.StatusOK, `{}`)
-	pin := thingMessage("GetThingRequest")
-	setField(pin, "tenant", protoreflect.ValueOfString("pinned-tenant"))
-	ids := pin.NewField(pin.Descriptor().Fields().ByName("ids"))
-	ids.List().Append(protoreflect.ValueOfString("pinned-id"))
-	pin.Set(pin.Descriptor().Fields().ByName("ids"), ids)
+func TestPassthroughOperationsDocumentEachMethodsOwnScopes(t *testing.T) {
 	module := passthroughModule()
-	module.Methods[0].Pin = pin
-	s := passthroughServer(t, gw.URL, module)
-
-	if status, body := call(t, s, searchPath, viewerBearer(), `{"tenant":"page-tenant","ids":["page-id"]}`); status != http.StatusOK {
-		t.Fatalf("status %d %v", status, body)
+	module.Scopes = nil
+	module.Methods = []ConsumedMethod{
+		{Name: searchName, Scopes: []Scope{{ResourceKind: "things", Actions: []string{"list"}}}, WholeResponse: true},
+		{Name: getName, Scopes: []Scope{{ResourceKind: "things", Actions: []string{"inspect"}}}, WholeResponse: true},
 	}
-	var sent struct {
-		Tenant string   `json:"tenant"`
-		IDs    []string `json:"ids"`
-	}
-	if err := json.Unmarshal([]byte(gw.bodys[0]), &sent); err != nil {
+	ops, err := PassthroughOperations(module)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// A pinned scalar replaces the page's; a pinned repeated value is added to
-	// the page's, so a module that ANDs them keeps the pin whatever the page sends.
-	if sent.Tenant != "pinned-tenant" || len(sent.IDs) != 2 || sent.IDs[0] != "page-id" || sent.IDs[1] != "pinned-id" {
-		t.Fatalf("module received %q", gw.bodys[0])
+	found := map[string]string{}
+	for _, op := range ops {
+		found[op.Path] = op.Callers
 	}
+	if !strings.Contains(found[searchPath], "things:[list]") || strings.Contains(found[searchPath], "inspect") {
+		t.Fatalf("search callers = %q", found[searchPath])
+	}
+	if !strings.Contains(found[getPath], "things:[inspect]") || strings.Contains(found[getPath], "list") {
+		t.Fatalf("get callers = %q", found[getPath])
+	}
+}
 
-	module.Methods[0].Pin = thingMessage("Thing")
-	if _, err := resolvePassthrough([]ConsumedModule{module}); err == nil {
-		t.Fatal("a pin of another type was accepted")
+func TestPassthroughOperationsDocumentAStreamedMethod(t *testing.T) {
+	ops, err := PassthroughOperations(watchModule(ConsumedMethod{MaxStreamDuration: time.Minute, MaxStreamMessageBytes: 4096}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var watch *Operation
+	for i := range ops {
+		if strings.HasSuffix(ops[i].Path, "/Watch") {
+			watch = &ops[i]
+		}
+	}
+	if watch == nil || !watch.Streaming || !strings.Contains(watch.Behavior, "server-streaming") || !strings.Contains(watch.Behavior, watchName) ||
+		!strings.Contains(watch.Behavior, "1m0s") || !strings.Contains(watch.Behavior, "4096 bytes") || !strings.Contains(watch.Behavior, "every streamed message") {
+		t.Fatalf("watch operation = %+v", watch)
+	}
+	doc, err := InterfaceDocument(InterfaceInfo{Title: "t", Version: "1", Tag: "t", OperationPrefix: "T"}, ops)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(doc), `"x-streaming": "server"`) {
+		t.Fatalf("the document does not mark the stream: %s", doc)
 	}
 }
 
@@ -397,43 +332,48 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 	if err := os.WriteFile(filepath.Join(dir, "service.codefly.yaml"), []byte("kind: service\nname: backend\nversion: 1.2.3\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	own := Operation{Path: "/own", Summary: "s", Callers: "c", Behavior: "b", Response: map[string]string{},
-		Handler: func(context.Context, *Gateway) (any, error) { return nil, nil }}
-	doc, err := InterfaceArtifact(dir, InterfaceInfo{Title: "t", BasePath: "/solutions/test", OperationPrefix: "Test", Tag: "test"}, []Operation{own}, passthroughModule())
+	server := New(Manifest{ID: "test"}).
+		Operations(served("get", "/v1/test/own", func(context.Context, *Gateway) (any, error) { return nil, nil })).
+		Consumes(passthroughModule()).
+		ServeMCP("tools", "v1", Requires("test.tools", "call"), func(*mcp.Server) {})
+	doc, err := server.InterfaceArtifact(dir, InterfaceInfo{Title: "t", OperationPrefix: "Test", Tag: "test"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var parsed struct {
-		Info  struct{ Version string } `json:"info"`
-		Paths map[string]any           `json:"paths"`
+		Info  struct{ Version string }             `json:"info"`
+		Paths map[string]map[string]map[string]any `json:"paths"`
 	}
 	if err := json.Unmarshal(doc, &parsed); err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Info.Version != "1.2.3" || parsed.Paths["/own"] == nil || parsed.Paths[searchPath] == nil {
+	policyAt := func(method, path string) string {
+		t.Helper()
+		policy, ok := parsed.Paths[path][method][PolicyExtension]
+		if !ok {
+			t.Fatalf("%s %s is not published with a policy: %v", method, path, parsed.Paths[path])
+		}
+		out, _ := json.Marshal(policy)
+		return string(out)
+	}
+	if parsed.Info.Version != "1.2.3" || len(parsed.Paths) != 3 {
 		t.Fatalf("artifact: version %q, paths %v", parsed.Info.Version, parsed.Paths)
 	}
-	if _, err := InterfaceArtifact(t.TempDir(), InterfaceInfo{}, nil); err == nil {
+	// Every served route is published at the path it is served at, with the
+	// policy a call to it must hold: the solution's own operation, the MCP
+	// route with the policy ServeMCP declared, and each relayed route with
+	// any checked caller, the child issued through the binding and the
+	// module's own method policy being what gates the call.
+	for route, want := range map[[2]string]string{
+		{"get", "/v1/test/own"}:           `{"any_checked_caller":true}`,
+		{"post", "/v1/test/mcp"}:          `{"requires":[{"actions":["call"],"resource_kind":"test.tools"}]}`,
+		{"post", "/v1/test" + searchPath}: `{"any_checked_caller":true}`,
+	} {
+		if got := policyAt(route[0], route[1]); got != want {
+			t.Errorf("%s %s publishes %s, want %s", route[0], route[1], got, want)
+		}
+	}
+	if _, err := New(Manifest{ID: "test"}).InterfaceArtifact(t.TempDir(), InterfaceInfo{}); err == nil {
 		t.Fatal("a backend with no service manifest rendered a version")
-	}
-}
-
-// TestAViewerBearerRouteRefusesToActWithoutACredential: a ViewerBearer route
-// mints nothing, so it asked the credential for nothing — and it was therefore
-// the one route that kept forwarding the viewer's bearer to the gateway after
-// the issuer refused this build.
-//
-// The credential is what authorises this process to act for a viewer, not
-// merely what it mints with. A route that forwards a viewer's bearer under a
-// withdrawn credential is acting without authority, whatever it does not mint.
-func TestViewerBearerRouteDoesNotAcquireModuleAuthority(t *testing.T) {
-	var calls atomic.Int32
-	server := New(Manifest{ID: testSolutionID}).Credential(countingIdleSource{calls: &calls})
-	route := passthroughRoute{module: ConsumedModule{As: "pages", ViewerBearer: true}}
-	if _, err := server.authorize(t.Context(), route, workHeaders(), nil); err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 0 {
-		t.Fatal("viewer-only route minted module authority")
 	}
 }

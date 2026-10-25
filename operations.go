@@ -1,9 +1,13 @@
 package solution
 
 import (
+	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -19,15 +23,24 @@ import (
 // exactly these into the interface artifact a solution commits and CI
 // re-generates. A route cannot be served undocumented, and an operation cannot
 // be documented without being served.
+//
+// Each operation also declares what a call to it must hold (Policy). Under
+// the authority interface the runtime asks the authority's Check for every
+// request "<VERB> <path>" as served, and the authority holds it to the row the
+// CLI derives from this artifact: the operation's x-codefly-authority-policy
+// at its path. An operation that declares none is refused at generation, by
+// name, so no served route reaches the artifact with nothing to be held to.
 
 // Operation is one public route of a solution backend.
 //
 // Summary, Callers and Behavior are all required: InterfaceDocument refuses an
 // operation missing any of them, which keeps an undocumented route out of the
-// artifact. Errors are not declared per operation, because the runtime gives
-// every operation the same failures.
+// artifact; Policy is required the same way. Errors are not declared per
+// operation, because the runtime gives every operation the same failures.
 type Operation struct {
-	// Path is the gateway-relative route, e.g. "/sources".
+	// Path is the route as this backend serves it, e.g. "/sources", or under
+	// the authority "/v1/<id>/sources". A pattern ending in "/" serves its
+	// whole subtree, and the artifact says so ("/x/{path=**}").
 	Path string
 	// Method is the documented HTTP method, lowercase; empty means "get".
 	Method string
@@ -51,9 +64,70 @@ type Operation struct {
 	// Streaming marks an operation answered as a stream of Response messages
 	// (a Connect server-streaming procedure) rather than one of them.
 	Streaming bool
+	// Policy is what a call to the route must hold, as the authority applies
+	// it: required on every operation the backend serves.
+	Policy *Policy
 	// Exactly one of Handler and RequestHandler answers the route.
 	Handler        Handler
 	RequestHandler RequestHandler
+}
+
+// Policy is what a call to an operation must hold: the authority's
+// authority.hop.v1.Policy, the declaration a module marks each of its methods
+// with, here for a route. Exactly one of its fields is set: an operation that
+// requires nothing says so with AnyCheckedCaller, because an absent
+// declaration and "nothing is required" must not look the same. Its JSON is
+// the extension's value.
+type Policy struct {
+	// Requires lists what the call must hold, every entry: each action on its
+	// resource kind, in the call's effective authority.
+	Requires []Requirement `json:"requires,omitempty"`
+	// AnyCheckedCaller lets through any call whose Work Context the authority
+	// checked, holding nothing in particular.
+	AnyCheckedCaller bool `json:"any_checked_caller,omitempty"`
+}
+
+// Requirement is actions on one resource kind, in the kind's own vocabulary as
+// the solution's contract declares it (scope_ceilings).
+type Requirement struct {
+	ResourceKind string   `json:"resource_kind"`
+	Actions      []string `json:"actions"`
+}
+
+// Requires is the policy that a call holds actions on kind.
+func Requires(kind string, actions ...string) *Policy {
+	return &Policy{Requires: []Requirement{{ResourceKind: kind, Actions: actions}}}
+}
+
+// AnyCheckedCaller is the policy that admits any call the authority checked.
+func AnyCheckedCaller() *Policy { return &Policy{AnyCheckedCaller: true} }
+
+// PolicyExtension is the operation extension the policy is written under, the
+// one the CLI reads route policies from.
+const PolicyExtension = "x-codefly-authority-policy"
+
+// validate reports a policy that is absent, both things at once, or names a
+// kind without an action. The vocabulary itself is the authority's to check.
+func (p *Policy) validate() error {
+	switch {
+	case p == nil:
+		return errors.New("declares no authority policy: every route this backend serves says what a call must hold, or that any checked caller may make it (AnyCheckedCaller)")
+	case p.AnyCheckedCaller && len(p.Requires) > 0:
+		return errors.New("declares both requirements and any checked caller")
+	case !p.AnyCheckedCaller && len(p.Requires) == 0:
+		return errors.New("declares an empty authority policy: name what a call must hold, or AnyCheckedCaller")
+	}
+	for _, r := range p.Requires {
+		if r.ResourceKind == "" || len(r.Actions) == 0 {
+			return fmt.Errorf("requires %q with actions %v: a requirement names a resource kind and at least one action", r.ResourceKind, r.Actions)
+		}
+		for _, action := range r.Actions {
+			if action == "" {
+				return fmt.Errorf("requires an empty action on %s", r.ResourceKind)
+			}
+		}
+	}
+	return nil
 }
 
 // QueryParameter is one documented query parameter of an Operation.
@@ -62,16 +136,90 @@ type QueryParameter struct {
 	Required bool
 }
 
-// Operations registers each operation's handler at its path.
+// Operations declares the routes this backend serves itself. Chainable. Each
+// is served for its own method only: a request is answered by the operation
+// declared for its method on its path, which is the operation the authority's
+// Check is asked about ("<VERB> <path>"), and a method the path does not
+// declare is refused by name before the authority is asked or any handler
+// runs. The boot refuses an operation that is undocumented, declares no
+// policy, names a method twice on one path, or takes the MCP route.
 func (s *Server) Operations(ops ...Operation) *Server {
-	for _, op := range ops {
-		if op.RequestHandler != nil {
-			s.HandleRequest(op.Path, op.RequestHandler)
-		} else {
-			s.Handle(op.Path, op.Handler)
-		}
-	}
+	s.operations = append(s.operations, ops...)
 	return s
+}
+
+// servedMethods are the methods an operation may declare. OPTIONS is the CORS
+// preflight the runtime answers on every declared path, never an operation.
+var servedMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
+
+// verb is the operation's method as a request spells it.
+func (o Operation) verb() string { return strings.ToUpper(cmp.Or(o.Method, "get")) }
+
+// requestHandler is whichever of the operation's two handler shapes it set.
+func (o Operation) requestHandler() RequestHandler {
+	if o.RequestHandler != nil {
+		return o.RequestHandler
+	}
+	handler := o.Handler
+	return func(r *http.Request, gw *Gateway) (any, error) { return handler(r.Context(), gw) }
+}
+
+// operationTable is the declared operations by path and then by method, or the
+// refusal of the first that cannot be served as declared.
+func (s *Server) operationTable() (map[string]map[string]RequestHandler, error) {
+	table := map[string]map[string]RequestHandler{}
+	for _, op := range s.operations {
+		if err := op.validate(); err != nil {
+			return nil, err
+		}
+		if table[op.Path] == nil {
+			table[op.Path] = map[string]RequestHandler{}
+		}
+		if _, taken := table[op.Path][op.verb()]; taken {
+			return nil, fmt.Errorf("operation %s %s is declared twice: one request would have two handlers", op.verb(), op.Path)
+		}
+		table[op.Path][op.verb()] = op.requestHandler()
+	}
+	return table, nil
+}
+
+// mountOperations serves each declared path on mux, dispatching on the
+// request's method to the operation declared for it.
+func (s *Server) mountOperations(mux *http.ServeMux) error {
+	table, err := s.operationTable()
+	if err != nil {
+		return fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	for path, methods := range table {
+		served := make(map[string]http.HandlerFunc, len(methods))
+		for method, handler := range methods {
+			served[method] = s.wrapRequest(handler)
+		}
+		mux.HandleFunc(path, withCORS(byMethod(path, served)))
+	}
+	return nil
+}
+
+// byMethod answers a request with the handler declared for its method on
+// path, or refuses a method path does not declare, by name, with the methods
+// it does (405, and Allow).
+func byMethod(path string, served map[string]http.HandlerFunc) http.HandlerFunc {
+	methods := make([]string, 0, len(served))
+	for method := range served {
+		methods = append(methods, method)
+	}
+	slices.Sort(methods)
+	allowed := strings.Join(methods, ", ")
+	return func(w http.ResponseWriter, r *http.Request) {
+		handler, ok := served[r.Method]
+		if !ok {
+			w.Header().Set("Allow", allowed)
+			message := fmt.Sprintf("%s is not an operation of %s: it serves %s", r.Method, path, allowed)
+			writeRefusal(w, r, http.StatusMethodNotAllowed, message, nil)
+			return
+		}
+		handler(w, r)
+	}
 }
 
 // InterfaceInfo is the document-level description of a solution's interface
@@ -82,12 +230,12 @@ type InterfaceInfo struct {
 	Title       string
 	Version     string
 	Description string
-	// BasePath is where the host gateway publishes the routes, e.g.
-	// "/solutions/<id>": the backend serves them at its own root, but a caller
-	// only ever reaches them prefixed.
+	// BasePath, when set, is a prefix a caller reaches every route under. An
+	// authority-served backend leaves it empty: its operations already carry
+	// the /v1/<id> the edge forwards them on.
 	BasePath string
-	// OperationPrefix starts every operationId ("Notes" renders "/sources" as
-	// "Notes_Sources"); Tag is the one tag every operation carries.
+	// OperationPrefix starts every operationId ("Notes" renders GET "/sources"
+	// as "Notes_Get_Sources"); Tag is the one tag every operation carries.
 	OperationPrefix string
 	Tag             string
 }
@@ -114,17 +262,30 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 			"properties": map[string]any{"error": map[string]any{"type": "string"}},
 		},
 	}
-	paths := map[string]any{}
+	paths := map[string]map[string]any{}
+	ids := map[string]string{}
 	for _, op := range ops {
 		if err := op.validate(); err != nil {
 			return nil, err
 		}
-		method := op.Method
+		method := strings.ToLower(op.Method)
 		if method == "" {
 			method = "get"
 		}
+		route := servedRoute(op.Path)
+		if paths[route] == nil {
+			paths[route] = map[string]any{}
+		}
+		if _, taken := paths[route][method]; taken {
+			return nil, fmt.Errorf("operation %s %s is declared twice", strings.ToUpper(method), route)
+		}
+		id := operationID(info.OperationPrefix, method, route)
+		if other, taken := ids[id]; taken {
+			return nil, fmt.Errorf("operations %s and %s %s share the operationId %q", other, strings.ToUpper(method), route, id)
+		}
+		ids[id] = strings.ToUpper(method) + " " + route
 		endpoint := map[string]any{
-			"operationId": operationID(info.OperationPrefix, op.Path),
+			"operationId": id,
 			"summary":     op.Summary,
 			"description": op.Callers + "\n\n" + op.Behavior,
 			"tags":        []string{info.Tag},
@@ -133,6 +294,9 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		if op.Streaming {
 			// Swagger 2 has no stream: the 200 schema is one message of it.
 			endpoint["x-streaming"] = "server"
+		}
+		if op.Policy != nil {
+			endpoint[PolicyExtension] = op.Policy
 		}
 		parameters := []any{}
 		if op.Request != nil {
@@ -144,36 +308,57 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		if len(parameters) > 0 {
 			endpoint["parameters"] = parameters
 		}
-		paths[op.Path] = map[string]any{method: endpoint}
+		paths[route][method] = endpoint
 	}
-	return map[string]any{
+	doc := map[string]any{
 		"swagger": "2.0",
 		"info": map[string]any{
 			"title":       info.Title,
 			"version":     info.Version,
 			"description": info.Description,
 		},
-		"basePath": info.BasePath,
 		"consumes": []string{"application/json"},
 		"produces": []string{"application/json"},
 		"securityDefinitions": map[string]any{
-			"bearer": map[string]any{
+			"workContext": map[string]any{
 				"type":        "apiKey",
-				"name":        "Authorization",
+				"name":        WorkContextHeader,
 				"in":          "header",
-				"description": "The signed-in person's access token, forwarded by the host. Every operation requires it.",
+				"description": "The signed-in person's Work Context for this solution, sent by the authority's edge. Every operation requires it.",
 			},
 		},
-		"security":    []any{map[string]any{"bearer": []string{}}},
+		"security":    []any{map[string]any{"workContext": []string{}}},
 		"paths":       paths,
 		"definitions": definitions,
-	}, nil
+	}
+	// No base path is the routes as served: an authority-served backend's
+	// operations already carry the /v1/<id> its edge forwards them on.
+	if info.BasePath != "" {
+		doc["basePath"] = info.BasePath
+	}
+	return doc, nil
+}
+
+// servedRoute spells an operation's path as the authority matches a request
+// against it: a pattern ending in "/", which the backend's mux serves for its
+// whole subtree, as that prefix and "{path=**}", the rest of the path; a
+// "{name...}" wildcard as "{name=**}"; a "{$}" anchor as the "/" it anchors.
+func servedRoute(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/{$}"):
+		return strings.TrimSuffix(path, "{$}")
+	case strings.HasSuffix(path, "/"):
+		return path + "{path=**}"
+	case strings.HasSuffix(path, "...}"):
+		return strings.TrimSuffix(path, "...}") + "=**}"
+	}
+	return path
 }
 
 // operationResponses describes what one operation answers. The 200 schema is
 // derived from the operation's response type; the failures are the runtime's,
-// not the handler's: it rejects a request with no bearer, and turns an error a
-// handler returns into a failure status.
+// not the handler's: it rejects a request whose Work Context the authority
+// does not check, and turns an error a handler returns into a failure status.
 func operationResponses(op Operation, definitions map[string]any) map[string]any {
 	return map[string]any{
 		"200": map[string]any{
@@ -181,11 +366,11 @@ func operationResponses(op Operation, definitions map[string]any) map[string]any
 			"schema":      valueSchema(op.Response, definitions),
 		},
 		"401": map[string]any{
-			"description": "The request carried no bearer token.",
+			"description": "The request carried no Work Context the authority checks for this solution.",
 			"schema":      map[string]any{"$ref": "#/definitions/Error"},
 		},
 		"502": map[string]any{
-			"description": "A call this operation makes through the host gateway failed.",
+			"description": "A call this operation makes to a module failed.",
 			"schema":      map[string]any{"$ref": "#/definitions/Error"},
 		},
 	}
@@ -196,7 +381,7 @@ func operationResponses(op Operation, definitions map[string]any) map[string]any
 func (o Operation) validate() error {
 	switch {
 	case !strings.HasPrefix(o.Path, "/"):
-		return fmt.Errorf("operation path %q must be gateway-relative", o.Path)
+		return fmt.Errorf("operation path %q must be an absolute path", o.Path)
 	case o.Summary == "":
 		return fmt.Errorf("operation %s has no summary", o.Path)
 	case o.Callers == "":
@@ -209,16 +394,28 @@ func (o Operation) validate() error {
 		return fmt.Errorf("operation %s has no handler", o.Path)
 	case o.Handler != nil && o.RequestHandler != nil:
 		return fmt.Errorf("operation %s declares two handlers", o.Path)
+	case !slices.Contains(servedMethods, o.verb()):
+		return fmt.Errorf("operation %s declares the method %q: an operation is one of %s", o.Path, o.Method, strings.Join(servedMethods, ", "))
+	}
+	if err := o.Policy.validate(); err != nil {
+		return fmt.Errorf("operation %s %s %w", o.verb(), o.Path, err)
 	}
 	return nil
 }
 
-// operationID renders "/sources" as "<prefix>_Sources"; a nested path
-// contributes one segment per level rather than carrying a slash into an
-// identifier.
-func operationID(prefix, path string) string {
-	id := prefix
-	for _, segment := range strings.Split(strings.Trim(path, "/"), "/") {
+// operationID renders GET "/sources" as "<prefix>_Get_Sources" from the
+// method and the route as served (servedRoute); a nested path contributes one
+// segment per level rather than carrying a slash into an identifier, and a
+// wildcard its name ("/x/{path=**}" ends "_X_Path"), so a path and the
+// subtree under it are two ids. The method is part of it because two methods
+// on one path are two operations, and an operationId names exactly one.
+func operationID(prefix, method, route string) string {
+	id := prefix + "_" + title(strings.ToLower(method))
+	for _, segment := range strings.Split(strings.Trim(route, "/"), "/") {
+		if name, ok := strings.CutPrefix(segment, "{"); ok {
+			name, _, _ = strings.Cut(strings.TrimSuffix(name, "}"), "=")
+			segment = name
+		}
 		id += "_" + title(segment)
 	}
 	return id

@@ -61,14 +61,13 @@ func TestABootThatNamesNoModuleIsRefused(t *testing.T) {
 			t.Setenv(resources.ModulePrefix, tc.module)
 			// Every endpoint overridden, so nothing else can be the reason.
 			t.Setenv("PORT", "8443")
-			t.Setenv("GATEWAY_URL", "https://gateway.cell")
 			t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
 
 			_, initErr := codefly.Init(context.Background())
 			if initErr == nil {
 				t.Fatal("codefly.Init accepted a process naming no module, or another one: the SDK's contract this boot relies on has changed")
 			}
-			cfg := loadConfig(context.Background(), testSolutionID, initErr)
+			cfg := loadConfig(context.Background(), initErr)
 			if cfg.environmentLoadErr != nil {
 				t.Errorf("an identity refusal was filed as an environment load failure: %v", cfg.environmentLoadErr)
 			}
@@ -95,18 +94,9 @@ func TestABootThatNamesNoModuleIsRefused(t *testing.T) {
 // test goes through endpoint resolution. It must not: the SDK's contract is
 // that a process failing Init does not serve.
 func TestTheBootIdentifiesItselfToTheSDK(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	t.Setenv(resources.ModulePrefix, "")
 	t.Cleanup(func() { _ = codefly.LoadEnvironmentVariables() })
-
-	err := bootFails(t, New(Manifest{ID: testSolutionID}), mint)
+	err := bootFails(t, New(Manifest{ID: testSolutionID}), func() { t.Setenv(resources.ModulePrefix, "") })
 	if !strings.Contains(err.Error(), resources.ModulePrefix) {
 		t.Errorf("the boot was refused, but not for naming no module: %v", err)
-	}
-	mint.mu.Lock()
-	reached := len(mint.paths)
-	mint.mu.Unlock()
-	if got := reached; got != 0 {
-		t.Errorf("the boot reached the mint %d time(s) before refusing: a process the SDK cannot identify must not present its projected token anywhere", got)
 	}
 }
