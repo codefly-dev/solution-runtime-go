@@ -100,7 +100,9 @@ func TestInterfaceDocumentRefusesAnUndocumentedOperation(t *testing.T) {
 }
 
 func TestOperationsServesEachDeclaredRoute(t *testing.T) {
-	s := New(Manifest{ID: "example"}).Operations(documentedOperations()...)
+	s, _ := authorityServer(t)
+	s.handlers = map[string]RequestHandler{}
+	s.Operations(documentedOperations()...)
 	handler, ok := s.handlers["/nodes/tree"]
 	if !ok {
 		t.Fatalf("the declared route was not registered: %v", s.handlers)
@@ -108,7 +110,7 @@ func TestOperationsServesEachDeclaredRoute(t *testing.T) {
 	srv := httptest.NewServer(s.wrapRequest(handler))
 	defer srv.Close()
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/nodes/tree", nil)
-	req.Header.Set("authorization", "Bearer viewer")
+	req.Header.Set(WorkContextHeader, edgeContext)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

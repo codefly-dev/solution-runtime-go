@@ -163,10 +163,10 @@ func TestUnderTheAuthorityTheViewerIsTheEdgesWorkContext(t *testing.T) {
 	})
 	request := httptest.NewRequest(http.MethodGet, "/v1/page/types", nil)
 	request.Header.Set(WorkContextHeader, edgeContext)
-	request.Header.Set(orgHeader, "org-the-caller-wrote")
+	request.Header.Set("x-org-id", "org-the-caller-wrote")
 	answer := httptest.NewRecorder()
 	handler(answer, request)
-	if answer.Code != http.StatusOK || seen == nil || seen.OrgID() != "org-from-the-authority" || seen.sessionID != "session-1" || seen.parentContext != edgeContext {
+	if answer.Code != http.StatusOK || seen == nil || seen.OrgID() != "org-from-the-authority" || seen.parentContext != edgeContext {
 		t.Fatalf("answered %d with %+v", answer.Code, seen)
 	}
 	for name, header := range map[string]http.Header{
@@ -187,11 +187,10 @@ func TestUnderTheAuthorityTheViewerIsTheEdgesWorkContext(t *testing.T) {
 // ForParent's Work Context is a child of the edge's, issued by the authority
 // through the named binding with this workload as actor, held until it is due
 // for renewal; ForBinding's is this module's own, in the viewer's organization.
-// A person's call never goes by ForModule under the authority.
 func TestUnderTheAuthorityEveryWorkContextIsIssued(t *testing.T) {
 	s, stand := authorityServer(t)
-	gw := s.gatewayFor(http.Header{})
-	gw.parentContext, gw.orgID, gw.sessionID = edgeContext, "org-from-the-authority", "session-1"
+	gw := s.newGateway()
+	gw.parentContext, gw.orgID = edgeContext, "org-from-the-authority"
 	ctx := context.Background()
 
 	viewer, err := gw.ForParent(ctx, "documents-read", Scope{ResourceKind: "documents", Actions: []string{"read"}})
@@ -226,45 +225,47 @@ func TestUnderTheAuthorityEveryWorkContextIsIssued(t *testing.T) {
 	if _, err := gw.ForParent(ctx, "refused", Scope{ResourceKind: "documents", Actions: []string{"read"}}); err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("a refused issue was not a refusal: %v", err)
 	}
-	gw.ceilings = map[string][]Scope{}
-	if _, err := gw.ForModule(ctx, "documents", Scope{ResourceKind: "documents", Actions: []string{"read"}}); err == nil || !strings.Contains(err.Error(), "ForParent") {
-		t.Fatalf("ForModule under the authority: %v", err)
-	}
 	if _, err := gw.WorkContext(ctx); err == nil {
 		t.Fatal("a gateway with no ask handed out a Work Context")
 	}
 	// A request the edge did not send carries no parent to issue a child of.
-	bare := s.gatewayFor(http.Header{})
+	bare := s.newGateway()
 	if _, err := bare.ForParent(ctx, "documents-read"); err == nil {
 		t.Fatal("ForParent issued a child of no context")
 	}
 }
 
-// A composition that names the authority needs no saas gateway and no broker
-// credential. A solution that consumes modules and names no authority is
-// refused for the authority, the one way its calls reach a module — never for
-// a gateway it would not call; one that consumes nothing and names neither is
-// refused for the gateway.
-func TestAConfigNamingTheAuthorityNeedsNoGateway(t *testing.T) {
-	cfg := config{port: "8080", profile: "local", authorityEndpoint: "127.0.0.1:1", requiresAuthority: true}
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("a composition naming the authority was refused: %v", err)
-	}
-	cfg.authorityEndpoint = ""
-	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "authority/endpoint") || strings.Contains(err.Error(), "gateway") {
-		t.Fatalf("a consuming solution with no authority: %v", err)
-	}
-	cfg.requiresAuthority = false
-	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "gateway") {
-		t.Fatalf("a composition naming neither started: %v", err)
+// ForBinding is the authority's alone: a gateway built outside a boot has no
+// authority to issue it.
+func TestForBindingWithoutTheAuthorityIsRefused(t *testing.T) {
+	gw := &Gateway{orgID: "org", contexts: newWorkContextCache()}
+	if _, err := gw.ForBinding(context.Background(), "records-types"); err == nil || !strings.Contains(err.Error(), "authority") {
+		t.Fatalf("ForBinding without the authority: %v", err)
 	}
 }
 
-// ForBinding is the authority's alone.
-func TestForBindingWithoutTheAuthorityIsRefused(t *testing.T) {
-	gw := newGateway("https://gateway.test", "Bearer viewer-session", "org", "session")
-	if _, err := gw.ForBinding(context.Background(), "records-types"); err == nil || !strings.Contains(err.Error(), "authority/endpoint") {
-		t.Fatalf("ForBinding without the authority: %v", err)
+// An ask's scopes are copied when it is made: a caller writing through its own
+// slice afterwards changes neither the cache key nor what the next issue asks.
+func TestAnAskCannotBeEditedAfterItIsMade(t *testing.T) {
+	s, stand := authorityServer(t)
+	gw := s.newGateway()
+	gw.parentContext, gw.orgID = edgeContext, "org-from-the-authority"
+	actions := []string{"read"}
+	viewer, err := gw.ForParent(context.Background(), "documents-read", Scope{ResourceKind: "documents", Actions: actions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions[0] = "delete"
+	for key, cached := range viewer.contexts.minted {
+		cached.reuseUntil = time.Time{}
+		viewer.contexts.minted[key] = cached
+	}
+	if _, err := viewer.WorkContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	asked := stand.asked()
+	if len(asked) != 2 || asked[1].GetScopes()[0].GetActions()[0] != "read" {
+		t.Fatalf("the renewed issue asked %v, want the read the ask was made with", asked[len(asked)-1].GetScopes())
 	}
 }
 
@@ -405,7 +406,7 @@ func TestHopEnforcementWarnMakesTheRouteCheckAdvisory(t *testing.T) {
 		if err := codefly.LoadEnvironmentVariables(); err != nil {
 			t.Fatal(err)
 		}
-		if got := loadConfig(context.Background(), "page", nil).routeAdvisory; got != advisory {
+		if got := loadConfig(context.Background(), nil).routeAdvisory; got != advisory {
 			t.Errorf("hop/ENFORCEMENT=%q: advisory %v, want %v", value, got, advisory)
 		}
 	}

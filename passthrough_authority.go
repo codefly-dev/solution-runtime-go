@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -86,6 +85,8 @@ func (s *Server) openRelays(lookup func(group, key string) (string, error)) (map
 			return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
 		}
 		relays[module.As] = &moduleRelay{binding: binding, conn: conn}
+		// Dialled, so a tool's error result cannot name it (withoutRuntimeAddresses).
+		s.cfg.dialled = append(s.cfg.dialled, dialledAddresses(endpoint)...)
 	}
 	return relays, nil
 }
@@ -126,9 +127,9 @@ func (s *Server) viewerGateway(ctx context.Context, carried, route string) (*Gat
 	if err != nil {
 		return nil, err
 	}
-	gw := s.gatewayFor(http.Header{})
+	gw := s.newGateway()
 	gw.parentContext = carried
-	gw.orgID, gw.sessionID, gw.installationID, gw.installationErr = viewer.GetTenantId(), viewer.GetSessionId(), "", nil
+	gw.orgID = viewer.GetTenantId()
 	principals, actors := principalsOf(viewer)
 	gw.viewer = &requestViewer{principals: principals, actors: actors}
 	return gw, nil
@@ -174,7 +175,7 @@ func (s *Server) relay(ctx context.Context, route passthroughRoute, req *connect
 	}
 	limit := route.method.MaxResponseBytes
 	if limit <= 0 {
-		limit = DefaultTranscodedResponseLimit
+		limit = DefaultPassthroughResponseLimit
 	}
 	out := dynamicpb.NewMessage(route.md.Output())
 	calling := grpcmetadata.AppendToOutgoingContext(ctx, WorkContextHeader, token)

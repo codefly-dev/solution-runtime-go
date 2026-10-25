@@ -15,13 +15,78 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
+
+// thingsTestFile is the messages of a module API, as its generated package
+// registers them.
+var thingsTestFile = func() protoreflect.FileDescriptor {
+	str := descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum()
+	i32 := descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum()
+	i64 := descriptorpb.FieldDescriptorProto_TYPE_INT64.Enum()
+	msg := descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum()
+	opt := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum()
+	rep := descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+	field := func(name string, number int32, label *descriptorpb.FieldDescriptorProto_Label, typ *descriptorpb.FieldDescriptorProto_Type, typeName string) *descriptorpb.FieldDescriptorProto {
+		f := &descriptorpb.FieldDescriptorProto{Name: proto.String(name), Number: proto.Int32(number), Label: label, Type: typ, JsonName: proto.String(jsonName(name))}
+		if typeName != "" {
+			f.TypeName = proto.String(typeName)
+		}
+		return f
+	}
+	file := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("solution_runtime_test/things.proto"),
+		Package: proto.String("things.v1"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{
+			{Name: proto.String("Sub"), Field: []*descriptorpb.FieldDescriptorProto{field("name", 1, opt, str, "")}},
+			{Name: proto.String("GetThingRequest"), Field: []*descriptorpb.FieldDescriptorProto{
+				field("tenant", 1, opt, str, ""),
+				field("entry_id", 2, opt, str, ""),
+				field("page_size", 3, opt, i32, ""),
+				field("ids", 4, rep, str, ""),
+				field("filter", 5, opt, msg, ".things.v1.Sub"),
+			}},
+			{Name: proto.String("Thing"), Field: []*descriptorpb.FieldDescriptorProto{
+				field("entry_id", 1, opt, str, ""),
+				field("big", 2, opt, i64, ""),
+				field("secret", 3, opt, str, ""),
+				field("sub", 4, opt, msg, ".things.v1.Sub"),
+				field("subs", 5, rep, msg, ".things.v1.Sub"),
+			}},
+		},
+	}
+	fd, err := protodesc.NewFile(file, protoregistry.GlobalFiles)
+	if err != nil {
+		panic(err)
+	}
+	if err := protoregistry.GlobalFiles.RegisterFile(fd); err != nil {
+		panic(err)
+	}
+	return fd
+}()
+
+func thingMessage(name string) *dynamicpb.Message {
+	return dynamicpb.NewMessage(thingsTestFile.Messages().ByName(protoreflect.Name(name)))
+}
+
+func setField(m *dynamicpb.Message, name string, v protoreflect.Value) {
+	m.Set(m.Descriptor().Fields().ByName(protoreflect.Name(name)), v)
+}
+
+func jsonName(name string) string {
+	parts := strings.Split(name, "_")
+	for i := 1; i < len(parts); i++ {
+		parts[i] = title(parts[i])
+	}
+	return strings.Join(parts, "")
+}
 
 // relayedTestFile is a module API as the modules serve one behind the hop: a
 // service of Connect/gRPC procedures, none carrying a google.api.http binding.
-// Its messages are transcodeTestFile's.
+// Its messages are thingsTestFile's.
 var relayedTestFile = func() protoreflect.FileDescriptor {
-	things := transcodeTestFile.Path()
+	things := thingsTestFile.Path()
 	method := func(name string, serverStreams, clientStreams bool) *descriptorpb.MethodDescriptorProto {
 		return &descriptorpb.MethodDescriptorProto{Name: proto.String(name), InputType: proto.String(".things.v1.GetThingRequest"), OutputType: proto.String(".things.v1.Thing"),
 			ServerStreaming: proto.Bool(serverStreams), ClientStreaming: proto.Bool(clientStreams)}

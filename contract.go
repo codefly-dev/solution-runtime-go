@@ -49,9 +49,11 @@ const (
 // without inferring it from the composition's inputs.
 const ContractPath = "/.well-known/module-contract"
 
-// ModuleContract is the authority contract a solution declares: the ceiling
-// this runtime holds its own declaration to at boot, and the ceiling an
-// operator reads off a running process.
+// ModuleContract is the contract a solution declares: the ceiling this runtime
+// holds its own passthrough declaration to at boot, and the ceiling an
+// operator reads off a running process. It is optional: the authority bounds
+// every call by the binding it is issued through and what the person holds,
+// and a solution that declares none publishes an empty contract.
 //
 // It is the author's declaration of the most authority this solution may ever
 // ask for. It is not the renderer's input — that is RendererContractFile, whose
@@ -88,11 +90,11 @@ type ModuleContract struct {
 	Ceilings map[string]map[string][]Scope
 }
 
-// Contract declares the authority contract this solution publishes. Chainable.
+// Contract declares the contract this solution publishes. Chainable.
 //
 // Not to be confused with Manifest.Contract, which is the capability contract
 // id the host's handshake reads. This one is about authority: which audiences
-// this solution holds bindings for, and how much it may ever ask of each.
+// this solution's passthrough asks for, and how much it may ever ask of each.
 func (s *Server) Contract(contract ModuleContract) *Server {
 	// FROZEN here, at the declaration boundary.
 	//
@@ -151,11 +153,10 @@ func frozenScopes(scopes []Scope) []Scope {
 // effectiveContract is the contract of the one profile this process runs under:
 // what it publishes, and what its declaration was held to at boot.
 type effectiveContract struct {
-	Schema    string            `json:"schema"`
-	Solution  string            `json:"solution"`
-	Profile   string            `json:"profile"`
-	Principal string            `json:"principal"`
-	Bindings  []contractBinding `json:"bindings"`
+	Schema   string            `json:"schema"`
+	Solution string            `json:"solution"`
+	Profile  string            `json:"profile"`
+	Bindings []contractBinding `json:"bindings"`
 }
 
 // contractBinding is one audience this solution holds authority for, and the
@@ -180,18 +181,11 @@ func (s *Server) resolveContract() (effectiveContract, error) {
 		Schema:   ContractSchema,
 		Solution: s.manifest.ID,
 		Profile:  s.cfg.profile,
-		// The principal is not declared here: it is one of the
-		// authority-bearing values the platform provisioned and this process
-		// froze at boot, so the contract reports who this workload actually is
-		// rather than who its author believed it would be. A contract that
-		// restated it would be a second source for one fact, and the one that
-		// disagreed would be this one.
-		Principal: s.principal,
 	}
-	// Under the authority, a solution that publishes no ceiling is bounded by
-	// the authority: each call is issued through one of its bindings, within
-	// that binding's ceiling and what the person holds.
-	if s.host != nil && len(s.declaredContract.Ceilings) == 0 {
+	// A solution that publishes no ceiling is bounded by the authority alone:
+	// each call is issued through one of its bindings, within that binding's
+	// ceiling and what the person holds.
+	if len(s.declaredContract.Ceilings) == 0 {
 		return contract, nil
 	}
 	bindings, err := checkContract(s.consumed, s.declaredContract, s.cfg.profile)
@@ -372,11 +366,6 @@ func (s *Server) handleContract(w http.ResponseWriter, _ *http.Request) {
 // reason: which profile applies is the renderer's to decide, and a build-time
 // document that had already chosen one would be a document that is true in one
 // environment.
-//
-// It carries no principal. The principal is an authority-bearing value the
-// platform provisions and the running process freezes at boot
-// (AuthorityGroup/PRINCIPAL); a build-time document that named one would be
-// asserting at render time what only the deployment knows.
 func ContractArtifact(id string, contract ModuleContract, modules ...ConsumedModule) ([]byte, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, fmt.Errorf("a contract artifact names no solution: pass the manifest id")

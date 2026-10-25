@@ -158,9 +158,9 @@ type InterfaceInfo struct {
 	Title       string
 	Version     string
 	Description string
-	// BasePath is where the host gateway publishes the routes, e.g.
-	// "/solutions/<id>": the backend serves them at its own root, but a caller
-	// only ever reaches them prefixed.
+	// BasePath, when set, is a prefix a caller reaches every route under. An
+	// authority-served backend leaves it empty: its operations already carry
+	// the /v1/<id> the edge forwards them on.
 	BasePath string
 	// OperationPrefix starts every operationId ("Notes" renders GET "/sources"
 	// as "Notes_Get_Sources"); Tag is the one tag every operation carries.
@@ -248,14 +248,14 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		"consumes": []string{"application/json"},
 		"produces": []string{"application/json"},
 		"securityDefinitions": map[string]any{
-			"bearer": map[string]any{
+			"workContext": map[string]any{
 				"type":        "apiKey",
-				"name":        "Authorization",
+				"name":        WorkContextHeader,
 				"in":          "header",
-				"description": "The signed-in person's access token, forwarded by the host. Every operation requires it.",
+				"description": "The signed-in person's Work Context for this solution, sent by the authority's edge. Every operation requires it.",
 			},
 		},
-		"security":    []any{map[string]any{"bearer": []string{}}},
+		"security":    []any{map[string]any{"workContext": []string{}}},
 		"paths":       paths,
 		"definitions": definitions,
 	}
@@ -285,8 +285,8 @@ func servedRoute(path string) string {
 
 // operationResponses describes what one operation answers. The 200 schema is
 // derived from the operation's response type; the failures are the runtime's,
-// not the handler's: it rejects a request with no bearer, and turns an error a
-// handler returns into a failure status.
+// not the handler's: it rejects a request whose Work Context the authority
+// does not check, and turns an error a handler returns into a failure status.
 func operationResponses(op Operation, definitions map[string]any) map[string]any {
 	return map[string]any{
 		"200": map[string]any{
@@ -294,11 +294,11 @@ func operationResponses(op Operation, definitions map[string]any) map[string]any
 			"schema":      valueSchema(op.Response, definitions),
 		},
 		"401": map[string]any{
-			"description": "The request carried no bearer token.",
+			"description": "The request carried no Work Context the authority checks for this solution.",
 			"schema":      map[string]any{"$ref": "#/definitions/Error"},
 		},
 		"502": map[string]any{
-			"description": "A call this operation makes through the host gateway failed.",
+			"description": "A call this operation makes to a module failed.",
 			"schema":      map[string]any{"$ref": "#/definitions/Error"},
 		},
 	}
@@ -309,7 +309,7 @@ func operationResponses(op Operation, definitions map[string]any) map[string]any
 func (o Operation) validate() error {
 	switch {
 	case !strings.HasPrefix(o.Path, "/"):
-		return fmt.Errorf("operation path %q must be gateway-relative", o.Path)
+		return fmt.Errorf("operation path %q must be an absolute path", o.Path)
 	case o.Summary == "":
 		return fmt.Errorf("operation %s has no summary", o.Path)
 	case o.Callers == "":

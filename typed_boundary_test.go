@@ -1497,8 +1497,12 @@ import (
 
 // Holding a source whose method returns the SDK's credential — which is an
 // alias for one of core's wire messages — is not constructing one. The first
-// run of the fixed point reported authorityHeldSource for exactly this, and
-// the finding was mine, not the code's: a method RESULT is not an allocation.
+// run of the fixed point reported such a holder for exactly this, and the
+// finding was the gate's, not the code's: a method RESULT is not an allocation.
+type CredentialSource interface {
+	Credential(ctx context.Context) (workcontext.Credential, error)
+}
+
 type fixtureHolder struct {
 	inner  CredentialSource
 	anchor *workcontext.Credential

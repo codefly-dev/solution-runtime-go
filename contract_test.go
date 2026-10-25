@@ -1,14 +1,10 @@
 package solution
 
 import (
-	"context"
 	"encoding/json"
-	"net/http"
-	"path/filepath"
+	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/codefly-dev/sdk-go/workcontext"
 )
 
 // contractServer is a solution consuming one module, with the declaration and
@@ -19,8 +15,7 @@ func contractServer(t *testing.T, profile string, contract ModuleContract, modul
 		modules = []ConsumedModule{passthroughModule()}
 	}
 	server := New(Manifest{ID: testSolutionID}).Consumes(modules...).Contract(contract)
-	server.cfg = config{brokerInternalToken: "broker-perimeter-token", profile: profile}
-	server.principal = testPrincipal
+	server.cfg = config{profile: profile}
 	return server
 }
 
@@ -226,7 +221,7 @@ func TestTheContractArtifactCarriesEveryProfileAndNoPrincipal(t *testing.T) {
 	if _, ok := document.Profiles["staging"]; !ok {
 		t.Error("artifact has no staging profile: a deployed process would have none to resolve its ceiling from")
 	}
-	if strings.Contains(string(raw), testPrincipal) {
+	if strings.Contains(string(raw), "principal") {
 		t.Error("the artifact carries a principal: that is a value only the deployment knows")
 	}
 
@@ -246,10 +241,7 @@ func TestAnUnusableProfileNameIsRefused(t *testing.T) {
 	}}, passthroughModule()); err == nil {
 		t.Error("a traversing profile name was rendered")
 	}
-	cfg := config{brokerInternalToken: "broker-perimeter-token",
-		port: "8080", gatewayURL: "https://gateway:42152", mintURL: "https://gateway:42152" + credentialMintPath,
-		projectedTokenPath: "t", profile: "../local",
-	}
+	cfg := config{port: "8080", authorityEndpoint: "127.0.0.1:1", projectedTokenPath: "t", profile: "../local"}
 	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), ContractProfileEnvironmentVariable) {
 		t.Errorf("validate = %v, want a refusal naming %s", err, ContractProfileEnvironmentVariable)
 	}
@@ -312,116 +304,28 @@ func TestThisRuntimesContractDoesNotClaimTheRenderersSchema(t *testing.T) {
 	}
 }
 
-// TestAnEmptyManifestIdCannotDisableTheCeiling: the ceiling applied only when
-// the resolved contract carried a solution id, and the solution id is
-// Manifest.ID — so the field that identifies the solution doubled as the
-// sentinel for "a boot resolved this contract". An empty id left the ceiling
-// switched off while every other part of the boot reported success, and
-// ForModule asking for no scopes against an undeclared audience reached the
-// host as a viewer mint.
-//
-// Two independent reasons it cannot recur: the ceiling is keyed on its own
-// flag, and an empty id is refused at boot. A value that is also a sentinel
-// has one, and which one it is depends on a caller.
-func TestAnEmptyManifestIdCannotDisableTheCeiling(t *testing.T) {
-	t.Run("an empty id is refused at boot", func(t *testing.T) {
-		err := Manifest{ID: ""}.validateID()
-		if err == nil {
-			t.Fatal("a manifest with no id was accepted: it is what the presence document names this solution by, what the published contract reports, and what every refusal here identifies this process as")
-		}
-		if !strings.Contains(err.Error(), "Manifest.ID") {
-			t.Errorf("the refusal %q does not name the field that fixes it", err)
-		}
-		// And whitespace is not an id either.
-		if err := (Manifest{ID: "   "}).validateID(); err == nil {
-			t.Error("a manifest whose id is whitespace was accepted")
-		}
-	})
-
-	// The one that matters: even reaching the state by hand, the ceiling is
-	// still governing, because it no longer reads an id to decide.
-	t.Run("the ceiling governs a resolved contract with no id", func(t *testing.T) {
-		gw := newModuleGateway(t, http.StatusOK, `{"entry_id":"e1"}`)
-		tokenFile := filepath.Join(t.TempDir(), "token")
-		writeFile(t, tokenFile, "projected")
-		mint := newHostMint(t, &hostMint{})
-		server := New(Manifest{ID: ""}).
-			Consumes(passthroughModule()).
-			Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
-				localProfile: {"things": {{ResourceKind: "things", Actions: []string{"read"}}}},
-			}}).
-			// A working credential, so the only thing that can refuse this ask
-			// is the ceiling. Without it the ask fails for want of an
-			// attestation whether the ceiling governs or not, and this test
-			// passes either way — which is exactly how the mutation survived
-			// the first version of it.
-			Credential(mintClientFor(t, mint, tokenFile))
-		server.cfg.profile = localProfile
-		server.cfg.gatewayURL = gw.URL
-		contract, err := server.resolveContract()
-		if err != nil {
-			t.Fatalf("resolveContract: %v", err)
-		}
-		if contract.Solution != "" {
-			t.Fatalf("this test needs a resolved contract carrying no solution id, got %q", contract.Solution)
-		}
-		server.contract = contract
-		server.contractResolved = true
-
-		header := http.Header{}
-		header.Set("authorization", viewerBearer())
-		header.Set(orgHeader, testOrganization)
-		header.Set(sessionHeader, "session-1")
-		header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-		// With a stated scope, so the ask reaches the ceiling rather than the
-		// earlier refusal for an ask that names no authority at all.
-		_, err = server.gatewayFor(header).ForModule(context.Background(), "undeclared",
-			Scope{ResourceKind: "secrets", Actions: []string{"read"}})
-		if err == nil {
-			t.Fatal("an ask for an audience the contract does not declare was minted for, on a contract carrying no solution id: the ceiling has to be keyed on whether a boot resolved it, not on a field that happens to be non-empty")
-		}
-		// And refused BY THE CEILING. Any-error would be satisfied by an ask
-		// that failed for want of a credential, a gateway, or anything else.
-		if !strings.Contains(err.Error(), "names no binding for that audience") {
-			t.Fatalf("the ask was refused for %q, not by the published ceiling: the ceiling is not governing this contract at all", err)
-		}
-
-		// The control: a declared audience inside the ceiling is still minted
-		// for, so the ceiling is applying rather than refusing everything.
-		if _, err := server.gatewayFor(header).ForModule(context.Background(), "things",
-			Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
-			t.Fatalf("an ask inside the published ceiling was refused: %v", err)
-		}
-		mints := gw.observedMints()
-		if len(mints) != 1 {
-			t.Errorf("observed %d mints, want exactly the one inside the ceiling: an ask outside it must never reach the host", len(mints))
-		}
-		for _, mint := range mints {
-			if mint.Audience == "undeclared" {
-				t.Error("the ask for an undeclared audience reached the host")
-			}
-		}
-	})
+// TestAnEmptyManifestIdIsRefused: the id is what the presence document names
+// this solution by, the audience the authority addresses its Work Contexts to,
+// what the published contract reports and what every refusal here identifies
+// this process as.
+func TestAnEmptyManifestIdIsRefused(t *testing.T) {
+	err := Manifest{ID: ""}.validateID()
+	if err == nil {
+		t.Fatal("a manifest with no id was accepted")
+	}
+	if !strings.Contains(err.Error(), "Manifest.ID") {
+		t.Errorf("the refusal %q does not name the field that fixes it", err)
+	}
+	if err := (Manifest{ID: "   "}).validateID(); err == nil {
+		t.Error("a manifest whose id is whitespace was accepted")
+	}
 }
 
-// TestTheDeclaredCeilingIsFrozenAtDeclaration is round fifteen's first major.
-//
-// Contract() stored the caller's value — the caller's maps, and the caller's
-// backing arrays inside every Scope. Resolution and every gateway built
-// afterwards retain the ceiling's slices, so keeping the `actions :=
-// []string{"read"}` used in the declaration and writing "delete" into it after
-// boot changed the ceiling every later request is checked against, and the
-// contract this process publishes with it.
-//
-// The previous round froze the ASK. This is the other operand, and a ceiling a
-// caller can still edit is not a ceiling.
+// TestTheDeclaredCeilingIsFrozenAtDeclaration: Contract() stored the caller's
+// maps and backing arrays, so a caller writing through its own slice after
+// boot changed the contract this process publishes. Both operands of the
+// ceiling comparison are frozen at declaration.
 func TestTheDeclaredCeilingIsFrozenAtDeclaration(t *testing.T) {
-	gw := newWorkContextGateway(t, &workContextGateway{})
-	mint := newHostMint(t, &hostMint{})
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	writeFile(t, tokenFile, "projected")
-
-	// The slices the caller keeps, on BOTH sides of the comparison.
 	ceilingActions := []string{"read"}
 	askedActions := []string{"read"}
 	module := passthroughModule()
@@ -429,23 +333,19 @@ func TestTheDeclaredCeilingIsFrozenAtDeclaration(t *testing.T) {
 	module.Scopes = []Scope{{ResourceKind: "things", Actions: askedActions}}
 
 	server := New(Manifest{ID: testSolutionID}).Consumes(module).
-		Credential(mintClientFor(t, mint, tokenFile)).
 		Contract(ModuleContract{Ceilings: map[string]map[string][]Scope{
 			localProfile: {"things": {{ResourceKind: "things", Actions: ceilingActions}}},
 		}})
-	server.cfg = config{brokerInternalToken: "broker-perimeter-token", gatewayURL: gw.URL, profile: localProfile}
-	server.principal = testPrincipal
+	server.cfg = config{profile: localProfile}
 	contract, err := server.resolveContract()
 	if err != nil {
 		t.Fatalf("resolve the published contract: %v", err)
 	}
-	server.contract, server.contractResolved = contract, true
+	server.contract = contract
 
-	// After boot, after resolution: the caller writes through its own slices.
 	ceilingActions[0] = "delete"
 	askedActions[0] = "delete"
 
-	// What this process PUBLISHES must still be the declaration.
 	published, err := json.Marshal(server.contract)
 	if err != nil {
 		t.Fatalf("render the published contract: %v", err)
@@ -453,29 +353,7 @@ func TestTheDeclaredCeilingIsFrozenAtDeclaration(t *testing.T) {
 	if strings.Contains(string(published), "delete") {
 		t.Errorf("the published contract names an action the declaration never contained: %s", published)
 	}
-
-	// And what it ENFORCES must still be the declaration.
-	header := http.Header{}
-	header.Set("authorization", viewerBearer())
-	header.Set(orgHeader, viewerOrg)
-	header.Set(sessionHeader, viewerSession)
-	header.Set(workcontext.InstallationIDHeaderName, testInstallation)
-	gateway := server.gatewayFor(header)
-
-	if _, err := gateway.ForModule(context.Background(), "things",
-		Scope{ResourceKind: "things", Actions: []string{"delete"}}); err == nil {
-		t.Error("an ask for delete was accepted: the ceiling was edited after boot through the caller's own slice, so the published contract and the authority this process mints no longer agree with each other or with what a reviewer approved")
-	}
-	select {
-	case got := <-gw.mints:
-		t.Errorf("a mint reached the issuer for %+v after the ceiling was edited: a refusal that happens after the ask is on the wire is not a ceiling", got.AuthorityScopes)
-	default:
-	}
-
-	// The control: the declaration's own ask still works, so this froze the
-	// values rather than breaking the comparison.
-	if _, err := gateway.ForModule(context.Background(), "things",
-		Scope{ResourceKind: "things", Actions: []string{"read"}}); err != nil {
-		t.Errorf("the declared ask was refused after the freeze, which would make every contract unusable: %v", err)
+	if again, err := server.resolveContract(); err != nil || strings.Contains(fmt.Sprint(again), "delete") {
+		t.Errorf("a contract resolved after the caller's edit names %v (%v): the declaration was not frozen", again, err)
 	}
 }

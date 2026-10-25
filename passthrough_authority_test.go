@@ -327,12 +327,11 @@ func TestARelayNeedsItsSlots(t *testing.T) {
 // whole of start() and relays both a unary call and a stream to the module, as
 // the viewer, at the address and binding the composition names.
 func TestABootedPassthroughRelaysProceduresThatCarryNoHTTPBinding(t *testing.T) {
-	stand, authority := interfaceAuthorityAt(t)
 	module := &relayedModule{streamed: 2}
-	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__AUTHORITY__ENDPOINT", "grpc://"+authority)
 	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__PAGE__THINGS_ENDPOINT", "grpc://"+module.serve(t))
 	t.Setenv("CODEFLY__WORKSPACE_CONFIGURATION__PAGE__THINGS_BINDING", "things-binding")
-	b := boot(t, New(Manifest{ID: "page", Frontend: []byte(testFrontend)}).Consumes(watchModule(ConsumedMethod{})), newHostMint(t, &hostMint{}))
+	b := boot(t, New(Manifest{ID: "page", Frontend: []byte(testFrontend)}).Consumes(watchModule(ConsumedMethod{})))
+	stand := b.authority
 	code, answer := connectCall(t, b.base+relayedSearchPath, edgeContext, `{"entryId":"e1"}`)
 	if code != http.StatusOK || answer["entryId"] != "e1" || answer["secret"] != nil {
 		t.Fatalf("the relayed call answered %d %v", code, answer)
@@ -346,22 +345,6 @@ func TestABootedPassthroughRelaysProceduresThatCarryNoHTTPBinding(t *testing.T) 
 	}
 	if asked := stand.asked(); len(asked) != 2 || asked[0].GetOperationBindingId() != "things-binding" || asked[0].GetParentToken() != edgeContext {
 		t.Fatalf("the authority was asked %v", asked)
-	}
-}
-
-// A solution that consumes modules and runs under no authority refuses to
-// boot, naming what is missing: there is no other way its page's calls reach a
-// module.
-func TestASolutionThatConsumesModulesRefusesToBootWithoutTheAuthority(t *testing.T) {
-	bootEnvironment(t, newHostMint(t, &hostMint{}))
-	s := New(Manifest{ID: "page"}).Consumes(passthroughModule())
-	takeListener(s)
-	ln, err := s.start(context.Background())
-	if ln != nil {
-		_ = ln.Close()
-	}
-	if err == nil || !strings.Contains(err.Error(), AuthorityInterfaceGroup+"/"+AuthorityEndpointKey) || !strings.Contains(err.Error(), "consumed modules") {
-		t.Fatalf("a consuming solution with no authority: %v", err)
 	}
 }
 
@@ -407,7 +390,7 @@ func TestARefusalIsWrittenInTheCallersProtocol(t *testing.T) {
 // refusal and keeps no text.
 func TestAWorkContextRefusalKeepsTheAuthoritysReason(t *testing.T) {
 	s, _ := authorityServer(t)
-	gw := s.gatewayFor(http.Header{})
+	gw := s.newGateway()
 	gw.parentContext = edgeContext
 	_, err := gw.ForParent(context.Background(), "refused")
 	var refusal *WorkContextRefusal
@@ -418,7 +401,7 @@ func TestAWorkContextRefusalKeepsTheAuthoritysReason(t *testing.T) {
 		t.Fatalf("a handler's refusal answered %d %q", status, message)
 	}
 	_ = s.host.conn.Close()
-	unreachable := s.gatewayFor(http.Header{})
+	unreachable := s.newGateway()
 	unreachable.orgID = "org-from-the-authority"
 	_, err = unreachable.ForBinding(context.Background(), "any")
 	if !errors.As(err, &refusal) || refusal.Reason != "" {

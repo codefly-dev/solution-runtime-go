@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — the runtime runs only under the authority; the saas-host mode is deleted (breaking)
+
+Since the passthrough relays only through the authority, nothing a consuming
+solution does reaches the saas host any more, and the rest of that mode is
+deleted with its tests and docs:
+
+- `Gateway.ForModule` and its published-ceiling check, the accounts
+  `StartTask` mint, and the identity headers it was rooted in
+  (`Gateway.InstallationID`, `x-org-id`, `x-session-id`,
+  `x-codefly-installation-id`).
+- The broker execution credential: `Server.Credential`, `CredentialSource`,
+  the `module-authority` group (`AuthorityGroup` and its keys,
+  `INTERNAL_TOKEN`), the per-installation credential controller, and the
+  `saas-sdk-go` dependency.
+- Calls through the saas gateway: `Gateway.Transcoded`, `MaxResponseBytes`,
+  `TranscodeOption`, `DefaultTranscodedResponseLimit` (now
+  `DefaultPassthroughResponseLimit`), `Unary`, `Gateway.HTTPClient`,
+  `Gateway.BaseURL`, gateway resolution by role (`GATEWAY_URL`,
+  `CODEFLY_HOST_MODULE`, `CODEFLY_HOST_GATEWAY`, `CODEFLY_HOST_FRONTEND`).
+- The install step: `Server.OnInstall`, `Installation`, `RefuseInstall`,
+  `ErrInstallRefused` and `POST /_codefly/installations`.
+- The MCP surface's saas wiring: the gateway-stamped identity it read, the
+  OAuth Protected Resource Metadata document and its challenge,
+  `ProtectedResourceMetadataPath`, `MCPEnvironment`, the `mcp` group
+  (`issuer-url`, `public-url`) and `PUBLIC_URL`.
+- `ErrNotAttested`, `ErrCredentialRefused`, `ErrCredentialUnavailable`,
+  `WorkContextPrincipals` from an accounts mint, and the published
+  contract's `principal`.
+
+Kept, because the authority path reaches it:
+
+- `ServeMCP` and `ViewerFromContext`: the MCP transport, now served at
+  `/v1/<id>/mcp` and admitted exactly as a handler route is — the authority's
+  `Check` of the Work Context the request carries, naming `POST /v1/<id>/mcp`.
+  A tool reaches a module through `ForParent`. This is the transport an
+  authority-based MCP route (robin calling a solution's tools) builds on.
+- `Contract`/`ModuleContract`/`ContractArtifact`: optional; a solution that
+  declares no ceiling is bounded by the authority alone.
+- `GatewayError`, `ClientError`, `WorkContextRefusal`: a handler's own
+  refusals and the authority's.
+
+A composition that names no `authority/endpoint` is now refused at boot,
+whether or not the solution consumes modules, and so is one with no projected
+workload credential path.
+
 ## Unreleased — the passthrough relays only through the authority, by each module's own procedure (breaking)
 
 The passthrough relays every declared method over gRPC to the module's own

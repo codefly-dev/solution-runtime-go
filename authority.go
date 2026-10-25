@@ -23,14 +23,14 @@ import (
 )
 
 // The authority interface (codefly-dev/authority): the authority gateway on a
-// laptop, the host in a cell. When the composition names one
-// (authority/endpoint), the page is reached through the authority's edge (the
-// auth gateway's role), which signs the person in and sends each request on
-// with the person's Work Context addressed to this module. The runtime holds
-// no session bearer: it asks the authority's Check who that context is for,
-// and every call it makes to a module is issued by the authority as a child of
-// that context through one of this module's bindings (ForParent), or as this
-// module's own work (ForBinding). The runtime mints nothing.
+// laptop, the host in a cell. The composition names it (authority/endpoint),
+// and the page is reached through the authority's edge, which signs the person
+// in and sends each request on with the person's Work Context addressed to
+// this module. The runtime holds no session bearer: it asks the authority's
+// Check who that context is for, and every call it makes to a module is issued
+// by the authority as a child of that context through one of this module's
+// bindings (ForParent), or as this module's own work (ForBinding). The runtime
+// mints nothing.
 const (
 	// AuthorityInterfaceGroup and AuthorityEndpointKey name where the
 	// composition says which authority answers.
@@ -223,23 +223,21 @@ func refusalStatus(err error) int {
 	return http.StatusBadGateway
 }
 
-// ForParent is the viewer's own call to a module, under the authority: a child
-// of the Work Context the edge sent this request with, through one of this
-// module's declared bindings. The authority derives the audience from the
-// binding and grants within the binding's invoke ceiling and what the person
-// holds there; scopes narrow it further.
+// ForParent is the viewer's own call to a module: a child of the Work Context
+// the edge sent this request with, through one of this module's declared
+// bindings. The authority derives the audience from the binding and grants
+// within the binding's invoke ceiling and what the person holds there; scopes
+// narrow it further. The binding is the ceiling, so there is no ceiling of this
+// runtime's own to hold the ask to.
 func (g *Gateway) ForParent(ctx context.Context, binding string, scopes ...Scope) (*Gateway, error) {
 	if g.host == nil || g.parentContext == "" {
 		return nil, errors.New("ForParent is issued by the authority interface, as a child of the Work Context the edge sends a request with; this request carries none")
 	}
 	acting := *g
-	wire := make([]workContextScope, len(scopes))
-	for i, scope := range scopes {
-		wire[i] = workContextScope{ResourceKind: scope.ResourceKind, Actions: append([]string(nil), scope.Actions...), ResourceIDs: append([]string(nil), scope.ResourceIDs...)}
-	}
+	wire := askedScopesOf(scopes)
 	sum := sha256.Sum256([]byte(g.parentContext))
 	key, _ := json.Marshal(wire)
-	acting.delegation = &delegation{key: "parent\x00" + hex.EncodeToString(sum[:]) + "\x00" + binding + "\x00" + string(key), ask: startTaskRequest{OrgID: g.orgID, Binding: binding, AuthorityScopes: wire, child: true}}
+	acting.delegation = &delegation{key: "parent\x00" + hex.EncodeToString(sum[:]) + "\x00" + binding + "\x00" + string(key), ask: issueAsk{organization: g.orgID, binding: binding, scopes: wire, child: true}}
 	if _, err := acting.workContext(ctx); err != nil {
 		return nil, g.surfaced(err)
 	}
@@ -247,27 +245,28 @@ func (g *Gateway) ForParent(ctx context.Context, binding string, scopes ...Scope
 }
 
 // WorkContext is the Work Context this gateway acts under, issued (and renewed)
-// for ForModule's or ForBinding's ask: what a caller presents to a module it
-// reaches itself, over gRPC through the hop for example.
+// for ForParent's or ForBinding's ask: what a caller presents to the module it
+// reaches itself, over gRPC through the hop. The gateway a handler is given
+// acts under the edge's context, which is never forwarded as it is.
 func (g *Gateway) WorkContext(ctx context.Context) (string, error) {
-	if g.delegation == nil && g.carriedContext == "" {
-		return "", errors.New("this gateway acts under no Work Context: call ForParent, ForModule or ForBinding first")
+	if g.delegation == nil {
+		return "", errors.New("this gateway acts under no Work Context of its own: call ForParent or ForBinding first")
 	}
 	return g.workContext(ctx)
 }
 
-// ForBinding is ForModule for this module's own work: a Work Context through
-// one of its declared bindings, in the viewer's organization, carrying the
-// binding's headless scopes and no person. Only the authority issues one.
+// ForBinding is this module's own work: a Work Context through one of its
+// declared bindings, in the viewer's organization, carrying the binding's
+// headless scopes and no person.
 func (g *Gateway) ForBinding(ctx context.Context, binding string) (*Gateway, error) {
 	if g.host == nil {
-		return nil, errors.New("ForBinding is issued by the authority interface; this composition names none (authority/endpoint)")
+		return nil, errors.New("ForBinding is issued by the authority interface; this gateway was built outside a boot")
 	}
 	if g.orgID == "" {
 		return nil, &ClientError{StatusCode: http.StatusConflict, Message: "no organization selected"}
 	}
 	acting := *g
-	acting.delegation = &delegation{key: "binding\x00" + g.orgID + "\x00" + binding, ask: startTaskRequest{OrgID: g.orgID, Binding: binding}}
+	acting.delegation = &delegation{key: "binding\x00" + g.orgID + "\x00" + binding, ask: issueAsk{organization: g.orgID, binding: binding}}
 	if _, err := acting.workContext(ctx); err != nil {
 		return nil, g.surfaced(err)
 	}

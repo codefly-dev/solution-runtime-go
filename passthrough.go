@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"gopkg.in/yaml.v3"
 )
@@ -99,7 +99,7 @@ type ConsumedMethod struct {
 	// DefaultPassthroughRequestLimit.
 	MaxRequestBytes int
 	// MaxResponseBytes bounds the module's answer; zero is
-	// DefaultTranscodedResponseLimit.
+	// DefaultPassthroughResponseLimit.
 	MaxResponseBytes int64
 	// Timeout bounds one call, the issue of the viewer's Work Context
 	// included; zero is DefaultPassthroughTimeout. For a server-streaming
@@ -127,6 +127,9 @@ const (
 	// DefaultPassthroughRequestLimit bounds a request message unless the
 	// method sets its own bound.
 	DefaultPassthroughRequestLimit = 1 << 20
+	// DefaultPassthroughResponseLimit bounds a module's unary answer unless the
+	// method sets its own bound with MaxResponseBytes.
+	DefaultPassthroughResponseLimit = 8 << 20
 	// DefaultPassthroughTimeout bounds one call unless the method sets its own.
 	DefaultPassthroughTimeout = 60 * time.Second
 	// relayedMessageLimit bounds the module refusal text relayed to the page.
@@ -245,6 +248,40 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 		}
 	}
 	return routes, nil
+}
+
+// cleanPrefix reports whether prefix is an absolute path with no trailing
+// slash, dot segment, query or fragment: the shape a passthrough segment has
+// to have to be served under one route.
+func cleanPrefix(prefix string) bool {
+	if !strings.HasPrefix(prefix, "/") || strings.HasSuffix(prefix, "/") || strings.ContainsAny(prefix, "?#{}*:\\") {
+		return false
+	}
+	for _, segment := range strings.Split(prefix[1:], "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// methodDescriptor resolves "/package.Service/Method" (or the dotted
+// "package.Service.Method") in the global registry, which is where a declared
+// method's generated package must have been linked in.
+func methodDescriptor(method string) (protoreflect.MethodDescriptor, error) {
+	name := strings.TrimPrefix(method, "/")
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[:i] + "." + name[i+1:]
+	}
+	d, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(name))
+	if err != nil {
+		return nil, fmt.Errorf("method %q is not in the protobuf registry (is its generated package linked in?): %w", method, err)
+	}
+	md, ok := d.(protoreflect.MethodDescriptor)
+	if !ok {
+		return nil, fmt.Errorf("%q names a %T, not a method", method, d)
+	}
+	return md, nil
 }
 
 // checkScopes refuses a scope that could not name an authority: one with no
@@ -412,42 +449,6 @@ func relayedError(err error) error {
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
-	case errors.Is(err, workcontext.ErrRevoked):
-		// Checked before ErrNotAttested, which now wraps it: a renewal the
-		// issuer refuses because the state the credential is sealed to has
-		// moved arrives here as both, and the first matching branch decides
-		// what a page is told. Reported as unavailable it reads as "retry
-		// shortly", which is the one thing that cannot help.
-		//
-		// The capability was sound when it was minted and the state moved under
-		// it — an installation revision, a principal's epoch, a build
-		// incarnation, a binding. The holder's answer to every one of those is
-		// the same and it is not "retry": it is to mint again. Reported as the
-		// unavailable fallthrough below, a page or a client policy would retry
-		// against a credential guaranteed to keep failing; reported as a plain
-		// denial, a condition one mint fixes would reach the viewer as their
-		// own authorization failing. Aborted is neither, and a caller that
-		// re-asks gets a fresh mint because the cache no longer holds a current
-		// one.
-		return connect.NewError(connect.CodeAborted, errors.New("the authority this solution presented has been superseded; the call was not made"))
-	case errors.Is(err, ErrNotAttested):
-		// This solution could not attest which module is asking, so it did not
-		// ask. The viewer's authority is not in question and the condition is
-		// one renewal away, which is what unavailable says and what neither
-		// internal nor permission_denied would.
-		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
-	case errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
-		// A capability this solution could not present is this solution's
-		// problem, not a module that is briefly unreachable, and not the
-		// viewer's authorization. Reported as the unavailable fallthrough it
-		// would be retried against a credential that will be exactly as
-		// unusable next time, and the one signal that the issuer handed back
-		// something this runtime cannot carry would be spent on a retry loop.
-		// The three are kept apart from each other at the point they are
-		// logged, not here: "another format", "no seal" and "bad capability"
-		// have different owners, and core deliberately does not let one
-		// errors.Is branch reach all three.
-		return connect.NewError(connect.CodeInternal, errors.New("this solution could not present a usable credential for the module"))
 	}
 	return connect.NewError(connect.CodeUnavailable, errors.New("the module call failed"))
 }

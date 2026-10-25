@@ -106,7 +106,6 @@ func TestThePostBootGateSeesEveryServingShape(t *testing.T) {
 	source := `package solution
 
 import (
-	"context"
 	"net/http"
 	"os"
 )
@@ -163,12 +162,14 @@ func (s *Server) MountAliasFixture(mux *http.ServeMux) {
 	})
 }
 
-// And the whole environment at once, through a function boot also uses:
-// discoverHostModule scans os.Environ, so an exported wrapper of it reads
+// And the whole environment at once: an exported scan of os.Environ reads
 // changing configuration after boot. os.Environ was missing from the reader
 // set entirely.
 func ExportedLateHost() string {
-	return discoverHostModule(context.Background(), "auth-gateway", "rest", "rest")
+	if all := os.Environ(); len(all) > 0 {
+		return all[0]
+	}
+	return ""
 }
 `
 	// os.LookupEnvValue does not exist; the fixture must compile, so use the

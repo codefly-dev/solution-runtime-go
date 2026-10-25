@@ -13,15 +13,8 @@ import (
 )
 
 func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer viewer" {
-			t.Error("viewer credential lost")
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer upstream.Close()
-	s := New(Manifest{ID: "test"})
-	s.cfg.gatewayURL = upstream.URL
+	s, _ := authorityServer(t)
+	s.handlers = map[string]RequestHandler{}
 	s.HandleRequest("/ask", func(r *http.Request, gw *Gateway) (any, error) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -33,22 +26,21 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 		if r.Context().Value(requestTestKey{}) != "request-context" {
 			t.Error("request context lost")
 		}
-		req, _ := http.NewRequestWithContext(r.Context(), "GET", gw.BaseURL(), nil)
-		resp, err := gw.HTTPClient().Do(req)
-		if err != nil {
-			return nil, err
+		if gw.OrgID() != "org-from-the-authority" {
+			t.Errorf("the viewer's organization is %q, not the authority's answer", gw.OrgID())
 		}
-		_ = resp.Body.Close()
 		return map[string]string{"answer": "ok"}, nil
 	})
-	for _, bearer := range []string{"", "Bearer viewer"} {
+	for _, workContext := range []string{"", edgeContext} {
 		req := httptest.NewRequest("POST", "/ask?mode=notes", strings.NewReader(`{"question":"why?"}`))
 		req = req.WithContext(context.WithValue(req.Context(), requestTestKey{}, "request-context"))
-		req.Header.Set("Authorization", bearer)
+		if workContext != "" {
+			req.Header.Set(WorkContextHeader, workContext)
+		}
 		rec := httptest.NewRecorder()
 		s.wrapRequest(s.handlers["/ask"])(rec, req)
 		want := http.StatusOK
-		if bearer == "" {
+		if workContext == "" {
 			want = http.StatusUnauthorized
 		}
 		if rec.Code != want {
@@ -60,7 +52,8 @@ func TestRequestHandlerPreservesCallerAndInput(t *testing.T) {
 type requestTestKey struct{}
 
 func TestRequestHandlerRejectsInvalidInput(t *testing.T) {
-	s := New(Manifest{ID: "test"})
+	s, _ := authorityServer(t)
+	s.handlers = map[string]RequestHandler{}
 	s.HandleRequest("/ask", func(r *http.Request, _ *Gateway) (any, error) {
 		body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 32))
 		if err != nil {
@@ -93,7 +86,7 @@ func TestRequestHandlerRejectsInvalidInput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest("POST", "/ask", strings.NewReader(tc.body))
-			req.Header.Set("Authorization", "Bearer viewer")
+			req.Header.Set(WorkContextHeader, edgeContext)
 			rec := httptest.NewRecorder()
 			withCORS(s.wrapRequest(s.handlers["/ask"]))(rec, req)
 			if rec.Code != tc.status {
@@ -132,12 +125,13 @@ func TestHandlerErrorStatusContract(t *testing.T) {
 		{"out of range status", &ClientError{StatusCode: 1000, Message: "invalid status"}, 502},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := New(Manifest{ID: "test"})
+			s, _ := authorityServer(t)
+			s.handlers = map[string]RequestHandler{}
 			s.Handle("/legacy", func(context.Context, *Gateway) (any, error) { return nil, tc.err })
 			s.HandleRequest("/request", func(*http.Request, *Gateway) (any, error) { return nil, tc.err })
 			for _, path := range []string{"/legacy", "/request"} {
 				req := httptest.NewRequest("POST", path, nil)
-				req.Header.Set("Authorization", "Bearer viewer")
+				req.Header.Set(WorkContextHeader, edgeContext)
 				rec := httptest.NewRecorder()
 				s.wrapRequest(s.handlers[path])(rec, req)
 				if rec.Code != tc.status {
