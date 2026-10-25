@@ -112,9 +112,10 @@ func (s *Server) openRelays(routes map[string]passthroughRoute, lookup func(grou
 // travels on it, so where it may go is the SDK's one rule for a credential's
 // destination (workcontext.AdmitEndpoint): https anywhere; cleartext to a
 // loopback host on a local run, or to an in-cluster address the mesh carries.
-// A bare host:port, as an endpoint reference resolves, is cleartext.
+// A bare host:port, as an endpoint reference resolves, and grpc:// are
+// cleartext.
 func dialModule(endpoint string, transport workcontext.TransportSource, what string) (*grpc.ClientConn, error) {
-	raw := strings.TrimSpace(endpoint)
+	raw := strings.TrimPrefix(strings.TrimSpace(endpoint), "grpc://")
 	if !strings.Contains(raw, "://") {
 		raw = "http://" + raw
 	}

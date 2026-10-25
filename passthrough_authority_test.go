@@ -72,7 +72,7 @@ func relayedPage(t *testing.T, binding string, refuse error) (*httptest.Server, 
 	t.Helper()
 	s, stand := authorityServer(t)
 	module := &relayedModule{refuse: refuse}
-	slots := map[string]string{"page/THINGS_ENDPOINT": module.serve(t), "page/THINGS_BINDING": binding}
+	slots := map[string]string{"page/THINGS_ENDPOINT": "grpc://" + module.serve(t), "page/THINGS_BINDING": binding}
 	declared := passthroughModule()
 	declared.Methods[0].Pin = func() *dynamicpb.Message {
 		pin := thingMessage("GetThingRequest")
