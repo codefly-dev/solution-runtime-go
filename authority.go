@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -35,6 +36,12 @@ const (
 	// composition says which authority answers.
 	AuthorityInterfaceGroup = "authority"
 	AuthorityEndpointKey    = "endpoint"
+	// EnforcementGroup and EnforcementKey are the composition's one switch for
+	// a permissive run, hop/ENFORCEMENT, which the authority's hop reads too:
+	// "warn" makes the route check advisory, anything else enforces it. A
+	// developer's composition says so; a cell never does.
+	EnforcementGroup = "hop"
+	EnforcementKey   = "ENFORCEMENT"
 	// authorityCallTimeout bounds one call to the authority.
 	authorityCallTimeout = 10 * time.Second
 )
@@ -46,6 +53,12 @@ const WorkContextHeader = "x-codefly-work-context"
 // ErrNoViewer is a request whose Work Context the authority does not check.
 var ErrNoViewer = errors.New("the authority does not check the Work Context this request carries for this module")
 
+// ErrRequestRefused is a request the authority refuses the Work Context it
+// carries for: the route's delivered policy is not held, the route declares
+// none or is not served, or the context no longer stands. Answered 403, with
+// the authority's reason.
+var ErrRequestRefused = errors.New("the authority refuses this request")
+
 // hostAuthority is the runtime's connection to the authority interface.
 type hostAuthority struct {
 	conn      *grpc.ClientConn
@@ -56,12 +69,17 @@ type hostAuthority struct {
 	// credential is this workload's credential as the run attests it, read on
 	// every call so a rotation takes effect.
 	credential func() (string, error)
+	// advisory is hop/ENFORCEMENT=warn: the route check is asked as advice,
+	// and a route the call does not hold is let through with the authority's
+	// reason logged. A Work Context the authority does not check is refused
+	// either way.
+	advisory bool
 }
 
 // dialAuthority connects to the authority at endpoint. The connection is
 // in-cell transport, which the mesh carries; the runtime terminates no TLS to
 // it.
-func dialAuthority(endpoint, tokenFile, principal string) (*hostAuthority, error) {
+func dialAuthority(endpoint, tokenFile, principal string, advisory bool) (*hostAuthority, error) {
 	target := strings.TrimSpace(endpoint)
 	for _, scheme := range []string{"grpc://", "http://", "tcp://"} {
 		target = strings.TrimPrefix(target, scheme)
@@ -77,6 +95,7 @@ func dialAuthority(endpoint, tokenFile, principal string) (*hostAuthority, error
 		conn:      conn,
 		authority: authorityv1.NewAuthorityServiceClient(conn),
 		principal: principal,
+		advisory:  advisory,
 		credential: func() (string, error) {
 			raw, err := os.ReadFile(tokenFile)
 			if err != nil || strings.TrimSpace(string(raw)) == "" {
@@ -88,19 +107,43 @@ func dialAuthority(endpoint, tokenFile, principal string) (*hostAuthority, error
 }
 
 // viewer asks the authority's Check whose the Work Context a request carries
-// is, addressed to this module. A context the authority does not check is no
-// viewer, whatever it claims.
-func (h *hostAuthority) viewer(ctx context.Context, workContext string) (*authorityv1.WorkContextV1, error) {
+// is, addressed to this module, and, when route is named, whether it holds
+// what this module's delivery declares for that route: "<VERB> <path>", the
+// request as this module serves it, which the authority matches against the
+// "<VERB> <template>" rows the CLI derives from the published contract. A
+// context the authority does not check is no viewer, whatever it claims.
+func (h *hostAuthority) viewer(ctx context.Context, workContext, route string) (*authorityv1.WorkContextV1, error) {
 	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
 	defer cancel()
-	checked, err := h.authority.Check(ctx, &authorityv1.CheckRequest{Token: workContext, Audience: h.principal})
+	checked, err := h.authority.Check(ctx, &authorityv1.CheckRequest{Token: workContext, Audience: h.principal, Method: route, Advisory: h.advisory && route != ""})
 	if err != nil && refusalStatus(err) < http.StatusInternalServerError {
-		return nil, fmt.Errorf("%w: %s", ErrNoViewer, status.Convert(err).Message())
+		if status.Code(err) == codes.Unauthenticated {
+			return nil, fmt.Errorf("%w: %s", ErrNoViewer, status.Convert(err).Message())
+		}
+		return nil, fmt.Errorf("%w: %s", ErrRequestRefused, status.Convert(err).Message())
 	}
 	if err != nil || checked.GetContext().GetTenantId() == "" {
 		return nil, ErrNoViewer
 	}
+	if advice := checked.GetRefusal(); advice != "" {
+		log.Printf("PERMISSIVE (%s/%s=warn): let through %s, which the authority refused: %s", EnforcementGroup, EnforcementKey, route, advice)
+	}
 	return checked.GetContext(), nil
+}
+
+// principalsOf is whom a Work Context the authority answered is for: its
+// organization, its owner, and the actor chain in order, the current actor
+// last; with no actor in the chain the owner acts.
+func principalsOf(wc *authorityv1.WorkContextV1) (WorkContextPrincipals, []string) {
+	principals := WorkContextPrincipals{OrgID: wc.GetTenantId(), OwnerPrincipalID: wc.GetOwnerPrincipalId(), CurrentActorPrincipalID: wc.GetOwnerPrincipalId()}
+	var actors []string
+	for _, actor := range wc.GetActorChain() {
+		actors = append(actors, actor.GetPrincipalId())
+	}
+	if len(actors) > 0 {
+		principals.CurrentActorPrincipalID = actors[len(actors)-1]
+	}
+	return principals, actors
 }
 
 // issueChild asks the authority for a child of the viewer's Work Context
@@ -152,11 +195,7 @@ func (h *hostAuthority) issue(ctx context.Context, req *authorityv1.IssueRequest
 		}
 		return "", time.Time{}, WorkContextPrincipals{}, refusal
 	}
-	wc := issued.GetContext()
-	principals := WorkContextPrincipals{OrgID: wc.GetTenantId(), OwnerPrincipalID: wc.GetOwnerPrincipalId(), CurrentActorPrincipalID: wc.GetOwnerPrincipalId()}
-	if chain := wc.GetActorChain(); len(chain) > 0 {
-		principals.CurrentActorPrincipalID = chain[len(chain)-1].GetPrincipalId()
-	}
+	principals, _ := principalsOf(issued.GetContext())
 	expires := time.Unix(issued.GetExpiresAtUnix(), 0)
 	lifetime := time.Until(expires)
 	if issued.GetToken() == "" || lifetime < workContextMinimumLifetime {

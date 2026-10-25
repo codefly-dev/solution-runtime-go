@@ -54,6 +54,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -228,6 +229,9 @@ type config struct {
 	// (authority/endpoint). When set, the runtime asks it instead of the saas
 	// gateway (authority.go), and no gateway is required.
 	authorityEndpoint string
+	// routeAdvisory is hop/ENFORCEMENT=warn: the authority's route check is
+	// asked as advice and its refusal logged rather than answered.
+	routeAdvisory bool
 	// dialled is every address this process talks to, assembled at boot.
 	//
 	// It exists so nothing has to re-read the configuration to ask "is this
@@ -552,12 +556,14 @@ func loadConfig(ctx context.Context, id string, initErr error) config {
 
 	internalToken, _ := query.WorkspaceSecret("module-authority", "INTERNAL_TOKEN")
 	authorityEndpoint, _ := query.WorkspaceConfiguration(AuthorityInterfaceGroup, AuthorityEndpointKey)
+	enforcement, _ := query.WorkspaceConfiguration(EnforcementGroup, EnforcementKey)
 	cfg := config{
 		brokerInternalToken: strings.TrimSpace(internalToken),
 		port:                port,
 		listenHost:          listenHost(self),
 		gatewayURL:          gatewayURL,
 		authorityEndpoint:   strings.TrimSpace(authorityEndpoint),
+		routeAdvisory:       strings.EqualFold(strings.TrimSpace(enforcement), "warn"),
 		assetsDir:           env("ASSETS_DIR", "../fe-remote/dist"),
 		dialled:             dialledAddresses(gatewayURL),
 		projectedTokenPath:  strings.TrimSpace(env(ProjectedTokenFileEnvironmentVariable, DefaultProjectedTokenFile)),
@@ -913,7 +919,7 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// contract publishes, and a value the platform never provisioned is named
 	// here rather than discovered when a mint is refused.
 	if s.cfg.authorityEndpoint != "" {
-		authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.projectedTokenPath, s.manifest.ID)
+		authority, err := dialAuthority(s.cfg.authorityEndpoint, s.cfg.projectedTokenPath, s.manifest.ID, s.cfg.routeAdvisory)
 		if err != nil {
 			return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 		}
@@ -1294,12 +1300,18 @@ func (s *Server) wrapRequest(handler RequestHandler) http.HandlerFunc {
 		var gw *Gateway
 		if s.host != nil {
 			// Under the authority the edge sends the request on with the
-			// person's Work Context for this module, and who it is for is the
-			// authority's Check of that context. No session bearer reaches this
-			// process.
+			// person's Work Context for this module — or a module calling it
+			// as a tool sends the child the authority issued it — and who it
+			// is for is the authority's Check of that context, which also
+			// applies this module's delivered policy for the route. No session
+			// bearer reaches this process.
 			var err error
-			if gw, err = s.viewerGateway(r.Context(), r.Header.Get(WorkContextHeader)); err != nil {
-				writeRefusal(w, r, http.StatusUnauthorized, err.Error(), err)
+			if gw, err = s.viewerGateway(r.Context(), r.Header.Get(WorkContextHeader), r.Method+" "+r.URL.Path); err != nil {
+				code := http.StatusUnauthorized
+				if errors.Is(err, ErrRequestRefused) {
+					code = http.StatusForbidden
+				}
+				writeRefusal(w, r, code, err.Error(), err)
 				return
 			}
 		} else {
@@ -1344,6 +1356,9 @@ type Gateway struct {
 	// edge sent the request with: the parent every ForParent child is issued
 	// from. Never forwarded as it is.
 	parentContext string
+	// viewer is whom the authority's Check said that context is for, and who
+	// acts for them; nil when the request carried none.
+	viewer *requestViewer
 	// carriedContext is the install call's opaque bearer, carried unchanged
 	// to the host for verification. Viewer gateways never inherit an inbound
 	// capability: their Work Context is minted through ForModule instead.
@@ -2243,7 +2258,15 @@ type WorkContextPrincipals struct {
 // minting) the capability exactly as a request would. A handler compares them
 // against an identity it was handed rather than trusting that identity. On a
 // gateway that acts under no capability it is an error.
+//
+// Under the authority, the gateway a handler is given acts under the Work
+// Context the request carried, and reports whom the authority's Check said it
+// is for: the person as owner and, on a module's tool call, that module as the
+// current actor.
 func (g *Gateway) WorkContextPrincipals(ctx context.Context) (WorkContextPrincipals, error) {
+	if g.delegation == nil && g.viewer != nil {
+		return g.viewer.principals, nil
+	}
 	if g.delegation == nil {
 		return WorkContextPrincipals{}, errors.New("this gateway acts under no work context; derive one with ForModule")
 	}
@@ -2265,6 +2288,25 @@ func (g *Gateway) WorkContextPrincipals(ctx context.Context) (WorkContextPrincip
 		return WorkContextPrincipals{}, errors.New("the work context issuance named no organization, owner or actor")
 	}
 	return principals, nil
+}
+
+// requestViewer is whom the Work Context a request carried is for, as the
+// authority's Check answered it.
+type requestViewer struct {
+	principals WorkContextPrincipals
+	actors     []string
+}
+
+// ActorChain is who acts, in order, under the Work Context the request carried
+// (under the authority): empty when the person acts for themselves; on a
+// module's tool call, the module issued the child through its binding, last.
+// It is the authority's Check of that context, never anything the request
+// wrote, and it is empty when the request carried none.
+func (g *Gateway) ActorChain() []string {
+	if g.viewer == nil {
+		return nil
+	}
+	return slices.Clone(g.viewer.actors)
 }
 
 // workContextCache holds the capabilities minted while serving one request. The

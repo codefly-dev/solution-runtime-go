@@ -193,7 +193,17 @@ broker credential, and holds no session bearer:
 - **Who a request is for**: the authority's `Check` of that Work Context,
   addressed to this module. `OrgID` is its organization; a header the request
   wrote about itself is ignored, and a request with no context, or one the
-  authority does not check, is answered 401 before the handler runs.
+  authority does not check, is answered 401 before the handler runs. A module
+  calling a route as a tool sends the child the authority issued it through
+  its binding: `WorkContextPrincipals` names the person as owner and the module
+  as current actor, and `ActorChain()` the whole chain.
+- **Which routes it reaches**: the `Check` names the route, `"<VERB> <path>"`
+  as this module serves it, and the authority applies this module's delivered
+  route policy (the `"<VERB> <template>"` rows the CLI derives from the
+  published contract's `x-codefly-authority-policy`). A route the call does
+  not hold, one that declares nothing, and one not served are answered 403
+  with the authority's reason. Under `hop/ENFORCEMENT=warn` the check is
+  advisory: the route goes through and the refusal is logged.
 - **`ForParent(binding, scopes...)`** (authority only): the viewer's own call to
   a module, a child of the edge's Work Context through one of this module's
   declared bindings, issued by `authority.Issue` with the workload credential the

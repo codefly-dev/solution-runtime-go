@@ -142,20 +142,25 @@ func relayedRoutes(routes map[string]passthroughRoute, relays map[string]*module
 	return relayed
 }
 
-// viewerGateway is the gateway for the person whose Work Context the edge sent
-// a request with: who it is for is the authority's Check of that context, never
-// a header the request wrote about itself.
-func (s *Server) viewerGateway(ctx context.Context, carried string) (*Gateway, error) {
+// viewerGateway is the gateway for the person whose Work Context a request
+// carries — the edge's for the page, or a module's child of it for a tool call:
+// who it is for, and which module acts for them, is the authority's Check of
+// that context, never a header the request wrote about itself. route, when
+// named, is the request "<VERB> <path>" the authority applies this module's
+// delivered route policy to.
+func (s *Server) viewerGateway(ctx context.Context, carried, route string) (*Gateway, error) {
 	if carried == "" {
 		return nil, errors.New("no Work Context: this page is reached through the authority's edge, which signs the person in")
 	}
-	viewer, err := s.host.viewer(ctx, carried)
+	viewer, err := s.host.viewer(ctx, carried, route)
 	if err != nil {
 		return nil, err
 	}
 	gw := s.gatewayFor(http.Header{})
 	gw.parentContext = carried
 	gw.orgID, gw.sessionID, gw.installationID, gw.installationErr = viewer.GetTenantId(), viewer.GetSessionId(), "", nil
+	principals, actors := principalsOf(viewer)
+	gw.viewer = &requestViewer{principals: principals, actors: actors}
 	return gw, nil
 }
 
@@ -168,7 +173,9 @@ func (s *Server) relay(ctx context.Context, route passthroughRoute, req *connect
 	if relay == nil {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("no such operation"))
 	}
-	gw, err := s.viewerGateway(ctx, req.Header().Get(WorkContextHeader))
+	// No route is named: the relayed call is held to the module's own method
+	// policy, which its hop applies to the child issued through the binding.
+	gw, err := s.viewerGateway(ctx, req.Header().Get(WorkContextHeader), "")
 	if err != nil {
 		return nil, connect.NewError(connect.CodeUnauthenticated, err)
 	}

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — under the authority, a route is held to the solution's delivered policy; a module's tool call acts for the person
+
+The authority's `Check` of the Work Context a request carries now names the
+route it calls, `"<VERB> <path>"` as the solution serves it — the spelling the
+authority matches against the `"<VERB> <template>"` rows the CLI derives from
+the published contract — so the solution's delivered per-route policy is
+applied. Before, any context addressed to the solution reached every route. A
+route the call does not hold is answered 403 with the authority's reason
+(`ErrRequestRefused`); a context the authority does not check is still 401.
+Under `hop/ENFORCEMENT=warn` the check is the authority's advisory one, as a
+permissive hop's is: the route goes through and the refusal is logged. The
+passthrough relay names no route; the module it relays to applies its own.
+
+A module calling a solution route as a tool, with the child the authority
+issued through its binding, is admitted like the edge's context, and the
+handler's gateway says who it is for: `WorkContextPrincipals` answers the
+person as owner and the module as current actor, and the new
+`Gateway.ActorChain()` the whole chain, both from the authority's `Check`.
+
+`dialAuthority` is unexported; the authority client moves to 06d0d3b for
+`CheckRequest.advisory`.
+
 ## Unreleased — the passthrough under the authority; refusals keep their reason
 
 Under the authority interface the passthrough is no longer refused at boot: a

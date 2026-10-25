@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	connectrpc.com/connect v1.21.0
-	github.com/codefly-dev/authority/libraries/authority-client/go v0.0.0-20261023221258-84ff743d12b7
+	github.com/codefly-dev/authority/libraries/authority-client/go v0.0.0-20261025034102-06d0d3b85674
 	github.com/codefly-dev/core v0.19.6-0.20261018051341-b81d92e6feda
 	github.com/codefly-dev/saas-sdk-go v0.1.3-0.20261014043138-b7169d3c4095
 	github.com/codefly-dev/sdk-go v0.4.1-0.20261018052022-70dc7a546458
