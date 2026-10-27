@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — every read a solution serves is a Runnable operation, and so a tool
+
+- **The artifact marks each read (`x-codefly-operation`).** An operation whose
+  policy requires only `read` is published with core's marker beside its
+  `x-codefly-authority-policy`, written by core from that policy
+  (`runnable.RouteMarker`, core#852, merged as `518714d0`): core's default bounds, the
+  `Summary` as the tool's description, the operationId as its name, and
+  `Manifest.ID` as the audience. `codefly generate runnables` derives a
+  Runnable from it (codefly-dev/cli#1184). Mutations, any-checked-caller
+  routes, streams, the MCP route and relayed routes are not marked.
+- **`Operation.Exclude`** keeps a read from every agent.
+- **Commit `Server.InterfaceArtifact`, never `InterfaceDocument`**, which marks
+  nothing (it does not know the audience): a solution committing its output
+  publishes no tool. `codefly generate runnables` names each such read.
+- **Every defined object closes `additionalProperties`**, which core's bounded
+  profile requires of a fixed shape. Every consumer's committed artifact
+  changes on regeneration.
+- **Core moves to `v0.19.7-0.20261026182446-518714d046af`**, the commit that
+  merged core#852, for `runnable.RouteMarker`.
+
 ## Unreleased — a child names the owner its parent is selected to
 
 - **A child of a person's context at an installation names the

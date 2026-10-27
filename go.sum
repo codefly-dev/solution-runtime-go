@@ -34,8 +34,8 @@ github.com/codefly-dev/authority/libraries/authority-client/go v0.0.0-2026102701
 github.com/codefly-dev/authority/libraries/authority-client/go v0.0.0-20261027012935-f41cc2baa2ec/go.mod h1:4hRjiWuJOKzrEk8AS87pbWCbpiEmhEvQBGQaJo5Hmkg=
 github.com/codefly-dev/authority/libraries/hop/go v0.0.0-20261027012935-f41cc2baa2ec h1:QhncdaWaMERAGpZthlSXjKroXNl/L8llPtBMX+e5w/A=
 github.com/codefly-dev/authority/libraries/hop/go v0.0.0-20261027012935-f41cc2baa2ec/go.mod h1:NqCbvIWbkbCzSpUUYQjP8Jv+LpFnDRbVhPdAj67DHhE=
-github.com/codefly-dev/core v0.19.7-0.20261026092055-b23dc13543b2 h1:I1wL0ANXhTdQuEAnxXF+s4+rKILlBu/QHILq4Skyi3I=
-github.com/codefly-dev/core v0.19.7-0.20261026092055-b23dc13543b2/go.mod h1:1ina3kP+YSAL4tlZvnEYd4P8bFGnJECfkP86ojeeF1A=
+github.com/codefly-dev/core v0.19.7-0.20261026182446-518714d046af h1:JLTecMs4Oja+fl51chLyGw262S4yz7jzEEiFxoq7Viw=
+github.com/codefly-dev/core v0.19.7-0.20261026182446-518714d046af/go.mod h1:1ina3kP+YSAL4tlZvnEYd4P8bFGnJECfkP86ojeeF1A=
 github.com/codefly-dev/gortk v0.2.0 h1:7bOlS5valYz2zil+fZctQNcPCYBcPj86abcw9N8h1hQ=
 github.com/codefly-dev/gortk v0.2.0/go.mod h1:dDWUMFgAP063OCGhTEpV7FFUj9+zTcxxO/nV80VKEwg=
 github.com/codefly-dev/sdk-go v0.4.1-0.20261018052022-70dc7a546458 h1:hi+KhotTLMOJ/PUSzVO/Axfho7yZ2UOjrCFfrLI1EKU=

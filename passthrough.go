@@ -553,6 +553,9 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			// Any checked caller: the child issued through the binding and the
 			// module's own method policy gate the call (see above).
 			Policy: AnyCheckedCaller(),
+			// Another module's call: it is a tool through that module's own
+			// derived operation, never twice through this relay.
+			Exclude: true,
 		})
 	}
 	return ops, nil
@@ -608,7 +611,7 @@ func (s *Server) InterfaceArtifact(dir string, info InterfaceInfo) ([]byte, erro
 		op.Path = s.authorityRoute() + op.Path
 		ops = append(ops, op)
 	}
-	return InterfaceDocument(info, ops)
+	return interfaceDocument(info, ops, s.manifest.ID)
 }
 
 // ServiceVersion is the version the service manifest (service.codefly.yaml)

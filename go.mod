@@ -6,7 +6,7 @@ require (
 	connectrpc.com/connect v1.21.0
 	github.com/codefly-dev/authority/libraries/authority-client/go v0.0.0-20261027012935-f41cc2baa2ec
 	github.com/codefly-dev/authority/libraries/hop/go v0.0.0-20261027012935-f41cc2baa2ec
-	github.com/codefly-dev/core v0.19.7-0.20261026092055-b23dc13543b2
+	github.com/codefly-dev/core v0.19.7-0.20261026182446-518714d046af
 	github.com/codefly-dev/sdk-go v0.4.1-0.20261018052022-70dc7a546458
 	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261018052022-70dc7a546458
 	github.com/modelcontextprotocol/go-sdk v1.8.0

@@ -655,6 +655,33 @@ ending in `/` serves its subtree and is written `/…/{path=**}`. The passthroug
 routes `InterfaceArtifact` publishes beside the solution's own are any checked
 caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
 
+**Every read is a Runnable operation, and so a tool.** Beside the policy of
+each operation whose policy requires only `read`, `InterfaceArtifact` writes
+core's `x-codefly-operation` marker — the proto3 JSON of
+`codefly.runnable.v0.Operation` that core itself derives from that policy
+(`runnable.RouteMarker`): recomputed on an uncertain outcome, core's default
+bounds, invoked under exactly the scopes the policy requires, for the audience
+this runtime's hop checks (`Manifest.ID`), presented as a read-only tool named
+by the operationId and described by the `Summary`. `codefly generate runnables`
+then derives a Runnable package from it, as it does from every method a module
+serves behind the hop; a `GET`'s query parameters are its input. A mutation is
+not marked: it is resolved by an effect receipt, read through a receipt route
+this runtime does not serve, so it stays a route its own page calls. Neither is
+a route any checked caller may call, a stream, the MCP route or a relayed route.
+`Operation.Exclude` keeps a read from every agent, as
+`codefly.runnable.v0.exclude` keeps a module's method. Every object the artifact
+defines closes `additionalProperties` — a struct marshals exactly its fields
+and protojson refuses an undeclared one — which is what lets a Runnable
+contract describe it.
+
+> **Commit `Server.InterfaceArtifact`, never `InterfaceDocument`.**
+> `InterfaceDocument` marks nothing — the marker names the audience the serving
+> runtime's hop admits, which only the `Server` knows — so a solution that
+> commits its output publishes no tool, silently, however many reads it serves.
+> `InterfaceDocument` stays for documenting or validating a list of operations.
+> `codefly generate runnables` names each read of a document that marks no route
+> at all, which is this trap's signature (codefly-dev/cli#1185).
+
 > **Dependency pins.** `go.mod` records the exact Core, SDK and authority
 > client revisions used by this runtime, including unreleased commit
 > pseudo-versions. No local `replace` directive is shipped. Core owns capability
