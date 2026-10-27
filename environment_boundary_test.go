@@ -192,7 +192,7 @@ func ExportedLateHost() string {
 		"fixtureMountedRead",      // reached only as a handler value
 		"fixtureStoredRead",       // reached only through a stored method value
 		"servingAliasRead",        // an aliased reader with a constant key
-		"discoverHostModule",      // the whole environment, via an exported wrapper
+		"ExportedLateHost",        // the whole environment, scanned by an exported function
 	} {
 		if !holders[want] {
 			t.Errorf("no post-boot read reported inside %s, so that shape is unwalked; reported: %v", want, holders)
