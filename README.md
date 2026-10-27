@@ -2,552 +2,254 @@
 
 Generic Go runtime for **codefly solutions** — independently deployed modules
 that plug into a host at runtime with no build-time coupling. Owns configuration
-resolution, this execution's one credential, a listener that presents the
-workload's own identity, CORS, Module Federation asset serving, the capability
-handshake, the manifest, the published authority contract, and the gateway
-client each handler uses to read composed modules on the viewer's behalf.
+resolution, a plain-HTTP listener on the port Codefly resolves, CORS, Module
+Federation asset serving, the capability handshake, the manifest served from
+the declared frontend file, the published contract, the connection to the
+**authority interface**, the passthrough that relays a page's module calls as
+the viewer, and serving the solution's MCP server to agent clients.
 
-A solution author writes a manifest and one handler:
+A component author writes a manifest, optionally embeds a frontend, and
+declares its operations — each one method on one path, the policy a call to it
+must hold, and its handler:
 
 ```go
-solution.New(solution.Manifest{ID: "my-solution", Title: "My Solution"}).
-    Handle("/thing", func(ctx context.Context, gw *solution.Gateway) (any, error) {
-        resp, err := solution.Unary[Req, Resp](ctx, gw, "/pkg.Service/Method", &Req{})
-        return resp, err
+//go:embed solution.frontend.codefly.yaml
+var frontend []byte
+
+solution.New(solution.Manifest{ID: "my-solution", Frontend: frontend}).
+    Operations(solution.Operation{
+        Method: "get", Path: "/v1/my-solution/thing",
+        Summary: "Read the thing", Callers: "Readers.", Behavior: "The thing.", Response: thing{},
+        Policy: solution.Requires("my-solution.thing", "read"),
+        Handler: func(ctx context.Context, gw *solution.Gateway) (any, error) {
+            docs, err := gw.ForParent(ctx, "documents-read",
+                solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
+            if err != nil {
+                return nil, err
+            }
+            token, err := docs.WorkContext(ctx) // present it to the module, over gRPC through the hop
+            ...
+        },
     }).
     Serve()
 ```
 
-The gateway URL, the caller's bearer, and the wire protocol are hidden.
+Every request reaches the solution through the authority's edge with the
+person's Work Context, and every Work Context the solution acts under is issued
+by the authority. What the host lists the solution under — title, nav order,
+exposed module, host contract, dashboard, surfaces — lives in
+[`solution.frontend.codefly.yaml`](#the-declared-frontend) beside the backend's
+`service.codefly.yaml`, which the CLI delivers in the presence document and
+this runtime serves its manifest from.
+
+## The saas host is gone
+
+This runtime used to run against the saas host as well: a bearer forwarded to
+the host's gateway, a Task Work Context minted through accounts for the viewer
+(`Gateway.ForModule`, with its ceiling check), an execution credential obtained
+from the host's module broker (`Server.Credential`, `CredentialSource`, the
+`module-authority` group), a module called over its REST binding
+(`Gateway.Transcoded`, `Unary`, `HTTPClient`, `BaseURL`), the install step
+(`OnInstall`, `Installation`, `RefuseInstall`), the identity headers the
+gateway stamped (`InstallationID`, `x-org-id`, `x-session-id`), and the MCP
+surface's OAuth discovery against the host's issuer. All of it is **deleted,
+not fenced**: a solution that consumes modules relays them only through the
+authority, and no path of the saas mode was still reachable. A composition
+that names no `authority/endpoint` is refused at boot. Nothing bridges the two
+models.
 
 ## A runtime does not register itself
 
-**If you are upgrading from a runtime that did, read this first.** Nothing
-bridges the two models, and the cutover is deliberate:
+Presence is **delivered**. A signed presence document declares which solution
+runs on which host, at which generation and build, under which workload
+identity; the host reconciles towards it. Health is **answered**, never
+pushed: the host probes the destination its own presence document names, and
+nothing this process answers can make it present. Boot and health ask the
+authority nothing.
 
-- An **old runtime against a new host** gets `404` on the endpoints it
-  registers with — they are deleted, in the same cutover, by design. It will
-  log a failed registration forever and the host will never learn of it. It
-  must be redeployed on this runtime. There is no compatibility mode, no
-  fallback credential, and no version of the host that serves both.
-- A **new runtime against an old host** registers nothing, because it has
-  nothing to register with, and mints nothing, because the old host serves no
-  mint endpoint: the boot fails, naming the endpoint it could not reach, and
-  the process exits non-zero.
+A solution used to become present by announcing itself — two
+self-registrations on a 15s heartbeat, each burning an audited single-use
+credential — which made presence a claim a process could make. That is gone,
+with the endpoints that accepted it.
 
-What changed, and why. A solution used to become present by announcing itself:
-two self-registrations — the manifest to the host frontend, the dialable
-upstream to the gateway — on a 15s heartbeat, each beat burning a single-use
-credential the issuer audited as a mint. A solution that had not changed in a
-week announced itself roughly 11,500 times a day, the audit log recorded every
-one, and presence came from a process being up, which means a process could
-claim it.
+## Native listener isolation
 
-Presence is **delivered** now. A signed presence document declares which
-solution runs on which host, at which generation and build, under which
-workload identity; the host reconciles towards it. Authority is delivered the
-same way, by a signed document bound to one approved build. This runtime's only
-outbound act at boot is to obtain its own credential once, from the
-service-account token the platform projects for it; it renews that credential
-when it expires and otherwise says nothing to anyone. Health is **answered**,
-never pushed: the host probes the destination its own presence document names,
-and nothing this process answers can make it present.
+On a local native run the runtime binds the loopback host and port of its own
+SDK-resolved `http` endpoint. `PORT` can change the port, but cannot broaden the
+listener to other interfaces. An absent or non-loopback native endpoint fails
+configuration validation. The CLI supplies the endpoint automatically; there is
+no separate host override to copy into each component.
 
-Four things follow, and each is a boot failure rather than a degraded run:
-
-| | |
-|---|---|
-| The listener presents this workload's X.509-SVID over TLS | there is no plain-HTTP listener, because the host refuses a plain-HTTP destination |
-| The credential is obtained once, before the listener exists | a refusal is terminal and never retried; an unavailable mint is waited out inside a bounded deadline — see [One credential per execution](#one-credential-per-execution) |
-| The authority-bearing values are read once and frozen | the credential is sealed to the values it was minted under, so a value that drifts is an error, never a reload |
-| The contract is published, and the declaration is held to it | an ask outside its declared ceiling fails the boot — see [The published contract](#the-published-contract) |
+Container and Kubernetes processes retain their container-wide listener, where
+the platform owns network admission. A local environment name alone does not
+turn a container listener into a loopback listener. Production admission still
+requires the declared mesh boundary; this change does not qualify that boundary.
 
 ## Handler errors
 
-Return `ClientError` for an explicitly public validation message. Connect errors
-returned by `Unary` retain actionable statuses: authentication 401, permission
-403, missing resource 404, invalid input 400, conflict 409, precondition 412,
-quota 429, unavailable 503 and deadline 504. Other RPC failures return 502.
-Only generic status text reaches the browser; wrapped/upstream details remain
-available to the handler. No request is retried or replayed.
+Return `ClientError` for an explicitly public validation message. A Connect
+error a handler returns — a module's answer to a call the handler made —
+retains an actionable status: authentication 401, permission 403, missing
+resource 404, invalid input 400, conflict 409, precondition 412, quota 429,
+unavailable 503 and deadline 504. Other RPC failures return 502. Only generic
+status text reaches the browser. An authority refusal (`WorkContextRefusal`)
+keeps its status and the authority's reason. A transport failure never names
+its destination. No request is retried or replayed.
 
 REST adapters can return `&solution.GatewayError{StatusCode: resp.StatusCode}`
-after a non-success response through the gateway. The runtime preserves 4xx,
-503 and 504; unexpected statuses and other server failures become 502. This
-error carries no raw body, URL or headers. Work Context mint refusals use this
-same path. Untyped errors retain the existing 502/public-error-string behavior,
-so handlers must not put private details in them. Consumers using an older runtime
-or flattening failures into strings must adopt these typed errors to benefit.
+after a non-success response. The runtime preserves 4xx, 503 and 504;
+unexpected statuses and other server failures become 502. This error carries no
+raw body, URL or headers. Untyped errors keep the 502/public-error-string
+behavior, so handlers must not put private details in them.
+
+## The authority interface
+
+The composition names the authority interface in workspace configuration
+`authority/endpoint` (the authority gateway on a laptop, the host in a cell; see
+codefly-dev/authority), and a boot without it is refused. The page is reached through the authority's **edge**,
+the auth gateway's role: the browser's one origin, which signs the person in and
+sends each request on with the person's Work Context addressed to this module
+(`x-codefly-work-context`). The runtime holds no session bearer and mints
+nothing:
+
+- **Who a request is for**: the authority's `Check` of that Work Context,
+  addressed to this module. `OrgID` is its organization; a header the request
+  wrote about itself is ignored, and a request with no context, or one the
+  authority does not check, is answered 401 before the handler runs. A module
+  calling a route as a tool sends the child the authority issued it through
+  its binding: `WorkContextPrincipals` names the person as owner and the module
+  as current actor, and `ActorChain()` the whole chain.
+- **Which routes it reaches**: the `Check` names the operation the request was
+  dispatched to, `"<VERB> <template>"` exactly as its row is published, and
+  the authority applies this module's delivered route policy (the
+  `"<VERB> <template>"` rows the CLI derives from the published contract's
+  `x-codefly-authority-policy`). The request's own path is never what is
+  asked about: an encoded `/` in a segment (`/pages/a%2Fhistory`) runs the
+  `/pages/{id}` operation while its decoded path reads as `/pages/{id}/history`,
+  and a subtree and a `{id}` route the mux tells apart would both match it. A route the call does
+  not hold, one that declares nothing, and one not served are answered 403
+  with the authority's reason. Under `hop/ENFORCEMENT=warn` the check is
+  advisory: the route goes through and the refusal is logged. An authority
+  that cannot be reached refused nobody: the request is answered 503, naming
+  that, never 401.
+- **The operation checked is the operation run.** A request is served by the
+  operation declared for its method on its path, and the `"<VERB> <template>"`
+  the authority is asked about is that operation's, so it is the operation
+  whose handler runs. A method the
+  path does not declare is answered 405, naming the methods it serves (and
+  `Allow`), before the authority is asked or any handler runs. The boot
+  refuses an operation with no policy, an undocumented one, one method
+  declared twice on a path, or a method that is not an operation's
+  (`OPTIONS` is the CORS preflight the runtime answers).
+- **`ForParent(binding, scopes...)`**: the viewer's own call to
+  a module, a child of the edge's Work Context through one of this module's
+  declared bindings, issued through the authority's hop library
+  (`hop.Outbound.IssueForParent`, over the authority's generated client) with
+  the workload credential the run attests as the actor. The authority derives the audience from the binding
+  and grants within its invoke ceiling and what the person holds there; held
+  until it is due for renewal.
+- **`ForBinding(binding)`**: this module's own Work Context
+  through one of its declared bindings, in the viewer's organization, with no
+  person in it (`hop.Outbound.IssueForModule`). The runtime builds no issue
+  request of its own: every Work Context it acts under is asked through the
+  hop library, which reads the credential from the projected path on every
+  call (`hop.FileCredential`).
+- **`WorkContext(ctx)`**: the token a gateway acts under, for a caller that
+  reaches a module itself — over gRPC through the hop.
+
+- **The passthrough** (`Consumes`) is served from the same declaration, at
+  `/v1/<id>/modules/<as>/<package.Service>/<Method>` (the edge routes a solution
+  at `/v1/<id>` and forwards requests unchanged). Every consumed module's
+  `Authority` names its configuration slots — the module's gRPC address, the
+  hop in front of it, and the id of this solution's binding for it — and each
+  call, unary or server-streaming, is relayed over gRPC to the module's own
+  procedure as the viewer: a child of the edge's Work Context through that
+  binding with the method's declared scopes, the pin merged in and the
+  response allowlist applied. No `google.api.http` binding is needed. A
+  missing slot refuses the boot. A solution that publishes no ceiling is
+  bounded by the authority.
+- **Every refusal names its reason.** The authority's reason for refusing an
+  issue is kept (`WorkContextRefusal.Reason`), and a refusal reaches a Connect
+  or gRPC caller as a Connect error with the authority's code — a Connect
+  client reads nothing else — and a plain REST caller as `{"error": …}`.
+
+The workload credential the authority takes as the actor of every issue is
+the projected token at `/var/run/secrets/codefly/token` (overridden by
+`CODEFLY__WORKLOAD_TOKEN_FILE`), re-read on every call because the projection
+is rotated under the running process. Declare `module-identity` on the
+backend so the run projects it.
 
 ## Configuration
 
-The runtime hardcodes nothing. On boot `Serve` calls
-`codefly.LoadEnvironmentVariables()` to load Codefly's injected carriers, then
-`loadConfig` resolves every address, port, and path through the codefly Go SDK
-(`github.com/codefly-dev/sdk-go`), falling back to the local native workspace
-map when not running under the runtime. Most values have an explicit env
-override for an operator with a deployment the resolver cannot see; the
-SDK-resolved value is the default.
-
-The two MCP values have none, because a Codefly composition cannot set a bare
-environment variable on a service: every value a service receives is either an
-endpoint the SDK resolves or a **declared configuration** the render projects.
-Their override is therefore a value in the `mcp` workspace-configuration group,
-resolved through the SDK the way the registration secret is — see [The resource
-identifier and the issuer](#the-resource-identifier-and-the-issuer).
+On boot `Serve` calls `codefly.Init(ctx)`, which loads Codefly's injected
+carriers and pins the module this process belongs to from `CODEFLY__MODULE`.
+The SDK resolves no endpoint for a process it has not pinned, so a boot that
+names no module — or a different one from the module the process was first
+pinned to — is refused naming `CODEFLY__MODULE`. Then `loadConfig` resolves
+every value through the codefly Go SDK (`github.com/codefly-dev/sdk-go`),
+falling back to the local native workspace map when not running under the
+runtime, and `validate()` refuses each one that is unresolved, naming the value
+and the provisioning path that fixes it — including the difference between
+"the SDK resolved nothing" and "loading the injected environment failed
+first".
 
 | What | SDK resolution | Env override (default) |
 |---|---|---|
 | Own listen port | `codefly.For(ctx).Endpoint("http").NetworkInstance()` — the Codefly-assigned port, not a fixed default | `PORT` |
-| Gateway URL (auth-gateway `rest`) | resolved by role — the single module owning the `auth-gateway` `rest`/`rest` endpoint, discovered from the injected carriers (or the workspace, run locally). Must be `https` | `GATEWAY_URL` |
-| Credential mint URL | **not resolved — required explicitly.** Must be `https`. Nothing derives it: whether the host mints through the gateway or the workload posts straight to the issuer is unsettled and neither endpoint is deployed, and this is the address the projected service-account token goes to, so an assumed one is refused at boot. Every boot logs where it will mint, and a 404 there means that endpoint does not exist on that host — not that this build was refused | `CODEFLY__CREDENTIAL_MINT_URL` (**required**) |
-| Projected service-account token | `codefly.For(ctx).WorkspaceConfiguration("workload-identity", "TOKEN_FILE")` — a **path**, re-read at every mint | `CODEFLY__WORKLOAD_TOKEN_FILE` |
-| Workload identity certificate | `workload-identity`/`CERT_FILE` | `CODEFLY__WORKLOAD_IDENTITY_CERT_FILE` |
-| Workload identity private key | `workload-identity`/`KEY_FILE` | `CODEFLY__WORKLOAD_IDENTITY_KEY_FILE` |
-| Peer trust anchor | `workload-identity`/`TRUST_BUNDLE_FILE` — **required**: the listener requires and verifies a caller's certificate against it, and the outbound client verifies the platform against it | `CODEFLY__WORKLOAD_IDENTITY_TRUST_BUNDLE_FILE` |
-| Allowed callers | `workload-identity`/`ALLOWED_CALLERS_FILE` — **required**, a **path** to a file of identities, one per line (normally the gateway's); re-read per handshake. Verifying against the anchor says a caller holds an identity the platform issued; this says which of them this solution serves | `CODEFLY__WORKLOAD_IDENTITY_ALLOWED_CALLERS_FILE` |
-| Credential mint peer | `workload-identity`/`MINT_PEERS_FILE` — **required**, a **path** to a file of identities; re-read per handshake. This is the set the credential mint endpoint is admitted by: the SDK's mint client reads it during the handshake and refuses a peer whose single URI SAN is not in it, even when the certificate was signed by the accepted anchor. It also narrows the shared-address case, where the mint and the gateway answer at one address and a dial cannot be attributed: what is admitted there is the intersection of this set and the gateway's | `CODEFLY__WORKLOAD_IDENTITY_MINT_PEERS_FILE` |
-| Gateway peer | `workload-identity`/`GATEWAY_PEERS_FILE` — **required**, same shape. One set **per destination**: the mint and the gateway are two parties, and a single set spanning both authorises each to stand in for the other at the other's address — and the mint is the destination that receives the projected service-account token. A dial to an address that is neither has no set and is refused. When the two are at the **same** host and port — the brokered shape — a dial there cannot be attributed to one of them, so it is held to the **intersection** of both sets, and an empty intersection is refused at boot | `CODEFLY__WORKLOAD_IDENTITY_GATEWAY_PEERS_FILE` |
-| Principal this workload runs as | `module-authority`/`PRINCIPAL`, read once and frozen | — |
-| Audience it mints against | `module-authority`/`AUDIENCE`, read once and frozen | — |
-| Audience of its own projected token | `module-authority`/`PROJECTION_AUDIENCE`, read once and frozen | — |
+| Authority interface | workspace configuration `authority/endpoint`, an `${endpoint:…}` reference the run resolves. Required | — (declared configuration) |
+| Route enforcement | workspace configuration `hop/ENFORCEMENT`; `warn` makes the route check advisory, as the hop's is | — (declared configuration) |
+| Each consumed module's hop and binding | the workspace configuration slots its `AuthorityRelay` names | — (declared configuration) |
+| Mesh assertion | `codefly.For(ctx).WorkspaceValueIfSet("internal-transport", "mesh-protected")` — read once at boot and handed to the SDK's rule for a module's address; exactly `true` asserts that every in-cluster hop is carried by a mutually authenticated mesh, unset or `false` keeps plaintext refused, any other value is a refusal | — (declared configuration) |
+| Projected workload credential | a **path**, re-read on every call to the authority; `/var/run/secrets/codefly/token`, the CLI projection | `CODEFLY__WORKLOAD_TOKEN_FILE` |
 | Contract profile | the Codefly environment's own name, which is how Core resolves a profile for an environment that declares none | `CODEFLY__CONTRACT_PROFILE` |
 | MF assets | `Manifest.Assets` when set (see below), else the `../fe-remote/dist` directory | `ASSETS_DIR` (directory only) |
-| Host issuer (MCP) | `codefly.For(ctx).WorkspaceConfiguration("mcp", "issuer-url")` — the declared value the composition supplies; without one, the resolved host frontend origin (see [Exposing an MCP server](#exposing-an-mcp-server)). Checked at boot only when `ServeMCP` is declared | — (declared configuration, no env override) |
-| Public MCP URL | **declared** (`mcp/public-url`) in a deployed runtime context, where a derived value is refused: the derivation encodes the route the *host* serves this solution on. Locally, derived from `<PUBLIC_URL>/solutions/<id>/mcp`. Overridden by `codefly.For(ctx).WorkspaceConfiguration("mcp", "public-url")` (must end in `/mcp`). With neither, the resource identifier is reconstructed per request from `x-forwarded-proto` / `x-forwarded-host` / `x-forwarded-prefix` | — (declared configuration, no env override) |
 
-Every `workload-identity` value is a **path, never material**, the three
-admission sets included — and that is what makes them live. They are admission
-decisions, and an admission decision read once at boot cannot narrow: removing a
-compromised identity from either file takes effect on the next handshake, the
-next dial and the next connection check, with no restart. A set that resolves to
-nothing, or that cannot be read, **refuses** rather than falling back to the set
-the process booted with.
+**Removed with the saas host**: `GATEWAY_URL`, `CODEFLY_HOST_MODULE`,
+`CODEFLY_HOST_GATEWAY`, `CODEFLY_HOST_FRONTEND`, `PUBLIC_URL`, the
+`module-authority` group (`PRINCIPAL`, `AUDIENCE`, `PROJECTION_AUDIENCE`,
+`INTERNAL_TOKEN`) and the `mcp` group (`issuer-url`, `public-url`). Setting any
+of them now does nothing. The registration variables (`SELF_UPSTREAM`,
+`HOST_REGISTER_URL` and the rest) and the `workload-identity` group went
+earlier, with the registrations and the in-cell TLS they fed.
 
-> They were configuration *values* until round four of review, re-resolved on
-> every handshake through the SDK's accessor — which does not work and this
-> README claimed it did. A configuration value, inline or file-carried, is fixed
-> at process start (the SDK reads the file once and keeps it, `file_carrier.go`),
-> so the re-resolution returned the boot answer for the life of the process, the
-> refusal branch was unreachable in any deployment, and revoking a caller
-> silently needed a restart. They are paths now, read by this process like the
-> trust anchor beside them, which is the only form that can be what was
-> documented.
+## Plain HTTP inside the cell
 
-The files behind these paths are read by this process — the token at every mint,
-the key pair and the anchor at every handshake, the two admission sets at every
-handshake and dial — so the SDK's value accessors are the wrong tool for any of
-it: a file-carried configuration value is read once and kept for the life of the
-process, which is right for a configuration value and wrong for anything the
-platform changes underneath one.
+Past the authority's edge, every hop inside a cell is plain HTTP, and the
+cell's mesh — istio ambient: ztunnel mTLS, the workload's identity being its
+ServiceAccount's SPIFFE ID — carries transport security and destination
+identity. TLS ends at the edge. So this listener is plain TCP on the port
+Codefly resolved, presents no certificate and verifies no caller: a listener
+that re-decided either would be a second copy of a decision the cell makes for
+every workload. The previous generation served TLS 1.3 under a projected
+X.509-SVID and admitted callers by provisioned peer files; all of it is
+deleted.
 
-The three `module-authority` values are read through the SDK's authority reader
-and **frozen**: the credential this process holds is sealed to the values it was
-minted under, so a value that resolves differently later is an error and not a
-reload. They are rechecked before every renewal, which is the one moment a
-drifted value would otherwise be laundered into a credential nobody approved.
+What this process still decides is what a caller may do once admitted, and
+where the viewer's Work Context may travel:
 
-Every unresolved value is refused at boot, naming the value and the provisioning
-path that fixes it — including the difference between "the SDK resolved nothing"
-and "loading the injected environment failed first", because one generic message
-sent an operator to inspect endpoint resolution over a variable they had broken
-themselves.
+- **The authority's Check of the request's Work Context is the viewer.** No
+  header a request wrote about itself is read.
+- **A plaintext module address is admitted only where the mesh is.** Each
+  relayed module's hop address is held to the SDK's one transport rule,
+  `workcontext.AdmitEndpoint`: `https` to any host; `http` to a loopback host
+  on a local run, or to an in-cluster Service address
+  (`<svc>.<ns>.svc[.<domain>]`) when the composition asserts
+  `internal-transport/mesh-protected=true`; anything else refuses the boot.
+- **The listener bounds a stalled peer.** A request's headers must arrive
+  within ten seconds and a keep-alive connection nobody uses is closed after
+  thirty; neither bounds a whole request, because a declared long-running
+  stream is conforming traffic.
 
-`PUBLIC_URL` survived the cutover with one consumer. It fed the manifest
-registration, where building an absolute URL from it was wrong — the route a
-browser reaches this solution through is the host's to resolve — and the
-manifest is a path now. The MCP resource identifier an agent client binds its
-token to does need a public origin, and derives from it when no `mcp/public-url`
-is declared. Whether a runtime should derive the host's `/solutions/<id>` route
-even for that is an open follow-up.
-
-**Removed in this cutover, with the registrations they fed**: `SELF_UPSTREAM`, `HOST_REGISTER_URL`, `GATEWAY_REGISTER_URL`,
-`GATEWAY_MODULE_REGISTER_URL`, `GATEWAY_MODULE_REGISTRATION_TOKEN_URL`,
-`GATEWAY_SOLUTION_REGISTRATION_TOKEN_URL`, `CODEFLY_INTERNAL_TOKEN`,
-`CODEFLY__SOLUTION_REGISTRATION_SECRET`, `CODEFLY__MODULE_REGISTRATION_SECRETS`,
-and `CODEFLY__SOLUTION_REGISTRATION_INTERVAL`. Setting any of them now does
-nothing.
-
-`CODEFLY_HOST_FRONTEND` is **not** in that list, and this said it was. It went
-with the registrations and then came back for one consumer, the same way
-`PUBLIC_URL` did: it names the host's frontend service, whose resolved URL is
-the fallback the MCP issuer identifier is derived from when no `mcp/issuer-url`
-is declared (`resolveMCPIssuer`). It is read in `loadConfig` like every other
-value here. Nothing reads the shared cluster-internal token or
-a per-solution registration secret any more: the credential this runtime
-presents attests which workload it is, and there is no fallback to one that
-attests nothing.
-
-The host it plugs into is named by Codefly-convention **service roles**, not by
-its workspace module name: the runtime discovers the single module that owns the
-gateway role — from the injected endpoint carriers when deployed, or the
-workspace on disk when run locally — so a solution composing the host under any
-module name resolves identically (codefly-dev/core#382).
-The role is overridable: `CODEFLY_HOST_GATEWAY` (default `auth-gateway`). There
-is no fallback to the pre-v0.0.49 `auth-sidecar` role: a composition exposing
-only that one is a composition to re-render, and an unresolved current gateway
-silently selecting the service that used to answer the deleted registration
-endpoints is worse than a boot that fails naming the role. `CODEFLY_HOST_MODULE` is
-empty by default and only needs setting to disambiguate a composition where
-**more than one** module exposes the same role — otherwise an ambiguous match
-resolves to nothing and the runtime fails loud at boot rather than picking a host
-arbitrarily. Concrete addresses always come from the SDK.
-
-## The workload identity
-
-The listener presents the X.509-SVID issued to this workload, over TLS 1.3, and
-there is no plain-HTTP listener. A configuration that cannot produce an identity
-is refused at boot, naming the missing material: a solution that came up on
-plain HTTP would be refused at the edge instead, for a reason only the edge can
-see, which is the failure the delivered-presence model exists to end.
-
-The default source is the pair the platform projects at the two paths above,
-read through the SDK's certificate reloader: it re-reads the files when they
-change and keeps serving the last good pair through a half-written replacement.
-That matters more here than anywhere else, because workload leaves are
-deliberately short-lived and rotated well before expiry — a process that loaded
-its leaf once at boot serves a stale leaf while a valid one sits on disk, and
-then fails every handshake with the issuer reporting nothing wrong.
-
-Issuing an identity is the platform's job, not this runtime's, so the source is
-a hook:
-
-```go
-solution.New(manifest).Identity(mySPIFFEWorkloadAPI{}).Serve()
-```
-
-An `IdentitySource` returns the `*tls.Config` the listener serves with, so an
-issuer with its own rotation, revocation or peer-verification rules keeps them.
-A source that returns no certificate is refused rather than started: a listener
-that completes no handshake reports a TLS error naming nothing to every caller.
-
-**The listener authorises its callers, not merely authenticates them.** Every
-workload in the trust domain holds a certificate from the same anchor —
-including the modules this solution consumes — so verifying one answers "did the
-platform issue this identity", not "may this caller call me". The admitted set
-is therefore declared and provisioned (`workload-identity`/`ALLOWED_CALLERS_FILE`)
-and the boot is refused when it is absent, naming the value; the comparison is
-the SPIFFE ID in the caller's URI SAN. Without it a consumed module could call a
-handler or a passthrough route directly, bypassing the admission the host
-decides on its own routes, and — because `x-org-id` and `x-session-id` are read
-as headers the gateway stamped from a verified bearer — set them itself and have
-this runtime mint capabilities under its attestation for an organization and
-session nobody authenticated. A confused deputy, where the deputy is the one
-process the issuer trusts to say which module is asking. The refusal names the
-identity that arrived and never the admitted set.
-
-**The listener authenticates its callers, and so does the identity it presents
-outward.** It requires and verifies a caller's certificate against the projected
-anchor — not optionally, and not when one happens to be configured: a listener
-that verifies no peer accepts anything that can route to the pod, which bypasses
-the admission and exposure decisions the host makes on its own routes. An absent
-anchor is a boot refusal naming the value; an unusable one fails the handshake
-rather than falling back, because judging callers by a stale anchor lets in who
-should be refused, which is not symmetric with serving a stale leaf. Peer trust
-is re-read **per handshake**, so removing a compromised root from the bundle
-stops it authenticating new callers without a restart.
-
-And every **established** connection is re-verified too, once a second, in both
-directions — the caller's chain against the current anchor and the current
-admitted set, the platform's against the same. Re-reading trust per handshake
-bounds nothing about a connection that has already handshaken: a caller removed
-from the admitted set, or whose issuing root was pulled, kept the keep-alive
-connection it already held and kept being served on it, and so did an outbound
-connection carrying a request every 100ms. An idle timeout cannot bound a
-connection that is never idle. A connection whose peer stops verifying is closed
-— busy or idle, request or stream — and nothing else closes it: a failure to
-re-read *this* workload's own key pair is not a judgement about the peer and
-leaves established connections alone. The listener also sets a handshake and
-header deadline and an idle timeout, so a peer that connects and then stalls
-mid-`ClientHello` no longer holds a goroutine and a descriptor indefinitely;
-neither bounds a whole request, because a declared long-running stream is
-conforming traffic.
-
-**A consumer's `IdentitySource` that sets `GetConfigForClient` must implement
-`PeerAnchorSource`** — whatever it carries on the base configuration. Re-verifying an established caller, and
-verifying the platform this runtime dials, both need the anchor *as it is now* —
-and if the only way to get it is the source's `GetConfigForClient`, the runtime
-would have to call it with a `ClientHelloInfo` nobody sent. That is the defect
-this cutover was already blocked on one field along: a source keyed on the hello
-answers a synthetic probe with one thing and the real handshake with another,
-demonstrably. So the source is asked directly —
-`PeerAnchor() (*x509.CertPool, error)` — and one that can only answer through a
-handshake is refused at boot. Carrying a pool on the base as well does not
-answer it: that pool is one object fixed when the source built it, so it would
-freeze the anchor this process judges by while the callback went on resolving a
-fresh one — which is exactly what happened when the refusal only fired on a nil
-base pool. A source with no callback at all may carry its anchor on the
-configuration and needs nothing extra. The projected source implements the
-interface.
-
-Nor may a source set `VerifyPeerCertificate`: it is handed the parsed chain this
-runtime reads the caller's identity from, and it runs first, so a source that
-rewrote the leaf's URI SANs decided who was admitted. The identity is read from
-a fresh parse of the raw DER regardless — the bytes the peer signed are the only
-thing that cannot be edited between the handshake and the check — and the field
-is refused as well.
-
-The same fabrication is still used for the outbound **certificate**, and that is
-sound for a reason worth stating: whatever comes back is held to the frozen
-principal at the moment it is presented, so a source answering differently from
-the real handshake is caught by that hold. An anchor has no check behind it — it
-*is* the check.
-
-**An outbound TLS handshake carries its own 10-second deadline.** A custom
-`DialTLSContext` takes `net/http` out of the handshake, so
-`Transport.TLSHandshakeTimeout` does nothing and the only bound would be the
-caller's context — which is right for a request and wrong for the one place it
-matters, since the client that carries streams sets no timeout on purpose. A
-handshake is not a stream.
-
-**An admission set answered twice is refused, not ranked.** The env override and
-the platform's provisioning are two sources for one authorization fact; if both
-answer, the boot fails naming both. Logging which one won reports the conflict
-without resolving it, and for admission the cost of picking wrong is admitting a
-caller. The other `workload-identity` paths still take the override first: the
-worst case there is this process reading its own material from elsewhere.
-
-**This listener does not resume TLS sessions.** A resumed connection presents
-**no certificate** — the peer is accepted on a ticket — and this listener's
-whole model is that a caller's certificate names them and the provisioned set
-decides whether that name may call. So anything able to forge a ticket is able
-to be admitted as whoever it was issued to. A review demonstrated it: with a
-source-supplied ticket key, a client holding only that key and an admitted
-caller's ticket resumed as that caller, presenting nothing, and the per-second
-recheck then re-verified the stolen certificate and kept the connection open.
-A denylist could not close that, because `SetSessionTicketKeys` installs keys
-that cannot be read back off the configuration — so resumption is turned off on
-the configuration served and on every per-connection answer. It costs one round
-trip on a reconnect.
-
-**An admission entry must be a whole line.** The file is read per handshake and
-per dial, so it is read while the platform may be rewriting it: a file caught
-mid-write truncated an entry, and the truncation was admitted as an identity of
-its own (`…/sa/gateway-internal` read as `…/sa/gateway`, admitting a caller the
-set never named). A file that does not end in a newline is refused, every entry
-must be a SPIFFE ID, control characters and a byte-order mark are refused, and
-the file is capped at 64 KiB because it is re-read once a second per established
-connection in each direction.
-
-**A credential-bearing URL carries a destination and nothing else.** Userinfo, a
-query and a fragment are refused at boot on both the gateway and the mint:
-credentials in a URL are a secret that gets logged and, for userinfo, that
-net/http strips before the request is sent, so it is disclosed and never used.
-Both URLs are logged through `url.Redacted()` with the query dropped regardless,
-because a log line is the wrong place to depend on a check that runs elsewhere.
-
-**No credential-bearing request follows a redirect, and none leaves the
-gateway's own origin.** Go copies a request's headers onto a redirected one and
-strips only `Authorization`, `WWW-Authenticate` and `Cookie`; a 307 re-sends the
-body; and this runtime sets the bearer per round trip, which puts back the one
-header Go strips. So a single `307 Location: http://elsewhere/` would hand a
-third party the viewer's bearer, the capability minted for them and this
-workload's own credential, in cleartext — nothing about an `http://` hop involves
-the TLS configuration that protects the first one. Every client is therefore
-built with `ErrUseLastResponse` (a 3xx is reported, never taken), and the
-transport refuses any destination that is not the gateway's origin, so a client
-built later without the policy is still stopped.
-
-**Outbound trust is re-read per connection, not snapshotted at boot** — the same
-rule as inbound, for the same reason, and it applies with more force: the two
-destinations on the other side of that client receive the projected
-service-account token, the viewer's bearer and this workload's own credential, so
-a root removed because it was compromised must stop authenticating them without a
-restart. Each dial builds its own configuration — and each
-established connection re-verifies the peer it already has, once a second,
-against the current anchor and the current the destination's own provisioned set, closing it when
-that stops holding.
-
-The recheck is there because the idle cap it replaces was not a bound. An
-inactivity timeout bounds a connection nobody is using; a connection carrying a
-request every 100ms never becomes idle, and one was demonstrated still answering
-31 seconds after its server's root was removed from the bundle, over a single
-handshake. A stream is the same shape by construction, held open for as long as
-its declared `MaxStreamDuration` allows. Re-verifying rather than imposing a
-maximum connection age is deliberate: a maximum age would cut a conforming
-30-minute stream to answer a question that can be answered without cutting it,
-since the chain the peer presented is already in hand. A peer that no longer
-verifies loses the connection, in flight or idle, stream or request.
-
-**And the destination is authorised, not just authenticated.** Verifying the
-chain and the hostname says the cell issued a certificate for the address this
-runtime dialled, which every workload in the cell holds one of — a neighbouring
-workload answering at the gateway's address under a valid certificate was handed
-the projected token, the viewer's bearer and this workload's credential. So the
-peer's own SPIFFE ID must be in that destination's provisioned set. The outbound leaf is held to
-the frozen principal too, at the moment it is presented, which matters because
-on the default path it comes from a second reloader over the same files as the
-listener's.
-
-The same identity goes out. Every platform request — the mint, and every call a
-handler's gateway makes — presents this workload's X.509-SVID and verifies the
-far end against the same anchor, because an `https` URL on its own says only
-that the scheme is https: without an anchor the far end is checked against
-whatever the image's system roots hold, and without a client certificate it
-cannot tell this workload from anything else that reached it. Nothing is
-proxied, and no redirect is followed.
-
-**The certificate served is the certificate checked.** The pair the platform
-projects and the principal it provisioned are two facts nothing else compares,
-so this runtime compares them: the SPIFFE ID in the leaf's URI SAN must equal
-`module-authority/PRINCIPAL`. A pair projected for a neighbouring workload — the
-wrong Secret mounted, a Certificate issued for another service — would otherwise
-be served happily, and the mismatch would surface at whatever verifies this
-destination, as a refusal naming neither file.
-
-The comparison is made on the pair a handshake actually selected, not on a
-sample. A boot-time check that called `GetCertificate` once and approved the
-configuration was demonstrated passing four configurations that then served
-another workload's leaf: a callback keyed on the server name answering a probe
-and a real hello differently, a `NameToCertificate` map, a static
-`Certificates[0]` that Go reaches without consulting the callback at all when
-the caller sends no SNI, and a `tls.Certificate.Leaf` that did not describe its
-own DER. So the selection surface is narrowed to one certificate (a
-`NameToCertificate` map or a list of several is refused — a workload has one
-X.509-SVID), the DER is parsed rather than `Leaf` believed, and the callback is
-wrapped so that what it returns for this handshake is what is compared. A
-boot-time refusal remains, asked with the empty hello a peer addressed by IP
-really sends, and it can only refuse a boot — never approve one.
-
-Every one of those applies to a consumer-supplied `IdentitySource` too, checked
-on what it returns: a certificate, a TLS 1.3 floor, and a caller it
-authenticates. Checking only that a certificate came back left the floor and
-peer authentication silently optional for exactly the consumers who wrote their
-own integration.
-
-It is checked **per connection** as well as at boot. A `*tls.Config` may carry a
-`GetConfigForClient` callback, and the configuration that callback returns
-replaces the base one for that handshake — floor, peer requirement and
-certificate included — so a source that conforms at boot could answer each
-individual connection with TLS 1.2, no peer authentication, or a neighbouring
-workload's leaf. This is the documented shape here rather than an odd one: the
-projected source uses that callback to re-read peer trust. So each returned
-configuration is held to the same posture and the same frozen principal, and one
-below it fails that handshake instead of serving it weakened. A callback that
-returns `nil` is Go's "serve the base configuration", and passes through only
-when that base really satisfies the posture on its own: a source answering for
-one hello and not another was otherwise serving a listener that requires a
-caller's certificate and verifies it against the host's system roots, which is
-mutual TLS in every log line and a client certificate from any public CA
-admitted.
-
-## One credential per execution
-
-`Serve` obtains this execution's credential once, before the listener exists,
-through the SDK's mint client (`sdk-go/workcontext`): the projected
-service-account token is presented to the host's mint endpoint, and the host —
-which establishes the principal, the installation and the build from that token
-and its own records, never from anything this process reports — answers with a
-credential sealed to this build incarnation and this installation.
-
-The runtime holds no mint of its own, and it runs **no registration
-heartbeat** — which is the claim this cutover is about. It does run other
-timers, and saying otherwise here was wrong twice: the inbound and outbound
-trust watchers re-verify an established peer once a second, the credential
-acquisition holds off after a failure (capped, jittered), and the listener has
-idle and header bounds. None of them tells the host this process exists, which
-is the property; "no timers at all" was never it. Every use goes through the client, which hands back the
-credential it holds while that one is current and renews it once it has entered
-its renewal lead, re-reading the rotated projection and rechecking the frozen
-authority values first. A process that runs for a week under credentials the
-issuer chose to make long-lived mints once and renews a handful of times; it
-never mints per beat or per probe, and does not mint per request: acquisition is
-single-flight, a failed ask quiets the next ones for a second, and a credential
-already in hand and unexpired is what serves meanwhile. That last part is not a
-detail — renewal begins inside a lead *before* expiry, so refusing while the
-issuer is slow would answer 503 to every viewer over a dependency this process
-does not yet need. A route gate that asked per request turned a 503-ing issuer
-into one audited mint per request, which is worse than the heartbeat this
-runtime replaced, because the heartbeat at least minted on a timer.
-
-**A refused first mint fails the boot and is never retried. An unavailable one
-is waited for, within a bound.** The two are different answers:
-
-- a **refusal** (`ErrMintRefused`, which the SDK latches for exactly two
-  statuses, `401` and `403`) is the issuer judging this workload: this build is not the one
-  its presence document approved, the pod's identity does not match, the token
-  attests to another subject. No number of attempts changes any of those
-  answers, so the boot reports what the issuer said and exits non-zero. A loop
-  around it is what this change exists to delete: the old runtime answered every
-  refusal by beating again, minting a fresh single-use token each time, so one
-  undeployable solution produced an audited mint every 15 seconds for as long as
-  it ran.
-- an **unavailable** mint (`ErrMintUnavailable`: the host's `503`, `429`, any
-  other `5xx`, **and a `404`**) is not a judgement. A workload may legitimately start before its
-  presence generation has been applied, and then there is no incarnation to mint
-  against yet; the issuer may also be unable to reach the Kubernetes API or its
-  own policy log, and a host that issues nothing in those cases is behaving
-  correctly. So the boot asks again, backing off, for up to **two minutes**, and
-  then exits non-zero.
-
-  A `404` is in this set, and that is a deliberate change rather than an
-  oversight: the rule here was "`429` and `5xx` retry, everything else is
-  terminal", and sdk-go v0.3.0 inverted it after measuring the cost — a `408`
-  from a proxy, with a valid credential in hand, latched for the life of the
-  process, and a `404` from an ingress mid-rollout would do the same. `401` and
-  `403` are the two statuses the host signs. So **an old runtime against a host
-  of this generation waits out its bounded window and exits non-zero for the
-  orchestrator rather than failing on the first answer.** It still does not
-  recover; what changed is the shape, not the outcome.
-
-The bound is what keeps the second case from being the heartbeat again: it is a
-boot waiting for a dependency, with no steady state, nothing minted on success
-beyond the one credential, and an exit — the orchestrator's cue to restart —
-when it is spent.
-
-The credential is also what this runtime presents on the mint it runs **for a
-viewer** (see [Reading a Work-Context-authenticated
-module](#reading-a-work-context-authenticated-module)): the viewer's bearer says
-on whose behalf, and this credential says which module is asking, so the issuer
-can hold that mint to the installation and binding the credential is sealed to
-instead of seeing only that somebody holding a viewer's bearer asked.
-
-**A mint this runtime cannot attest for is not sent.** If the credential cannot
-be obtained — no source, a refused renewal, authority that drifted, a capability
-that cannot be attached — the call is refused with `ErrNotAttested` and the page
-sees `unavailable`: the viewer's own authority is not in question and one
-renewal fixes it.
-
-It used to log and carry on, and that was wrong in the one case the attestation
-exists for. The issuer stops renewing precisely when the installation has moved,
-the build is no longer approved, or the principal's epoch has advanced — so a
-workload in exactly that state kept minting viewer capabilities with no
-execution binding on any of them. "The host does not require the attestation
-yet" is a statement about the counterpart's current state, and boot-time
-approval is not authorization at use. The refusal is logged once per distinct
-failure rather than once per request, and once more when it recovers; what a
-caller gets is not throttled, because every affected call is refused.
-
-**Nothing is inferred from a module's 409.** A capability is held until its own
-expiry, whatever a callee answers. A 409 means "the state you were sealed to
-has moved" and it means "that page already exists", and nothing on the wire
-says which — so a runtime that read one as supersession evicted a perfectly
-valid capability every time a module reported a duplicate or a lost update, and
-the next call minted again. Matching installation metadata identifies the
-*scope* of a conflict; it does not establish supersession.
-
-A genuinely superseded capability is therefore refused call by call by the far
-end — correct if noisy — and the renewal that replaces it happens on the
-credential's own schedule. Acting on a conflict needs a machine-readable
-discriminator from the host or the verifier, which nothing publishes today;
-what a viewer sees meanwhile is the 409 itself.
-
-A consumer whose issuer is reached another way supplies its own source:
-
-```go
-solution.New(manifest).Credential(mySource).Serve() // Credential(ctx) (workcontext.Credential, error)
-```
-
-### This runtime neither signs, parses nor verifies a capability
+## This runtime neither signs, parses nor verifies a capability
 
 There is **one** implementation of a Work Context — Core's (`core/workcontext`:
-deterministic proto, Ed25519) — and this runtime is not it. It obtains a
-credential through the SDK's client, carries it as the string it travels as,
+deterministic proto, Ed25519) — and this runtime is not it. It has the
+authority issue every Work Context it acts under, carries it as the string it travels as,
 and lets whoever consumes it decide. It declares none of a capability's fields
 and reads none of them: the capability a handler's gateway presents to a module
 is a string this package never decoded, and the one check that must happen
 before a call rather than at the far end — that a capability is sealed at all —
-is the carrier's (`workcontext.Attach`).
+is the module's.
 
 It also does not **verify**, and that is a position rather than an omission.
 Core's verifier requires four live sources — the authorization revision,
@@ -557,17 +259,6 @@ solution runtime holds none of those: it is the party presenting a capability,
 not the party deciding on one. So there is no verifier here to configure, and a
 change that adds one has to answer where those four sources come from.
 
-Core's conformance kit is still run, through the boundary this package does own:
-all 39 fixtures are offered to the carrier, and each one's refusal is attributed
-to a side. A capability whose bytes are visibly not a capability — no separator,
-an unreadable payload, no seal, another encoding — is refused here, before a
-request is sent, with Core's own sentinel. A tampered payload, an unknown key,
-an audience in the payload and every sealed value the issuer has moved past are
-carried, because judging them needs those four sources and a carrier that
-refused them would be claiming a strength it does not have. The classification
-is per fixture, so a fixture Core adds fails the test until somebody decides
-which side it belongs to.
-
 Both halves are pinned by `work_context_boundary_test.go`, which fails on a
 signing primitive, on a `WorkContext`-named type or function of this package's
 own, and on a call to a verifier. The duplication it prevents already happened
@@ -575,24 +266,13 @@ once, in a module whose only job was to carry these things, and 3,532 lines had
 to be deleted to get back to one implementation. Every step of that was locally
 reasonable, which is why the first step fails a test here.
 
-A module's refusal of a presented capability reaches a handler by kind:
-`ErrRevoked` — the capability was sound when minted and the state moved under
-it (an installation revision, a principal's epoch, a build incarnation, a
-binding) — is reported as `aborted`, because the call was not made and
-retrying the same call will not make it. It does **not** retire the capability:
-see "Nothing is inferred from a module's 409" above, since that answer is
-indistinguishable from an ordinary business conflict. `ErrInvalid` and `ErrNotACoreToken` are reported as `internal`: a
-credential this solution could not present is this solution's problem, not a
-module that is briefly unreachable. There are two, not three: core v0.9.0
-**deleted** `ErrUnsealed`, because the seal is now required by the schema and
-`protovalidate` refuses a capability carrying none before any seal check is
-reached — so that case arrives as `ErrInvalid`, and a consumer who wrote a
-branch for the dedicated sentinel had one that could never run.
-
 ## The published contract
 
-A solution **declares** the most authority it may ever ask for: which audiences
-it holds bindings for, and the ceiling on each. The runtime holds its own asks
+A solution **may declare** the most authority its passthrough may ever ask
+for: which audiences it consumes, and the ceiling on each. A solution that
+declares none publishes an empty contract and is bounded by the authority
+alone — each call is issued through one of its bindings, within that binding's
+ceiling and what the person holds. The runtime holds its own asks
 to that declaration at boot, and answers it at `/.well-known/module-contract` so
 an operator can read what a process holds itself to.
 
@@ -628,10 +308,7 @@ more action would widen the ceiling meant to refuse it, and a reviewer approving
 the contract would be approving whatever the next commit asks for. What *is*
 derived is the binding set: the audiences are the `as` of the solution's
 `api.consumes` entries, which Codefly projects and the declaration is already
-checked against, so restating them would be a second source for one fact. The
-principal is neither: it is the `module-authority` value the platform
-provisioned, so the contract reports who this workload actually is rather than
-who its author believed it would be.
+checked against, so restating them would be a second source for one fact.
 
 Keyed by **configuration profile**, because a deployment and a developer machine
 do not grant the same authority. A deployed environment reads its own profile —
@@ -645,20 +322,19 @@ Every one of these is a boot failure naming the value:
 
 | Refused | Because |
 |---|---|
-| no ceiling for a consumed audience | this runtime would have no declared ceiling to check a mint against, for a module it does call |
+| no ceiling for a consumed audience | this runtime would have no declared ceiling to check the ask against, for a module it does call |
 | a ceiling for an audience nothing consumes | the ceiling governs a call that cannot happen, and whoever wrote it believes otherwise |
 | an ask outside its ceiling (action, or resource id) | the ceiling is what a reviewer approved; widening it is an edit, not an inference |
 | an ask across a whole resource kind under a ceiling naming resources | "every document" is not inside "these two documents" |
-| a ceiling on a `ViewerBearer` module | it mints nothing, so the ceiling governs nothing — and whoever wrote it believes it does |
-| no profile at all, for a solution that mints authority | a deployed process would have no profile to resolve its ceiling from |
+| no profile at all, for a solution that declares a ceiling | a deployed process would have no profile to resolve its ceiling from |
 | a profile name that is not a single path component | profile names select directories wherever one is read |
 
 A running solution publishes the contract of the profile it runs under at
-`/.well-known/module-contract` — the resolved principal, the profile, and each
-binding with its ceiling and the ask inside it. Nothing is pushed: answering
+`/.well-known/module-contract` — the profile, and each binding with its ceiling
+and the ask inside it. Nothing is pushed: answering
 there makes this solution present to nobody. `ContractArtifact(id, contract,
-modules...)` renders the same document at build time, with every profile and no
-principal — that is a value only the deployment knows — checked by exactly the
+modules...)` renders the same document at build time, with every profile,
+checked by exactly the
 rule the boot applies, so a contract that would refuse to boot cannot be
 published. It is for review and for diffing a build, not for the renderer.
 
@@ -675,51 +351,80 @@ document names the route and the destination, and the host resolves both.
   failed to load. The origin a browser reaches this solution through is the
   host's route, and naming the host's route layout here would couple every
   solution to it.
-- The **upstream the gateway dials** is in the presence document, not in a
-  registration. `SELF_UPSTREAM` and the self-endpoint carrier it fell back to
-  are gone. A deployed solution used to register its own loopback listen
-  address, boot, look healthy, and be proxied by the gateway to the gateway
-  itself while the product reported it as failed to load; the refusal that
-  caught that is gone with the registration that needed it.
+- The **address the edge dials** is in the presence document's endpoints,
+  resolved through the SDK from the carrier the CLI hands it, exactly as for a
+  module. Nothing here reports it.
 
 This solution still publishes what it is, at fixed paths, for anything that
 asks: `/.well-known/solution.json` (the manifest: nav, the exposed module, the
 federation manifest path, the backend's service alias, declared surfaces and an
-optional dashboard), `/.well-known/capabilities` (the contract id and the
-majors), `/.well-known/module-contract` (the authority contract above) and
-`/health`. Publishing is not announcing — nothing is pushed, and answering
-makes this solution present to nobody.
+optional dashboard, all from [the declared frontend](#the-declared-frontend)),
+`/.well-known/capabilities` (the contract id and the majors),
+`/.well-known/module-contract` (the authority contract above) and `/health`.
+Publishing is not announcing — nothing is pushed, and answering makes this
+solution present to nobody: the host builds its registry entry from the
+delivered presence document and its own constants, never from this route.
 
-`/health` **asks the credential** rather than reporting only what some other
-request happened to discover. Renewal is lazy by design, so a solution serving
-only ViewerBearer routes, plain handlers and assets would otherwise never ask and
-never learn that the issuer had stopped approving its build. Asking is not a
-heartbeat: the client holds one credential and returns the same one until its own
-renewal point, so a probe is a mutex and a comparison except at the renewal the
-credential's expiry dictates. A credential that cannot currently be obtained is
-503 and nothing ends; a refusal is 503 **and** ends the process.
+`/health` reports process health and asks the authority nothing.
 
-So `/health` answers 200 while this process can do its job, and **503 once the
-issuer has refused this execution's credential for good** — `ErrMintRefused` at
-renewal, which is a judgement about this execution that no retry changes.
-(`ErrRevoked` is not one of these: it never comes back from the mint, only from
-a callee rejecting a capability this runtime minted for a viewer, which is a 409
-on that request.) The process then stops serving and returns that reason, for the
-orchestrator to restart it against the delivery as it stands. An unconditional
-200 was wrong in exactly the case the probe exists for: the boot already treats a
-refusal as terminal, while at renewal the same judgement reached a page as
-"unavailable, one renewal fixes it", so a solution would answer 503 to every
-request forever and report itself healthy throughout — a solution that serves
-nothing and looks alive, which is what the delivered-presence model replaced the
-heartbeat to avoid. An *unavailable* mint is not a judgement and deliberately
-does not do this: exiting on a transient dependency failure is a crash loop.
+The manifest declares the majors it is built against rather than leaving a
+reader to assume them — `schemaVersion: 1`, this runtime's manifest schema, and
+`frontend.hostContract`, the host contract the author declared — and the
+capability document declares the same majors from the same places, so a bump
+cannot leave one document announcing the old major while the other announces
+the new one.
 
-The manifest declares the contract majors it is built against
-(`schemaVersion: 1`, `frontend.hostContract: 1`) rather than leaving a reader to
-assume them, and the capability document declares the same majors from the same
-constants — so a bump cannot leave one document announcing the old major while
-the other announces the new one.
+### The declared frontend
 
+A solution declares what the host lists it under in **one file**,
+`solution.frontend.codefly.yaml`, beside the backend's `service.codefly.yaml`.
+The backend embeds it — `//go:embed solution.frontend.codefly.yaml` into
+`Manifest.Frontend` — and serves its manifest from it; the CLI reads the same
+file into the presence document's `frontend` block (core's
+`solutionhost.Frontend`), which is what the host's registry projects. Two
+readers of one file cannot disagree, where a Go field beside a file could, and
+nothing is reported at mint any more. The declaration is optional for either
+component kind: a nil `Manifest.Frontend` is headless. A present malformed file
+is refused by the same Core reader used by the CLI.
+
+```yaml
+title: Widgets           # nav title; one non-empty line
+order: 10                # nav order; declared, zero included
+exposed_module: ./Page   # the Module Federation module the host loads the page from
+host_contract: 1         # the host page-contract major the page is built against; >= 1
+dashboard:               # optional: a mapping the host's data-graph validator reads,
+  events: [...]          # served and delivered as JSON, at most 64 KiB encoded
+surfaces:                # optional: what the solution offers inside a client
+  - id: footnote         # lowercase letters and digits, dashes between; unique per client
+    client: word         # word, powerpoint, excel or slack
+    title: Footnote
+    description: Cite a claim.          # optional
+    module: /surfaces/word/footnote.js  # a rooted path on this solution's own origin
+    contract: 1                          # the surface contract major; >= 1
+    applies: always                      # declared: "always", or {tagged: [one or more tags]}
+    events: [documents.entry]            # optional; journal namespaces the surface reconciles on
+```
+
+The file is YAML, decoded strictly — an unknown key is refused by name — and
+its top-level mapping is the block itself, with no wrapper and no schema key:
+its keys are core's field names, field for field. Every scalar is declared,
+because core refuses an omitted one rather than reading it as zero. The
+dashboard is opaque to this runtime but has to be the JSON object the host
+reads: a mapping, every key a string, no fraction (JSON spells those more than
+one way, and the presence document is canonical bytes), bounded at 64 KiB
+encoded. A surface declares its `applies` selector — `always`, or
+`{tagged: [...]}` naming one or more tags — because core carries no default,
+and names each of its `events` once, as a lowercase dotted journal namespace
+(segments of letters and digits separated by a dot, dash or underscore). What
+a tag selects and what a namespace names are the client's to interpret; the
+shapes are what core signs.
+
+`Manifest` keeps `ID`, `Contract` and `Capabilities` as Go fields: the id is
+what the presence document names the solution by, and the capability handshake
+at `/.well-known/capabilities` is the backend's own, which the frontend block
+does not carry. `Title`, `Order`, `ExposedModule`, `Dashboard` and `Surfaces`
+are gone from it with the `Surface` type; the MCP metadata document's
+`resource_name` is the declared title.
 
 ### Serving the frontend
 
@@ -734,248 +439,12 @@ and the remote entry above all, whose names never change — `no-cache`, as is
 any response that is not the file (a `404` for a hashed name must not be cached
 under the name the next build will serve).
 
-### Consumed-module federation
-
-A solution that declares `api.consumes` reads each consumed module through the
-gateway's `/v1/<as>/*` prefix. **Those routes are delivered**, like everything
-else: the gateway holds them in its durable registry, from the presence
-documents, and this runtime registers no upstream for them. The three
-heartbeats that used to — one per consumed module, each brokering a signed
-prefix-bound token through the gateway, plus the two self-registrations — are
-deleted, along with `CODEFLY__MODULE_REGISTRATION_SECRETS` and the per-module
-secrets it carried.
-
-Codefly still projects the targets into `CODEFLY__API_CONSUMES`, and that
-projection is still what the passthrough declaration is checked against — at
-boot, resolved like every other value, so a malformed one is a refusal rather
-than a log line. It used to be read at serve time: a malformed projection
-disabled the whole federation with one log line while the solution served on,
-so every consumed facade 404'd at the gateway and the solution looked healthy.
-
-The refusal fires **whether or not the solution declares a passthrough**. Being
-resolved at boot is not the same as being judged there, and for a release it
-was only the first: the projection was decoded by the code that consumes it,
-which returns early when there is no `Consumes` declaration, so the same
-undecodable value was refused for one solution and served for another. It is
-decoded once at boot now and refused either way, naming `CODEFLY__API_CONSUMES`
-— the projection is the composition's output, so no override an operator can
-set repairs it, and `codefly run solution` is where it is fixed.
-
-Unset is not malformed. A solution that consumes nothing leaves the variable
-empty, and whitespace alone counts as empty, so a render emitting a bare
-newline for it does not fail a boot.
-
-
-### Reading a Work-Context-authenticated module
-
-The gateway client a handler receives forwards the viewer's bearer. That is
-enough for the accounts API, but not for a module that authenticates by signed
-**Work Context**: it derives tenant and subject from `x-codefly-work-context`
-and answers `Unauthenticated` to a bearer alone. The gateway only verifies and
-forwards a context that is already presented — nothing mints one for the viewer
-— so `Gateway.ForModule` does:
-
-```go
-docs, err := gw.ForModule(ctx, "documents",
-    solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
-if err != nil {
-    return nil, err
-}
-resp, err := solution.Unary[Req, Resp](ctx, docs, "/docs.v1.Documents/List", &Req{})
-```
-
-`ForModule` mints a Task Work Context through accounts' `StartTask`, presenting
-the viewer's bearer so accounts resolves the same subject the module would have
-seen, and this execution's own credential beside it so the issuer knows which
-module is asking (see [One credential per
-execution](#one-credential-per-execution)). It names no actor principal, which makes the viewer both owner and actor
-of the Task; the audience is the module; the authority is the scopes asked for
-and nothing more. The returned gateway then carries **both** credentials — the
-bearer and the capability — on every request, so a module verifying either one
-is satisfied.
-
-The returned gateway holds the *ask*, not the capability: it resolves one per
-request. A handler may therefore keep it for as long as it keeps the viewer's
-request. A capability captured once at derivation would lapse while the handler
-still held it, and the gateway verifies freshness on any presented context
-*before* routing — so a stale one is rejected at the edge and never reaches the
-module at all, which is worse than the bearer-only client it replaced.
-
-The audience is the module's facade entry-point: the `as` of its `api.consumes`
-target above, which is both what the gateway routes `/v1/<as>/*` to and what the
-module verifies as its own audience. A solution declares the consumption once
-and names it here.
-
-A mint is scoped to one organization, which the bearer does not carry. It comes
-from `x-org-id`, one of the canonical identity headers the gateway injects after
-authenticating the caller; a request reaching a handler without it is refused
-here rather than sent to accounts to be refused there. The gateway injects that
-header from the caller's *active* org, so it arrives present-but-empty for a
-viewer with no organization selected and for an org-less API key — the refusal
-names both shapes, because pointing only at an absent header sends whoever
-reads it to inspect one the gateway demonstrably did set.
-
-The Task is rooted in the viewer's **session**, which arrives the same way:
-`x-session-id`, stamped from the same verified claims and replacing anything the
-caller sent. That session is the one accounts sealed the selected organization
-into, so the Task it roots is attributable — the mint accounts journals names the
-session that asked for it. A session id the runtime invented would be a
-well-formed UUID naming no session, attributable to nothing.
-
-Every mint also **names the installation it acts under**. The host requires it
-(core's `StartInput.InstallationID`) and refuses a mint naming none, and an
-organization is not a substitute: one org may hold several installations, so a
-capability minted without naming one is attributable to the org and to no
-deployment inside it.
-
-For a viewer-driven mint it is the viewer's own, read from the
-`x-codefly-installation-id` header the gateway stamps — on the same footing as
-`x-org-id` and `x-session-id`, which the gateway also stamps from verified
-claims and replaces whatever the caller sent. A request naming no installation
-is refused, and the refusal is deliberately *not* a `ClientError`: no caller
-can stamp one, so telling a viewer to fix it would point them at something that
-is not theirs.
-
-This section described the opposite for two rounds — the installation read from
-the **seal** of a carried capability, with the header as a fallback. That is the
-SDK's rule for the direction where a capability *is* the authority being
-carried: outbound, where `Attach` puts the seal's own installation beside it and
-the far end refuses the two if they disagree. Inbound, that carrier is
-caller-controlled — a browser can send `x-codefly-work-context`, and a
-caller-supplied capability authenticates nothing here — so reading the
-installation out of it would let a caller name the deployment their own mint is
-attributed to.
-
-A background or delegated call would carry the installation its parent
-capability was sealed to, read off this execution's held credential. **This
-runtime has no such path today** — every mint it makes is driven by a viewer
-request, and `ForModule` refuses one without an organization and a session.
-
-This execution's own credential is sealed to an installation by the host, from
-the projected service-account token; the runtime names none on that mint and
-cannot, since the SDK's `MintOptions` carries no such field. What it does is
-refuse a credential sealed to no installation at all, and refuse a *renewal*
-sealed to a different one than the credential this process has been acting
-under: that is a different identity arriving through the renewal path, not a
-renewal, and it would make the mints before and after it name different
-deployments with nothing recording that they did.
-
-**An MCP tool call is held to the same credential as a handler.** A tool
-receives a gateway carrying the viewer's bearer, so running one while the issuer
-has withdrawn this execution's credential is acting for a viewer without
-authority — and a tool that mints nothing still sends that bearer wherever it
-dials. Every MCP method except the handshake, the keepalive, the listings and
-notifications goes through the same check a handler route does, and the viewer
-is told the same sanitized sentence. The list is of the methods that act for
-nobody, so a method a future MCP SDK adds is checked rather than exempt.
-
-**An MCP error result never names an address this runtime dialled.** A tool's
-own refusal reaches the agent client unchanged, but a result that would carry
-the mint's or the gateway's address — in its text, or in its structured content
-— is replaced with one sentence, and the replacement is logged with what was
-caught. What is published is built from strings and bytes this runtime owns:
-every marshaller runs first, then nothing is inspected that is not about to be
-published. Content whose serialization this runtime cannot read is replaced
-rather than passed on.
-
-Rooting the Task there does **not** make the capability revocable, and nothing
-here should be read as saying it does. The edge verifies a presented context's
-signature and validity window, not the liveness of the session named in it, so
-revoking a session stops the *next* request — at the gateway's own revocation
-check, before any mint — while a capability already minted stands until its own
-expiry. That expiry, not the session's, is what bounds one; accounts caps a
-Task's requested TTL at 15 minutes.
-
-Each boundary is refused rather than guessed, and each refusal carries a
-`ClientError`, so a handler that returns it answers a status the caller can act
-on instead of the generic 502: no active organization is `409`, no session is
-`403`. The second has a consequence worth stating outright — **an API key cannot
-read a composed module**. It authenticates a principal and no session, so the
-gateway stamps `x-session-id` empty, and accounts requires a Task to name one
-(`session_id` is a required UUID on `StartTask`). A solution could previously
-mint for such a caller only because this runtime invented a session id, which is
-exactly what made the capability attributable to nothing. The user-absent path
-accounts does provide is the headless installation mint, which this runtime does
-not implement.
-
-Neither boundary is ever taken from the handler or from anything a browser sent:
-a solution names the audience and the scopes, and the runtime names who the
-viewer is.
-
-Minting is an audited event on accounts, so capabilities are cached under the
-ask they were minted for and shared by every gateway derived from the one a
-handler was given: a handler reading a module repeatedly mints once, and so does
-one that fans the same ask out across goroutines — concurrent asks wait on the single
-mint in flight rather than each running their own. The cache lives no longer
-than the request, since the gateway that owns it does not.
-
-The cache refuses to accept an expiry it cannot use, rather than caching one it
-can never reuse. An expiry that is absent, or that this host's clock reads as
-already gone by, would otherwise read as "always lapsed" — every call correct,
-no error, no log, and one audited mint per read. Both are reported, separately,
-because an issuer that omitted `expiresAt` (or spelled it `expires_at`, as
-protobuf JSON does) and a host clock skewed past the credential's lifetime have
-different fixes. A capability whose whole life is shorter than the renewal lead
-is not refused: the lead is clamped to half its lifetime, with a one-time log,
-because how long a credential lives is the issuer's call and not this runtime's
-to veto.
-
-This traffic is never proxied: every gateway target is composition-local (its
-address is resolved from the SDK's endpoint map), and these requests carry the
-viewer's bearer and the capability minted for them in headers. The credential
-mint this runtime runs for itself is not proxied either, and refuses to follow
-a redirect: it presents the projected token that attests which workload this
-process is, and `net/http` strips only `Authorization`, `WWW-Authenticate` and
-`Cookie` when a redirect crosses hosts — so anything able to answer at the mint
-URL with a `Location` would be handed that token, and the theft would look like
-an ordinary successful mint.
-
-### Calling a composed module over its REST binding
-
-The gateway reaches a composed module only under the REST prefix the solution
-federates for it (`/v1/<as>/*`), so the module's generated gRPC or Connect
-client cannot be pointed at it: its procedure paths are not under that prefix.
-What the module does publish is each RPC's `google.api.http` binding, in its
-generated descriptor. `Gateway.Transcoded` speaks that binding with the
-module's own generated messages:
-
-```go
-docs, err := gw.ForModule(ctx, "documents",
-    solution.Scope{ResourceKind: "documents", Actions: []string{"read"}})
-if err != nil {
-    return nil, err
-}
-var page documentsv1.ListCollectionResponse
-err = docs.Transcoded(ctx, "/v1/documents", documentsv1.DocumentsService_ListCollection_FullMethodName,
-    &documentsv1.ListCollectionRequest{PageSize: 500}, &page)
-```
-
-The call uses the method's first binding — the primary rule, then its
-additional bindings in order — whose path lies under the prefix. The URL, the
-HTTP method, and which request fields go into the path, the query or the body
-all come from the descriptor. The caller can name no path of its own, and a
-method with no binding under the prefix is refused before anything is sent, as
-is a multi-segment path variable, an empty or dot-segment path value, and a
-request or response of the wrong type. The response is decoded with unknown
-fields discarded and is bounded (`MaxResponseBytes`, 8 MiB by default). A
-non-2xx answer is a `*GatewayError` carrying the status.
-
-`Gateway.OrgID` is the viewer's active organization, the same one `ForModule`
-mints in. A handler scoping a module read to a tenant names this one.
-
-`Gateway.WorkContextPrincipals` reports whom a `ForModule` capability was
-issued for — the organization, the Task's owner and its current actor, as
-accounts answered the mint — so a handler compares a claimed owner against
-accounts' own resolution instead of trusting it. It reuses the cached
-capability rather than minting again.
-
 ### Letting the page call a consumed module: the passthrough
 
-The host proxy forwards a solution's page only to the solution's own backend,
-so a page cannot reach a composed module's `/v1/<as>/*` prefix, and a module
-that authenticates by Work Context would refuse its bearer anyway. Instead of a
+A page reaches only its own backend, through the authority's edge, and a module
+authenticates every call by a Work Context addressed to it. Instead of a
 handler per module operation, a solution declares which operations its page
-may call:
+may call, and where the composition says each module is:
 
 ```go
 solution.New(manifest).Consumes(solution.ConsumedModule{
@@ -985,21 +454,51 @@ solution.New(manifest).Consumes(solution.ConsumedModule{
         Name:     documentsv1.DocumentsService_GetDocument_FullMethodName,
         Response: solution.MustFieldMask(&documentsv1.GetDocumentResponse{}, "document.entry"),
     }},
+    // Workspace configuration slots: the hop's gRPC address
+    // (${endpoint:authority/hop/grpc}) and this solution's binding for the module.
+    Authority: solution.AuthorityRelay{Group: "wiki", EndpointKey: "DOCUMENTS_ENDPOINT", BindingKey: "DOCUMENTS_BINDING"},
 })
 ```
 
-Each declared method is served as a Connect unary procedure at
-`/modules/<as>/<package.Service>/<Method>`, so the page uses the module's own
-generated client (connect-es) unmodified, with the base URL
-`<apiBase>/modules/<as>`. A call is answered by the module as the viewer: the
-runtime mints the viewer's Work Context with the declared scopes (`ForModule`),
-or, with `ViewerBearer`, forwards only the bearer to a module that
-authenticates the viewer itself, and forwards the request over the method's
-binding (`Transcoded`). The page names a procedure and a request message,
-never a path, a prefix, an audience or an authority, and authorization stays at
-the module.
+Each declared method is served as a Connect procedure at
+`/v1/<id>/modules/<as>/<package.Service>/<Method>` — the edge routes a solution
+at `/v1/<id>` and forwards requests unchanged — so the page uses the module's
+own generated client (connect-es) unmodified, with the base URL
+`<apiBase>/modules/<as>`. Each call is relayed over gRPC to the module's own
+procedure, the face it serves behind the hop, as the viewer: a child of the
+edge's Work Context issued by the authority through the module's binding
+(`ForParent`) with the method's declared scopes, the pin merged in and only the
+declared response fields returned. No `google.api.http` binding is read or
+needed. The page names a procedure and a request message, never an address, a
+binding or an authority, and authorization stays at the module, whose hop holds
+each call to the module's own method policy.
 
-Authority is minted per method. A method may declare its own `Scopes`, which
+**Why a relayed route is any checked caller's.** Every relayed route is
+published in the interface artifact with `x-codefly-authority-policy:
+{"any_checked_caller": true}`, and the runtime's `Check` names it as served
+(`POST /v1/<id>/modules/<as>/<package.Service>/<Method>`), so an enforcing
+authority admits it for what it declares rather than refusing it for declaring
+nothing. The route row is not the gate, by design: the gate on a relayed call
+is the per-call child the authority issues through the solution's declared
+binding for the module — the person's current grants at the module (which
+include what the solution's roles grant there) intersected with the binding's
+invoke ceiling, narrowed to the method's declared scopes — and the module's
+own method policy, which its hop applies to that child. A second route policy
+of the solution's would restate, in the solution's vocabulary, what the binding
+and the module's policy already decide, and could only disagree with them. The
+child is issued per call (the passthrough builds a fresh gateway for each), and
+each relayed call costs the authority three round trips: the `Check` of the
+edge's context, the `Issue` of the child, and the hop's `Check` of the child.
+
+**The authority is the only way a call reaches a module.** A solution that
+declares consumed modules and has no `authority/endpoint` refuses to boot,
+naming it; a module whose slots name no address or no binding refuses the boot
+naming the slot; and an address the viewer's Work Context may not travel to (a
+cleartext host off the machine that the mesh does not carry) is refused by the
+SDK's endpoint rule. A solution that publishes no ceiling is bounded by the
+authority.
+
+Authority is asked per method. A method may declare its own `Scopes`, which
 replace the module's for a call to that method — never add to them — so one
 module's methods that need different authority are declared under one `as`:
 
@@ -1010,44 +509,44 @@ solution.ConsumedModule{
         {Name: ownListMethod, Scopes: []solution.Scope{{ResourceKind: "tasks", Actions: []string{"list"}}}, WholeResponse: true},
         {Name: orgListMethod, Scopes: []solution.Scope{{ResourceKind: "tasks", Actions: []string{"inspect"}}}, WholeResponse: true},
     },
+    Authority: tasksRelay,
 }
 ```
 
-Each call mints only its own method's authority. A viewer who lacks one
-method's authority is refused that method as `permission_denied`, with the
-issuer's reason (which names the missing permission), and is still served
-every other method; the mint is never widened or retried with less. Every
-method of a module that is not `ViewerBearer` needs scopes, its own or the
-module's, and `ViewerBearer` takes none at either level.
+Each call asks only its own method's authority, and a viewer refused one
+method is still served every other. Every method needs scopes, its own or the
+module's.
 
 Least privilege by default. A method that is not declared is `not_found`. At
-boot, `Serve` refuses a module whose `as` is not in the solution's api.consumes,
-a method missing from the registry or with no binding under `/v1/<as>`, a
-client-streaming method, stream bounds on a unary method or out of range, a method with no declared response fields, a method with no
-scopes of its own or its module's (unless the module is `ViewerBearer`), scopes
-on a `ViewerBearer` module or method, and a scope with no resource kind, no
-action, or a blank or repeated action. `Response`
-names the fields returned to the page; `WholeResponse` must be said explicitly.
-`Pin` fixes part of every request server-side (merged with `proto.Merge`): a
-pinned scalar replaces the page's value and a pinned repeated value is added to
-the page's, so a filter clause the module ANDs stays in force whatever the page
-sends.
-A module's refusal reaches the page in the Connect error: a `google.rpc.Status`
-body keeps its code and message, any other small JSON refusal is the message
-verbatim under the code its HTTP status maps to, and anything else is reported
-by kind only. `PassthroughOperations` renders the declaration for the interface
-artifact, and `InterfaceArtifact(dir, info, ops, modules...)` renders a
-backend's whole artifact — its own operations and the passthrough — at the
+boot, `Serve` refuses a module with no authority relay (or one naming fewer
+than all three of its group, endpoint slot and binding slot), a method missing
+from the registry, a client-streaming method, stream bounds on a unary method
+or out of range, a method with no declared response fields, a method with no
+scopes of its own or its module's, and a scope with no resource kind, no
+action, or a blank or repeated action. `Response` names the fields returned to
+the page; `WholeResponse` must be said explicitly. `Pin` fixes part of every
+request server-side (merged with `proto.Merge`): a pinned scalar replaces the
+page's value and a pinned repeated value is added to the page's, so a filter
+clause the module ANDs stays in force whatever the page sends.
+
+The authority's refusal reaches the page with the authority's code and reason.
+A module's refusal of the page's own request (`invalid_argument`, `not_found`,
+`permission_denied`, `failed_precondition`, …) keeps its code and message; any
+other failure is reported by kind only and logged where an operator reads it,
+since its text may name an internal address. `PassthroughOperations` renders
+the declaration for the interface artifact (paths relative to the solution's
+route), and `Server.InterfaceArtifact(dir, info)` renders a backend's whole
+artifact from the server it serves — its operations, its MCP route, and the
+passthrough at the paths they are served at, each with its policy — at the
 version its `service.codefly.yaml` declares.
 
 #### Streamed methods
 
 A server-streaming method passes through too, as a Connect server-streaming
-procedure at the same path, so connect-es's generated client consumes it
-unmodified. It takes the same authority as a unary call — the viewer's Work
-Context minted for that method, or the bearer alone for a `ViewerBearer`
-module — and the declared response fields (`Response`, or `WholeResponse`)
-apply to **every** message of the stream.
+procedure at the same path, relayed as a gRPC stream to the module's own
+procedure under the same authority as a unary call. The declared response
+fields (`Response`, or `WholeResponse`) apply to **every** message of the
+stream.
 
 Every stream is bounded, and both bounds are declared per method:
 
@@ -1057,318 +556,68 @@ Every stream is bounded, and both bounds are declared per method:
 | `MaxStreamMessageBytes` | `DefaultStreamMessageLimit` (1 MiB) | negative |
 
 A stream that reaches its duration ends with `deadline_exceeded`; a message
-over its bound ends it with `resource_exhausted` and is never truncated. For a
-streaming method `Timeout` bounds only the mint and the module's first answer
-(status line and headers), and `MaxResponseBytes` is refused (bound each
-message instead). The page disconnecting cancels the module request at once.
-
-**The wire a module answers a streamed method with** is grpc-gateway's for a
-server-streaming method, over the method's `google.api.http` binding: a 2xx
-response with content type `application/x-ndjson` (`application/json` is
-accepted too), one JSON object per line, each flushed as it is ready:
-
-```
-{"result": <the message, in protobuf JSON>}
-{"error": {"code": <google.rpc.Code number>, "message": "<text>"}}
-```
-
-Blank lines are ignored, so a module may send them to keep an idle connection
-open. An error line ends the stream with that code and message; the end of the
-body ends it normally. A non-2xx answer before the stream starts is the
-module's refusal, relayed like a unary one. `Gateway.TranscodedStream` is the
-same call for a handler of the solution's own.
+over its bound ends it with `resource_exhausted` and is never truncated; the
+module ending its stream with a status ends the page's with that code. For a
+streaming method `Timeout` bounds only the issue of the viewer's Work Context,
+and `MaxResponseBytes` is refused (bound each message instead). The page
+disconnecting cancels the module's stream at once.
 
 In the interface artifact a streamed operation says so in its behaviour and
 carries `x-streaming: server` (Swagger 2 has no stream; its 200 schema is one
 message of it).
 
-#### Testing the passthrough: `passthroughtest`
-
-`Serve` resolves the gateway and api.consumes from the composition, mints this
-execution's credential and listens with this workload's identity, so a solution
-cannot run its own passthrough in a test through it. Package
-`github.com/codefly-dev/solution-runtime-go/passthroughtest` serves the real
-passthrough — the handler `Serve` mounts, behind
-the same boot check — over an `httptest` server, against a fake host:
-
-```go
-upstream := httptest.NewServer(fakeWidgets) // the test's stand-in for the module's binding
-host := passthroughtest.NewHost(t).Module("widgets", upstream.URL)
-page := passthroughtest.Start(t, host, declaration...) // the solution's Consumes
-client := widgetsv1connect.NewWidgetsClient(page.Client(), page.BaseURL("widgets"))
-```
-
-| API | What it is |
-| --- | --- |
-| `NewHost(t)` | The fake host gateway: it mints the viewer's Work Context (the accounts `StartTask` procedure) and forwards `/v1/<as>/*` to each routed module, streams included, flushed as they arrive. |
-| `Host.Module(as, upstream)` | Routes a consumed module to the test's own server, path unchanged. Every routed module is also in the solution's api.consumes; one the declaration names but the host does not route is refused as `Serve` refuses it. |
-| `Host.RefuseMints(func(Mint) *Refusal)` | Decides each mint: a non-nil `Refusal` refuses it as accounts would (default status 403), so the page sees `permission_denied` with its message. |
-| `Host.Mints()`, `Host.Calls()` | Every mint asked for (audience, scopes, org, session, bearer, the token answered), and every call forwarded to a module, each with the `Mint` whose capability it presented — how a test asserts the authority each method was called under. |
-| `Start(t, host, consumes...)` / `Handler(host, consumes...)` | The passthrough served for the declaration, or the bare handler and the error `Serve` would refuse the declaration with. |
-| `Solution.Client()`, `ClientAs(Viewer)`, `BaseURL(as)` | A client that calls as `DefaultViewer` (or the viewer given), setting the bearer and the `x-org-id` / `x-session-id` headers the gateway stamps; and the base URL a module's generated client takes. |
-
-What a green test there proves is the solution's side: the declaration, the
-authority each method mints, the fields that reach the page, stream bounds and
-cancellation. It never proves that a real host admits the solution, that
-accounts grants the scopes, or that the real module answers its binding the way
-the test's stand-in does.
-
-**This seam is reachable only from here.** `Server.PassthroughHandler` was
-exported until this change, and that made it a production bypass: a solution
-could build a usable, credential-bearing handler that had skipped `validate()`,
-the mTLS boot, the caller allow-list, the published ceiling and authenticated
-outbound — a deployment calling it completed a viewer mint and a module call
-over plaintext and answered 200, with the viewer's bearer and this workload's
-own credential on the wire. Supplying a credential source, which a deployment
-does, defeated the "no source, nothing to mint with" mitigation. It is reached
-through `internal/seam` now, which Go's internal-package rule keeps inside this
-module. The fake host is still plaintext and still has no contract, and those
-are now properties of this module's own tests rather than of an API. A consumer
-that called `PassthroughHandler` directly uses `passthroughtest.Handler`
-instead.
-
-`passthroughtest` itself is importable by any module, so its own constructors
-**panic outside a test binary** (`testing.Testing()`). Taking a `testing.TB` is
-not the gate it resembles: `testing.TB`'s unexported method stops a type
-*declaring* the interface, not a type that embeds it, so a few lines of
-production code satisfy it. `testing.Testing()` is wrong for the root package —
-where the legitimate caller is production code — and exactly right here, where
-every legitimate caller is a test.
-
 ### Exposing an MCP server
 
-A solution exposes its experience to an agent client — Claude Code, Claude
-Desktop, any MCP client — the way it exposes it to a browser: as the signed-in
-person, through the host's gateway, with the same authority. The solution owns
-its tool surface; this runtime owns serving it. These are the three lines:
+A solution exposes its experience to an agent client the way it exposes it to
+a browser: as the person the authority says the request is for, with the same
+authority. The solution owns its tool surface; this runtime owns serving it:
 
 ```go
-solution.New(solution.Manifest{ID: "wiki", Title: "Wiki"}).
-    ServeMCP("wiki", "v1.0.0", func(srv *mcp.Server) {
-        mcp.AddTool(srv, &mcp.Tool{Name: "ask_wiki", Description: "ask the wiki a question"}, askWiki)
+solution.New(solution.Manifest{ID: "notes", Frontend: frontend}).
+    ServeMCP("notes", "v1.0.0", solution.Requires("notes.page", "read"), func(srv *mcp.Server) {
+        mcp.AddTool(srv, &mcp.Tool{Name: "ask_notes", Description: "ask the notes a question"}, askNotes)
     }).
     Serve()
 ```
 
-A composition that renders this solution supplies **two** declared values for
-it, and only in a deployment, both in the `mcp` workspace-configuration group,
-declared as a workspace-configuration dependency of the solution's backend:
-
-- `issuer-url` — the origin MCP clients authenticate against;
-- `public-url` — the URL clients dial, ending in `/mcp`.
-
-**This said *one* value, and a deployment following it does not boot.** The
-public URL is derived from `PUBLIC_URL` **for a local run only**: a deployed
-runtime context refuses a derived identifier, because the derivation encodes
-the route the *host* serves this solution on. Both keys are required there, and
-the boot names whichever is missing. See [The resource identifier and the
-issuer](#the-resource-identifier-and-the-issuer).
-
-`register` receives the official SDK's own `*mcp.Server`
-(`github.com/modelcontextprotocol/go-sdk`, pinned in this module's `go.mod`), so
-tools, prompts and resources are declared exactly as that SDK documents them and
-this runtime adds nothing to them. It is called once, when the endpoint is
-mounted.
-
-A tool call runs as the viewer who made the request. `ViewerFromContext` returns
-the same caller-bound `Gateway` a `Handler` is given, so a tool reads a composed
-module through `ForModule` under the viewer's own Work Context — the identical
-call the page makes, with the identical typed refusals:
+The endpoint is stateless Streamable HTTP (the official
+`github.com/modelcontextprotocol/go-sdk`) at `/v1/<id>/mcp` (`MCPPath` under
+the route the edge forwards). A tool call is admitted exactly as a handler
+route is: the authority's `Check` of the Work Context the request carries,
+naming the route `POST /v1/<id>/mcp`, so the solution's delivered route policy
+applies to it. That policy is the one `ServeMCP` declares, and
+`Server.InterfaceArtifact` publishes it for `POST /v1/<id>/mcp` like every
+operation's, so the CLI derives the route's row from the same document and an
+enforcing authority admits it. POST is the one method served; any other is
+refused by name before the transport reads it. A request with no Work Context is answered 401 before the MCP
+handler reads it; one the authority does not check runs no tool.
+`ViewerFromContext(ctx)` returns the same viewer-bound `Gateway` a `Handler`
+is given, so a tool reaches a module through `ForParent`:
 
 ```go
-func askWiki(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
+func askNotes(ctx context.Context, _ *mcp.CallToolRequest, in askIn) (*mcp.CallToolResult, askOut, error) {
     gw, err := solution.ViewerFromContext(ctx)
     if err != nil {
         return nil, askOut{}, err
     }
-    notes, err := gw.ForModule(ctx, "notes", solution.Scope{ResourceKind: "conversations", Actions: []string{"create"}})
-    if err != nil {
-        return nil, askOut{}, err
-    }
+    notes, err := gw.ForParent(ctx, "notes-create", solution.Scope{ResourceKind: "conversations", Actions: []string{"create"}})
     ...
 }
 ```
 
-The viewer comes from the identity headers the gateway stamped, never from the
-tool's arguments: those are written by a model, and a session id taken from them
-would be a client asking for another viewer's authority. `ViewerFromContext`
-errors only for a handler invoked outside a request this runtime served — a
-harness of its own, or an `*mcp.Server` mounted without `ServeMCP`.
+The viewer never comes from a tool's arguments, which a model writes. The
+runtime's own errors are sanitized before a tool holds them, and an error
+result naming an address this runtime dialled (the authority, a module's hop)
+is replaced and logged. The endpoint carries no CORS: an MCP client is not a
+browser page.
 
-#### What is served, and what is refused
-
-| Path | What |
-| --- | --- |
-| `/mcp` (`solution.MCPPath`) | Stateless Streamable HTTP. `/solutions/<id>/mcp` through the gateway, a route it already fronts. `POST` only: `GET` and `DELETE` are `405` and no `Mcp-Session-Id` is ever issued, because the gateway is a reverse proxy with no sticky routing — a session held in one replica's memory is unreachable from the next request. The SDK's DNS-rebinding protection is left on, so a request reaching a loopback listener with a non-loopback `Host` header is refused `403`: on a developer's machine that protection is the one that still applies, since a rebound page is same-origin and can forge identity headers that a cross-origin page cannot. |
-| `/.well-known/oauth-protected-resource` (`solution.ProtectedResourceMetadataPath`) | The OAuth 2.0 Protected Resource Metadata document (RFC 9728): the `resource` a client binds its token to, the host issuer in `authorization_servers`, and `bearer_methods_supported: ["header"]`. Served unauthenticated, with `Access-Control-Allow-Origin: *`, because discovery is public (RFC 9728 §3.1). |
-
-The MCP endpoint itself carries **no** CORS. The runtime's policy for a
-solution's own API admits any origin with an authorization header, which is the
-right answer there and the wrong one for the single route that acts with the
-viewer's full authority; an MCP client is not a browser page.
-
-The runtime verifies no token: the gateway strips caller identity headers, runs
-ext_authz on the bearer and stamps what it resolved, so verifying it again here
-would be a second, divergent implementation of the host's admission rules, with
-its own JWKS fetch, its own audience logic and its own bugs. What is enforced is
-that the gateway did it:
-
-| The request | Answer |
-| --- | --- |
-| No `authorization` | `401` with `WWW-Authenticate: Bearer resource_metadata="…"`. |
-| A bearer, but none of `x-user-id`, `x-org-id`, `x-session-id` stamped | `401` with the same challenge: nothing but the gateway may reach this endpoint, so either the request did not come through it or it did not authenticate the bearer. |
-| `x-session-id` stamped empty | `403`, naming the `x-credential-kind` the gateway stamped. A credential that authenticates without a session cannot act for a viewer, and every tool call that does mints a Work Context rooted in one — so this is refused at the boundary rather than once per tool call, where the same refusal would read as the tool being broken. Another token cannot fix it, so it carries no challenge. |
-
-**Which caller sees those two 401s.** Not an MCP client coming through the
-gateway: the gateway strips the caller's identity headers and runs ext_authz on
-the bearer *before* proxying, so an unauthenticated request is denied there with
-its own `401 authentication required` and never reaches the solution. The
-runtime's 401 is what a caller reaching this solution directly sees — a local
-run, a port-forward, a composition dialling the backend — and it is the shape
-the gateway's own challenge has to match for discovery to work at all. Emitting
-it at the gateway is the host's half
-([codefly-dev/module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003));
-the document that challenge must point at is served here either way.
-
-#### The resource identifier and the issuer
-
-The `resource` in the metadata document is what a client asks the authorization
-server for a token for (RFC 8707) and what its token is audience-bound to, so it
-must be the **public** MCP URL — not this process's listen address, not the
-in-cluster address the gateway dials. A client that is handed any other
-identifier rejects it, and unlike the manifest URL nobody downstream can resolve
-it on the solution's behalf.
-
-So it is **derived by construction** from the two things the runtime already
-has: the origin this product is reachable at and this solution's id —
-`<PUBLIC_URL>/solutions/<id>/mcp`. This is the one place the runtime encodes the
-gateway's solution route (see [Where the host reaches the
-solution](#where-the-host-reaches-the-solution)).
-
-**That derivation is for a local run only, and this said otherwise.** It read
-as "a deployment that already sets `PUBLIC_URL` … has addressed the MCP surface
-too", and a **deployed runtime context refuses a derived value at boot**
-(`mcp.go`, `validateMCP`): the derivation encodes the route the *host* serves
-this solution on, which this runtime does not know. So following that sentence
-in a deployment failed the boot. In a deployed context the identifier is
-**declared** — `mcp/public-url` in the workspace configuration, ending in
-`/mcp` — and `PUBLIC_URL` addresses nothing about MCP there.
-
-A host whose gateway fronts solutions under some other route declares
-`public-url` in the `mcp` group instead. It must end in `/mcp` — the metadata
-document's own URL is derived from it by swapping that suffix, the same pairing
-the registration token URLs use, refused at boot for the same reason when it
-cannot be made. With neither — no `PUBLIC_URL`, no declared override — the
-identifier is reconstructed per request from `x-forwarded-proto`,
-`x-forwarded-host` and `x-forwarded-prefix`, and `ServeMCP` logs at boot that it
-is doing so: a proxy that forwards no prefix yields an identifier missing the
-path it stripped, which a conforming client rejects and a tolerant one binds to
-the wrong resource. In a deployed runtime context that state is refused at boot
-rather than logged.
-
-`authorization_servers` is the host issuer resolved at boot, never derived from
-a request, so a crafted `Host` header cannot point a client at an authorization
-server of someone's choosing. It is `issuer-url` in the `mcp` group when the
-composition declares one, and otherwise the host frontend's origin resolved by
-role like every other host endpoint. That resolved value is the address this
-composition reaches the host at: right for a local run, and in a deployment an
-in-cluster address no public client could reach — so a deployed solution that
-declares `ServeMCP` must supply `mcp`/`issuer-url`, and is refused at boot
-naming it when it does not. It stops being the composition's to supply when
-[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003)
-settles what `iss` is. A solution that declares `ServeMCP` and resolves no
-issuer at all is refused at boot; one that declares no MCP server is unaffected.
-
-Both values are read with `codefly.For(ctx).WorkspaceConfiguration("mcp", …)`,
-never from the environment. `MCP_PUBLIC_URL` and `HOST_ISSUER_URL` were bare
-environment variables when `ServeMCP` landed, and a render cannot project one —
-so the boot refused with the name of something no composition could set
-(codefly-dev/solution-runtime-go#48). Provisioned locally with `codefly config
-generate`, and from the cell's configuration when deployed, exactly as the
-`solution-registration` group is.
-
-Three things about discovery belong to the host, not to this runtime, all of them
-tracked by
-[module-saas-starter#1003](https://github.com/codefly-dev/module-saas-starter/issues/1003).
-The gateway emits the 401 challenge, as above. It must admit an unauthenticated
-`GET` on `/solutions/<id>/.well-known/oauth-protected-resource`, or no client can
-read the document that challenge points at. And that is where the document is —
-on the solution's own path — whereas RFC 9728 §3.1 also defines a location
-derived from the resource's path,
-`/.well-known/oauth-protected-resource/solutions/<id>/mcp`, at the **host's**
-root. A client that follows `resource_metadata` reaches the document either way;
-one that only guesses the derived location needs the host to serve it there.
-
-#### Connecting
-
-Until the host is an MCP-conformant OAuth 2.1 authorization server, a client
-presents a token it already has, which the gateway already accepts:
-
-```sh
-claude mcp add --transport http wiki https://<host>/solutions/<id>/mcp \
-    --header "Authorization: Bearer <access token>"
-```
-
-Once the host supports it, the gateway's 401 challenge and the metadata document
-above are the whole of what a client needs to authenticate on its own.
-
-#### Testing the tools: there is no supported path yet
-
-**This section documented `s.mcpHandler`, and a consumer cannot call it.** The
-method is unexported, so the example could not compile from a consuming
-package; it also said `Serve` "registers with the host", which is the thing
-this cutover deleted.
-
-It was exported once, as `Server.MCPHandler`, and unexporting it was not a
-tidy-up: an exported method handing back a servable handler built without the
-boot is the `PassthroughHandler` incident verbatim — a handler that has skipped
-`validate()`, the mTLS boot, the caller allow-list, the published ceiling and
-authenticated outbound, carrying the viewer's bearer and this workload's own
-credential over whatever it is mounted on. `TestNoExportedPathHandsOutAServableHandler`
-fails if it comes back. So the example is removed rather than repaired, and
-restoring the export to make it compile is the one fix that is not available.
-
-What a consumer can do today is drive their tools as ordinary functions and
-test the authority each one asks for. What is missing is the MCP equivalent of
-`passthroughtest` — a seam reached through `internal/seam`, whose constructors
-panic outside a test binary, that runs the real MCP surface against a fake
-host. That is a follow-up on #45, not a capability this README should describe
-as existing.
-
-What a green test there proves is the solution's side: the declaration, the
-authority each method mints, the fields that reach the page, stream bounds and
-cancellation. It never proves that a real host admits the solution, that
-accounts grants the scopes, or that the real module answers its binding the way
-the test's stand-in does.
-
-**This seam is reachable only from here.** `Server.PassthroughHandler` was
-exported until this change, and that made it a production bypass: a solution
-could build a usable, credential-bearing handler that had skipped `validate()`,
-the mTLS boot, the caller allow-list, the published ceiling and authenticated
-outbound — a deployment calling it completed a viewer mint and a module call
-over plaintext and answered 200, with the viewer's bearer and this workload's
-own credential on the wire. Supplying a credential source, which a deployment
-does, defeated the "no source, nothing to mint with" mitigation. It is reached
-through `internal/seam` now, which Go's internal-package rule keeps inside this
-module. The fake host is still plaintext and still has no contract, and those
-are now properties of this module's own tests rather than of an API. A consumer
-that called `PassthroughHandler` directly uses `passthroughtest.Handler`
-instead.
-
-`passthroughtest` itself is importable by any module, so its own constructors
-**panic outside a test binary** (`testing.Testing()`). Taking a `testing.TB` is
-not the gate it resembles: `testing.TB`'s unexported method stops a type
-*declaring* the interface, not a type that embeds it, so a few lines of
-production code satisfy it. `testing.Testing()` is wrong for the root package —
-where the legitimate caller is production code — and exactly right here, where
-every legitimate caller is a test.
-
-> **This whole section was duplicated.** Two near-identical copies of
-> "Exposing an MCP server" sat 200 lines apart, which is why correcting one
-> passage left the same error in place — the `mcpHandler` example was removed
-> twice and the `PUBLIC_URL` claim corrected twice before the cause was
-> obvious. The stale copy is deleted.
-
+What is **not** here any more is the saas host's half: the OAuth 2.0
+Protected Resource Metadata document, the `WWW-Authenticate` challenge, the
+`mcp/issuer-url` and `mcp/public-url` values, and the gateway-stamped identity
+the surface used to read. How an agent client obtains a Work Context for a
+solution through the authority — robin calling a solution's tools, for the
+person or as itself — is the authority's to answer; this transport serves
+whatever context the edge sends.
 
 ### Generated messages in a response
 
@@ -1382,26 +631,54 @@ named, and a path naming no field fails at declaration.
 
 ### Documented operations
 
-`Server.Operations` registers a list of `solution.Operation`s — each a route,
-its handler, and the documentation a reader needs (summary, callers, behaviour,
-query parameters, request and response types). `solution.InterfaceDocument`
-renders the same list as a Swagger 2.0 artifact, so one declaration is the
-source of what is served and what is published, and an operation missing its
-documentation is refused. A `Message[T]` field is described from its
+`Server.Operations` declares a list of `solution.Operation`s — each a method and
+a route, its handler, its policy, and the documentation a reader needs
+(summary, callers, behaviour, query parameters, request and response types).
+It is the one way a backend serves a route of its own. `Server.InterfaceArtifact`
+renders the same declaration as a Swagger 2.0 artifact (`InterfaceDocument`
+renders any list), so one declaration is the source of what is served and what
+is published, and an operation missing its documentation or its policy is
+refused, at generation and at boot. A `Message[T]` field is described from its
 descriptor, with protobuf JSON names.
 
-> **Note on pins.** SDK in-process endpoint resolution for a solution composed
-> on an out-of-repo host depends on codefly-core accepting the composed module
-> path in its workspace loader (codefly-dev/core#365, merged); the
-> configuration-profile rule and `core/workcontext` come from core; and the
-> certificate reloader, the authority reader and the mint client come from
-> sdk-go. The `core` and `sdk-go` pins in `go.mod` carry all of it, and there is
-> **no `replace` directive** — both are ordinary pseudo-version `require`s, so
-> this module builds from its own tag for anyone.
+The artifact's security scheme is the `x-codefly-work-context` header the edge
+sends. Every operation also declares its `Policy`, what a call to the route must
+hold: `solution.Requires(kind, actions...)` or `solution.AnyCheckedCaller()`,
+the same shape as the authority's `authority.hop.v1.Policy`. The artifact
+writes it as the operation's `x-codefly-authority-policy`, the extension the
+CLI derives the solution's route rows from, and an operation that declares
+none, or both, is refused at generation by name. The artifact has no base path
+(`InterfaceInfo` has no `BasePath`): the edge forwards a solution's requests on
+`/v1/<id>`, which its operations already carry, so each route is written as
+served and is the `"<VERB> <template>"` the runtime's `Check` names. A path
+ending in `/` serves its subtree and is written `/…/{path=**}`. The passthrough
+routes `InterfaceArtifact` publishes beside the solution's own are any checked
+caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
+
+> **Dependency pins.** `go.mod` records the exact Core, SDK and authority
+> client revisions used by this runtime, including unreleased commit
+> pseudo-versions. No local `replace` directive is shipped. Core owns capability
+> decoding and frontend validation; sdk-go owns resolution and endpoint
+> admission; the authority client owns the authority's wire. Local source
+> composition does not require publishing a release.
 >
-> Both pins are **released** now: `core v0.9.0` and `sdk-go v0.3.0`, with the
-> `sdk-go/workcontext` leaf at a `main` pseudo-version because that leaf module
-> has no tag by design. This said they were unreleased branches that "must move
-> to the releases at merge"; they moved. Every capability's format changed in
-> that cutover, so verifiers upgrade before minters or calls fail closed in the
-> window — which is a statement about the rollout order, not about these pins.
+> **Open: the authority pins.** `codefly-dev/authority/libraries/authority-client/go`
+> and `.../hop/go` are pinned at commits that are, today, only on the unmerged
+> `authority/vision` branch of `codefly-dev/authority`. The module is private
+> and fetched direct, so a squash merge and a branch deletion would orphan both
+> commits. This closes when authority#1 merges **with a merge commit** (which
+> keeps both commits reachable from `main`) and this runtime re-pins to that
+> merge or a tag; no runtime release is cut before then.
+### Shared frontend validation and headless components
+
+`Manifest.Frontend == nil` declares a headless component: it boots normally and
+its frontend manifest route returns 404. A present file, including an empty one,
+is validated by Core's `solutionhost.ParseFrontend`, the same reader the CLI uses
+for modules and solutions before signed delivery. The runtime carries Core's
+frontend types and bounds directly; it no longer maintains a client-kind list
+or a second set of field validators. Client kinds are declared names, with
+support decided by the consuming client.
+
+Core limits text to 1 KiB, surface/event/tag collections to 64 entries, a
+dashboard to 64 KiB and the complete canonical frontend to 128 KiB. These are
+file/declaration constraints, independent of per-organisation page admission.

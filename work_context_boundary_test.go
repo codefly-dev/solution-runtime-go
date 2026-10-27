@@ -40,32 +40,10 @@ func TestNoWorkContextImplementationGrowsHere(t *testing.T) {
 		sources[name] = file
 	}
 	for name, file := range sources {
-		// issuesTLSMaterialOnly relaxes the signing-primitive rule for ONE
-		// narrow shape, and the condition is checked rather than asserted.
-		//
-		// sdk-go#51 holds the mint endpoint to the SPIFFE ID in its single URI
-		// SAN, so the fake host in passthroughtest has to issue a certificate
-		// carrying one — httptest's shared certificate has no URI SAN at all,
-		// and a client with AdmittedPeers refuses it, correctly. The seam's
-		// code lives in non-test files because a consumer imports it from
-		// their tests, so it cannot hide behind the _test.go exclusion the
-		// root package's own cell helpers use.
-		//
-		// The relaxation is conditional on the file touching NOTHING
-		// capability-shaped: issuing TLS material has no business importing a
-		// work-context package, and a file that does both is exactly what this
-		// gate is for. Every other rule below still applies to it — the
-		// capability-message construction rule, the verifier rule, the JOSE
-		// rule and the declaration-name rule — and
-		// TestTheSigningRelaxationIsConditional pins that.
-		issuesTLSMaterialOnly := issuesTLSMaterialOnly(name, file)
 		for _, imported := range file.Imports {
 			path := strings.Trim(imported.Path.Value, `"`)
 			switch path {
 			case "crypto/ed25519", "crypto/ecdsa", "crypto/hmac", "crypto/rsa", "crypto/ed25519/internal/edwards25519":
-				if issuesTLSMaterialOnly {
-					continue
-				}
 				t.Errorf("%s imports %s: signing a capability is core's, and a runtime that can sign one is a second implementation waiting to happen. Carry the credential the mint client hands you.",
 					name, path)
 			}
@@ -201,8 +179,21 @@ func verifiersReachedBy(file *ast.File) []string {
 			// rule misses NewVerifier, which is the most ordinary name a
 			// verifier constructor can have. Nothing this package legitimately
 			// names through these imports contains it.
-			if strings.Contains(selector.Sel.Name, "Verif") {
-				reached = append(reached, pkg.Name+"."+selector.Sel.Name)
+			//
+			// And not "Verif" alone. Core v0.19 has two more entrypoints that
+			// check a signature against an issuer's keys, and neither is
+			// spelled that way: Inspector, a forwarding hop's check, and
+			// Authenticator, a callee's check against caller-supplied state.
+			// Inspector is the sharper of the two, because this runtime used
+			// to call core's STRUCTURAL read Inspect — renamed Decode in core
+			// v0.15 precisely so a structural read and a signature check would
+			// stop sharing a name — and the old spelling is now the one that
+			// verifies.
+			for _, verifies := range []string{"Verif", "Inspect", "Authenticat"} {
+				if strings.Contains(selector.Sel.Name, verifies) {
+					reached = append(reached, pkg.Name+"."+selector.Sel.Name)
+					break
+				}
 			}
 			return true
 		})
@@ -259,6 +250,18 @@ func f() { _ = next.NewVerifier() }`,
 import "github.com/codefly-dev/core/workcontext"
 func f() { _ = workcontext.Verifier() }`,
 		},
+		{
+			"a forwarding hop's signature check, which names no Verif",
+			`package solution
+import corework "github.com/codefly-dev/core/workcontext"
+func f(token string) { _, _ = (&corework.Inspector{}).Inspect(token, "route") }`,
+		},
+		{
+			"a callee's check against supplied state, which names no Verif either",
+			`package solution
+import corework "github.com/codefly-dev/core/workcontext"
+var a corework.Authenticator`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			file, err := parser.ParseFile(token.NewFileSet(), "escape.go", tc.source, 0)
@@ -283,6 +286,20 @@ func f() { _ = conformance.Fixtures() }`, 0)
 	}
 	if reached := verifiersReachedBy(file); len(reached) != 0 {
 		t.Errorf("the gate flagged %v in a file that reaches no verifier: reading core's published fixtures is how this suite gets a capability it did not sign itself", reached)
+	}
+
+	// And core's structural read, which is how this runtime reads the
+	// credential it was issued. It checks no signature, so it is not a
+	// verifier, and refusing it would push this package back to a hand-written
+	// parser of its own.
+	file, err = parser.ParseFile(token.NewFileSet(), "decode.go", `package solution
+import corework "github.com/codefly-dev/core/workcontext"
+func f(token string) { decoded, _ := corework.Decode(token); var _ *corework.Decoded = decoded }`, 0)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	if reached := verifiersReachedBy(file); len(reached) != 0 {
+		t.Errorf("the gate flagged %v in a file that only decodes: core's Decode checks no signature, and it is the one structural reader this runtime is allowed", reached)
 	}
 }
 
@@ -352,248 +369,14 @@ func isWorkContextPath(path string) bool {
 // typed_boundary_test.go now, built on go/types, where an alias, an anonymous
 // struct, a supplied destination and an assignment are all resolved rather than
 // matched. What stays in this file is what is genuinely syntactic: the import
-// rules, the declaration-name rule, the verifier rule and the seam's call
-// graph.
-
-// TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot pins the one
-// API this round removed.
-//
-// Server.PassthroughHandler was exported, and that made a usable
-// credential-bearing handler reachable without validate(), the mTLS boot, the
-// caller allow-list, the published ceiling or authenticated outbound: a
-// deployment calling it completed a viewer mint and a module call over
-// plaintext and answered 200, with the viewer's bearer and this workload's own
-// credential on the wire. It is reachable from package passthroughtest through
-// internal/seam now, which Go's internal-package rule keeps inside this module.
-//
-// The gate is here because the pressure to put it back is real — it is two
-// lines and it makes a consumer's test shorter — and because nothing else
-// notices an exported identifier reappearing.
-// The gate was two shapes too narrow, and both narrowings were about the
-// previous round's removal rather than the property it was removed for. It
-// skipped passthroughtest/ wholesale, and it matched only an exported func with
-// a *receiver* whose name contained "Passthrough" — so passthroughtest.Handler,
-// a plain exported function in a skipped file, was a production-importable path
-// to the same credential-bearing handler. It now reads every call to the seam
-// in the module and requires the calling function to refuse a non-test binary.
-func TestNoExportedPathBuildsACredentialBearingHandlerWithoutTheBoot(t *testing.T) {
-	reachesTheSeam, refusesANonTestBinary := seamCallGraph(t)
-	fset := token.NewFileSet()
-	for _, name := range moduleSources(t) {
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		for _, decl := range file.Decls {
-			switch declared := decl.(type) {
-			case *ast.FuncDecl:
-				if strings.Contains(name, "internal/seam") {
-					continue
-				}
-				// Whoever reaches the seam is an exported path to a handler
-				// holding a real credential, whatever it is called and whether
-				// it hangs off a receiver or not.
-				//
-				// Transitively. The rule matched only a function that calls
-				// seam.Passthrough *directly*, so an exported Handler
-				// delegating to an unexported helper — and a root-package
-				// wrapper over passthroughSeam — both walked past it. One hop
-				// of indirection is the first thing anyone writes.
-				if !reachesTheSeam[declared.Name.Name] {
-					continue
-				}
-				if !declared.Name.IsExported() {
-					continue
-				}
-				if !refusesANonTestBinary[declared.Name.Name] {
-					t.Errorf("%s exports %s, which builds a passthrough through internal/seam without refusing a non-test binary: that handler holds a real execution credential and skips validate(), the mTLS boot, the caller allow-list, the ceiling and authenticated outbound, so an exported path to it has to call mustBeATest()",
-						name, declared.Name.Name)
-				}
-			case *ast.GenDecl:
-				for _, spec := range declared.Specs {
-					if typed, ok := spec.(*ast.TypeSpec); ok && typed.Name.Name == "PassthroughEnvironment" {
-						t.Errorf("%s exports PassthroughEnvironment, the argument of the constructor this change removed", name)
-					}
-					// An exported *variable* holding the seam is the same
-					// bypass with no function to inspect: `var
-					// BuildPassthrough = passthroughSeam` in the root package,
-					// or `var Build = seam.Passthrough` in passthroughtest,
-					// both passed a gate that only read function bodies.
-					value, ok := spec.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					for i, declaredName := range value.Names {
-						if !declaredName.IsExported() || i >= len(value.Values) {
-							continue
-						}
-						if named := renderedReference(value.Values[i]); reachesTheSeam[named] || named == "seam.Passthrough" {
-							t.Errorf("%s exports the variable %s holding %s: that is a path to a credential-bearing handler with no function body for a gate to read and no refusal in front of it",
-								name, declaredName.Name, named)
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-// renderedReference is pkg.Name or Name for an expression that merely refers to
-// something, which is what an exported variable's initialiser is.
-func renderedReference(expr ast.Expr) string {
-	switch named := expr.(type) {
-	case *ast.Ident:
-		return named.Name
-	case *ast.SelectorExpr:
-		if pkg, ok := named.X.(*ast.Ident); ok {
-			return pkg.Name + "." + named.Sel.Name
-		}
-	}
-	return ""
-}
-
-// seamCallGraph is, for every function in the module, whether it reaches the
-// passthrough seam and whether it refuses a non-test binary — both
-// transitively, because one hop of indirection is the first thing anyone
-// writes and the previous rule only looked at direct calls.
-func seamCallGraph(t *testing.T) (reaches, refuses map[string]bool) {
-	t.Helper()
-	fset := token.NewFileSet()
-	var files []*ast.File
-	for _, name := range moduleSources(t) {
-		if strings.Contains(name, "internal/seam") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		files = append(files, file)
-	}
-	return seamReachability(files)
-}
-
-// seamReachability is seamCallGraph over files already parsed, so a probe can
-// supply its own.
-func seamReachability(files []*ast.File) (reaches, refuses map[string]bool) {
-	calls := map[string][]string{}
-	reaches, refuses = map[string]bool{}, map[string]bool{}
-	// defeated is every function that swallows a panic or guards a branch it
-	// cannot take, whether the refusal it defeats is its own call or one it
-	// inherits from a callee. Recording it for EVERY function, not only for
-	// the ones calling mustBeATest, is what makes the propagation below
-	// honest: the defeat check used to run only where the refusal was called
-	// directly, so the same `if false` moved one hop away was inherited as a
-	// refusal and passed the gate. Probed both ways in
-	// TestTheSeamGateIsNotDefeatedOneHopAway.
-	defeated := map[string]bool{}
-	for _, file := range files {
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			if defeatsItsOwnRefusal(fn) {
-				defeated[fn.Name.Name] = true
-			}
-			if callsThe(fn, "seam", "Passthrough") {
-				reaches[fn.Name.Name] = true
-			}
-			// A refusal swallowed by recover(), or sitting on a branch that
-			// cannot be taken, is not a refusal. Counting the call alone made
-			// both of those read as guarded.
-			if (callsThe(fn, "", "mustBeATest") || callsThe(fn, "", "refuseOutsideTest")) && !defeated[fn.Name.Name] {
-				refuses[fn.Name.Name] = true
-			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if callee, ok := calleeName(call); ok {
-					calls[fn.Name.Name] = append(calls[fn.Name.Name], callee)
-				}
-				return true
-			})
-		}
-	}
-	// Propagate both properties up the call graph until nothing changes.
-	for changed := true; changed; {
-		changed = false
-		for caller, callees := range calls {
-			for _, callee := range callees {
-				if reaches[callee] && !reaches[caller] {
-					reaches[caller], changed = true, true
-				}
-				// A caller inherits a callee's refusal only if it does not
-				// defeat it. `if false { return guard() }` reaches the seam by
-				// its real path and inherited guard()'s refusal, which is the
-				// defeat this gate already refused one hop closer in.
-				if refuses[callee] && !refuses[caller] && !defeated[caller] {
-					refuses[caller], changed = true, true
-				}
-			}
-		}
-	}
-	return reaches, refuses
-}
-
-// defeatsItsOwnRefusal reports whether fn recovers from a panic or guards the
-// refusal behind a constant false, either of which makes the call decorative.
-func defeatsItsOwnRefusal(fn *ast.FuncDecl) bool {
-	defeated := false
-	ast.Inspect(fn, func(node ast.Node) bool {
-		if call, ok := node.(*ast.CallExpr); ok {
-			if named, ok := call.Fun.(*ast.Ident); ok && named.Name == "recover" {
-				defeated = true
-			}
-		}
-		if branch, ok := node.(*ast.IfStmt); ok {
-			if cond, ok := branch.Cond.(*ast.Ident); ok && cond.Name == "false" {
-				defeated = true
-			}
-		}
-		return true
-	})
-	return defeated
-}
-
-// callsThe reports whether fn calls pkg.name, or bare name when pkg is empty.
-func callsThe(fn *ast.FuncDecl, pkg, name string) bool {
-	found := false
-	ast.Inspect(fn, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if pkg == "" {
-			if called, ok := call.Fun.(*ast.Ident); ok && called.Name == name {
-				found = true
-			}
-			return true
-		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		qualifier, ok := selector.X.(*ast.Ident)
-		if ok && qualifier.Name == pkg && selector.Sel.Name == name {
-			found = true
-		}
-		return true
-	})
-	return found
-}
+// rules, the declaration-name rule and the verifier rule.
 
 // moduleSources is every non-test Go source in this module, which is what both
 // gates above read.
 //
-// They read only the root directory until now, and passthroughtest/ is where a
-// capability is actually signed — with core's published fixture key, which is
-// the right way to do it and exactly the file a second implementation would
-// grow in, since it is the one place already holding a signing key. A gate that
-// does not look at the directory most likely to break it is a gate that reports
-// success for the wrong reason.
+// Every directory, not only the root: a gate that does not look at the
+// directory most likely to break it is a gate that reports success for the
+// wrong reason.
 func moduleSources(t *testing.T) []string {
 	t.Helper()
 	var sources []string
@@ -621,172 +404,4 @@ func moduleSources(t *testing.T) []string {
 		t.Fatalf("found %d sources to gate, which cannot be right: a gate that reads nothing passes", len(sources))
 	}
 	return sources
-}
-
-// TestTheSeamGateFollowsIndirection: the rule matched only a function calling
-// seam.Passthrough *directly*, so an exported wrapper one hop away passed it —
-// and one hop of indirection is the first thing anyone writes.
-func TestTheSeamGateFollowsIndirection(t *testing.T) {
-	parse := func(t *testing.T, source string) []*ast.File {
-		t.Helper()
-		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
-		if err != nil {
-			t.Fatalf("parse the probe: %v", err)
-		}
-		return []*ast.File{file}
-	}
-
-	t.Run("an exported path one hop from the seam is seen", func(t *testing.T) {
-		reaches, refuses := seamReachability(parse(t, `package solution
-func ExportedIndirect() (http.Handler, error) { return viaHelper() }
-func viaHelper() (http.Handler, error) { return seam.Passthrough(nil, "", "") }`))
-		if !reaches["ExportedIndirect"] {
-			t.Error("the gate did not see that ExportedIndirect reaches the seam: it delegates, so a rule matching only direct callers reports an exported path to a credential-bearing handler as if it were not one")
-		}
-		if refuses["ExportedIndirect"] {
-			t.Error("the gate thinks ExportedIndirect refuses a non-test binary, which nothing in it does")
-		}
-	})
-
-	t.Run("a refusal one hop away is seen too", func(t *testing.T) {
-		// Or the gate would flag a path that is in fact guarded, and a rule
-		// that cries wolf gets relaxed rather than obeyed.
-		_, refuses := seamReachability(parse(t, `package solution
-func Guarded() (http.Handler, error) { return guard() }
-func guard() (http.Handler, error) { mustBeATest(); return seam.Passthrough(nil, "", "") }`))
-		if !refuses["Guarded"] {
-			t.Error("the gate did not see that Guarded refuses a non-test binary through its helper")
-		}
-	})
-
-	t.Run("a function that reaches nothing is not flagged", func(t *testing.T) {
-		reaches, _ := seamReachability(parse(t, `package solution
-func Unrelated() error { return nil }`))
-		if reaches["Unrelated"] {
-			t.Error("the gate flagged a function that does not reach the seam")
-		}
-	})
-}
-
-// TestTheSeamGateIsNotDefeatedOneHopAway is B6: the defeat check ran only where
-// mustBeATest was called directly, and the propagation loop then handed the
-// refusal to any caller of a refusing callee without asking whether that
-// caller defeats it. So the gate caught `if false { mustBeATest() }` and
-// passed the same defeat one function away.
-func TestTheSeamGateIsNotDefeatedOneHopAway(t *testing.T) {
-	parse := func(t *testing.T, source string) []*ast.File {
-		t.Helper()
-		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
-		if err != nil {
-			t.Fatalf("parse the probe: %v", err)
-		}
-		return []*ast.File{file}
-	}
-	const guard = `
-func guard() (http.Handler, error) { mustBeATest(); return seam.Passthrough(nil, "", "") }`
-
-	defeats := []struct{ shape, source string }{
-		{
-			"the refusal is called directly on a branch that cannot be taken",
-			`package solution
-func Exported() (http.Handler, error) {
-	if false { mustBeATest() }
-	return seam.Passthrough(nil, "", "")
-}`,
-		},
-		{
-			"the guarded helper is called on a branch that cannot be taken, and the real path is not",
-			`package solution
-func Exported() (http.Handler, error) {
-	if false { return guard() }
-	return seam.Passthrough(nil, "", "")
-}` + guard,
-		},
-		{
-			"the guarded helper's panic is swallowed by the caller",
-			`package solution
-func Exported() (h http.Handler, err error) {
-	defer func() { recover() }()
-	return guard()
-}` + guard,
-		},
-	}
-	for _, probe := range defeats {
-		t.Run(probe.shape, func(t *testing.T) {
-			_, refuses := seamReachability(parse(t, probe.source))
-			if refuses["Exported"] {
-				t.Errorf("the gate reads Exported as refusing a non-test binary, and it does not — %s:\n%s", probe.shape, probe.source)
-			}
-		})
-	}
-
-	t.Run("passes: a refusal one hop away that nothing defeats", func(t *testing.T) {
-		_, refuses := seamReachability(parse(t, `package solution
-func Exported() (http.Handler, error) { return guard() }`+guard))
-		if !refuses["Exported"] {
-			t.Error("the gate stopped seeing a genuine refusal through a helper, which would fail every guarded path in the module")
-		}
-	})
-}
-
-// issuesTLSMaterialOnly is THE condition the signing-primitive relaxation
-// turns on, as one function.
-//
-// It was a copy: the gate computed the condition inline and the test that
-// claimed to pin it recomputed the same expression. An executed round changed
-// the real gate to permit a signing import in every passthroughtest file and
-// the test still passed — which makes it worthless as evidence for the gate,
-// and it is the exact failure I had written into the gate's own comments as
-// the thing to avoid ("a probe that re-implements the check proves only that
-// two copies agree"). Struck as evidence and replaced by this.
-func issuesTLSMaterialOnly(name string, file *ast.File) bool {
-	return strings.HasPrefix(name, "passthroughtest/") &&
-		len(workContextImports(file)) == 0 && dotImportedWorkContext(file) == ""
-}
-
-// TestTheSigningRelaxationIsConditional pins the one relaxation in the
-// signing-primitive rule, in both directions.
-//
-// A file under passthroughtest that issues TLS material may hold a key
-// primitive, because sdk-go#51 requires the fake mint endpoint to present a
-// SPIFFE ID and httptest's shared certificate has none. The same file may NOT
-// hold one once it touches anything capability-shaped — a file doing both is
-// precisely what this gate exists to refuse, and "it is only the test seam" is
-// how that would arrive.
-func TestTheSigningRelaxationIsConditional(t *testing.T) {
-	parse := func(t *testing.T, source string) *ast.File {
-		t.Helper()
-		file, err := parser.ParseFile(token.NewFileSet(), "probe.go", source, 0)
-		if err != nil {
-			t.Fatalf("parse the probe: %v", err)
-		}
-		return file
-	}
-	// THE rule the gate uses, not a copy of it. The copy survived the real
-	// condition being removed, which is why this calls the function the
-	// scanner calls.
-	relaxed := issuesTLSMaterialOnly
-
-	tlsOnly := parse(t, `package passthroughtest
-import (
-	"crypto/ecdsa"
-	"crypto/x509"
-)
-func leaf() (*x509.Certificate, *ecdsa.PrivateKey) { return nil, nil }`)
-	if !relaxed("passthroughtest/identity.go", tlsOnly) {
-		t.Error("the relaxation does not cover a passthroughtest file that only issues TLS material, so the seam cannot present the SPIFFE ID the SDK now requires of the mint endpoint")
-	}
-	if relaxed("credential.go", tlsOnly) {
-		t.Error("the relaxation reaches the root package: this is where the runtime lives, and a signing primitive here is the first step of the duplication this gate exists to refuse")
-	}
-
-	alsoCapabilities := parse(t, `package passthroughtest
-import (
-	"crypto/ecdsa"
-	"github.com/codefly-dev/sdk-go/workcontext"
-)
-func sign(seal *workcontext.SealedValues, key *ecdsa.PrivateKey) []byte { return nil }`)
-	if relaxed("passthroughtest/identity.go", alsoCapabilities) {
-		t.Error("a passthroughtest file holding BOTH a signing primitive and a work-context import is relaxed: that is a capability signer in the test seam, which is the shape this gate was written for and the one most likely to be argued for as harmless")
-	}
 }

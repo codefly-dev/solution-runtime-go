@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Coverage of what a solution still *serves*, restored under the TLS harness.
+// Coverage of what a solution still *serves*, served under the authority.
 //
 // It lived in the registration test files this PR deleted, which made it look
 // like coverage of registration; it is not. Nothing about these documents is
@@ -25,8 +25,7 @@ import (
 // a bump of either constant must not leave one announcing the old major while
 // the other announces the new one.
 func TestServedDocumentsDeclareOneSetOfMajors(t *testing.T) {
-	mint := newHostMint(t, &hostMint{})
-	solution := boot(t, New(Manifest{ID: testSolutionID, Title: testSolutionTitle}), mint)
+	solution := boot(t, New(Manifest{ID: testSolutionID}))
 
 	var capabilities map[string]any
 	readServed(t, solution, "/.well-known/capabilities", &capabilities)
@@ -67,8 +66,7 @@ func TestAssetsAreServedWithTheRightCachePolicy(t *testing.T) {
 	writeFile(t, filepath.Join(assets, "page.3f9a1c2b.js"), "console.log(1)")
 
 	t.Setenv("ASSETS_DIR", assets)
-	mint := newHostMint(t, &hostMint{})
-	solution := boot(t, New(Manifest{ID: testSolutionID}), mint)
+	solution := boot(t, New(Manifest{ID: testSolutionID}))
 
 	for _, tc := range []struct {
 		path   string
@@ -106,8 +104,7 @@ func TestTheAssetsOfAnEmbeddedBuildAreServedFromTheBinary(t *testing.T) {
 	// No assets directory on disk at all: a solution shipping its frontend in
 	// the binary reads nothing to serve it.
 	t.Setenv("ASSETS_DIR", filepath.Join(t.TempDir(), "does-not-exist"))
-	mint := newHostMint(t, &hostMint{})
-	solution := boot(t, New(Manifest{ID: testSolutionID, Assets: embeddedBuild{}}), mint)
+	solution := boot(t, New(Manifest{ID: testSolutionID, Assets: embeddedBuild{}}))
 
 	resp, err := solution.client.Get(solution.base + "/assets/mf-manifest.json")
 	if err != nil {

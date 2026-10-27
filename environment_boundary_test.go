@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
@@ -108,7 +107,6 @@ func TestThePostBootGateSeesEveryServingShape(t *testing.T) {
 	source := `package solution
 
 import (
-	"context"
 	"net/http"
 	"os"
 )
@@ -165,12 +163,14 @@ func (s *Server) MountAliasFixture(mux *http.ServeMux) {
 	})
 }
 
-// And the whole environment at once, through a function boot also uses:
-// discoverHostModule scans os.Environ, so an exported wrapper of it reads
+// And the whole environment at once: an exported scan of os.Environ reads
 // changing configuration after boot. os.Environ was missing from the reader
 // set entirely.
 func ExportedLateHost() string {
-	return discoverHostModule(context.Background(), "auth-gateway", "rest", "rest")
+	if all := os.Environ(); len(all) > 0 {
+		return all[0]
+	}
+	return ""
 }
 `
 	// os.LookupEnvValue does not exist; the fixture must compile, so use the
@@ -241,19 +241,6 @@ var readerNames = map[string]map[string]bool{
 	// and the escape rule below is what keeps that residual from being silent
 	// when a reader VALUE is what travels into it.
 	"golang.org/x/sys/unix": {"Getenv": true, "Setenv": true, "Clearenv": true, "Environ": true},
-}
-
-// readerPackageOf is the import path a reader package goes by, since SSA names
-// a package by path and the syntax names it by identifier.
-func readerPackageOf(path string) string { return path }
-
-// sdkReaderNames are the SDK's own accessors, by method name. They are matched
-// by name because they are methods on the SDK's query value rather than
-// package functions, and the older gate's round-four finding was precisely a
-// closure reading configuration through one of them.
-var sdkReaderNames = map[string]bool{
-	"WorkspaceConfiguration": true, "WorkspaceSecret": true,
-	"Environment": true, "Endpoint": true, "Secret": true,
 }
 
 // keylessReaders read the whole environment rather than one named variable, so
@@ -451,15 +438,6 @@ func isPostBootRoot(fn *ssa.Function) bool {
 	return ast.IsExported(fn.Name())
 }
 
-// staticCall reports whether an edge is a call that names its callee, rather
-// than one CHA resolved from a function type.
-func staticCall(edge *callgraph.Edge, callee *ssa.Function) bool {
-	if edge.Site == nil {
-		return false
-	}
-	return edge.Site.Common().StaticCallee() == callee
-}
-
 // addressTaken is every function of the package whose value is used as a
 // value rather than called: stored in a variable or a struct, handed to a
 // registration call, closed over. SSA makes this visible — a function
@@ -513,29 +491,6 @@ func isBootResolution(fn *ssa.Function) bool {
 		fn.Pkg.Pkg.Path() == "github.com/codefly-dev/solution-runtime-go"
 }
 
-// environmentReader reports whether an SSA function is one of the readers, by
-// the SAME definition the key gate uses: package and name for the os and
-// syscall readers, method name for the SDK's accessors, and this package's own
-// env helper.
-func environmentReader(fn *ssa.Function) (string, bool) {
-	if fn.Pkg != nil {
-		path := fn.Pkg.Pkg.Path()
-		if readerNames[path][fn.Name()] {
-			return path + "." + fn.Name(), true
-		}
-		if path == "github.com/codefly-dev/solution-runtime-go" && fn.Name() == "env" {
-			return "env", true
-		}
-	}
-	// The SDK's own accessors, matched by the package they belong to as well
-	// as the name: a bare name match reported grpc's resolver `Endpoint` as a
-	// configuration read, which it is not.
-	if fn.Pkg != nil && sdkReaderNames[fn.Name()] && strings.HasPrefix(fn.Pkg.Pkg.Path(), "github.com/codefly-dev/sdk-go") {
-		return "the SDK's " + fn.Name(), true
-	}
-	return "", false
-}
-
 // unparen removes every layer of parentheses, so `(env)(...)` is a call to env
 // rather than a call to something this gate has never heard of.
 func unparen(expr ast.Expr) ast.Expr {
@@ -546,23 +501,6 @@ func unparen(expr ast.Expr) ast.Expr {
 		}
 		expr = paren.X
 	}
-}
-
-// isFuncTyped reports whether a type is a function type.
-func isFuncTyped(t types.Type) bool {
-	if t == nil {
-		return false
-	}
-	_, ok := types.Unalias(t).Underlying().(*types.Signature)
-	return ok
-}
-
-// pkgOf is the import path of the package a function belongs to.
-func pkgOf(fn *types.Func) string {
-	if fn.Pkg() == nil {
-		return ""
-	}
-	return fn.Pkg().Path()
 }
 
 // And the read has to happen at boot, not merely be written there.
@@ -940,8 +878,10 @@ func readsEnvironment(call *ast.CallExpr) bool {
 	case "WorkspaceConfiguration", "Environment", "Endpoint", "Secret":
 		return true
 	}
-	// Not LoadEnvironmentVariables: that is the loader, and start() calling it
-	// before loadConfig is the documented shape rather than a read to govern.
+	// Not Init, nor the LoadEnvironmentVariables it begins with: that is the
+	// loader, and start() calling it before loadConfig is the documented shape
+	// rather than a read to govern. What it fails with is handed to loadConfig
+	// and refused by validate(), like every other boot value.
 	// Not For() either — it returns the query; the read is the accessor called
 	// on it, which the names above cover.
 	return false

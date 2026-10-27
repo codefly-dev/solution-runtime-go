@@ -2,10 +2,8 @@ package solution
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,66 +12,61 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/codefly-dev/core/solution/manifest"
-	"github.com/codefly-dev/sdk-go/workcontext"
-	"github.com/codefly-dev/solution-runtime-go/internal/seam"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/dynamicpb"
 	"gopkg.in/yaml.v3"
 )
 
 // --- Consumed-module passthrough ---
 //
-// A solution's page reaches only its own backend: the host proxy forwards the
-// browser to /solutions/<id>/…, never to a composed module's /v1/<as>/* prefix,
-// and a module that authenticates by Work Context would refuse the browser's
-// bearer anyway. Without this, every module read a page makes needs a handler
-// in the solution that decodes the browser's request, mints the viewer's
-// capability, calls the module and re-encodes the answer — the same code in
-// every solution, once per operation.
+// A solution's page reaches only its own backend, through the authority's
+// edge, and a module authenticates a call by a Work Context addressed to it.
+// Without this, every module read a page makes needs a handler in the solution
+// that decodes the page's request, has the viewer's Work Context issued, calls
+// the module and re-encodes the answer — the same code in every solution, once
+// per operation.
 //
 // Consumes declares, instead, which operations of which consumed module the
-// page may call. The runtime serves each one as a Connect unary procedure at
+// page may call. The runtime serves each one as a Connect procedure at
 //
-//	/modules/<as>/<package.Service>/<Method>
+//	/v1/<id>/modules/<as>/<package.Service>/<Method>
 //
-// so the module's own generated client (connect-es, connect-go) is used
-// unmodified with the base URL `<apiBase>/modules/<as>`. A server-streaming
-// method is served the same way as a Connect server-streaming procedure; see
-// "Streamed methods" in stream.go for the wire a module answers it with. Each call is answered
-// by the module, as the viewer: the runtime mints the viewer's Work Context for
-// the module (Gateway.ForModule) — or forwards only the bearer, for a module
-// that authenticates the viewer itself — and forwards the request over the
-// method's google.api.http binding (Gateway.Transcoded). The browser names a
-// declared procedure and a request message; it never names a path, a prefix,
-// an audience or an authority. Authorization stays where it is: at the module.
+// the route the edge forwards this solution's requests on unchanged, so the
+// module's own generated client (connect-es, connect-go) is used unmodified
+// with the base URL `<apiBase>/modules/<as>`. Each call is relayed to the
+// module's own procedure, the face it serves behind the authority's hop
+// (passthrough_authority.go), as the viewer: a child of the edge's Work
+// Context issued through this solution's binding for the module, carrying the
+// method's declared scopes. A unary method is relayed as a unary call and a
+// server-streaming one as a stream. The browser names a declared procedure and
+// a request message; it never names an address, a binding or an authority.
+// Authorization stays where it is: at the module.
 //
 // Least privilege is the default throughout. A method that is not declared is
-// not served. A module whose `as` the solution does not consume is refused at
-// boot. A declared method returns only the response fields its mask names,
-// unless the declaration explicitly passes the whole response.
+// not served. A declared method returns only the response fields its mask
+// names, unless the declaration explicitly passes the whole response.
 
 // ConsumedModule declares the operations of one consumed module the solution's
 // page may call through the passthrough.
 type ConsumedModule struct {
-	// As is the `as` of the module's api.consumes entry: the gateway prefix
-	// /v1/<As> the module is federated under, and the audience a Work Context
-	// for it is minted for. A module the solution does not consume under this
-	// name is refused at boot.
+	// As is the `as` of the module's api.consumes entry: the segment the page
+	// calls it under (/modules/<As>) and the audience the published contract
+	// names its ceiling for.
 	As string
-	// Scopes is the authority minted for the viewer on every call (ForModule)
-	// of a method that declares none of its own, no more than those methods
-	// need. A module that is not ViewerBearer sets Scopes, or sets Scopes on
-	// every one of its methods.
+	// Scopes is the authority asked for the viewer on every call of a method
+	// that declares none of its own, no more than those methods need. Set it,
+	// or set Scopes on every one of the module's methods.
 	Scopes []Scope
-	// ViewerBearer forwards only the viewer's bearer: for a module that
-	// authenticates the viewer and mints its own authority from that bearer,
-	// so a capability minted here would be one it never reads.
-	ViewerBearer bool
 	// Methods is the allowlist. Nothing else of the module is reachable.
 	Methods []ConsumedMethod
+	// Authority names the configuration slots that say where the module is
+	// and which of this solution's bindings the viewer's calls are issued
+	// through (passthrough_authority.go). Every consumed module names them:
+	// the hop is the only way a call reaches a module.
+	Authority AuthorityRelay
 }
 
 // ConsumedMethod is one operation of a consumed module the page may call.
@@ -82,13 +75,12 @@ type ConsumedMethod struct {
 	// "/package.Service/Method" constant a gRPC or Connect stub exports. The
 	// module's generated package must be linked into the solution.
 	Name string
-	// Scopes, when set, is the authority minted for the viewer on a call to
+	// Scopes, when set, is the authority asked for the viewer on a call to
 	// this method, instead of the module's Scopes — never in addition to them.
 	// It is how one module's methods that need different authority are
-	// declared under one `as`: each call mints only what its own method needs,
+	// declared under one `as`: each call asks only what its own method needs,
 	// so a viewer who lacks one method's authority is refused that method
-	// (permission_denied) and is still served every other. Not allowed on a
-	// ViewerBearer module, which mints nothing.
+	// (permission_denied) and is still served every other.
 	Scopes []Scope
 	// Response is the allowlist of response fields returned to the page. A
 	// field the module adds later is dropped until someone names it here.
@@ -97,7 +89,7 @@ type ConsumedMethod struct {
 	// the zero value of a declaration returns nothing it did not name.
 	WholeResponse bool
 	// Pin, when set, is merged into every request the page sends before it is
-	// forwarded (proto.Merge): a scalar it sets replaces the page's value, a
+	// relayed (proto.Merge): a scalar it sets replaces the page's value, a
 	// message merges, and a repeated field is appended. It is how a solution
 	// fixes part of a request server-side — a filter clause the module ANDs
 	// with the page's own, say — so the page can narrow the call but not undo
@@ -107,12 +99,12 @@ type ConsumedMethod struct {
 	// DefaultPassthroughRequestLimit.
 	MaxRequestBytes int
 	// MaxResponseBytes bounds the module's answer; zero is
-	// DefaultTranscodedResponseLimit.
+	// DefaultPassthroughResponseLimit.
 	MaxResponseBytes int64
-	// Timeout bounds one call, the mint included; zero is
-	// DefaultPassthroughTimeout. For a server-streaming method it bounds the
-	// mint and the module's first answer (its status line and headers); the
-	// stream itself is bounded by MaxStreamDuration.
+	// Timeout bounds one call, the issue of the viewer's Work Context
+	// included; zero is DefaultPassthroughTimeout. For a server-streaming
+	// method it bounds the issue, and then the module's first message; the
+	// stream after that is bounded by MaxStreamDuration.
 	Timeout time.Duration
 	// MaxStreamDuration bounds how long one stream of a server-streaming
 	// method stays open, from the call to its last message; zero is
@@ -121,20 +113,23 @@ type ConsumedMethod struct {
 	// deadline_exceeded. Only for a server-streaming method.
 	MaxStreamDuration time.Duration
 	// MaxStreamMessageBytes bounds each message of a server-streaming method's
-	// stream, as the module sends it (one line of its answer); zero is
-	// DefaultStreamMessageLimit. A larger message ends the stream with
-	// resource_exhausted: it is never truncated. Only for a server-streaming
-	// method.
+	// stream, as the module sends it; zero is DefaultStreamMessageLimit. A
+	// larger message ends the stream with resource_exhausted: it is never
+	// truncated. Only for a server-streaming method.
 	MaxStreamMessageBytes int64
 }
 
 const (
-	// PassthroughPathPrefix is where the passthrough serves: a declared method
-	// is at PassthroughPathPrefix + <as> + "/" + <package.Service>/<Method>.
+	// PassthroughPathPrefix is where the passthrough serves under the
+	// solution's route: a declared method is at /v1/<id> +
+	// PassthroughPathPrefix + <as> + "/" + <package.Service>/<Method>.
 	PassthroughPathPrefix = "/modules/"
 	// DefaultPassthroughRequestLimit bounds a request message unless the
 	// method sets its own bound.
 	DefaultPassthroughRequestLimit = 1 << 20
+	// DefaultPassthroughResponseLimit bounds a module's unary answer unless the
+	// method sets its own bound with MaxResponseBytes.
+	DefaultPassthroughResponseLimit = 8 << 20
 	// DefaultPassthroughTimeout bounds one call unless the method sets its own.
 	DefaultPassthroughTimeout = 60 * time.Second
 	// relayedMessageLimit bounds the module refusal text relayed to the page.
@@ -172,9 +167,28 @@ type passthroughRoute struct {
 	module ConsumedModule
 	method ConsumedMethod
 	md     protoreflect.MethodDescriptor
-	verb   string
-	// template is the module binding the call is forwarded over.
-	template string
+}
+
+// procedure is the module's own procedure the route relays to: the face the
+// module serves behind the hop, which needs no binding of any other kind.
+func (r passthroughRoute) procedure() string {
+	return "/" + string(r.md.Parent().FullName()) + "/" + string(r.md.Name())
+}
+
+func (r passthroughRoute) timeout() time.Duration {
+	if r.method.Timeout > 0 {
+		return r.method.Timeout
+	}
+	return DefaultPassthroughTimeout
+}
+
+// answer is what of the module's answer reaches the page: the declared
+// response fields, or all of them when the declaration says so.
+func (r passthroughRoute) answer(out *dynamicpb.Message) *dynamicpb.Message {
+	if r.method.WholeResponse {
+		return out
+	}
+	return Apply(r.method.Response, out)
 }
 
 // resolvePassthrough checks every declaration against the generated
@@ -184,16 +198,16 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 	routes := map[string]passthroughRoute{}
 	seen := map[string]bool{}
 	for _, module := range modules {
-		prefix := "/v1/" + module.As
+		a := module.Authority
 		switch {
-		case module.As == "" || strings.ContainsAny(module.As, "/?#{}*:\\") || !cleanPrefix(prefix):
+		case module.As == "" || strings.ContainsAny(module.As, "/?#{}*:\\") || !cleanPrefix(PassthroughPathPrefix+module.As):
 			return nil, fmt.Errorf("consumed module %q: as must be one path segment, the `as` of its api.consumes entry", module.As)
 		case seen[module.As]:
 			return nil, fmt.Errorf("consumed module %q is declared twice", module.As)
-		case module.ViewerBearer && len(module.Scopes) > 0:
-			return nil, fmt.Errorf("consumed module %q: declare exactly one of Scopes (the authority minted for the viewer) and ViewerBearer (the module authenticates the viewer itself)", module.As)
 		case len(module.Methods) == 0:
 			return nil, fmt.Errorf("consumed module %q declares no methods", module.As)
+		case a.Group == "" || a.EndpointKey == "" || a.BindingKey == "":
+			return nil, fmt.Errorf("consumed module %q: its authority relay names a group, an endpoint slot and a binding slot, all three; a call reaches a module only through the authority's hop, at the address and binding the composition names in them", module.As)
 		}
 		if err := checkScopes(module.Scopes); err != nil {
 			return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
@@ -210,10 +224,6 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 			if err := checkStreamBounds(md, method); err != nil {
 				return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
 			}
-			_, verb, template, err := bindingUnder(md, prefix)
-			if err != nil {
-				return nil, fmt.Errorf("consumed module %q: %w", module.As, err)
-			}
 			switch {
 			case method.WholeResponse && method.Response.desc != nil:
 				return nil, fmt.Errorf("consumed module %q: %s declares both a response mask and the whole response", module.As, md.FullName())
@@ -221,12 +231,8 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 				return nil, fmt.Errorf("consumed module %q: %s declares no response fields; name them in Response, or pass WholeResponse explicitly", module.As, md.FullName())
 			case method.Response.desc != nil && method.Response.desc.FullName() != md.Output().FullName():
 				return nil, fmt.Errorf("consumed module %q: %s answers %s, but its response mask is over %s", module.As, md.FullName(), md.Output().FullName(), method.Response.desc.FullName())
-			}
-			switch {
-			case module.ViewerBearer && len(method.Scopes) > 0:
-				return nil, fmt.Errorf("consumed module %q: %s declares Scopes, but the module is ViewerBearer: it mints nothing, so the scopes would never be asked for", module.As, md.FullName())
-			case !module.ViewerBearer && len(module.Scopes) == 0 && len(method.Scopes) == 0:
-				return nil, fmt.Errorf("consumed module %q: %s declares no Scopes and the module declares none either; name the authority minted for the viewer, or declare the module ViewerBearer", module.As, md.FullName())
+			case len(module.Scopes) == 0 && len(method.Scopes) == 0:
+				return nil, fmt.Errorf("consumed module %q: %s declares no Scopes and the module declares none either; name the authority asked for the viewer", module.As, md.FullName())
 			}
 			if err := checkScopes(method.Scopes); err != nil {
 				return nil, fmt.Errorf("consumed module %q: %s: %w", module.As, md.FullName(), err)
@@ -238,10 +244,44 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 			if _, dup := routes[path]; dup {
 				return nil, fmt.Errorf("consumed module %q: %s is declared twice", module.As, md.FullName())
 			}
-			routes[path] = passthroughRoute{path: path, module: module, method: method, md: md, verb: verb, template: template}
+			routes[path] = passthroughRoute{path: path, module: module, method: method, md: md}
 		}
 	}
 	return routes, nil
+}
+
+// cleanPrefix reports whether prefix is an absolute path with no trailing
+// slash, dot segment, query or fragment: the shape a passthrough segment has
+// to have to be served under one route.
+func cleanPrefix(prefix string) bool {
+	if !strings.HasPrefix(prefix, "/") || strings.HasSuffix(prefix, "/") || strings.ContainsAny(prefix, "?#{}*:\\") {
+		return false
+	}
+	for _, segment := range strings.Split(prefix[1:], "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// methodDescriptor resolves "/package.Service/Method" (or the dotted
+// "package.Service.Method") in the global registry, which is where a declared
+// method's generated package must have been linked in.
+func methodDescriptor(method string) (protoreflect.MethodDescriptor, error) {
+	name := strings.TrimPrefix(method, "/")
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[:i] + "." + name[i+1:]
+	}
+	d, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(name))
+	if err != nil {
+		return nil, fmt.Errorf("method %q is not in the protobuf registry (is its generated package linked in?): %w", method, err)
+	}
+	md, ok := d.(protoreflect.MethodDescriptor)
+	if !ok {
+		return nil, fmt.Errorf("%q names a %T, not a method", method, d)
+	}
+	return md, nil
 }
 
 // checkScopes refuses a scope that could not name an authority: one with no
@@ -268,7 +308,7 @@ func checkScopes(scopes []Scope) error {
 	return nil
 }
 
-// scopes is the authority a call to this route mints for the viewer: the
+// scopes is the authority a call to this route asks for the viewer: the
 // method's own, else the module's. Never the union.
 func (r passthroughRoute) scopes() []Scope {
 	if len(r.method.Scopes) > 0 {
@@ -277,48 +317,17 @@ func (r passthroughRoute) scopes() []Scope {
 	return r.module.Scopes
 }
 
-// checkConsumed refuses a declaration for a module the solution does not
-// consume under that name: the gateway would federate no /v1/<as> prefix for
-// it, so every call would fail at the gateway instead of here.
-func checkConsumed(modules []ConsumedModule, consumed []manifest.ConsumedAPI) error {
-	names := map[string]bool{}
-	for _, c := range consumed {
-		names[c.As] = true
-	}
-	for _, module := range modules {
-		if !names[module.As] {
-			return fmt.Errorf("consumed module %q is declared for the page, but api.consumes lists no module as %q", module.As, module.As)
-		}
-	}
-	return nil
-}
-
-// validatePassthrough is Serve's boot check of the declaration.
-func (s *Server) validatePassthrough() (map[string]passthroughRoute, error) {
-	routes, err := resolvePassthrough(s.consumed)
-	if err != nil || len(s.consumed) == 0 {
-		return routes, err
-	}
-	// Decoded at boot (loadConfig), where validate() has already refused an
-	// undecodable one by name. Reported here rather than assumed away: the
-	// seam below builds a config without going through validate().
-	if s.cfg.consumes.err != nil {
-		return nil, fmt.Errorf("consumed modules cannot be checked against api.consumes: %w", s.cfg.consumes.err)
-	}
-	return routes, checkConsumed(s.consumed, s.cfg.consumes.targets)
-}
-
-// mountPassthrough mounts the declared routes on mux at PassthroughPathPrefix:
-// the one place the passthrough is wired, so the test seam serves what Serve
-// serves. Serve has already resolved and checked the routes; a test that calls
-// serve directly has not, and resolves them here.
-//
-// It named Server.PassthroughHandler as the other caller, which was removed —
-// an exported constructor for a credential-bearing handler with no boot behind
-// it. The seam reached through internal/seam replaced it.
+// mountPassthrough mounts the declared routes on mux at the route the edge
+// forwards this solution's requests on: the one place the passthrough is
+// wired. Serve has already resolved the routes and opened the relays; a test
+// that calls serve directly has resolved neither, and the routes are resolved
+// here.
 func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 	if len(s.consumed) == 0 {
 		return nil
+	}
+	if s.host == nil {
+		return fmt.Errorf("solution %q declares consumed modules and runs under no authority interface: the passthrough relays only through the authority's hop", s.manifest.ID)
 	}
 	routes := s.passthrough
 	if routes == nil {
@@ -327,61 +336,12 @@ func (s *Server) mountPassthrough(mux *http.ServeMux) error {
 			return err
 		}
 	}
-	mux.Handle(PassthroughPathPrefix, s.passthroughHandler(routes))
+	mux.Handle(s.authorityRoute()+PassthroughPathPrefix, http.StripPrefix(s.authorityRoute(), s.passthroughHandler(routes)))
 	return nil
 }
 
-// init registers the passthrough seam for package passthroughtest, which is the
-// only caller that can reach it: internal/seam is importable inside this module
-// and nowhere else.
-func init() {
-	seam.Passthrough = passthroughSeam
-}
-
-// passthroughSeam is what Server.PassthroughHandler used to be, minus the
-// "exported" part.
-//
-// Exported, it was a production bypass: a solution could build a usable
-// credential-bearing handler that had skipped validate(), the mTLS boot, the
-// caller allow-list, the published ceiling and authenticated outbound, and a
-// deployment calling it completed a viewer mint and a module call over
-// plaintext, 200, with the viewer's bearer and this workload's own credential
-// on the wire. Supplying a credential source — which a real deployment does —
-// defeated the "no source, nothing to mint with" mitigation it relied on. Fail
-// closed admits no exception for a shape that exists to make testing
-// convenient, so the shape moved behind the compiler instead: see
-// internal/seam.
-//
-// What it builds is otherwise unchanged, and deliberately so — it is the
-// declaration checked by the same boot check and mounted by the same code at
-// PassthroughPathPrefix, so a consumer's test serves what Serve serves. Serve
-// overwrites the environment set here when it resolves its own.
-func passthroughSeam(server any, gatewayURL, consumesJSON string) (http.Handler, error) {
-	s, ok := server.(*Server)
-	if !ok {
-		return nil, fmt.Errorf("the passthrough seam was handed a %T rather than a solution server", server)
-	}
-	if len(s.consumed) == 0 {
-		return nil, fmt.Errorf("solution %q declares no consumed modules (Consumes)", s.manifest.ID)
-	}
-	// The seam supplies the projection instead of resolving it, so it decodes
-	// here what loadConfig decodes at a boot — through the same constructor,
-	// which is the only one there is.
-	s.cfg.gatewayURL, s.cfg.consumes = gatewayURL, newProjection(consumesJSON)
-	routes, err := s.validatePassthrough()
-	if err != nil {
-		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
-	}
-	s.passthrough = routes
-	mux := http.NewServeMux()
-	if err := s.mountPassthrough(mux); err != nil {
-		return nil, err
-	}
-	return mux, nil
-}
-
 // passthroughHandler serves every route under PassthroughPathPrefix. Each
-// route is a Connect unary handler over the method's own descriptor, so every
+// route is a Connect handler over the method's own descriptor, so every
 // protocol the module's generated clients speak is accepted and every refusal
 // is written in the caller's protocol.
 func (s *Server) passthroughHandler(routes map[string]passthroughRoute) http.Handler {
@@ -422,10 +382,9 @@ func (s *Server) passthroughRoute(route passthroughRoute) http.Handler {
 	if limit <= 0 {
 		limit = DefaultPassthroughRequestLimit
 	}
-	procedure := "/" + string(md.Parent().FullName()) + "/" + string(md.Name())
 	if md.IsStreamingServer() {
-		handler := connect.NewServerStreamHandler(procedure, func(ctx context.Context, req *connect.Request[dynamicpb.Message], stream *connect.ServerStream[dynamicpb.Message]) error {
-			return s.forwardStream(ctx, route, req, stream)
+		handler := connect.NewServerStreamHandler(route.procedure(), func(ctx context.Context, req *connect.Request[dynamicpb.Message], stream *connect.ServerStream[dynamicpb.Message]) error {
+			return s.relayStream(ctx, route, req, stream)
 		},
 			connect.WithSchema(md),
 			connect.WithRequestInitializer(initialize),
@@ -433,8 +392,8 @@ func (s *Server) passthroughRoute(route passthroughRoute) http.Handler {
 		)
 		return http.StripPrefix(PassthroughPathPrefix+route.module.As, handler)
 	}
-	handler := connect.NewUnaryHandler(procedure, func(ctx context.Context, req *connect.Request[dynamicpb.Message]) (*connect.Response[dynamicpb.Message], error) {
-		resp, err := s.forward(ctx, route, req)
+	handler := connect.NewUnaryHandler(route.procedure(), func(ctx context.Context, req *connect.Request[dynamicpb.Message]) (*connect.Response[dynamicpb.Message], error) {
+		resp, err := s.relay(ctx, route, req)
 		if err != nil {
 			return nil, err
 		}
@@ -447,176 +406,49 @@ func (s *Server) passthroughRoute(route passthroughRoute) http.Handler {
 	return http.StripPrefix(PassthroughPathPrefix+route.module.As, handler)
 }
 
-// forward answers one call as the viewer: it mints the declared authority (or
-// forwards the bearer alone), calls the module over its binding, and returns
-// only the declared response fields.
-func (s *Server) forward(ctx context.Context, route passthroughRoute, req *connect.Request[dynamicpb.Message]) (*dynamicpb.Message, error) {
-	bearer := req.Header().Get("authorization")
-	if bearer == "" {
-		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("missing bearer"))
+// applyPin merges the declared pin into the request. It is merged through the
+// wire form: the pin is the generated type, the request a dynamic message over
+// the same descriptor.
+func applyPin(route passthroughRoute, msg *dynamicpb.Message) error {
+	if route.method.Pin == nil {
+		return nil
 	}
-	timeout := route.method.Timeout
-	if timeout <= 0 {
-		timeout = DefaultPassthroughTimeout
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	gw, err := s.authorize(ctx, route, req.Header(), req.Msg)
+	pinned, err := proto.Marshal(route.method.Pin)
 	if err != nil {
-		return nil, err
+		return connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
 	}
-	out := dynamicpb.NewMessage(route.md.Output())
-	var opts []TranscodeOption
-	if route.method.MaxResponseBytes > 0 {
-		opts = append(opts, MaxResponseBytes(route.method.MaxResponseBytes))
+	if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, msg); err != nil {
+		return connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
 	}
-	if err := gw.Transcoded(ctx, "/v1/"+route.module.As, route.method.Name, req.Msg, out, opts...); err != nil {
-		return nil, relayedError(err)
-	}
-	if !route.method.WholeResponse {
-		out = Apply(route.method.Response, out)
-	}
-	return out, nil
+	return nil
 }
 
-// authorize prepares one call as the viewer: the declared authority minted for
-// this method (or the bearer alone, for a ViewerBearer module), and the
-// declared pin merged into the request.
-func (s *Server) authorize(ctx context.Context, route passthroughRoute, header http.Header, msg *dynamicpb.Message) (*Gateway, error) {
-	// Whether or not this route mints anything. A ViewerBearer route forwards
-	// the viewer's bearer and asks the credential for nothing, so it was the
-	// one route that never consulted it — and it kept forwarding that bearer
-	// to the gateway after the issuer refused this build. See
-	// actingForAViewer: the credential is what authorises this process to act
-	// for a viewer, not merely what it mints with.
-	if err := s.actingForAViewer(ctx); err != nil {
-		// Sanitized, for the reason wrapRequest records: the error wraps what
-		// the source said, and this branch handed it to the page verbatim.
-		code := connect.CodeUnavailable
-		if errors.Is(err, ErrCredentialRefused) {
-			code = connect.CodeFailedPrecondition
-		}
-		log.Printf("solution: refusing to act for a viewer on %s: %v", route.module.As, err)
-		return nil, connect.NewError(code, errors.New(credentialRefusalForAViewer(err)))
-	}
-	gw := s.gatewayFor(header)
-	if !route.module.ViewerBearer {
-		acting, err := gw.ForModule(ctx, route.module.As, route.scopes()...)
-		if err != nil {
-			return nil, relayedError(err)
-		}
-		gw = acting
-	}
-	if route.method.Pin != nil {
-		// Merged through the wire form: the pin is the generated type, the
-		// request a dynamic message over the same descriptor.
-		pinned, err := proto.Marshal(route.method.Pin)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
-		}
-		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(pinned, msg); err != nil {
-			return nil, connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
-		}
-	}
-	return gw, nil
-}
-
-// relayedError turns a failed call into the Connect error the page receives.
-// A module's own refusal keeps its meaning: a google.rpc.Status body keeps its
-// code and message exactly, and any other small JSON refusal is relayed as the
-// message, verbatim, with the code its HTTP status maps to — it is the module's
-// answer to the page's own request. Anything else (a transport failure, an
-// undecodable answer) is reported by kind only, never by its internal detail.
+// relayedError turns a failure to act as the viewer into the Connect error the
+// page receives: the authority's refusal of the viewer's Work Context keeps its
+// code and reason, a refusal of the caller's own request keeps its message,
+// and anything else is reported by kind only, never by its internal detail.
+// The module's own answer is moduleRefusal's.
 func relayedError(err error) error {
 	var refusal *WorkContextRefusal
 	if errors.As(err, &refusal) && refusal != nil && refusal.StatusCode >= 400 && refusal.StatusCode < 500 {
-		// The issuer refused the viewer's authority for this call: say so, in
-		// its own code and words (they name the missing permission), rather
-		// than as a failed module call. It is the viewer's own authorization,
-		// so nothing of another principal is disclosed.
-		code := codeForStatus(refusal.StatusCode)
-		var parsed connect.Code
-		if refusal.Code != "" && parsed.UnmarshalText([]byte(refusal.Code)) == nil && parsed != connect.CodeUnknown {
-			code = parsed
+		code, message := codeForStatus(refusal.StatusCode), "the viewer's authority for this module was refused"
+		if refusal.code != 0 {
+			code = refusal.code
 		}
-		message := "the viewer's authority for the " + refusal.Audience + " module was refused"
-		if refusal.Message != "" {
-			message += ": " + truncated(refusal.Message)
+		if refusal.Reason != "" {
+			message += ": " + truncated(refusal.Reason)
 		}
 		return connect.NewError(code, errors.New(message))
-	}
-	var streamErr *StreamError
-	if errors.As(err, &streamErr) && streamErr != nil {
-		code := connect.CodeUnknown
-		if streamErr.Code > 0 && streamErr.Code <= 16 {
-			code = connect.Code(streamErr.Code)
-		}
-		return connect.NewError(code, errors.New(truncated(streamErr.Message)))
-	}
-	if errors.Is(err, ErrStreamMessageTooLarge) {
-		return connect.NewError(connect.CodeResourceExhausted, errors.New("a message of the module's stream exceeds its declared bound"))
 	}
 	var clientErr *ClientError
 	if errors.As(err, &clientErr) && clientErr != nil {
 		return connect.NewError(codeForStatus(clientErr.StatusCode), errors.New(clientErr.Message))
-	}
-	var gatewayErr *GatewayError
-	if errors.As(err, &gatewayErr) && gatewayErr != nil {
-		var status struct {
-			Code    *int32 `json:"code"`
-			Message string `json:"message"`
-		}
-		detail := gatewayErr.detail
-		if json.Unmarshal(detail, &status) == nil && status.Code != nil && *status.Code > 0 && *status.Code <= 16 {
-			return connect.NewError(connect.Code(*status.Code), errors.New(truncated(status.Message)))
-		}
-		message := http.StatusText(gatewayErr.StatusCode)
-		if len(detail) > 0 && len(detail) <= relayedMessageLimit && json.Valid(detail) {
-			message = string(detail)
-		}
-		return connect.NewError(codeForStatus(gatewayErr.StatusCode), errors.New(message))
 	}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the module did not answer in time"))
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, errors.New("the call was canceled"))
-	case errors.Is(err, workcontext.ErrRevoked):
-		// Checked before ErrNotAttested, which now wraps it: a renewal the
-		// issuer refuses because the state the credential is sealed to has
-		// moved arrives here as both, and the first matching branch decides
-		// what a page is told. Reported as unavailable it reads as "retry
-		// shortly", which is the one thing that cannot help.
-		//
-		// The capability was sound when it was minted and the state moved under
-		// it — an installation revision, a principal's epoch, a build
-		// incarnation, a binding. The holder's answer to every one of those is
-		// the same and it is not "retry": it is to mint again. Reported as the
-		// unavailable fallthrough below, a page or a client policy would retry
-		// against a credential guaranteed to keep failing; reported as a plain
-		// denial, a condition one mint fixes would reach the viewer as their
-		// own authorization failing. Aborted is neither, and a caller that
-		// re-asks gets a fresh mint because the cache no longer holds a current
-		// one.
-		return connect.NewError(connect.CodeAborted, errors.New("the authority this solution presented has been superseded; the call was not made"))
-	case errors.Is(err, ErrNotAttested):
-		// This solution could not attest which module is asking, so it did not
-		// ask. The viewer's authority is not in question and the condition is
-		// one renewal away, which is what unavailable says and what neither
-		// internal nor permission_denied would.
-		return connect.NewError(connect.CodeUnavailable, errors.New("this solution cannot currently act for the viewer against the module"))
-	case errors.Is(err, workcontext.ErrNotACoreToken), errors.Is(err, workcontext.ErrInvalid):
-		// A capability this solution could not present is this solution's
-		// problem, not a module that is briefly unreachable, and not the
-		// viewer's authorization. Reported as the unavailable fallthrough it
-		// would be retried against a credential that will be exactly as
-		// unusable next time, and the one signal that the issuer handed back
-		// something this runtime cannot carry would be spent on a retry loop.
-		// The three are kept apart from each other at the point they are
-		// logged, not here: "another format", "no seal" and "bad capability"
-		// have different owners, and core deliberately does not let one
-		// errors.Is branch reach all three.
-		return connect.NewError(connect.CodeInternal, errors.New("this solution could not present a usable credential for the module"))
 	}
 	return connect.NewError(connect.CodeUnavailable, errors.New("the module call failed"))
 }
@@ -663,7 +495,17 @@ func codeForStatus(status int) connect.Code {
 
 // PassthroughOperations documents the declared methods for the interface
 // artifact, in path order, so a solution's committed description of what its
-// page may call is rendered from the same declaration the runtime serves.
+// page may call is rendered from the same declaration the runtime serves. Each
+// path is relative to the solution's route (/modules/<as>/...); the server's
+// InterfaceArtifact publishes them under it, as served.
+//
+// Every relayed route declares that any checked caller may make it. The gate on
+// a relayed call is not a row of the solution's: it is the child the authority
+// issues for the call through the solution's binding for the module (the
+// person's current grants there, within the binding's ceiling) and the
+// module's own method policy, which its hop applies to that child. The route's
+// row says so, so an enforcing authority admits the route for what it is
+// rather than refusing it for declaring nothing.
 func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 	routes, err := resolvePassthrough(modules)
 	if err != nil {
@@ -677,15 +519,12 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 	ops := make([]Operation, 0, len(paths))
 	for _, path := range paths {
 		route := routes[path]
-		callers := fmt.Sprintf("Signed-in viewers. The %s module authorizes every call itself, under a Work Context minted for the viewer (audience %q, %s).",
-			route.module.As, route.module.As, scopeText(route.scopes()))
-		if route.module.ViewerBearer {
-			callers = fmt.Sprintf("Signed-in viewers. The %s module authenticates the viewer's bearer and authorizes every call itself.", route.module.As)
-		}
-		behavior := fmt.Sprintf("A Connect unary call, forwarded to the module's %s %s binding. ", route.verb, route.template)
+		callers := fmt.Sprintf("Signed-in people, through the authority's edge. The %s module authorizes every call itself, under a Work Context the authority issues for the viewer through this solution's binding for it (%s).",
+			route.module.As, scopeText(route.scopes()))
+		behavior := fmt.Sprintf("A Connect unary call, relayed to the module's own procedure %s through the authority's hop. ", route.procedure())
 		if route.md.IsStreamingServer() {
-			behavior = fmt.Sprintf("A Connect server-streaming call, forwarded to the module's %s %s binding, which answers as newline-delimited JSON. "+
-				"The stream stays open at most %s and each message is at most %d bytes. ", route.verb, route.template, route.streamDuration(), route.streamMessageLimit())
+			behavior = fmt.Sprintf("A Connect server-streaming call, relayed to the module's own procedure %s through the authority's hop. "+
+				"The stream stays open at most %s and each message is at most %d bytes. ", route.procedure(), route.streamDuration(), route.streamMessageLimit())
 		}
 		if route.method.Pin != nil {
 			pin, _ := protojson.Marshal(route.method.Pin)
@@ -711,6 +550,9 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			// Documentation only: InterfaceDocument requires a handler, and the
 			// passthrough, not Operations, serves these routes.
 			Handler: func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the passthrough") },
+			// Any checked caller: the child issued through the binding and the
+			// module's own method policy gate the call (see above).
+			Policy: AnyCheckedCaller(),
 		})
 	}
 	return ops, nil
@@ -731,12 +573,19 @@ type describedMessage struct {
 
 func (d describedMessage) messageDescriptor() protoreflect.MessageDescriptor { return d.md }
 
-// InterfaceArtifact renders the interface artifact of the solution backend
-// rooted at dir: its own operations and the consumed-module operations its
-// page may call, at the version its service.codefly.yaml declares. The
-// artifact carries the version the platform ships, never a second number kept
-// in step by hand. An empty info.Version is read from the manifest.
-func InterfaceArtifact(dir string, info InterfaceInfo, ops []Operation, modules ...ConsumedModule) ([]byte, error) {
+// InterfaceArtifact renders the interface artifact of this solution backend,
+// rooted at dir, from the declaration it serves: every route it serves, each
+// with the policy a call to it must hold — its operations, its MCP route when
+// it declares one, and the relayed module routes its page may call, at the
+// path each is served at — at the version its service.codefly.yaml declares.
+// The artifact carries the version the platform ships, never a second number
+// kept in step by hand. An empty info.Version is read from the manifest.
+//
+// It is the document `codefly generate contracts` publishes as the http
+// endpoint's contract, from which the CLI derives the route rows the
+// authority's Check applies. Rendered from the server itself, a route cannot
+// be served without a row, nor published without being served.
+func (s *Server) InterfaceArtifact(dir string, info InterfaceInfo) ([]byte, error) {
 	if info.Version == "" {
 		version, err := ServiceVersion(dir)
 		if err != nil {
@@ -744,11 +593,22 @@ func InterfaceArtifact(dir string, info InterfaceInfo, ops []Operation, modules 
 		}
 		info.Version = version
 	}
-	consumed, err := PassthroughOperations(modules...)
+	ops := append([]Operation{}, s.operations...)
+	if s.mcp != nil {
+		if err := s.validateMCPDeclaration(); err != nil {
+			return nil, err
+		}
+		ops = append(ops, s.mcpOperation())
+	}
+	consumed, err := PassthroughOperations(s.consumed...)
 	if err != nil {
 		return nil, err
 	}
-	return InterfaceDocument(info, append(append([]Operation{}, ops...), consumed...))
+	for _, op := range consumed {
+		op.Path = s.authorityRoute() + op.Path
+		ops = append(ops, op)
+	}
+	return InterfaceDocument(info, ops)
 }
 
 // ServiceVersion is the version the service manifest (service.codefly.yaml)
