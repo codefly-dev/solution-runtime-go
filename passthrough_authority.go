@@ -132,7 +132,7 @@ func (s *Server) viewerGateway(ctx context.Context, carried, route string) (*Gat
 	gw.parentContext = carried
 	gw.orgID = viewer.GetTenantId()
 	principals, actors := principalsOf(viewer)
-	gw.viewer = &requestViewer{principals: principals, actors: actors}
+	gw.viewer = &requestViewer{principals: principals, actors: actors, owner: selectedOwner(viewer)}
 	return gw, nil
 }
 

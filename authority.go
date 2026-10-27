@@ -165,14 +165,44 @@ func principalsOf(wc *authorityv1.WorkContextV1) (WorkContextPrincipals, []strin
 	return principals, actors
 }
 
+// selectedOwner is the one owner a checked Work Context's effective scopes
+// select: the current actor's granted scopes, or the authority scopes when no
+// actor has hopped. A person's context at a solution carries its installation
+// roles selected to the installation's principal, and the authority holds a
+// child of it within what that owner holds there (authority-core: a child is
+// the owner's current grants intersected with the binding), so an ask naming
+// no owner reads as every owner's resources and is refused as a widening. ""
+// when the scopes select no owner, or more than one: the runtime never picks
+// between owners, and the authority refuses an ask that had to name one.
+func selectedOwner(wc *authorityv1.WorkContextV1) string {
+	effective := wc.GetAuthorityScopes()
+	if chain := wc.GetActorChain(); len(chain) > 0 {
+		effective = chain[len(chain)-1].GetGrantedScopes()
+	}
+	owner := ""
+	for _, scope := range effective {
+		switch selected := scope.GetResourceOwnerId(); {
+		case selected == "", selected == owner:
+		case owner == "":
+			owner = selected
+		default:
+			return ""
+		}
+	}
+	return owner
+}
+
 // issueChild asks the authority, through the hop library's Outbound, for a
 // child of the viewer's Work Context through one of this module's bindings:
 // the audience is the binding's, and the scopes the binding's invoke ceiling
-// narrowed to what was asked and to what the person holds there.
-func (h *hostAuthority) issueChild(ctx context.Context, parent, binding string, scopes []workContextScope) (string, time.Time, WorkContextPrincipals, error) {
+// narrowed to what was asked and to what the person holds there. Each asked
+// scope names owner, the owner the parent's effective scopes select
+// (selectedOwner), so the ask stays within what that owner holds rather than
+// widening to every owner's resources; an empty owner names none.
+func (h *hostAuthority) issueChild(ctx context.Context, parent, binding, owner string, scopes []workContextScope) (string, time.Time, WorkContextPrincipals, error) {
 	asked := make([]*authorityv1.WorkScopeV1, 0, len(scopes))
 	for _, scope := range scopes {
-		asked = append(asked, &authorityv1.WorkScopeV1{ResourceKind: scope.ResourceKind, Actions: scope.Actions, ResourceIds: scope.ResourceIDs})
+		asked = append(asked, &authorityv1.WorkScopeV1{ResourceKind: scope.ResourceKind, Actions: scope.Actions, ResourceIds: scope.ResourceIDs, ResourceOwnerId: owner})
 	}
 	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
 	defer cancel()

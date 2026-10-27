@@ -195,8 +195,17 @@ func TestThePassthroughRelaysAsTheViewer(t *testing.T) {
 		t.Fatalf("the module was called %+v (tenant %q)", call, tenant)
 	}
 	asked := stand.asked()[0]
-	if asked.GetParentToken() != edgeContext || asked.GetOperationBindingId() != "things-binding" || len(asked.GetScopes()) != 1 || asked.GetScopes()[0].GetResourceKind() != "things" {
+	if asked.GetParentToken() != edgeContext || asked.GetOperationBindingId() != "things-binding" || len(asked.GetScopes()) != 1 || asked.GetScopes()[0].GetResourceKind() != "things" ||
+		asked.GetScopes()[0].GetResourceOwnerId() != "" {
 		t.Fatalf("the child was asked %v", asked)
+	}
+	// A person at an installation: the relayed child names the owner the
+	// authority checked the request's context is selected to.
+	if code, answer := connectCall(t, page.URL+relayedSearchPath, solutionContext, `{"entryId":"e1"}`); code != http.StatusOK {
+		t.Fatalf("a person at the installation was answered %d %v", code, answer)
+	}
+	if asked := stand.asked(); len(asked) != 2 || asked[1].GetParentToken() != solutionContext || asked[1].GetScopes()[0].GetResourceOwnerId() != installationPrincipal {
+		t.Fatalf("the installation's child was asked %v", asked[len(asked)-1])
 	}
 	// What is not declared is not served, whatever the module offers; a
 	// request the edge did not send carries no viewer.
@@ -208,7 +217,7 @@ func TestThePassthroughRelaysAsTheViewer(t *testing.T) {
 	if code, answer := connectCall(t, page.URL+relayedSearchPath, "", `{}`); code != http.StatusUnauthorized || answer["code"] != "unauthenticated" {
 		t.Errorf("no Work Context answered %d %v", code, answer)
 	}
-	if len(module.observed()) != 1 {
+	if len(module.observed()) != 2 {
 		t.Fatalf("the module was called %d times", len(module.observed()))
 	}
 }

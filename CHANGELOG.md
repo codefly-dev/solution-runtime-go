@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — a child names the owner its parent is selected to
+
+- **A child of a person's context at an installation names the
+  installation's principal.** Since codefly-dev/authority#7, the authority
+  issues a person's context at a solution with every role scope selected to
+  the installation's principal (`resource_owner_id`), and holds a child of it
+  within what that owner holds there. `issueChild` asked owner-blind, which
+  reads as every owner's resources, so every relayed call through a solution
+  was refused: `a child widens what its owner holds through binding
+  "documents"`. The runtime now reads the owner from the authority's own
+  `Check` answer (the current actor's granted scopes, or the authority scopes
+  when no actor hopped), keeps it on the request's viewer, and names it on
+  every scope a `ForParent` child asks. Scopes selecting no owner, or more than
+  one, name none: the runtime never picks between owners. Nothing is decoded
+  here; the owner is the authority's answer.
+- The authority client and hop libraries move to codefly-dev/authority main
+  `f41cc2ba` (`WorkScopeV1.resource_owner_id`); `go` moves to 1.27.3 with them.
+
 ## Unreleased — review fixes for #75: the authority is asked about the operation dispatched (breaking)
 
 From the independent review of #75 (r1):
