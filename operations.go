@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode"
 
+	corerunnable "github.com/codefly-dev/core/runnable"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
@@ -67,6 +68,12 @@ type Operation struct {
 	// Policy is what a call to the route must hold, as the authority applies
 	// it: required on every operation the backend serves.
 	Policy *Policy
+	// Exclude keeps the route from every agent, as
+	// codefly.runnable.v0.exclude keeps a module's method: the artifact marks
+	// it as no Runnable operation even when its policy is a read. The MCP
+	// route and every relayed route carry it, being a protocol and another
+	// module's call rather than this backend's own operation.
+	Exclude bool
 	// Exactly one of Handler and RequestHandler answers the route.
 	Handler        Handler
 	RequestHandler RequestHandler
@@ -105,6 +112,64 @@ func AnyCheckedCaller() *Policy { return &Policy{AnyCheckedCaller: true} }
 // PolicyExtension is the operation extension the policy is written under, the
 // one the CLI reads route policies from.
 const PolicyExtension = "x-codefly-authority-policy"
+
+// OperationExtension marks an operation as a Runnable one, and so a tool:
+// core's x-codefly-operation, whose value is the proto3 JSON of
+// codefly.runnable.v0.Operation. `codefly generate runnables` derives a
+// Runnable package from every operation carrying it, as it does from every
+// method a module serves behind the hop.
+const OperationExtension = corerunnable.OpenAPIOperationMarker
+
+// operationMarker is the x-codefly-operation an operation publishes beside its
+// policy, or nil when it is no Runnable operation. It is core's own default
+// for the route, written by core from the policy this operation already
+// publishes (corerunnable.RouteMarker), so the runtime invents no bound: the
+// tool is named by the operationId and described by the Summary the operation
+// is required to carry, and audience is the principal this runtime's hop
+// checks a Work Context against.
+//
+// Only a read is marked. A mutation is resolved by its effect receipt, read
+// through a receipt route this runtime does not serve, so marking one would
+// publish a tool whose uncertain outcome nothing could resolve; it stays a
+// route its own page calls. A policy any checked caller satisfies requires
+// nothing to mint a call's capability from, a stream is not one finite call,
+// and a relayed subtree is a path template — core derives none of them. An
+// operation the owner excludes is never marked. A marked read whose payload
+// core cannot carry is refused by `codefly generate runnables`, naming the
+// route and why, rather than silently left unmarked here: the owner either
+// fixes the shape or excludes the route.
+func operationMarker(op Operation, method, route, id, audience string) (json.RawMessage, error) {
+	if audience == "" || op.Exclude || op.Streaming || !op.Policy.readOnly() {
+		return nil, nil
+	}
+	policy, err := json.Marshal(op.Policy)
+	if err != nil {
+		return nil, err
+	}
+	marker, err := corerunnable.RouteMarker(method, route, policy, audience, id, op.Summary)
+	if errors.Is(err, corerunnable.ErrNotDerivable) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("operation %s %s: %w", strings.ToUpper(method), route, err)
+	}
+	return marker, nil
+}
+
+// readOnly reports a policy whose every requirement is the one read action, as
+// core reads one (corerunnable.Authority.ReadOnly): a call holding nothing but
+// read cannot change what it reads.
+func (p *Policy) readOnly() bool {
+	if p == nil || p.AnyCheckedCaller || len(p.Requires) == 0 {
+		return false
+	}
+	for _, r := range p.Requires {
+		if len(r.Actions) != 1 || r.Actions[0] != corerunnable.ReadOnlyScopeAction {
+			return false
+		}
+	}
+	return true
+}
 
 // validate reports a policy that is absent, both things at once, or names a
 // kind without an action. The vocabulary itself is the authority's to check.
@@ -243,9 +308,20 @@ type InterfaceInfo struct {
 
 // InterfaceDocument renders ops as a Swagger 2.0 document — the dialect the
 // platform's proto-generated modules emit, so one reader handles every
-// repository's artifact — indented, with a trailing newline.
+// repository's artifact — indented, with a trailing newline. It marks no
+// operation as a Runnable one: a marker names the audience the serving
+// runtime's hop admits, which only the Server knows. A solution that commits
+// this output therefore publishes no tool at all; the artifact a solution
+// commits is Server.InterfaceArtifact's, and this is for documenting or
+// validating a list of operations.
 func InterfaceDocument(info InterfaceInfo, ops []Operation) ([]byte, error) {
-	doc, err := swaggerDocument(info, ops)
+	return interfaceDocument(info, ops, "")
+}
+
+// interfaceDocument is InterfaceDocument marking each Runnable operation for
+// audience (operationMarker).
+func interfaceDocument(info InterfaceInfo, ops []Operation, audience string) ([]byte, error) {
+	doc, err := swaggerDocument(info, ops, audience)
 	if err != nil {
 		return nil, err
 	}
@@ -256,11 +332,12 @@ func InterfaceDocument(info InterfaceInfo, ops []Operation) ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
-func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error) {
+func swaggerDocument(info InterfaceInfo, ops []Operation, audience string) (map[string]any, error) {
 	definitions := map[string]any{
 		"Error": map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"error": map[string]any{"type": "string"}},
+			"type":                 "object",
+			"properties":           map[string]any{"error": map[string]any{"type": "string"}},
+			"additionalProperties": false,
 		},
 	}
 	paths := map[string]map[string]any{}
@@ -298,6 +375,13 @@ func swaggerDocument(info InterfaceInfo, ops []Operation) (map[string]any, error
 		}
 		if op.Policy != nil {
 			endpoint[PolicyExtension] = op.Policy
+		}
+		marker, err := operationMarker(op, method, route, id, audience)
+		if err != nil {
+			return nil, err
+		}
+		if marker != nil {
+			endpoint[OperationExtension] = marker
 		}
 		parameters := []any{}
 		if op.Request != nil {
@@ -510,7 +594,9 @@ func structSchema(t reflect.Type, definitions map[string]any) map[string]any {
 		}
 		properties[name] = schemaFor(field.Type, definitions)
 	}
-	return map[string]any{"type": "object", "properties": properties}
+	// A struct marshals exactly its fields, so the object is closed: that is
+	// what makes it a fixed shape a Runnable contract can describe.
+	return map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 }
 
 // messageSchema describes a generated message as its protobuf JSON: lowerCamel
@@ -530,7 +616,9 @@ func messageSchema(md protoreflect.MessageDescriptor, definitions map[string]any
 			fd := fields.Get(i)
 			properties[fd.JSONName()] = fieldSchema(fd, definitions)
 		}
-		definitions[name] = map[string]any{"type": "object", "properties": properties}
+		// protojson refuses a field the message does not declare, so the
+		// object is closed, as a struct's is.
+		definitions[name] = map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 	}
 	return map[string]any{"$ref": "#/definitions/" + name}
 }

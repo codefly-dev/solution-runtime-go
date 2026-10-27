@@ -117,7 +117,10 @@ func (s *Server) mcpOperation() Operation {
 		Request:  json.RawMessage{},
 		Response: json.RawMessage{},
 		Policy:   s.mcp.policy,
-		Handler:  func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the MCP transport") },
+		// The body is a JSON-RPC message for any of the server's tools, not
+		// one operation's input: each tool is its own surface.
+		Exclude: true,
+		Handler: func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the MCP transport") },
 	}
 }
 
