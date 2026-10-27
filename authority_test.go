@@ -45,6 +45,13 @@ const edgeContext = "edge-context-for-the-page"
 // (InvalidArgument).
 const malformedContext = "malformed-context"
 
+// solutionContext is a person's Work Context at the page as a solution: the
+// installation's roles, each selected to the installation's principal.
+const solutionContext = "person-through-the-installation"
+
+// installationPrincipal is the principal solutionContext's scopes select.
+const installationPrincipal = "installation-principal"
+
 // robinChild is a module's tool call to the page: Maya's Work Context, issued
 // by the authority as a child through robin's declared binding, robin acting,
 // addressed to the page.
@@ -63,6 +70,9 @@ func (a *interfaceAuthority) Check(_ context.Context, r *authorityv1.CheckReques
 	case r.GetAudience() != "page":
 	case r.GetToken() == edgeContext:
 		wc = &authorityv1.WorkContextV1{TenantId: "org-from-the-authority", OwnerPrincipalId: "person-1", SessionId: "session-1", Audience: "page"}
+	case r.GetToken() == solutionContext:
+		wc = &authorityv1.WorkContextV1{TenantId: "org-from-the-authority", OwnerPrincipalId: "person-1", SessionId: "session-1", Audience: "page",
+			AuthorityScopes: []*authorityv1.WorkScopeV1{{ResourceKind: "pages", Actions: []string{"read", "write"}, ResourceOwnerId: installationPrincipal}}}
 	case r.GetToken() == robinChild:
 		wc = &authorityv1.WorkContextV1{TenantId: "org-from-the-authority", OwnerPrincipalId: "maya", Audience: "page",
 			ActorChain: []*authorityv1.WorkActorV1{{PrincipalId: "robin", PrincipalKind: "module"}}}
@@ -483,5 +493,89 @@ func TestAMalformedRequestIsRefusedWithTheAuthoritysReason(t *testing.T) {
 	}
 	if got := refusalStatus(status.Error(codes.Unavailable, "down")); got != http.StatusServiceUnavailable {
 		t.Fatalf("an outage maps to %d, want 503", got)
+	}
+}
+
+// A child names the owner its parent's effective scopes select: the current
+// actor's granted scopes, or the authority scopes when no actor has hopped.
+// The authority holds the child within what that owner holds, so an owner-blind
+// ask would read as every owner's resources. Scopes selecting no owner name
+// none; scopes selecting two owners name none either, rather than picking one.
+func TestTheSelectedOwnerIsTheOneTheEffectiveScopesSelect(t *testing.T) {
+	scope := func(owner string) *authorityv1.WorkScopeV1 {
+		return &authorityv1.WorkScopeV1{ResourceKind: "pages", Actions: []string{"read"}, ResourceOwnerId: owner}
+	}
+	for name, c := range map[string]struct {
+		wc   *authorityv1.WorkContextV1
+		want string
+	}{
+		"no scopes":          {&authorityv1.WorkContextV1{}, ""},
+		"owner-blind scopes": {&authorityv1.WorkContextV1{AuthorityScopes: []*authorityv1.WorkScopeV1{scope("")}}, ""},
+		"one owner":          {&authorityv1.WorkContextV1{AuthorityScopes: []*authorityv1.WorkScopeV1{scope("p"), scope(""), scope("p")}}, "p"},
+		"two owners":         {&authorityv1.WorkContextV1{AuthorityScopes: []*authorityv1.WorkScopeV1{scope("p"), scope("q")}}, ""},
+		"the current actor's, not the owner's": {&authorityv1.WorkContextV1{
+			AuthorityScopes: []*authorityv1.WorkScopeV1{scope("p")},
+			ActorChain: []*authorityv1.WorkActorV1{
+				{PrincipalId: "first", GrantedScopes: []*authorityv1.WorkScopeV1{scope("q")}},
+				{PrincipalId: "robin", GrantedScopes: []*authorityv1.WorkScopeV1{scope("r")}},
+			}}, "r"},
+		"an actor granted no owner": {&authorityv1.WorkContextV1{
+			AuthorityScopes: []*authorityv1.WorkScopeV1{scope("p")},
+			ActorChain:      []*authorityv1.WorkActorV1{{PrincipalId: "robin", GrantedScopes: []*authorityv1.WorkScopeV1{scope("")}}}}, ""},
+	} {
+		if got := selectedOwner(c.wc); got != c.want {
+			t.Errorf("%s: selected %q, want %q", name, got, c.want)
+		}
+	}
+}
+
+// Every scope of a child of a person's context at an installation names the
+// installation's principal, the owner the authority checked that context's
+// scopes are selected to; a child of a context selecting no owner names none,
+// and a gateway built outside a request names none either.
+func TestAChildNamesTheOwnerItsParentIsSelectedTo(t *testing.T) {
+	s, stand := authorityServer(t)
+	ctx := context.Background()
+	ask := []Scope{{ResourceKind: "documents", Actions: []string{"read"}}, {ResourceKind: "documents.collection", Actions: []string{"create"}, ResourceIDs: []string{"c-1"}}}
+	for _, c := range []struct{ parent, want string }{{solutionContext, installationPrincipal}, {edgeContext, ""}} {
+		gw, err := s.viewerGateway(ctx, c.parent, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		child, err := gw.ForParent(ctx, "documents", ask...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := child.WorkContext(ctx); err != nil {
+			t.Fatal(err)
+		}
+		asked := stand.asked()
+		scopes := asked[len(asked)-1].GetScopes()
+		if asked[len(asked)-1].GetParentToken() != c.parent || len(scopes) != 2 {
+			t.Fatalf("a child of %s was asked %v", c.parent, asked[len(asked)-1])
+		}
+		for _, scope := range scopes {
+			if scope.GetResourceOwnerId() != c.want {
+				t.Errorf("a child of %s asked %v, want owner %q", c.parent, scope, c.want)
+			}
+		}
+		if ids := scopes[1].GetResourceIds(); !slices.Equal(ids, []string{"c-1"}) {
+			t.Errorf("a child of %s lost the ids it asked for: %v", c.parent, ids)
+		}
+	}
+	bare := s.newGateway()
+	bare.parentContext = solutionContext
+	child, err := bare.ForParent(ctx, "documents", ask...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := child.WorkContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	asked := stand.asked()
+	for _, scope := range asked[len(asked)-1].GetScopes() {
+		if scope.GetResourceOwnerId() != "" {
+			t.Errorf("a gateway with no checked viewer named owner %q", scope.GetResourceOwnerId())
+		}
 	}
 }

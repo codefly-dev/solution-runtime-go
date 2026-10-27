@@ -1010,7 +1010,7 @@ func (g *Gateway) issue(ctx context.Context, ask issueAsk) (string, time.Time, e
 	var principals WorkContextPrincipals
 	var err error
 	if ask.child {
-		token, renew, principals, err = g.host.issueChild(ctx, g.parentContext, ask.binding, ask.scopes)
+		token, renew, principals, err = g.host.issueChild(ctx, g.parentContext, ask.binding, g.viewer.selectedOwner(), ask.scopes)
 	} else {
 		token, renew, principals, err = g.host.issueForBinding(ctx, ask.organization, ask.binding)
 	}
@@ -1064,6 +1064,18 @@ func (g *Gateway) WorkContextPrincipals(ctx context.Context) (WorkContextPrincip
 type requestViewer struct {
 	principals WorkContextPrincipals
 	actors     []string
+	// owner is the one owner the context's effective scopes select
+	// (selectedOwner), which every child of it names; "" when none or several.
+	owner string
+}
+
+// selectedOwner is the owner a child of the viewer's context names, "" on a
+// gateway built outside a request.
+func (v *requestViewer) selectedOwner() string {
+	if v == nil {
+		return ""
+	}
+	return v.owner
 }
 
 // ActorChain is who acts, in order, under the Work Context the request
