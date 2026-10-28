@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — an operation names the tool it is offered as
+
+- **`Operation.Tool`** is the model-facing name of a marked read. Empty keeps
+  the previous behaviour exactly: the name falls back to the operationId. It is
+  validated as snake_case within 64 characters and refused rather than
+  sanitised, because core's `toolName` keeps what it is handed, so a capital or
+  a hyphen would reach a model as typed.
+- The operationId does not move. Generated clients are named from it; a nicer
+  tool name is not worth renaming every caller's method.
+- **One name names one operation.** Two reads offering one tool name are
+  refused where a duplicate operationId already is: a tool name is the identity
+  a model addresses, and nothing downstream dedupes on the word.
+- **Only a read is named.** A name on a mutation, a stream, an excluded route
+  or an any-checked-caller route is refused, because none of them is ever
+  marked: the name would be silently dropped while reading as an exposure.
+
 ## Unreleased — every read a solution serves is a Runnable operation, and so a tool
 
 - **The artifact marks each read (`x-codefly-operation`).** An operation whose
