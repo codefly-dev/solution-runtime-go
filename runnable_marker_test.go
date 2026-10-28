@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
@@ -290,6 +291,79 @@ func TestAToolNameIsOneSpelling(t *testing.T) {
 		}
 		if err == nil {
 			t.Errorf("the tool name %q was accepted; a model-facing name is one spelling", name)
+		}
+	}
+}
+
+// TestOneToolNameNamesOneOperation: a tool name is the identity a model
+// addresses, so it names exactly one operation, as an operationId names
+// exactly one route. Two reads claiming one name would publish two tools a
+// model cannot tell apart, and nothing downstream collapses them — a derived
+// package is keyed by the operationId, and Robin's catalogue dedupes on the
+// operation, the contract digest and the policy, never on the word.
+func TestOneToolNameNamesOneOperation(t *testing.T) {
+	answer := func(context.Context, *Gateway) (any, error) { return nil, nil }
+	reads := Requires("records.records", "read")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "service.codefly.yaml"), []byte("kind: service\nname: backend\nversion: 0.3.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := New(Manifest{ID: "releases"}).Operations(
+		Operation{Path: "/v1/releases/one", Summary: "One", Callers: "Any member", Behavior: "One object",
+			Tool: "read_board", Response: recordResult{}, Policy: reads, Handler: answer},
+		Operation{Path: "/v1/releases/two", Summary: "Two", Callers: "Any member", Behavior: "One object",
+			Tool: "read_board", Response: recordResult{}, Policy: reads, Handler: answer},
+	)
+	_, err := server.InterfaceArtifact(dir, InterfaceInfo{Title: "releases", OperationPrefix: "Releases", Tag: "releases"})
+	if err == nil {
+		t.Fatal("two operations offered one tool name and the artifact rendered")
+	}
+	if !strings.Contains(err.Error(), "both offer the tool") || !strings.Contains(err.Error(), "read_board") {
+		t.Errorf("the refusal must name the tool and both routes, got %v", err)
+	}
+}
+
+// TestANameOnWhatIsNeverATool: only a read is marked, so only a read is named.
+// A name on anything else is a declaration that does nothing and reads as the
+// opposite — the owner believes they exposed a tool.
+func TestANameOnWhatIsNeverATool(t *testing.T) {
+	answer := func(context.Context, *Gateway) (any, error) { return nil, nil }
+	base := func() Operation {
+		return Operation{Path: "/v1/releases/thing", Summary: "Thing", Callers: "Any member",
+			Behavior: "One object", Tool: "read_thing", Response: recordResult{},
+			Policy: Requires("records.records", "read"), Handler: answer}
+	}
+	for _, c := range []struct {
+		why   string
+		of    func(Operation) Operation
+		names string
+	}{
+		{"a mutation", func(o Operation) Operation {
+			o.Method, o.Policy = "post", Requires("records.records", "read", "write")
+			return o
+		}, "only a read"},
+		{"an excluded route", func(o Operation) Operation { o.Exclude = true; return o }, "excludes itself"},
+		{"a stream", func(o Operation) Operation { o.Streaming = true; return o }, "streams"},
+		{"any checked caller", func(o Operation) Operation { o.Policy = AnyCheckedCaller(); return o }, "only a read"},
+	} {
+		err := c.of(base()).validate()
+		if err == nil {
+			t.Errorf("%s named a tool and was accepted", c.why)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.names) {
+			t.Errorf("%s: the refusal must say why it is never a tool, got %v", c.why, err)
+		}
+	}
+	// The same operation without a name is valid: this refuses the name, not
+	// the operation.
+	for _, of := range []func(Operation) Operation{
+		func(o Operation) Operation { o.Tool, o.Exclude = "", true; return o },
+		func(o Operation) Operation { o.Tool, o.Streaming = "", true; return o },
+		func(o Operation) Operation { o.Tool, o.Policy = "", AnyCheckedCaller(); return o },
+	} {
+		if err := of(base()).validate(); err != nil {
+			t.Errorf("an unnamed operation must stay valid, got %v", err)
 		}
 	}
 }

@@ -668,7 +668,12 @@ by `Operation.Tool` — or, left empty, by the operationId — and described by 
 `Operation.Tool` is the one part of the marker the owner says rather than core
 derives, because it is the one part a model reads: snake_case, at most 64
 characters, refused at validation rather than sanitised, since core's own
-`toolName` keeps whatever it is given. The fallback identifies the route and
+`toolName` keeps whatever it is given. One name names one operation, as an
+operationId names one route — two reads claiming one name publish two tools a
+model cannot tell apart, and nothing downstream collapses them. And only a read
+is named, because only a read is marked: a name on a mutation, a stream, an
+excluded route or an any-checked-caller route is a declaration that does
+nothing and reads as the opposite, so it is refused. The fallback identifies the route and
 describes nothing — `Wiki_Get_V1_Wiki_Upload-configuration` says where a route
 is, not what calling it does. The operationId is deliberately not changed to
 read better: generated clients are named from it, so moving it would rename

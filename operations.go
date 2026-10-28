@@ -355,6 +355,7 @@ func swaggerDocument(info InterfaceInfo, ops []Operation, audience string) (map[
 	}
 	paths := map[string]map[string]any{}
 	ids := map[string]string{}
+	tools := map[string]string{}
 	for _, op := range ops {
 		if err := op.validate(); err != nil {
 			return nil, err
@@ -375,6 +376,18 @@ func swaggerDocument(info InterfaceInfo, ops []Operation, audience string) (map[
 			return nil, fmt.Errorf("operations %s and %s %s share the operationId %q", other, strings.ToUpper(method), route, id)
 		}
 		ids[id] = strings.ToUpper(method) + " " + route
+		// A tool name is the identity a MODEL addresses, so it names exactly
+		// one operation, as an operationId names exactly one route. Two reads
+		// claiming one name publish two tools a model cannot tell apart, and
+		// nothing downstream collapses them: a derived package is keyed by the
+		// operationId, and Robin's catalogue dedupes on the operation, the
+		// contract digest and the policy — never on the word.
+		if op.Tool != "" {
+			if other, taken := tools[op.Tool]; taken {
+				return nil, fmt.Errorf("operations %s and %s %s both offer the tool %q", other, strings.ToUpper(method), route, op.Tool)
+			}
+			tools[op.Tool] = strings.ToUpper(method) + " " + route
+		}
 		endpoint := map[string]any{
 			"operationId": id,
 			"summary":     op.Summary,
@@ -504,7 +517,16 @@ func (o Operation) validate() error {
 		// Held here rather than sanitised: core's toolName keeps whatever it
 		// is given, so a name typed with a capital or a hyphen would reach a
 		// model as typed. An owner naming its own tool is told what a name is.
-		return fmt.Errorf("operation %s names the tool %q: a tool name is 1..64 characters of %s", o.Path, o.Tool, toolNameSpelling)
+		return fmt.Errorf("operation %s names the tool %q: a tool name is 1..%d characters of %s", o.Path, o.Tool, maxToolName, toolNameSpelling)
+	case o.Tool != "" && o.Exclude:
+		return fmt.Errorf("operation %s names the tool %q and excludes itself from every agent: one of the two", o.Path, o.Tool)
+	case o.Tool != "" && o.Streaming:
+		return fmt.Errorf("operation %s names the tool %q and streams: a stream is not one finite call, so it is never offered as a tool", o.Path, o.Tool)
+	case o.Tool != "" && !o.Policy.readOnly():
+		// A name on something that can never be marked is a declaration that
+		// does nothing, and it reads as the opposite: the owner believes they
+		// exposed a tool. Only a read is marked, so only a read is named.
+		return fmt.Errorf("operation %s names the tool %q, and only a read is offered as one: its policy requires more than %q, so the operation is resolved by its effect receipt and stays a route its own page calls", o.Path, o.Tool, corerunnable.ReadOnlyScopeAction)
 	}
 	if err := o.Policy.validate(); err != nil {
 		return fmt.Errorf("operation %s %s %w", o.verb(), o.Path, err)
