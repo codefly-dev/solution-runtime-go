@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"unicode"
@@ -74,6 +75,18 @@ type Operation struct {
 	// route and every relayed route carry it, being a protocol and another
 	// module's call rather than this backend's own operation.
 	Exclude bool
+	// Tool is the name this operation is offered to a model under, when it is
+	// marked as a Runnable operation at all. It is the one part of the marker
+	// the owner says rather than core derives, because it is the one part a
+	// model reads: snake_case, 1..64 characters, starting with a letter.
+	//
+	// Left empty the name falls back to the operationId, which is this
+	// document's own identity for the route and a fine key but a poor word to
+	// put in front of a model — `Wiki_Get_V1_Wiki_Upload-configuration` says
+	// where the route is, not what calling it does. The operationId is not
+	// changed to improve it: generated clients are named from it, so moving it
+	// would rename every caller's method to make one tool read better.
+	Tool string
 	// Exactly one of Handler and RequestHandler answers the route.
 	Handler        Handler
 	RequestHandler RequestHandler
@@ -376,7 +389,7 @@ func swaggerDocument(info InterfaceInfo, ops []Operation, audience string) (map[
 		if op.Policy != nil {
 			endpoint[PolicyExtension] = op.Policy
 		}
-		marker, err := operationMarker(op, method, route, id, audience)
+		marker, err := operationMarker(op, method, route, cmp.Or(op.Tool, id), audience)
 		if err != nil {
 			return nil, err
 		}
@@ -456,6 +469,17 @@ func operationResponses(op Operation, definitions map[string]any) map[string]any
 	}
 }
 
+// toolName is what a model-facing name may be: lowercase letters, digits and
+// underscores, starting with a letter. It is core's admitted set narrowed to
+// one spelling, so two owners' tools read the same way.
+var toolName = regexp.MustCompile(`^[a-z][a-z0-9]*(_[a-z0-9]+)*$`)
+
+// maxToolName is the longest name a model-facing tool carries, as core bounds
+// one (corerunnable.BoundedName over its own maxToolName).
+const maxToolName = 64
+
+const toolNameSpelling = "lowercase letters and digits in underscore-separated words, starting with a letter"
+
 // validate reports an operation that cannot be rendered because it is
 // undocumented or unserved.
 func (o Operation) validate() error {
@@ -476,6 +500,11 @@ func (o Operation) validate() error {
 		return fmt.Errorf("operation %s declares two handlers", o.Path)
 	case !slices.Contains(servedMethods, o.verb()):
 		return fmt.Errorf("operation %s declares the method %q: an operation is one of %s", o.Path, o.Method, strings.Join(servedMethods, ", "))
+	case o.Tool != "" && (len(o.Tool) > maxToolName || !toolName.MatchString(o.Tool)):
+		// Held here rather than sanitised: core's toolName keeps whatever it
+		// is given, so a name typed with a capital or a hyphen would reach a
+		// model as typed. An owner naming its own tool is told what a name is.
+		return fmt.Errorf("operation %s names the tool %q: a tool name is 1..64 characters of %s", o.Path, o.Tool, toolNameSpelling)
 	}
 	if err := o.Policy.validate(); err != nil {
 		return fmt.Errorf("operation %s %s %w", o.verb(), o.Path, err)

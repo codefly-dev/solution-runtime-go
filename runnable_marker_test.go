@@ -39,6 +39,7 @@ func releasesServer() *Server {
 	return New(Manifest{ID: "releases"}).Operations(
 		Operation{Path: "/v1/releases/recorded", Summary: "Read the board as records holds it, without asking GitHub",
 			Callers: "Any member who may read records", Behavior: "The newest recorded pin of every component",
+			Tool:     "read_recorded_board",
 			Response: recordedBoard{}, Policy: reads, Handler: answer},
 		Operation{Path: "/v1/releases/history", Summary: "Read the recorded tags of one repository and the recorded pins of one component",
 			Callers: "Any member who may read records", Behavior: "Newest first",
@@ -223,5 +224,72 @@ func TestAnExcludedReadIsNoOperation(t *testing.T) {
 	ops[0].Exclude = false
 	if doc, err = interfaceDocument(InterfaceInfo{OperationPrefix: "Releases"}, ops, "releases"); err != nil || !containsKey(t, doc, OperationExtension) {
 		t.Fatalf("the same read, not excluded, was not marked (%v): %s", err, doc)
+	}
+}
+
+// TestAnOperationNamesTheToolItIsOfferedAs: the one part of the marker a model
+// actually reads is the one part the owner says. Left empty it falls back to
+// the operationId, which identifies the route and describes nothing, and the
+// operationId itself never moves — generated clients are named from it.
+func TestAnOperationNamesTheToolItIsOfferedAs(t *testing.T) {
+	doc := releasesArtifact(t)
+	var parsed struct {
+		Paths map[string]map[string]struct {
+			OperationID string `json:"operationId"`
+			Marker      *struct {
+				// The marker is proto3 JSON; decoded here as the plain
+				// document a reader sees, not through the proto type, whose
+				// enum does not round-trip encoding/json.
+				Tool struct {
+					Name   string `json:"name"`
+					Effect string `json:"effect"`
+				} `json:"tool"`
+			} `json:"x-codefly-operation"`
+		} `json:"paths"`
+	}
+	if err := json.Unmarshal(doc, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	named := parsed.Paths["/v1/releases/recorded"]["get"]
+	if named.Marker == nil {
+		t.Fatal("the named read is marked as a Runnable operation")
+	}
+	if got := named.Marker.Tool.Name; got != "read_recorded_board" {
+		t.Errorf("the tool is offered as %q, not the name its owner gave it", got)
+	}
+	if named.OperationID != "Releases_Get_V1_Releases_Recorded" {
+		t.Errorf("naming the tool moved the operationId to %q, which renames every generated client", named.OperationID)
+	}
+
+	fallback := parsed.Paths["/v1/releases/history"]["get"]
+	if fallback.Marker == nil {
+		t.Fatal("the unnamed read is still marked")
+	}
+	if got := fallback.Marker.Tool.Name; got != fallback.OperationID {
+		t.Errorf("an operation that names no tool falls back to its operationId, got %q", got)
+	}
+}
+
+// TestAToolNameIsOneSpelling: core's own sanitiser keeps whatever it is given,
+// so a name typed with a capital or a hyphen would reach a model as typed. An
+// owner naming its own tool is told what a name is, at the one place that can
+// still refuse it.
+func TestAToolNameIsOneSpelling(t *testing.T) {
+	for _, name := range []string{"Read_Board", "read-board", "9read", "", "read board", "read_board_"} {
+		op := Operation{
+			Path: "/v1/releases/recorded", Summary: "Read the board", Callers: "Anyone", Behavior: "One object",
+			Tool: name, Response: recordedBoard{}, Policy: Requires("records.records", "read"),
+			Handler: func(context.Context, *Gateway) (any, error) { return nil, nil },
+		}
+		err := op.validate()
+		if name == "" {
+			if err != nil {
+				t.Errorf("an operation that names no tool is valid, got %v", err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("the tool name %q was accepted; a model-facing name is one spelling", name)
+		}
 	}
 }
