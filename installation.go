@@ -39,9 +39,11 @@ type Installation struct {
 	ID             string
 	OrganizationID string
 	Revision       uint64
-	// Receipt is the consent operation the step was issued under. A host retry
-	// of the same attempt carries the same receipt.
-	Receipt string
+	// OperationID is the consent operation the step was issued under (the
+	// verified task id). It names the attempt, not the whole consent receipt,
+	// whose intent, delivered generation and digest the authority checks. A
+	// host retry of the same attempt carries the same operation.
+	OperationID string
 }
 
 // ErrInstallRefused marks an intentional install refusal. Use RefuseInstall
@@ -116,21 +118,20 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 		installationOutcome{status: http.StatusConflict, reason: "the installation step does not name the installation the authority verified"}.write(w)
 		return
 	}
-	installation.Receipt = verified.GetTaskId()
+	installation.OperationID = verified.GetTaskId()
 	s.installOnce(r.Context(), installation).write(w)
 }
 
 // decodeInstallation bounds the entire body, including whitespace after the
-// object, and accepts exactly one JSON object, whose installation the
-// carriers beside the credential must name too. The host also sends the
-// installation's scope; it is decoded and dropped, because the step credential
-// verifies none of it.
+// object, and accepts exactly one JSON object with exactly the three fields
+// the authority verifies, whose installation the carriers beside the
+// credential must name too. Any other member, a scope among them, is refused:
+// the step credential verifies nothing else, so nothing else is read.
 func decodeInstallation(w http.ResponseWriter, r *http.Request) (Installation, error) {
 	var body struct {
-		ID             string             `json:"installation_id"`
-		OrganizationID string             `json:"organization_id"`
-		Revision       uint64             `json:"revision"`
-		Scope          []workContextScope `json:"scope"`
+		ID             string `json:"installation_id"`
+		OrganizationID string `json:"organization_id"`
+		Revision       uint64 `json:"revision"`
 	}
 	reader := http.MaxBytesReader(w, r.Body, installationMaxBytes)
 	defer func() { _ = reader.Close() }()
@@ -162,26 +163,31 @@ func (h *hostAuthority) installationStep(ctx context.Context, token string) (*au
 	checked, err := h.authority.Check(ctx, &authorityv1.CheckRequest{Token: token, Audience: h.principal, Method: installationStepMethod})
 	switch status.Code(err) {
 	case codes.OK:
-		if checked.GetContext() == nil {
-			log.Printf("the authority verified an install step and answered no context")
-			return nil, installationOutcome{status: http.StatusServiceUnavailable}
+		if checked.GetContext() == nil || checked.GetRefusal() != "" {
+			// A refusal beside a context is advice, and this check is never
+			// advisory: it is a refusal.
+			log.Printf("the authority answered an install step with refusal %q (context present: %t)", checked.GetRefusal(), checked.GetContext() != nil)
+			return nil, installationOutcome{status: http.StatusConflict, reason: installationStepRefused}
 		}
 		return checked.GetContext(), installationOutcome{}
-	case codes.PermissionDenied, codes.InvalidArgument, codes.NotFound:
-		// The authority refuses this attempt by name, and a retry of it is
-		// refused the same way.
-		return nil, installationOutcome{status: http.StatusConflict, reason: publicReason(status.Convert(err).Message(), ErrInstallRefused.Error())}
-	case codes.Unauthenticated:
-		// The credential does not verify; the host's next attempt is issued
-		// a fresh one.
-		log.Printf("the authority does not verify an install step's credential: %v", status.Convert(err).Message())
-		return nil, installationOutcome{status: http.StatusUnauthorized}
+	case codes.PermissionDenied, codes.InvalidArgument, codes.Unauthenticated, codes.NotFound:
+		// The authority refuses this credential for this attempt. That ends
+		// this delivery, not the installation: a fresh claim or a fresh
+		// consent may be issued another. The reason crossing into the host's
+		// job history is generic; the authority's own is logged here.
+		log.Printf("the authority refuses an install step: %v", status.Convert(err).Message())
+		return nil, installationOutcome{status: http.StatusConflict, reason: installationStepRefused}
 	}
 	// Not now (the attempt changed, or the credential is outside its delivery
-	// window), or no answer: the installation stays pending and is retried.
+	// window), cancelled, or no answer: the installation stays pending and is
+	// retried.
 	log.Printf("the authority's verification of an install step did not complete: %v", err)
 	return nil, installationOutcome{status: http.StatusServiceUnavailable}
 }
+
+// installationStepRefused is the one reason an authority refusal of a step
+// answers with.
+const installationStepRefused = "the authority refuses this installation step"
 
 // sameInstallation requires the verified step to be exactly the one the body
 // names, at this module, carrying only the step's own scope. The authority
@@ -198,7 +204,7 @@ func sameInstallation(wc *authorityv1.WorkContextV1, principal string, installat
 		return fmt.Errorf("the step is sealed to installation %q at revision %d, not %q at %d",
 			wc.GetSeal().GetInstallationId(), wc.GetSeal().GetInstallationRevision(), installation.ID, installation.Revision)
 	case wc.GetTaskId() == "":
-		return errors.New("the verified step names no consent receipt")
+		return errors.New("the verified step names no consent operation")
 	case len(wc.GetActorChain()) != 0:
 		return errors.New("the verified step carries an actor chain")
 	case len(scopes) != 1 || scopes[0].GetResourceKind() != "installations" ||
@@ -210,9 +216,9 @@ func sameInstallation(wc *authorityv1.WorkContextV1, principal string, installat
 }
 
 type installationKey struct {
-	id       string
-	revision uint64
-	receipt  string
+	id        string
+	revision  uint64
+	operation string
 }
 
 type installationOutcome struct {
@@ -228,7 +234,7 @@ type installationResult struct {
 // The outcome cache is bounded. Only an acknowledgement is kept: a refusal or a
 // transient failure is forgotten once its waiters have it, so the host's retry
 // — including an administrator's Retry after fixing the cause, which keeps the
-// receipt — runs the step again. Completed outcomes are evicted oldest first
+// consent operation — runs the step again. Completed outcomes are evicted oldest first
 // past maxInstallOutcomes: the step must converge, so a repeat after eviction
 // runs it again rather than answering from memory. Steps in flight are never
 // evicted; past maxInstallsInFlight a new one is answered unavailable, which
@@ -240,7 +246,7 @@ const (
 
 // installOnce is entered only after the authority verified this very attempt.
 func (s *Server) installOnce(ctx context.Context, installation Installation) installationOutcome {
-	key := installationKey{id: installation.ID, revision: installation.Revision, receipt: installation.Receipt}
+	key := installationKey{id: installation.ID, revision: installation.Revision, operation: installation.OperationID}
 	s.installMu.Lock()
 	if previous := s.installations[key]; previous != nil {
 		s.installMu.Unlock()
@@ -315,8 +321,6 @@ func (outcome installationOutcome) write(w http.ResponseWriter) {
 		_ = json.NewEncoder(w).Encode(struct {
 			Reason string `json:"reason"`
 		}{Reason: outcome.reason})
-	case http.StatusUnauthorized:
-		http.Error(w, "the authority does not verify this installation step", http.StatusUnauthorized)
 	default:
 		http.Error(w, installationFailure, http.StatusServiceUnavailable)
 	}

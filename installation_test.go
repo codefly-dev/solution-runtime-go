@@ -19,8 +19,8 @@ import (
 )
 
 // stepCredential is the setup-only credential the authority issued for one
-// pending attempt: installation inst-1 at revision 3 in org-1, consent receipt
-// receipt-1, addressed to the page.
+// pending attempt: installation inst-1 at revision 3 in org-1, consent operation
+// operation-1, addressed to the page.
 const stepCredential = "installation-step-credential"
 
 // verifiedStep is what the authority's step verifier answers for
@@ -32,7 +32,7 @@ func verifiedStep(edit func(*authorityv1.WorkContextV1)) func(*authorityv1.Check
 		}
 		org := "org-1"
 		wc := &authorityv1.WorkContextV1{
-			Audience: r.GetAudience(), TenantId: org, OrganizationId: &org, OwnerPrincipalId: "installation-agent", TaskId: "receipt-1",
+			Audience: r.GetAudience(), TenantId: org, OrganizationId: &org, OwnerPrincipalId: "installation-agent", TaskId: "operation-1",
 			Seal:            &authorityv1.WorkSealV1{InstallationId: "inst-1", InstallationRevision: 3},
 			AuthorityScopes: []*authorityv1.WorkScopeV1{{ResourceKind: "installations", Actions: []string{"install"}, ResourceIds: []string{"inst-1"}}},
 		}
@@ -45,7 +45,7 @@ func verifiedStep(edit func(*authorityv1.WorkContextV1)) func(*authorityv1.Check
 
 func stepRequest(credentials ...string) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, installationPath,
-		strings.NewReader(`{"installation_id":"inst-1","organization_id":"org-1","revision":3,"scope":[{"resourceKind":"pages","actions":["read"]}]}`))
+		strings.NewReader(`{"installation_id":"inst-1","organization_id":"org-1","revision":3}`))
 	for _, credential := range credentials {
 		r.Header.Add(workcontext.HeaderName, credential)
 	}
@@ -78,7 +78,7 @@ func install(s *Server, r *http.Request) *httptest.ResponseRecorder {
 }
 
 // The step runs only once the authority's step verifier has verified the
-// attempt, and runs with exactly what it verified, receipt included. The check
+// attempt, and runs with exactly what it verified, consent operation included. The check
 // is never advisory, even under hop/ENFORCEMENT=warn, because it is not a
 // route check.
 func TestAnInstallStepRunsOnlyWhatTheAuthorityVerified(t *testing.T) {
@@ -87,7 +87,7 @@ func TestAnInstallStepRunsOnlyWhatTheAuthorityVerified(t *testing.T) {
 	if answer := install(s, stepRequest(stepCredential)); answer.Code != http.StatusNoContent {
 		t.Fatalf("a verified step answered %d: %s", answer.Code, answer.Body)
 	}
-	want := Installation{ID: "inst-1", OrganizationID: "org-1", Revision: 3, Receipt: "receipt-1"}
+	want := Installation{ID: "inst-1", OrganizationID: "org-1", Revision: 3, OperationID: "operation-1"}
 	if len(*ran) != 1 || (*ran)[0] != want {
 		t.Fatalf("the step ran with %+v, want once with %+v", *ran, want)
 	}
@@ -108,7 +108,7 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 	}{
 		"no credential":           {request: func() *http.Request { return stepRequest() }, status: http.StatusUnauthorized},
 		"two credentials":         {request: func() *http.Request { return stepRequest(stepCredential, stepCredential) }, status: http.StatusUnauthorized},
-		"a credential that fails": {request: func() *http.Request { return stepRequest("forged") }, status: http.StatusUnauthorized},
+		"a credential that fails": {request: func() *http.Request { return stepRequest("forged") }, status: http.StatusConflict},
 		"no installation carriers": {request: func() *http.Request {
 			r := stepRequest(stepCredential)
 			r.Header.Del(workcontext.InstallationIDHeaderName)
@@ -119,6 +119,11 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 			r.Header.Set(workcontext.InstallationRevisionHeaderName, "2")
 			return r
 		}, status: http.StatusBadRequest},
+		"a body carrying a scope": {request: func() *http.Request {
+			r := stepRequest(stepCredential)
+			r.Body = io.NopCloser(strings.NewReader(`{"installation_id":"inst-1","organization_id":"org-1","revision":3,"scope":[{"resourceKind":"pages","actions":["read"]}]}`))
+			return r
+		}, status: http.StatusBadRequest},
 		"a body with an unknown field": {request: func() *http.Request {
 			r := stepRequest(stepCredential)
 			r.Body = io.NopCloser(strings.NewReader(`{"installation_id":"inst-1","organization_id":"org-1","revision":3,"activate":true}`))
@@ -127,6 +132,14 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 		"the authority refuses the attempt": {step: func(*authorityv1.CheckRequest) (*authorityv1.CheckResponse, error) {
 			return nil, status.Error(codes.PermissionDenied, "not this installation's setup credential")
 		}, status: http.StatusConflict},
+		"a refusal beside the context": {step: func(r *authorityv1.CheckRequest) (*authorityv1.CheckResponse, error) {
+			answer, _ := verifiedStep(nil)(r)
+			answer.Refusal = "not this installation's setup credential"
+			return answer, nil
+		}, status: http.StatusConflict},
+		"the delivery was cancelled": {step: func(*authorityv1.CheckRequest) (*authorityv1.CheckResponse, error) {
+			return nil, status.Error(codes.Canceled, "cancelled")
+		}, status: http.StatusServiceUnavailable},
 		"the attempt changed": {step: func(*authorityv1.CheckRequest) (*authorityv1.CheckResponse, error) {
 			return nil, status.Error(codes.FailedPrecondition, "installation step attempt changed")
 		}, status: http.StatusServiceUnavailable},
@@ -140,7 +153,7 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 			wc.OrganizationId = &other
 		}), status: http.StatusConflict},
 		"addressed to another module": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.Audience = "documents" }), status: http.StatusConflict},
-		"no consent receipt":          {step: verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.TaskId = "" }), status: http.StatusConflict},
+		"no consent operation":        {step: verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.TaskId = "" }), status: http.StatusConflict},
 		"an ordinary capability": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) {
 			wc.AuthorityScopes = append(wc.AuthorityScopes, &authorityv1.WorkScopeV1{ResourceKind: "pages", Actions: []string{"read"}})
 		}), status: http.StatusConflict},
@@ -154,8 +167,12 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 			if c.request != nil {
 				request = c.request()
 			}
-			if answer := install(s, request); answer.Code != c.status {
+			answer := install(s, request)
+			if answer.Code != c.status {
 				t.Errorf("answered %d (%s), want %d", answer.Code, strings.TrimSpace(answer.Body.String()), c.status)
+			}
+			if strings.Contains(answer.Body.String(), "setup credential") {
+				t.Errorf("the authority's own reason reached the host's job history: %s", answer.Body)
 			}
 			if len(*ran) != 0 {
 				t.Errorf("the step ran: %+v", *ran)
@@ -166,7 +183,7 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 
 // One attempt runs once: a repeat is answered from memory, but only after the
 // authority verified the repeat too, so a remembered acknowledgement is never
-// an answer to an attempt that no longer stands. Another receipt for the same
+// an answer to an attempt that no longer stands. Another consent operation for the same
 // installation is another attempt.
 func TestAnInstallAttemptRunsOnceAndARepeatIsStillVerified(t *testing.T) {
 	s, stand, ran := installServer(t)
@@ -184,9 +201,9 @@ func TestAnInstallAttemptRunsOnceAndARepeatIsStillVerified(t *testing.T) {
 	if answer := install(s, stepRequest(stepCredential)); answer.Code != http.StatusServiceUnavailable {
 		t.Fatalf("a remembered attempt the authority no longer verifies answered %d", answer.Code)
 	}
-	stand.step = verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.TaskId = "receipt-2" })
-	if answer := install(s, stepRequest(stepCredential)); answer.Code != http.StatusNoContent || len(*ran) != 2 || (*ran)[1].Receipt != "receipt-2" {
-		t.Fatalf("another receipt answered %d and ran %+v", answer.Code, *ran)
+	stand.step = verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.TaskId = "operation-2" })
+	if answer := install(s, stepRequest(stepCredential)); answer.Code != http.StatusNoContent || len(*ran) != 2 || (*ran)[1].OperationID != "operation-2" {
+		t.Fatalf("another consent operation answered %d and ran %+v", answer.Code, *ran)
 	}
 }
 

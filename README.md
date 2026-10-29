@@ -188,7 +188,8 @@ active only after this answers 204 for it, and `OnInstall(step)` is what
 answers. The request carries a **setup-only credential** that the authority
 issued for that one pending attempt, in `x-codefly-work-context`, with
 `x-codefly-installation-id` and `x-codefly-installation-revision` beside it. Its
-body is `{installation_id, organization_id, revision, scope}`.
+body is exactly `{installation_id, organization_id, revision}`; any other member,
+a `scope` among them, is refused 400.
 
 - **The authority verifies the step, and nothing else does.** The runtime asks
   the authority's `Check` at the method `POST /_codefly/installations`. The
@@ -198,33 +199,45 @@ body is `{installation_id, organization_id, revision, scope}`.
   module's delivered principal, the installation and its revision, the
   delivered generation, and the current pending attempt. The runtime then
   requires the body and the carriers to name exactly what was verified: the
-  organization, installation and revision. It also requires a consent receipt
-  and a single scope, `installations:install` on that installation. A carrier
+  organization, installation and revision. It also requires a consent
+  operation and a single scope, `installations:install` on that installation. A carrier
   parsed alone is never enough.
 - **`Installation` is what was verified**: `ID`, `OrganizationID`, `Revision`,
-  and `Receipt`, the consent operation the step was issued under, which a host
-  retry of the same attempt keeps. The body's `scope` is decoded and dropped:
-  the step credential verifies none of it.
+  and `OperationID`, the consent operation the step was issued under (the
+  verified task id), which a host retry of the same attempt keeps. The rest of
+  the consent receipt (its intent, the delivered generation and the offer
+  digest) is the authority's to check, through the step's signed binding and
+  its current state. Nothing else is passed on.
 - **The step holds nothing.** It is given no Gateway (`ViewerFromContext`
   errors inside it), and the setup credential is never handed to it or
   forwarded. A pending installation is active nowhere, so there is nothing to
   act under until it is.
 - **One attempt runs once per process.** Concurrent deliveries of one
-  (installation, revision, receipt) wait for the first, and an
+  (installation, revision, consent operation) wait for the first, and an
   acknowledgement is answered from memory for the most recent 1024 attempts.
   A repeat is still verified by the authority first, so a remembered 204 is
   never the answer to an attempt that no longer stands. A refusal and a
   failure are not remembered, so the host's retry runs the step again. The
   memory is per process: across a restart or another replica the step runs
   again, so it must converge.
-- **Answers.** 204 is done. 409 `{"reason": …}` is terminal: `RefuseInstall`'s
-  public reason, the authority's refusal of the attempt, a verified step that
-  names another installation, or a solution that declares no step (with no
-  step, nothing is ever acknowledged). 401 means the credential did not
-  verify. 400 means a malformed body or carriers. 503 covers everything the
-  host should retry, the installation staying pending: the attempt changed
-  or its credential is outside its window, the authority is unreachable, or
-  the step failed. A step's own error text never reaches the answer.
+- **Answers.** 204 is done. 409 `{"reason": …}` ends this delivery:
+  - `RefuseInstall`'s public reason;
+  - the authority refusing the credential (PermissionDenied, InvalidArgument,
+    Unauthenticated, NotFound, or a refusal answered beside the context), with
+    one generic reason, the authority's own being logged;
+  - a verified step that names another installation;
+  - a solution that declares no step (with no step, nothing is ever
+    acknowledged).
+
+  A 409 does not end the installation: a fresh claim or a fresh consent may
+  issue another credential. 401 means no single credential was carried. 400
+  means a malformed body or carriers. 503 covers everything the host should
+  retry, the installation staying pending: the attempt changed or its
+  credential is outside its window (FailedPrecondition), the call was cancelled
+  or timed out, the authority failed or is unreachable, or the step failed. A
+  step's own error text never reaches the answer. Verification is admission,
+  not a reservation: the authority's activation fence still refuses a revoke
+  or redelivery that races the step.
 
 ## Configuration
 
