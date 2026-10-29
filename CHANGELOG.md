@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — the install step, verified by the authority
+
+- **`OnInstall`, `Installation`, `RefuseInstall`, `ErrInstallRefused`** are back,
+  additive to the current API. The host delivers a pending installation's setup
+  to `POST /_codefly/installations`, as its existing delivery already does.
+  The runtime asks the authority's `Check` at that method, which is the
+  authority's dedicated, never-advisory step verifier. The body and the
+  installation carriers must then name exactly the organization, installation
+  and revision it verified, with a consent receipt and only
+  `installations:install` on that installation.
+- `Installation` is the verified facts, with the new `Receipt`. The body's
+  `scope` is not passed on.
+- The step is given no Gateway, and a solution with no step is answered 409,
+  never 204.
+- One (installation, revision, receipt) runs once per process. A repeat is
+  verified before a remembered 204 answers it.
+- What the e80369a deletion removed stays removed: a carrier parsed alone, a
+  nil step acknowledged, and a step acting under the carried capability.
+
 ## Unreleased — an operation names the tool it is offered as
 
 - **`Operation.Tool`** is the model-facing name of a marked read. Empty keeps

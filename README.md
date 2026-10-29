@@ -50,13 +50,14 @@ the host's gateway, a Task Work Context minted through accounts for the viewer
 from the host's module broker (`Server.Credential`, `CredentialSource`, the
 `module-authority` group), a module called over its REST binding
 (`Gateway.Transcoded`, `Unary`, `HTTPClient`, `BaseURL`), the install step
-(`OnInstall`, `Installation`, `RefuseInstall`), the identity headers the
+the host verified itself from a carried capability, the identity headers the
 gateway stamped (`InstallationID`, `x-org-id`, `x-session-id`), and the MCP
 surface's OAuth discovery against the host's issuer. All of it is **deleted,
 not fenced**: a solution that consumes modules relays them only through the
 authority, and no path of the saas mode was still reachable. A composition
 that names no `authority/endpoint` is refused at boot. Nothing bridges the two
-models.
+models. The install step came back under the authority
+([below](#the-install-step)): the authority verifies it, not the carrier.
 
 ## A runtime does not register itself
 
@@ -178,6 +179,52 @@ the projected token at `/var/run/secrets/codefly/token` (overridden by
 `CODEFLY__WORKLOAD_TOKEN_FILE`), re-read on every call because the projection
 is rotated under the running process. Declare `module-identity` on the
 backend so the run projects it.
+
+### The install step
+
+The host records an installation **pending** and delivers its setup to
+`POST /_codefly/installations` on this listener. The installation becomes
+active only after this answers 204 for it, and `OnInstall(step)` is what
+answers. The request carries a **setup-only credential** that the authority
+issued for that one pending attempt, in `x-codefly-work-context`, with
+`x-codefly-installation-id` and `x-codefly-installation-revision` beside it. Its
+body is `{installation_id, organization_id, revision, scope}`.
+
+- **The authority verifies the step, and nothing else does.** The runtime asks
+  the authority's `Check` at the method `POST /_codefly/installations`. The
+  authority routes that method to its dedicated step verifier and never to
+  ordinary checking, and the check is never advisory, under
+  `hop/ENFORCEMENT=warn` too. The verifier holds the credential to this
+  module's delivered principal, the installation and its revision, the
+  delivered generation, and the current pending attempt. The runtime then
+  requires the body and the carriers to name exactly what was verified: the
+  organization, installation and revision. It also requires a consent receipt
+  and a single scope, `installations:install` on that installation. A carrier
+  parsed alone is never enough.
+- **`Installation` is what was verified**: `ID`, `OrganizationID`, `Revision`,
+  and `Receipt`, the consent operation the step was issued under, which a host
+  retry of the same attempt keeps. The body's `scope` is decoded and dropped:
+  the step credential verifies none of it.
+- **The step holds nothing.** It is given no Gateway (`ViewerFromContext`
+  errors inside it), and the setup credential is never handed to it or
+  forwarded. A pending installation is active nowhere, so there is nothing to
+  act under until it is.
+- **One attempt runs once per process.** Concurrent deliveries of one
+  (installation, revision, receipt) wait for the first, and an
+  acknowledgement is answered from memory for the most recent 1024 attempts.
+  A repeat is still verified by the authority first, so a remembered 204 is
+  never the answer to an attempt that no longer stands. A refusal and a
+  failure are not remembered, so the host's retry runs the step again. The
+  memory is per process: across a restart or another replica the step runs
+  again, so it must converge.
+- **Answers.** 204 is done. 409 `{"reason": …}` is terminal: `RefuseInstall`'s
+  public reason, the authority's refusal of the attempt, a verified step that
+  names another installation, or a solution that declares no step (with no
+  step, nothing is ever acknowledged). 401 means the credential did not
+  verify. 400 means a malformed body or carriers. 503 covers everything the
+  host should retry, the installation staying pending: the attempt changed
+  or its credential is outside its window, the authority is unreachable, or
+  the step failed. A step's own error text never reaches the answer.
 
 ## Configuration
 
