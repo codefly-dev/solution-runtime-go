@@ -31,7 +31,8 @@ import (
 //
 // The step is given no Gateway. The installation is pending, so nothing it
 // holds is active yet, and the setup credential grants delivery of the step
-// and nothing else: it is never handed to the step and never forwarded.
+// and explicitly declared setup methods, issued separately by Authority. The
+// callback credential is never exposed to solution code or sent to a module.
 
 // Installation is one pending installation of this solution, as the authority
 // verified the step for it.
@@ -44,6 +45,7 @@ type Installation struct {
 	// whose intent, delivered generation and digest the authority checks. A
 	// host retry of the same attempt carries the same operation.
 	OperationID string
+	setup       *installationSetup
 }
 
 // ErrInstallRefused marks an intentional install refusal. Use RefuseInstall
@@ -75,8 +77,9 @@ func (*installRefusal) Unwrap() error   { return ErrInstallRefused }
 // A solution that declares no step is not installable: the step is refused
 // rather than acknowledged, because an acknowledgement is what activates the
 // installation, and nothing here set it up.
-func (s *Server) OnInstall(step func(context.Context, Installation) error) *Server {
+func (s *Server) OnInstall(step func(context.Context, Installation) error, modules ...SetupModule) *Server {
 	s.installStep = step
+	s.setupModules = append([]SetupModule(nil), modules...)
 	return s
 }
 
@@ -119,7 +122,10 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	installation.OperationID = verified.GetTaskId()
-	s.installOnce(r.Context(), installation).write(w)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	installation.setup = &installationSetup{ctx: ctx, server: s, token: tokens[0]}
+	s.installOnce(ctx, installation).write(w)
 }
 
 // decodeInstallation bounds the entire body, including whitespace after the

@@ -62,8 +62,12 @@ func (s *Server) authorityRoute() string { return "/v1/" + s.manifest.ID }
 // refuses the boot naming what is missing: a backend that cannot name a
 // binding cannot be issued a capability, and that belongs at start-up.
 func (s *Server) openRelays(lookup func(group, key string) (string, error)) (map[string]*moduleRelay, error) {
+	return s.openModuleRelays(s.consumed, lookup)
+}
+
+func (s *Server) openModuleRelays(modules []ConsumedModule, lookup func(group, key string) (string, error)) (map[string]*moduleRelay, error) {
 	relays := map[string]*moduleRelay{}
-	for _, module := range s.consumed {
+	for _, module := range modules {
 		a := module.Authority
 		slot := func(key, what string) (string, error) {
 			value, err := lookup(a.Group, key)
