@@ -33,9 +33,11 @@ type relayedModule struct {
 	streamed int
 	hold     bool
 	// secret is the Thing's undeclared field, which never reaches the page.
-	secret string
-	mu     sync.Mutex
-	calls  []relayedCall
+	secret        string
+	unaryStarted  chan struct{}
+	unaryCanceled chan struct{}
+	mu            sync.Mutex
+	calls         []relayedCall
 }
 
 type relayedCall struct {
@@ -71,6 +73,12 @@ func (m *relayedModule) serve(t *testing.T) string {
 			return out
 		}
 		if method != watchName {
+			if m.unaryStarted != nil {
+				close(m.unaryStarted)
+				<-stream.Context().Done()
+				close(m.unaryCanceled)
+				return stream.Context().Err()
+			}
 			if refuse != nil {
 				return refuse
 			}

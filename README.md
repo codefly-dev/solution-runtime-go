@@ -207,11 +207,8 @@ a `scope` among them, is refused 400.
   verified task id), which a host retry of the same attempt keeps. The rest of
   the consent receipt (its intent, the delivered generation and the offer
   digest) is the authority's to check, through the step's signed binding and
-  its current state. Nothing else is passed on.
-- **The step holds nothing.** It is given no Gateway (`ViewerFromContext`
-  errors inside it), and the setup credential is never handed to it or
-  forwarded. A pending installation is active nowhere, so there is nothing to
-  act under until it is.
+  its current state. The callback also carries a private attempt handle for declared setup calls.
+- **Setup calls are explicit.** `OnInstall(step, SetupModule{As: ..., Authority: ..., Methods: ...})` declares exact unary RPCs. `installation.Call(ctx, alias, method, request, response)` exchanges the verified callback credential through Authority for that one setup method. Composition must declare the same setup binding/method. No Gateway or ordinary pending authority is granted; the callback credential is private and never sent to the destination. Calls expire with the callback and cannot be used from a retained handle.
 - **One attempt runs once per process.** Concurrent deliveries of one
   (installation, revision, consent operation) wait for the first, and an
   acknowledgement is answered from memory for the most recent 1024 attempts.

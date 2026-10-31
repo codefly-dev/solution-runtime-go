@@ -88,7 +88,7 @@ func TestAnInstallStepRunsOnlyWhatTheAuthorityVerified(t *testing.T) {
 		t.Fatalf("a verified step answered %d: %s", answer.Code, answer.Body)
 	}
 	want := Installation{ID: "inst-1", OrganizationID: "org-1", Revision: 3, OperationID: "operation-1"}
-	if len(*ran) != 1 || (*ran)[0] != want {
+	if len(*ran) != 1 || (*ran)[0].ID != want.ID || (*ran)[0].OrganizationID != want.OrganizationID || (*ran)[0].Revision != want.Revision || (*ran)[0].OperationID != want.OperationID || (*ran)[0].setup == nil {
 		t.Fatalf("the step ran with %+v, want once with %+v", *ran, want)
 	}
 	checks := stand.checks()

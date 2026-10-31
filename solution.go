@@ -148,7 +148,9 @@ type Server struct {
 	passthrough map[string]passthroughRoute
 	// relays is each relayed consumed module's binding and connection
 	// (passthrough_authority.go).
-	relays map[string]*moduleRelay
+	relays       map[string]*moduleRelay
+	setupModules []SetupModule
+	setupRelays  map[string]*moduleRelay
 	// mcp is the MCP server the solution declared with ServeMCP, nil when it
 	// declared none; mcpRedeclared records a second ServeMCP, which the boot
 	// refuses rather than letting the last call quietly be the only surface.
@@ -561,6 +563,9 @@ func (s *Server) start(ctx context.Context) (net.Listener, error) {
 	// The passthrough relays each consumed module, as the viewer, through the
 	// hop and the binding the composition names for it.
 	if s.relays, err = s.openRelays(codefly.For(ctx).WorkspaceConfiguration); err != nil {
+		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
+	}
+	if s.setupRelays, err = s.openSetupRelays(codefly.For(ctx).WorkspaceConfiguration); err != nil {
 		return nil, fmt.Errorf("solution %q: %w", s.manifest.ID, err)
 	}
 	// The contract this solution publishes is resolved from the same
