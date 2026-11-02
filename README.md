@@ -641,6 +641,36 @@ is published, and an operation missing its documentation or its policy is
 refused, at generation and at boot. A `Message[T]` field is described from its
 descriptor, with protobuf JSON names.
 
+Declare required top-level request keys with
+`Request: solution.RequiredFields(reviewRequest{}, "recordId", "revision", "typeRevision")`.
+Names are exact JSON property names, not Go field names. This emits a separate
+request definition for the operation with Swagger `required`; Core projects those fields as
+`optional: false`. Other operations, responses and nested uses of the same type
+remain unchanged, including recursive occurrences. No names means no change.
+This declares key presence only; handlers still own nonblank, non-null and
+business validation. It does not install request validation middleware.
+
+The opt-in supports a named ordinary struct or non-nil pointer to it with
+direct, uniquely named exported fields. Its reachable fields may use named
+structs, strings, booleans, signed integers, floats, pointers, arrays, non-byte
+slices and string-keyed maps. At generation and boot it refuses unknown, blank
+or repeated required names, and rejects embedding, invalid JSON names, the JSON
+`string` option, JSON/text codecs (including `time.Time`), protobuf `Message`,
+byte slices and interfaces anywhere in the request graph. Two distinct types
+whose names produce the same definition within that graph are also refused.
+The graph has its own definition namespace, so another operation or response
+using the same short type name cannot change it, nor can the built-in `Error`.
+Unexported and `json:"-"` fields cannot be named. `omitempty` does not imply
+input optionality. Use the wrapper only in `Request`; nested requirements are
+outside this API.
+
+The generated contract retains the generator's **non-null input subset**:
+pointer and collection properties may be absent when optional, but a present
+value must have the declared JSON type. Go can encode nil pointers and nil
+collections as `null`; that value is outside this contract even if a handler
+accepts it. This API neither adds nullability nor claims to describe every
+input Go's decoder can accept.
+
 The artifact's security scheme is the `x-codefly-work-context` header the edge
 sends. Every operation also declares its `Policy`, what a call to the route must
 hold: `solution.Requires(kind, actions...)` or `solution.AnyCheckedCaller()`,
