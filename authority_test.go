@@ -36,6 +36,9 @@ type interfaceAuthority struct {
 	// method no row matches is refused with the authority's reason, or, on an
 	// advisory check, answered beside the context.
 	held []string
+	// step, when set, answers a Check at the install step's method: the
+	// authority's dedicated step verifier.
+	step func(*authorityv1.CheckRequest) (*authorityv1.CheckResponse, error)
 }
 
 // edgeContext is the person's Work Context the edge sends the page.
@@ -60,8 +63,14 @@ const robinChild = "robin-child-for-the-page"
 func (a *interfaceAuthority) Check(_ context.Context, r *authorityv1.CheckRequest) (*authorityv1.CheckResponse, error) {
 	a.mu.Lock()
 	a.checked = append(a.checked, proto.Clone(r).(*authorityv1.CheckRequest))
-	held := a.held
+	held, step := a.held, a.step
 	a.mu.Unlock()
+	if r.GetMethod() == installationStepMethod {
+		if step == nil {
+			return nil, status.Error(codes.PermissionDenied, "not this installation's setup credential")
+		}
+		return step(r)
+	}
 	if r.GetToken() == malformedContext {
 		return nil, status.Error(codes.InvalidArgument, "the Work Context is not a token the authority can read")
 	}

@@ -155,6 +155,13 @@ type Server struct {
 	mcp           *mcpSurface
 	mcpRedeclared bool
 	cfg           config
+	// installStep is declared before Serve, like the handlers (OnInstall).
+	// installations remembers each attempt's outcome under installMu
+	// (installation.go).
+	installStep      func(context.Context, Installation) error
+	installMu        sync.Mutex
+	installations    map[installationKey]*installationResult
+	installCompleted []installationKey
 	// host is the authority interface the composition names, dialled at boot.
 	host *hostAuthority
 	// declaredContract is the contract the author declared (Contract);
@@ -583,6 +590,8 @@ func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	// presence document names; this process does not report its liveness
 	// anywhere, and has no way to make itself present by answering.
 	mux.HandleFunc(HealthPath, s.handleHealth)
+	// The install step, which the authority verifies before anything runs.
+	mux.HandleFunc("POST "+installationPath, s.handleInstallation)
 	if err := s.mountOperations(mux); err != nil {
 		return err
 	}

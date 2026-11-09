@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -375,5 +376,40 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 	}
 	if _, err := New(Manifest{ID: "test"}).InterfaceArtifact(t.TempDir(), InterfaceInfo{}); err == nil {
 		t.Fatal("a backend with no service manifest rendered a version")
+	}
+}
+
+// A relayed method that declares its own policy is published with it, so the
+// authority's Check holds the route to the solution's own roles before any
+// child is issued; one that declares none stays any checked caller's. A
+// malformed policy is refused when the relay is resolved, by name.
+func TestARelayedMethodPublishesTheSolutionsOwnPolicy(t *testing.T) {
+	module := watchModule(ConsumedMethod{WholeResponse: true})
+	module.Methods[0].Policy = Requires("test.page", "read")
+	ops, err := PassthroughOperations(module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, op := range ops {
+		policy, _ := json.Marshal(op.Policy)
+		got[op.Path] = string(policy)
+		// A declared policy, a read-only one included, never makes a relayed
+		// route an agent's: it stays excluded, so it is never marked as a
+		// Runnable operation.
+		if !op.Exclude {
+			t.Fatalf("relayed route %s is offered to agents", op.Path)
+		}
+	}
+	want := map[string]string{
+		searchPath: `{"requires":[{"resource_kind":"test.page","actions":["read"]}]}`,
+		"/modules/things/relayed.v1.Things/Watch": `{"any_checked_caller":true}`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("relayed routes publish %v, want %v", got, want)
+	}
+	module.Methods[0].Policy = &Policy{}
+	if _, err := PassthroughOperations(module); err == nil || !strings.Contains(err.Error(), "empty authority policy") {
+		t.Fatalf("an empty relayed policy was accepted: %v", err)
 	}
 }

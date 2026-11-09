@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — a relayed method may declare the solution's own policy
+
+- **`ConsumedMethod.Policy`** is what a call to the method's relayed route must
+  hold at the solution itself, in the solution's own vocabulary.
+  `PassthroughOperations` (and so `InterfaceArtifact`) publishes it as the
+  route's `x-codefly-authority-policy`, so the authority's `Check` holds the
+  route to the solution's roles before any child is issued, and each role's
+  reach lists the relayed calls it has.
+- Unset keeps the previous behaviour exactly: the route is any checked
+  caller's, gated by the child issued through the binding and the module's own
+  method policy. Those still apply behind a declared `Policy`; it only narrows.
+  Under `hop/ENFORCEMENT=warn` the route check is advisory, as for every route,
+  so a `Policy` refusal is logged and the call proceeds.
+- A malformed `Policy`, an empty one included, is refused when the relay is
+  resolved (`Consumes` at boot, `PassthroughOperations`), naming the method.
+- A relayed route stays excluded from every agent and unmarked whatever its
+  policy: a read-only `Policy` does not make it a Runnable operation.
+
+## Unreleased — the install step, verified by the authority
+
+- **`OnInstall`, `Installation`, `RefuseInstall`, `ErrInstallRefused`** are back,
+  additive to the current API. The host delivers a pending installation's setup
+  to `POST /_codefly/installations`, whose body is exactly
+  `{installation_id, organization_id, revision}`.
+  The runtime asks the authority's `Check` at that method, which is the
+  authority's dedicated, never-advisory step verifier. The body and the
+  installation carriers must then name exactly the organization, installation
+  and revision it verified, with a consent operation and only
+  `installations:install` on that installation.
+- `Installation` is the verified facts, with the new `OperationID` (the consent
+  operation, the verified task id). An authority refusal answers 409 with one
+  generic reason, as does a refusal answered beside the verified context. A body carrying
+  any other member, `scope` included, is refused 400.
+- The step is given no Gateway, and a solution with no step is answered 409,
+  never 204.
+- One (installation, revision, consent operation) runs once per process. A repeat is
+  verified before a remembered 204 answers it.
+- What the e80369a deletion removed stays removed: a carrier parsed alone, a
+  nil step acknowledged, and a step acting under the carried capability.
+
 ## Unreleased — an operation names the tool it is offered as
 
 - **`Operation.Tool`** is the model-facing name of a marked read. Empty keeps

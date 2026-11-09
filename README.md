@@ -50,13 +50,14 @@ the host's gateway, a Task Work Context minted through accounts for the viewer
 from the host's module broker (`Server.Credential`, `CredentialSource`, the
 `module-authority` group), a module called over its REST binding
 (`Gateway.Transcoded`, `Unary`, `HTTPClient`, `BaseURL`), the install step
-(`OnInstall`, `Installation`, `RefuseInstall`), the identity headers the
+the host verified itself from a carried capability, the identity headers the
 gateway stamped (`InstallationID`, `x-org-id`, `x-session-id`), and the MCP
 surface's OAuth discovery against the host's issuer. All of it is **deleted,
 not fenced**: a solution that consumes modules relays them only through the
 authority, and no path of the saas mode was still reachable. A composition
 that names no `authority/endpoint` is refused at boot. Nothing bridges the two
-models.
+models. The install step came back under the authority
+([below](#the-install-step)): the authority verifies it, not the carrier.
 
 ## A runtime does not register itself
 
@@ -178,6 +179,65 @@ the projected token at `/var/run/secrets/codefly/token` (overridden by
 `CODEFLY__WORKLOAD_TOKEN_FILE`), re-read on every call because the projection
 is rotated under the running process. Declare `module-identity` on the
 backend so the run projects it.
+
+### The install step
+
+The host records an installation **pending** and delivers its setup to
+`POST /_codefly/installations` on this listener. The installation becomes
+active only after this answers 204 for it, and `OnInstall(step)` is what
+answers. The request carries a **setup-only credential** that the authority
+issued for that one pending attempt, in `x-codefly-work-context`, with
+`x-codefly-installation-id` and `x-codefly-installation-revision` beside it. Its
+body is exactly `{installation_id, organization_id, revision}`; any other member,
+a `scope` among them, is refused 400.
+
+- **The authority verifies the step, and nothing else does.** The runtime asks
+  the authority's `Check` at the method `POST /_codefly/installations`. The
+  authority routes that method to its dedicated step verifier and never to
+  ordinary checking, and the check is never advisory, under
+  `hop/ENFORCEMENT=warn` too. The verifier holds the credential to this
+  module's delivered principal, the installation and its revision, the
+  delivered generation, and the current pending attempt. The runtime then
+  requires the body and the carriers to name exactly what was verified: the
+  organization, installation and revision. It also requires a consent
+  operation and a single scope, `installations:install` on that installation. A carrier
+  parsed alone is never enough.
+- **`Installation` is what was verified**: `ID`, `OrganizationID`, `Revision`,
+  and `OperationID`, the consent operation the step was issued under (the
+  verified task id), which a host retry of the same attempt keeps. The rest of
+  the consent receipt (its intent, the delivered generation and the offer
+  digest) is the authority's to check, through the step's signed binding and
+  its current state. Nothing else is passed on.
+- **The step holds nothing.** It is given no Gateway (`ViewerFromContext`
+  errors inside it), and the setup credential is never handed to it or
+  forwarded. A pending installation is active nowhere, so there is nothing to
+  act under until it is.
+- **One attempt runs once per process.** Concurrent deliveries of one
+  (installation, revision, consent operation) wait for the first, and an
+  acknowledgement is answered from memory for the most recent 1024 attempts.
+  A repeat is still verified by the authority first, so a remembered 204 is
+  never the answer to an attempt that no longer stands. A refusal and a
+  failure are not remembered, so the host's retry runs the step again. The
+  memory is per process: across a restart or another replica the step runs
+  again, so it must converge.
+- **Answers.** 204 is done. 409 `{"reason": …}` ends this delivery:
+  - `RefuseInstall`'s public reason;
+  - the authority refusing the credential (PermissionDenied, InvalidArgument,
+    Unauthenticated, NotFound, or a refusal answered beside the context), with
+    one generic reason, the authority's own being logged;
+  - a verified step that names another installation;
+  - a solution that declares no step (with no step, nothing is ever
+    acknowledged).
+
+  A 409 does not end the installation: a fresh claim or a fresh consent may
+  issue another credential. 401 means no single credential was carried. 400
+  means a malformed body or carriers. 503 covers everything the host should
+  retry, the installation staying pending: the attempt changed or its
+  credential is outside its window (FailedPrecondition), the call was cancelled
+  or timed out, the authority failed or is unreachable, or the step failed. A
+  step's own error text never reaches the answer. Verification is admission,
+  not a reservation: the authority's activation fence still refuses a revoke
+  or redelivery that races the step.
 
 ## Configuration
 
@@ -473,22 +533,39 @@ needed. The page names a procedure and a request message, never an address, a
 binding or an authority, and authorization stays at the module, whose hop holds
 each call to the module's own method policy.
 
-**Why a relayed route is any checked caller's.** Every relayed route is
-published in the interface artifact with `x-codefly-authority-policy:
-{"any_checked_caller": true}`, and the runtime's `Check` names it as served
+**Why a relayed route is any checked caller's, by default.** A relayed route
+with no `Policy` of its own is published in the interface artifact with
+`x-codefly-authority-policy: {"any_checked_caller": true}`, and the runtime's
+`Check` names it as served
 (`POST /v1/<id>/modules/<as>/<package.Service>/<Method>`), so an enforcing
 authority admits it for what it declares rather than refusing it for declaring
-nothing. The route row is not the gate, by design: the gate on a relayed call
-is the per-call child the authority issues through the solution's declared
-binding for the module — the person's current grants at the module (which
-include what the solution's roles grant there) intersected with the binding's
-invoke ceiling, narrowed to the method's declared scopes — and the module's
-own method policy, which its hop applies to that child. A second route policy
-of the solution's would restate, in the solution's vocabulary, what the binding
-and the module's policy already decide, and could only disagree with them. The
-child is issued per call (the passthrough builds a fresh gateway for each), and
-each relayed call costs the authority three round trips: the `Check` of the
-edge's context, the `Issue` of the child, and the hop's `Check` of the child.
+nothing. The route row is not the gate then: the gate on a relayed call is the
+per-call child the authority issues through the solution's declared binding for
+the module — the person's current grants at the module (which include what the
+solution's roles grant there) intersected with the binding's invoke ceiling,
+narrowed to the method's declared scopes — and the module's own method policy,
+which its hop applies to that child. The child is issued per call (the
+passthrough builds a fresh gateway for each), and each relayed call costs the
+authority three round trips: the `Check` of the edge's context, the `Issue` of
+the child, and the hop's `Check` of the child.
+
+**A relayed method may hold the route to the solution's own roles.** Those
+gates ask what the person may do *at the module*, and a person's grants there
+need not come from this solution. When the solution's own roles decide who
+makes a call at all — an upload only its editors make, say — the method
+declares `Policy`, in the solution's vocabulary, exactly as an operation does:
+
+```go
+{Name: uploadMethod, Policy: solution.Requires("wiki.page", "write"), WholeResponse: true}
+```
+
+The route is published with that row instead, so the authority's `Check`
+refuses it by name at the solution before any child is issued, and each role's
+reach says which relayed calls it has. That refusal holds in an enforcing run:
+under `hop/ENFORCEMENT=warn` the route check is advisory, as for every route,
+so the refusal is logged and the call proceeds to the child. The child and the module's method policy
+still apply behind it: a `Policy` only narrows. A malformed `Policy` (an empty
+one included) is refused at boot, naming the method.
 
 **The authority is the only way a call reaches a module.** A solution that
 declares consumed modules and has no `authority/endpoint` refuses to boot,
@@ -653,7 +730,8 @@ none, or both, is refused at generation by name. The artifact has no base path
 served and is the `"<VERB> <template>"` the runtime's `Check` names. A path
 ending in `/` serves its subtree and is written `/…/{path=**}`. The passthrough
 routes `InterfaceArtifact` publishes beside the solution's own are any checked
-caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
+caller's unless a method declares its own `Policy`: see
+[why](#letting-the-page-call-a-consumed-module-the-passthrough).
 
 **Every read is a Runnable operation, and so a tool.** Beside the policy of
 each operation whose policy requires only `read`, `InterfaceArtifact` writes

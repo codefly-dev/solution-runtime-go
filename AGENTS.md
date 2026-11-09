@@ -15,9 +15,15 @@ agent clients.
 **The runtime runs only under the authority.** The saas-host mode — a bearer
 forwarded to the host's gateway, `ForModule` minting a Task Work Context
 through accounts, the broker execution credential, `Transcoded`/`Unary`
-calls over a module's REST binding, the install step, gateway-stamped
-identity headers and the MCP surface's OAuth discovery against the host's
-issuer — is **deleted, not fenced**. A boot whose composition names no
+calls over a module's REST binding, the install step verified from its
+carrier alone, gateway-stamped identity headers and the MCP surface's OAuth
+discovery against the host's issuer — is **deleted, not fenced**. The install
+step is back under the authority (`installation.go`). The authority's `Check`
+at `POST /_codefly/installations` is its dedicated step verifier. A step runs
+only after that check, and only when the body names exactly what was verified.
+It is given no Gateway, and a solution with no `OnInstall` is never
+acknowledged. Do not let a remembered acknowledgement answer before the check,
+and do not hand the step anything to act under. A boot whose composition names no
 `authority/endpoint` is refused. If you are about to add a path that reaches a
 module, or learns who a viewer is, without the authority, you are rebuilding
 what this repository deleted.
