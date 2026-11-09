@@ -11,6 +11,8 @@
 - Unset keeps the previous behaviour exactly: the route is any checked
   caller's, gated by the child issued through the binding and the module's own
   method policy. Those still apply behind a declared `Policy`; it only narrows.
+  Under `hop/ENFORCEMENT=warn` the route check is advisory, as for every route,
+  so a `Policy` refusal is logged and the call proceeds.
 - A malformed `Policy`, an empty one included, is refused when the relay is
   resolved (`Consumes` at boot, `PassthroughOperations`), naming the method.
 - A relayed route stays excluded from every agent and unmarked whatever its

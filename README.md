@@ -561,7 +561,9 @@ declares `Policy`, in the solution's vocabulary, exactly as an operation does:
 
 The route is published with that row instead, so the authority's `Check`
 refuses it by name at the solution before any child is issued, and each role's
-reach says which relayed calls it has. The child and the module's method policy
+reach says which relayed calls it has. That refusal holds in an enforcing run:
+under `hop/ENFORCEMENT=warn` the route check is advisory, as for every route,
+so the refusal is logged and the call proceeds to the child. The child and the module's method policy
 still apply behind it: a `Policy` only narrows. A malformed `Policy` (an empty
 one included) is refused at boot, naming the method.
 

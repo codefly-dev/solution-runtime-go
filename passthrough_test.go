@@ -385,7 +385,7 @@ func TestInterfaceArtifactCarriesTheManifestVersionAndBothSurfaces(t *testing.T)
 // malformed policy is refused when the relay is resolved, by name.
 func TestARelayedMethodPublishesTheSolutionsOwnPolicy(t *testing.T) {
 	module := watchModule(ConsumedMethod{WholeResponse: true})
-	module.Methods[0].Policy = Requires("test.page", "write")
+	module.Methods[0].Policy = Requires("test.page", "read")
 	ops, err := PassthroughOperations(module)
 	if err != nil {
 		t.Fatal(err)
@@ -394,14 +394,15 @@ func TestARelayedMethodPublishesTheSolutionsOwnPolicy(t *testing.T) {
 	for _, op := range ops {
 		policy, _ := json.Marshal(op.Policy)
 		got[op.Path] = string(policy)
-		// A declared policy never makes a relayed route an agent's: it stays
-		// excluded, so it is never marked as a Runnable operation.
+		// A declared policy, a read-only one included, never makes a relayed
+		// route an agent's: it stays excluded, so it is never marked as a
+		// Runnable operation.
 		if !op.Exclude {
 			t.Fatalf("relayed route %s is offered to agents", op.Path)
 		}
 	}
 	want := map[string]string{
-		searchPath: `{"requires":[{"resource_kind":"test.page","actions":["write"]}]}`,
+		searchPath: `{"requires":[{"resource_kind":"test.page","actions":["read"]}]}`,
 		"/modules/things/relayed.v1.Things/Watch": `{"any_checked_caller":true}`,
 	}
 	if !reflect.DeepEqual(got, want) {

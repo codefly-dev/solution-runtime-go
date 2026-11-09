@@ -289,7 +289,8 @@ func (s *Server) installOnce(ctx context.Context, installation Installation) ins
 func (s *Server) runInstall(ctx context.Context, installation Installation) (outcome installationOutcome) {
 	outcome.status = http.StatusServiceUnavailable
 	defer func() {
-		if recover() != nil {
+		if p := recover(); p != nil {
+			log.Printf("solution %q: the install step for installation %q panicked: %v", s.manifest.ID, installation.ID, p)
 			outcome = installationOutcome{status: http.StatusServiceUnavailable}
 		}
 	}()

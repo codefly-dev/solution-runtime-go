@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	authorityv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/authority/v1"
 	"github.com/codefly-dev/sdk-go/workcontext"
@@ -154,6 +155,16 @@ func TestAnInstallStepTheAuthorityDoesNotVerifyNeverRuns(t *testing.T) {
 		}), status: http.StatusConflict},
 		"addressed to another module": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.Audience = "documents" }), status: http.StatusConflict},
 		"no consent operation":        {step: verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.TaskId = "" }), status: http.StatusConflict},
+		"verified in another tenant":  {step: verifiedStep(func(wc *authorityv1.WorkContextV1) { wc.TenantId = "org-2" }), status: http.StatusConflict},
+		"acting for another actor": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) {
+			wc.ActorChain = []*authorityv1.WorkActorV1{{PrincipalId: "someone"}}
+		}), status: http.StatusConflict},
+		"installing another installation": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) {
+			wc.AuthorityScopes[0].ResourceIds = []string{"inst-2"}
+		}), status: http.StatusConflict},
+		"another action on the installation": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) {
+			wc.AuthorityScopes[0].Actions = []string{"read"}
+		}), status: http.StatusConflict},
 		"an ordinary capability": {step: verifiedStep(func(wc *authorityv1.WorkContextV1) {
 			wc.AuthorityScopes = append(wc.AuthorityScopes, &authorityv1.WorkScopeV1{ResourceKind: "pages", Actions: []string{"read"}})
 		}), status: http.StatusConflict},
@@ -229,8 +240,15 @@ func TestConcurrentDeliveriesOfOneAttemptRunTheStepOnce(t *testing.T) {
 			answers[i] = install(s, stepRequest(stepCredential)).Code
 		}()
 	}
-	// The first delivery is inside the step; the others reach it and wait.
+	// The first delivery is inside the step. Hold it there until every
+	// delivery has been verified, and give the others time to reach the
+	// in-flight entry, so a ledger that registered an attempt only once its
+	// step finished would run the step again here.
 	<-started
+	for len(stand.checks()) < len(answers) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
 	close(release)
 	wg.Wait()
 	if runs.Load() != 1 {

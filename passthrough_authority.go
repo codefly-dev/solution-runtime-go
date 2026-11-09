@@ -145,9 +145,10 @@ func (s *Server) asTheViewer(ctx context.Context, route passthroughRoute, req *c
 		return nil, "", connect.NewError(connect.CodeNotFound, errors.New("no such operation"))
 	}
 	// The route is named as served, so the authority applies the row the
-	// interface artifact publishes for it: any checked caller. What the call
-	// may do is the child issued below through the binding, and the module's
-	// own method policy, which its hop applies to that child.
+	// interface artifact publishes for it: the method's Policy, else any
+	// checked caller. What the call may do is the child issued below through
+	// the binding, and the module's own method policy, which its hop applies
+	// to that child.
 	gw, err := s.viewerGateway(ctx, req.Header().Get(WorkContextHeader), req.HTTPMethod()+" "+s.authorityRoute()+route.path)
 	if err != nil {
 		code := connect.CodeUnauthenticated
