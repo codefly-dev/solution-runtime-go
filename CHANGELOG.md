@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — a pinned list confines the page's
+
+- **A list of scalars a `ConsumedMethod.Pin` sets is the most the page may
+  name.** A request that names none takes the pin's values; one naming any
+  value outside them is refused `permission_denied`, naming the field, before
+  the module is called. It used to be appended (`proto.Merge`), so a pinned
+  set of collections was a floor the page could add to — the union widened
+  past what the solution meant to read. Singular messages are confined at any
+  depth, groups and extensions included; lists of messages (filter clauses a
+  module ANDs) and maps are merged as before, and so is every scalar. A pinned
+  field the request cannot carry is refused, never skipped.
+- `PassthroughOperations` describes the confinement in each pinned route's
+  behaviour.
+
 ## Unreleased — a relayed method may declare the solution's own policy
 
 - **`ConsumedMethod.Policy`** is what a call to the method's relayed route must

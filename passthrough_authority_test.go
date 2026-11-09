@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -219,6 +220,69 @@ func TestThePassthroughRelaysAsTheViewer(t *testing.T) {
 	}
 	if len(module.observed()) != 2 {
 		t.Fatalf("the module was called %d times", len(module.observed()))
+	}
+}
+
+// A pinned list of values is the most the page may name: a request naming
+// none takes the pin's, one naming part of it is relayed with that part, and
+// one naming anything else is refused by the field's name before the module
+// is called — never widened to the union. The same holds inside a pinned
+// message; a pinned scalar still replaces the page's.
+func TestAPinnedListConfinesTheRequest(t *testing.T) {
+	declared := pinnedSearch(passthroughModule())
+	pin := declared.Methods[0].Pin.(*dynamicpb.Message)
+	ids := pin.Mutable(pin.Descriptor().Fields().ByName("ids")).List()
+	ids.Append(protoreflect.ValueOfString("a"))
+	ids.Append(protoreflect.ValueOfString("b"))
+	filter := pin.Mutable(pin.Descriptor().Fields().ByName("filter")).Message()
+	filter.Mutable(filter.Descriptor().Fields().ByName("tags")).List().Append(protoreflect.ValueOfString("t1"))
+	module := &relayedModule{}
+	page, _ := relayedPage(t, declared, module, "things-binding")
+
+	values := func(m protoreflect.Message, name string) []string {
+		var out []string
+		list := m.Get(m.Descriptor().Fields().ByName(protoreflect.Name(name))).List()
+		for i := 0; i < list.Len(); i++ {
+			out = append(out, list.Get(i).String())
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name, body string
+		ids, tags  []string
+	}{
+		{"names none: the pin's", `{"entryId":"e1"}`, []string{"a", "b"}, []string{"t1"}},
+		{"names part of it: that part", `{"entryId":"e1","ids":["b"],"filter":{"tags":["t1"]}}`, []string{"b"}, []string{"t1"}},
+	} {
+		before := len(module.observed())
+		if code, answer := connectCall(t, page.URL+relayedSearchPath, edgeContext, tc.body); code != http.StatusOK {
+			t.Fatalf("%s: answered %d %v", tc.name, code, answer)
+		}
+		call := module.observed()[before]
+		filtered := call.request.Get(call.request.Descriptor().Fields().ByName("filter")).Message()
+		if got := values(call.request, "ids"); strings.Join(got, ",") != strings.Join(tc.ids, ",") {
+			t.Errorf("%s: the module was asked ids %v, want %v", tc.name, got, tc.ids)
+		}
+		if got := values(filtered, "tags"); strings.Join(got, ",") != strings.Join(tc.tags, ",") {
+			t.Errorf("%s: the module was asked tags %v, want %v", tc.name, got, tc.tags)
+		}
+		if tenant := call.request.Get(call.request.Descriptor().Fields().ByName("tenant")).String(); tenant != "pinned-tenant" {
+			t.Errorf("%s: the pinned scalar was not kept: %q", tc.name, tenant)
+		}
+	}
+	for name, tc := range map[string]struct{ body, field string }{
+		"a value outside the pin":        {`{"entryId":"e1","ids":["a","c"]}`, "things.v1.GetThingRequest.ids"},
+		"a nested value outside the pin": {`{"entryId":"e1","filter":{"tags":["t2"]}}`, "things.v1.Sub.tags"},
+	} {
+		before := len(module.observed())
+		code, answer := connectCall(t, page.URL+relayedSearchPath, edgeContext, tc.body)
+		message := fmt.Sprint(answer["message"])
+		if code != http.StatusForbidden || answer["code"] != "permission_denied" || !strings.Contains(message, tc.field) || strings.Contains(message, `"c"`) || strings.Contains(message, "t2") {
+			t.Errorf("%s: answered %d %v; want permission_denied naming the field", name, code, answer)
+		}
+		if len(module.observed()) != before {
+			t.Errorf("%s: the module was called", name)
+		}
 	}
 }
 
