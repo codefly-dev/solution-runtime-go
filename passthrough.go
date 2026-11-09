@@ -88,6 +88,15 @@ type ConsumedMethod struct {
 	// WholeResponse passes every response field, and must be said explicitly:
 	// the zero value of a declaration returns nothing it did not name.
 	WholeResponse bool
+	// Policy, when set, is what a call to this method's relayed route must hold
+	// at the solution itself, in the solution's own vocabulary: the row the
+	// authority's Check applies to the route before any child is issued. Unset,
+	// the route admits any checked caller, and the child issued through the
+	// binding and the module's own method policy are its only gates. A solution
+	// sets it where its roles say who may make the call at all — a write only
+	// its editors make, say — so the route is refused to everyone else by name
+	// at the solution, and every role's reach says which relayed calls it has.
+	Policy *Policy
 	// Pin, when set, is merged into every request the page sends before it is
 	// relayed (proto.Merge): a scalar it sets replaces the page's value, a
 	// message merges, and a repeated field is appended. It is how a solution
@@ -175,6 +184,15 @@ func (r passthroughRoute) procedure() string {
 	return "/" + string(r.md.Parent().FullName()) + "/" + string(r.md.Name())
 }
 
+// policy is what a call to the route must hold at the solution: the method's
+// declared Policy, else any checked caller.
+func (r passthroughRoute) policy() *Policy {
+	if r.method.Policy != nil {
+		return r.method.Policy
+	}
+	return AnyCheckedCaller()
+}
+
 func (r passthroughRoute) timeout() time.Duration {
 	if r.method.Timeout > 0 {
 		return r.method.Timeout
@@ -236,6 +254,11 @@ func resolvePassthrough(modules []ConsumedModule) (map[string]passthroughRoute, 
 			}
 			if err := checkScopes(method.Scopes); err != nil {
 				return nil, fmt.Errorf("consumed module %q: %s: %w", module.As, md.FullName(), err)
+			}
+			if method.Policy != nil {
+				if err := method.Policy.validate(); err != nil {
+					return nil, fmt.Errorf("consumed module %q: %s: %w", module.As, md.FullName(), err)
+				}
 			}
 			if method.Pin != nil && method.Pin.ProtoReflect().Descriptor().FullName() != md.Input().FullName() {
 				return nil, fmt.Errorf("consumed module %q: %s reads %s, but its pin is a %s", module.As, md.FullName(), md.Input().FullName(), method.Pin.ProtoReflect().Descriptor().FullName())
@@ -499,13 +522,15 @@ func codeForStatus(status int) connect.Code {
 // path is relative to the solution's route (/modules/<as>/...); the server's
 // InterfaceArtifact publishes them under it, as served.
 //
-// Every relayed route declares that any checked caller may make it. The gate on
-// a relayed call is not a row of the solution's: it is the child the authority
-// issues for the call through the solution's binding for the module (the
-// person's current grants there, within the binding's ceiling) and the
-// module's own method policy, which its hop applies to that child. The route's
-// row says so, so an enforcing authority admits the route for what it is
-// rather than refusing it for declaring nothing.
+// A relayed route declares the method's Policy when it sets one, and otherwise
+// that any checked caller may make it. The gate on such a call is not a row of
+// the solution's: it is the child the authority issues for the call through
+// the solution's binding for the module (the person's current grants there,
+// within the binding's ceiling) and the module's own method policy, which its
+// hop applies to that child. The route's row says so, so an enforcing
+// authority admits the route for what it is rather than refusing it for
+// declaring nothing. A declared Policy adds the solution's own gate in front
+// of both: its roles decide who makes the call at all.
 func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 	routes, err := resolvePassthrough(modules)
 	if err != nil {
@@ -550,9 +575,10 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 			// Documentation only: InterfaceDocument requires a handler, and the
 			// passthrough, not Operations, serves these routes.
 			Handler: func(context.Context, *Gateway) (any, error) { return nil, errors.New("served by the passthrough") },
-			// Any checked caller: the child issued through the binding and the
-			// module's own method policy gate the call (see above).
-			Policy: AnyCheckedCaller(),
+			// The method's own policy, else any checked caller: the child issued
+			// through the binding and the module's own method policy gate the
+			// call (see above).
+			Policy: route.policy(),
 			// Another module's call: it is a tool through that module's own
 			// derived operation, never twice through this relay.
 			Exclude: true,
