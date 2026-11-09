@@ -533,22 +533,37 @@ needed. The page names a procedure and a request message, never an address, a
 binding or an authority, and authorization stays at the module, whose hop holds
 each call to the module's own method policy.
 
-**Why a relayed route is any checked caller's.** Every relayed route is
-published in the interface artifact with `x-codefly-authority-policy:
-{"any_checked_caller": true}`, and the runtime's `Check` names it as served
+**Why a relayed route is any checked caller's, by default.** A relayed route
+with no `Policy` of its own is published in the interface artifact with
+`x-codefly-authority-policy: {"any_checked_caller": true}`, and the runtime's
+`Check` names it as served
 (`POST /v1/<id>/modules/<as>/<package.Service>/<Method>`), so an enforcing
 authority admits it for what it declares rather than refusing it for declaring
-nothing. The route row is not the gate, by design: the gate on a relayed call
-is the per-call child the authority issues through the solution's declared
-binding for the module — the person's current grants at the module (which
-include what the solution's roles grant there) intersected with the binding's
-invoke ceiling, narrowed to the method's declared scopes — and the module's
-own method policy, which its hop applies to that child. A second route policy
-of the solution's would restate, in the solution's vocabulary, what the binding
-and the module's policy already decide, and could only disagree with them. The
-child is issued per call (the passthrough builds a fresh gateway for each), and
-each relayed call costs the authority three round trips: the `Check` of the
-edge's context, the `Issue` of the child, and the hop's `Check` of the child.
+nothing. The route row is not the gate then: the gate on a relayed call is the
+per-call child the authority issues through the solution's declared binding for
+the module — the person's current grants at the module (which include what the
+solution's roles grant there) intersected with the binding's invoke ceiling,
+narrowed to the method's declared scopes — and the module's own method policy,
+which its hop applies to that child. The child is issued per call (the
+passthrough builds a fresh gateway for each), and each relayed call costs the
+authority three round trips: the `Check` of the edge's context, the `Issue` of
+the child, and the hop's `Check` of the child.
+
+**A relayed method may hold the route to the solution's own roles.** Those
+gates ask what the person may do *at the module*, and a person's grants there
+need not come from this solution. When the solution's own roles decide who
+makes a call at all — an upload only its editors make, say — the method
+declares `Policy`, in the solution's vocabulary, exactly as an operation does:
+
+```go
+{Name: uploadMethod, Policy: solution.Requires("wiki.page", "write"), WholeResponse: true}
+```
+
+The route is published with that row instead, so the authority's `Check`
+refuses it by name at the solution before any child is issued, and each role's
+reach says which relayed calls it has. The child and the module's method policy
+still apply behind it: a `Policy` only narrows. A malformed `Policy` (an empty
+one included) is refused at boot, naming the method.
 
 **The authority is the only way a call reaches a module.** A solution that
 declares consumed modules and has no `authority/endpoint` refuses to boot,
@@ -713,7 +728,8 @@ none, or both, is refused at generation by name. The artifact has no base path
 served and is the `"<VERB> <template>"` the runtime's `Check` names. A path
 ending in `/` serves its subtree and is written `/…/{path=**}`. The passthrough
 routes `InterfaceArtifact` publishes beside the solution's own are any checked
-caller's: see [why](#letting-the-page-call-a-consumed-module-the-passthrough).
+caller's unless a method declares its own `Policy`: see
+[why](#letting-the-page-call-a-consumed-module-the-passthrough).
 
 **Every read is a Runnable operation, and so a tool.** Beside the policy of
 each operation whose policy requires only `read`, `InterfaceArtifact` writes

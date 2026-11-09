@@ -394,6 +394,11 @@ func TestARelayedMethodPublishesTheSolutionsOwnPolicy(t *testing.T) {
 	for _, op := range ops {
 		policy, _ := json.Marshal(op.Policy)
 		got[op.Path] = string(policy)
+		// A declared policy never makes a relayed route an agent's: it stays
+		// excluded, so it is never marked as a Runnable operation.
+		if !op.Exclude {
+			t.Fatalf("relayed route %s is offered to agents", op.Path)
+		}
 	}
 	want := map[string]string{
 		searchPath: `{"requires":[{"resource_kind":"test.page","actions":["write"]}]}`,

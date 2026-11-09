@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — a relayed method may declare the solution's own policy
+
+- **`ConsumedMethod.Policy`** is what a call to the method's relayed route must
+  hold at the solution itself, in the solution's own vocabulary.
+  `PassthroughOperations` (and so `InterfaceArtifact`) publishes it as the
+  route's `x-codefly-authority-policy`, so the authority's `Check` holds the
+  route to the solution's roles before any child is issued, and each role's
+  reach lists the relayed calls it has.
+- Unset keeps the previous behaviour exactly: the route is any checked
+  caller's, gated by the child issued through the binding and the module's own
+  method policy. Those still apply behind a declared `Policy`; it only narrows.
+- A malformed `Policy`, an empty one included, is refused when the relay is
+  resolved (`Consumes` at boot, `PassthroughOperations`), naming the method.
+- A relayed route stays excluded from every agent and unmarked whatever its
+  policy: a read-only `Policy` does not make it a Runnable operation.
+
 ## Unreleased — the install step, verified by the authority
 
 - **`OnInstall`, `Installation`, `RefuseInstall`, `ErrInstallRefused`** are back,
