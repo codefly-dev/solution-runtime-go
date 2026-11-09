@@ -1,7 +1,9 @@
 package solution
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -456,6 +458,23 @@ func applyPin(route passthroughRoute, msg *dynamicpb.Message) error {
 	return nil
 }
 
+// pinText is a pin as the route's behaviour spells it, the same bytes from
+// every binary: protojson's single-line form inserts a space after a comma at
+// random (seeded per binary), so a pin of two or more fields would make a
+// committed interface artifact drift between builds. Compacting removes only
+// that insignificant whitespace.
+func pinText(pin proto.Message) string {
+	raw, err := protojson.Marshal(pin)
+	if err != nil {
+		return "(unencodable)"
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return string(raw)
+	}
+	return compact.String()
+}
+
 // confineToPin applies every list of scalars pin sets to msg, at any depth of
 // singular messages and groups, extensions included, and clears it from pin so
 // the merge that follows does not append it: an empty request list takes the
@@ -635,7 +654,7 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 				"The stream stays open at most %s and each message is at most %d bytes. ", route.procedure(), route.streamDuration(), route.streamMessageLimit())
 		}
 		if route.method.Pin != nil {
-			pin, _ := protojson.Marshal(route.method.Pin)
+			pin := pinText(route.method.Pin)
 			behavior += fmt.Sprintf("Every request is held to the declared pin %s first: a list of scalar values it sets is the most the request may name (none named takes the pin's, one outside it is refused); a list of messages or a map it sets is added to the request's, and a scalar replaces it. ", pin)
 		}
 		if route.method.WholeResponse {
