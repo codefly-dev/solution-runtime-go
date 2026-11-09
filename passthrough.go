@@ -97,12 +97,16 @@ type ConsumedMethod struct {
 	// its editors make, say — so the route is refused to everyone else by name
 	// at the solution, and every role's reach says which relayed calls it has.
 	Policy *Policy
-	// Pin, when set, is merged into every request the page sends before it is
-	// relayed (proto.Merge): a scalar it sets replaces the page's value, a
-	// message merges, and a repeated field is appended. It is how a solution
-	// fixes part of a request server-side — a filter clause the module ANDs
-	// with the page's own, say — so the page can narrow the call but not undo
-	// the pin. It must be the method's request type.
+	// Pin, when set, fixes part of every request the page sends before it is
+	// relayed, so the page can narrow the call but not undo the pin. A list of
+	// scalars it sets CONFINES the request's list: a request that names none
+	// takes the pin's, and one that names a value outside the pin is refused
+	// (PermissionDenied, naming the field) — a pinned set of collections is
+	// the most the page may read, never a floor it adds to. Everything else is
+	// merged (proto.Merge): a scalar it sets replaces the page's value, a
+	// message merges, and a list of messages is appended — a filter clause the
+	// module ANDs with the page's own, say. It must be the method's request
+	// type.
 	Pin proto.Message
 	// MaxRequestBytes bounds the request message the page sends; zero is
 	// DefaultPassthroughRequestLimit.
@@ -429,14 +433,19 @@ func (s *Server) passthroughRoute(route passthroughRoute) http.Handler {
 	return http.StripPrefix(PassthroughPathPrefix+route.module.As, handler)
 }
 
-// applyPin merges the declared pin into the request. It is merged through the
-// wire form: the pin is the generated type, the request a dynamic message over
-// the same descriptor.
+// applyPin applies the declared pin to the request (ConsumedMethod.Pin): the
+// lists of scalars it sets confine the request's, and the rest is merged
+// through the wire form, the pin being the generated type and the request a
+// dynamic message over the same descriptor.
 func applyPin(route passthroughRoute, msg *dynamicpb.Message) error {
 	if route.method.Pin == nil {
 		return nil
 	}
-	pinned, err := proto.Marshal(route.method.Pin)
+	pin := proto.Clone(route.method.Pin)
+	if err := confineToPin(pin.ProtoReflect(), msg); err != nil {
+		return err
+	}
+	pinned, err := proto.Marshal(pin)
 	if err != nil {
 		return connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be encoded"))
 	}
@@ -444,6 +453,60 @@ func applyPin(route passthroughRoute, msg *dynamicpb.Message) error {
 		return connect.NewError(connect.CodeInternal, errors.New("the declared pin cannot be applied"))
 	}
 	return nil
+}
+
+// confineToPin applies every list of scalars pin sets to msg, at any depth of
+// singular messages, and clears it from pin so the merge that follows does not
+// append it: an empty request list takes the pin's values, and a request
+// value the pin does not hold refuses the call by its field's name. Lists of
+// messages and maps are left to the merge.
+func confineToPin(pin protoreflect.Message, msg protoreflect.Message) error {
+	var refusal error
+	var confined []protoreflect.FieldDescriptor
+	pin.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		target := msg.Descriptor().Fields().ByNumber(fd.Number())
+		if target == nil {
+			return true
+		}
+		switch {
+		case fd.IsList() && fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind:
+			allowed := map[any]bool{}
+			for i := 0; i < v.List().Len(); i++ {
+				allowed[listKey(v.List().Get(i))] = true
+			}
+			asked := msg.Get(target).List()
+			if asked.Len() == 0 {
+				list := msg.Mutable(target).List()
+				for i := 0; i < v.List().Len(); i++ {
+					list.Append(v.List().Get(i))
+				}
+			}
+			for i := 0; i < asked.Len(); i++ {
+				if !allowed[listKey(asked.Get(i))] {
+					refusal = connect.NewError(connect.CodePermissionDenied, fmt.Errorf("%s names a value this solution does not let a page ask for: the field is pinned to a set the request must stay within", target.FullName()))
+					return false
+				}
+			}
+			confined = append(confined, fd)
+		case fd.Kind() == protoreflect.MessageKind && !fd.IsList() && !fd.IsMap():
+			if refusal = confineToPin(v.Message(), msg.Mutable(target).Message()); refusal != nil {
+				return false
+			}
+		}
+		return true
+	})
+	for _, fd := range confined {
+		pin.Clear(fd)
+	}
+	return refusal
+}
+
+// listKey is a list element as a map key: bytes by their content.
+func listKey(v protoreflect.Value) any {
+	if b, ok := v.Interface().([]byte); ok {
+		return string(b)
+	}
+	return v.Interface()
 }
 
 // relayedError turns a failure to act as the viewer into the Connect error the
@@ -553,7 +616,7 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 		}
 		if route.method.Pin != nil {
 			pin, _ := protojson.Marshal(route.method.Pin)
-			behavior += fmt.Sprintf("Every request is merged with the declared pin %s first. ", pin)
+			behavior += fmt.Sprintf("Every request is held to the declared pin %s first: a list of values it sets is the most the request may name (none named takes the pin's, one outside it is refused), and every other field it sets is merged in. ", pin)
 		}
 		if route.method.WholeResponse {
 			behavior += "The module's whole response is returned."

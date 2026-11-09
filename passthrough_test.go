@@ -41,7 +41,7 @@ var thingsTestFile = func() protoreflect.FileDescriptor {
 		Package: proto.String("things.v1"),
 		Syntax:  proto.String("proto3"),
 		MessageType: []*descriptorpb.DescriptorProto{
-			{Name: proto.String("Sub"), Field: []*descriptorpb.FieldDescriptorProto{field("name", 1, opt, str, "")}},
+			{Name: proto.String("Sub"), Field: []*descriptorpb.FieldDescriptorProto{field("name", 1, opt, str, ""), field("tags", 2, rep, str, "")}},
 			{Name: proto.String("GetThingRequest"), Field: []*descriptorpb.FieldDescriptorProto{
 				field("tenant", 1, opt, str, ""),
 				field("entry_id", 2, opt, str, ""),

@@ -602,9 +602,13 @@ or out of range, a method with no declared response fields, a method with no
 scopes of its own or its module's, and a scope with no resource kind, no
 action, or a blank or repeated action. `Response` names the fields returned to
 the page; `WholeResponse` must be said explicitly. `Pin` fixes part of every
-request server-side (merged with `proto.Merge`): a pinned scalar replaces the
-page's value and a pinned repeated value is added to the page's, so a filter
-clause the module ANDs stays in force whatever the page sends.
+request server-side. A pinned list of scalars confines the page's: a request
+that names none takes the pin's values, and one naming a value outside them is
+refused (`permission_denied`, naming the field), so a pinned set — the
+collections a solution reads, say — is the most the page may ask for, never a
+floor it adds to. Everything else is merged with `proto.Merge`: a pinned scalar
+replaces the page's value and a pinned list of messages is added to the page's,
+so a filter clause the module ANDs stays in force whatever the page sends.
 
 The authority's refusal reaches the page with the authority's code and reason.
 A module's refusal of the page's own request (`invalid_argument`, `not_found`,
