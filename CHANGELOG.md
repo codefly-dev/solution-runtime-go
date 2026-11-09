@@ -8,8 +8,9 @@
   the module is called. It used to be appended (`proto.Merge`), so a pinned
   set of collections was a floor the page could add to — the union widened
   past what the solution meant to read. Singular messages are confined at any
-  depth; lists of messages (filter clauses a module ANDs) and maps are merged
-  as before, and so is every scalar.
+  depth, groups and extensions included; lists of messages (filter clauses a
+  module ANDs) and maps are merged as before, and so is every scalar. A pinned
+  field the request cannot carry is refused, never skipped.
 - `PassthroughOperations` describes the confinement in each pinned route's
   behaviour.
 

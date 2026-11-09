@@ -270,13 +270,14 @@ func TestAPinnedListConfinesTheRequest(t *testing.T) {
 			t.Errorf("%s: the pinned scalar was not kept: %q", tc.name, tenant)
 		}
 	}
-	for name, body := range map[string]string{
-		"a value outside the pin":        `{"entryId":"e1","ids":["a","c"]}`,
-		"a nested value outside the pin": `{"entryId":"e1","filter":{"tags":["t2"]}}`,
+	for name, tc := range map[string]struct{ body, field string }{
+		"a value outside the pin":        {`{"entryId":"e1","ids":["a","c"]}`, "things.v1.GetThingRequest.ids"},
+		"a nested value outside the pin": {`{"entryId":"e1","filter":{"tags":["t2"]}}`, "things.v1.Sub.tags"},
 	} {
 		before := len(module.observed())
-		code, answer := connectCall(t, page.URL+relayedSearchPath, edgeContext, body)
-		if code != http.StatusForbidden || answer["code"] != "permission_denied" || !strings.Contains(fmt.Sprint(answer["message"]), "things.v1.") {
+		code, answer := connectCall(t, page.URL+relayedSearchPath, edgeContext, tc.body)
+		message := fmt.Sprint(answer["message"])
+		if code != http.StatusForbidden || answer["code"] != "permission_denied" || !strings.Contains(message, tc.field) || strings.Contains(message, `"c"`) || strings.Contains(message, "t2") {
 			t.Errorf("%s: answered %d %v; want permission_denied naming the field", name, code, answer)
 		}
 		if len(module.observed()) != before {

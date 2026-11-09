@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -456,20 +457,26 @@ func applyPin(route passthroughRoute, msg *dynamicpb.Message) error {
 }
 
 // confineToPin applies every list of scalars pin sets to msg, at any depth of
-// singular messages, and clears it from pin so the merge that follows does not
-// append it: an empty request list takes the pin's values, and a request
-// value the pin does not hold refuses the call by its field's name. Lists of
-// messages and maps are left to the merge.
+// singular messages and groups, extensions included, and clears it from pin so
+// the merge that follows does not append it: an empty request list takes the
+// pin's values, and a request value the pin does not hold refuses the call by
+// its field's name. Lists of messages and maps are left to the merge. A pinned
+// field the request's descriptor cannot resolve is refused, never skipped.
 func confineToPin(pin protoreflect.Message, msg protoreflect.Message) error {
 	var refusal error
 	var confined []protoreflect.FieldDescriptor
 	pin.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
-		target := msg.Descriptor().Fields().ByNumber(fd.Number())
-		if target == nil {
-			return true
+		target := fd
+		if !fd.IsExtension() {
+			target = msg.Descriptor().Fields().ByNumber(fd.Number())
 		}
+		if target == nil || target.Kind() != fd.Kind() || target.Cardinality() != fd.Cardinality() {
+			refusal = connect.NewError(connect.CodeInternal, fmt.Errorf("the declared pin sets %s, which the request cannot carry", fd.FullName()))
+			return false
+		}
+		message := fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind
 		switch {
-		case fd.IsList() && fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind:
+		case fd.IsList() && !message:
 			allowed := map[any]bool{}
 			for i := 0; i < v.List().Len(); i++ {
 				allowed[listKey(v.List().Get(i))] = true
@@ -488,7 +495,7 @@ func confineToPin(pin protoreflect.Message, msg protoreflect.Message) error {
 				}
 			}
 			confined = append(confined, fd)
-		case fd.Kind() == protoreflect.MessageKind && !fd.IsList() && !fd.IsMap():
+		case message && !fd.IsList() && !fd.IsMap():
 			if refusal = confineToPin(v.Message(), msg.Mutable(target).Message()); refusal != nil {
 				return false
 			}
@@ -501,13 +508,26 @@ func confineToPin(pin protoreflect.Message, msg protoreflect.Message) error {
 	return refusal
 }
 
-// listKey is a list element as a map key: bytes by their content.
+// listKey is a list element as a map key, equal where protobuf's value
+// equality is: bytes by their content, and every NaN as one key.
 func listKey(v protoreflect.Value) any {
-	if b, ok := v.Interface().([]byte); ok {
-		return string(b)
+	switch x := v.Interface().(type) {
+	case []byte:
+		return string(x)
+	case float64:
+		if math.IsNaN(x) {
+			return nanKey{}
+		}
+	case float32:
+		if math.IsNaN(float64(x)) {
+			return nanKey{}
+		}
 	}
 	return v.Interface()
 }
+
+// nanKey stands for NaN, which no float map key equals, itself included.
+type nanKey struct{}
 
 // relayedError turns a failure to act as the viewer into the Connect error the
 // page receives: the authority's refusal of the viewer's Work Context keeps its
@@ -616,7 +636,7 @@ func PassthroughOperations(modules ...ConsumedModule) ([]Operation, error) {
 		}
 		if route.method.Pin != nil {
 			pin, _ := protojson.Marshal(route.method.Pin)
-			behavior += fmt.Sprintf("Every request is held to the declared pin %s first: a list of values it sets is the most the request may name (none named takes the pin's, one outside it is refused), and every other field it sets is merged in. ", pin)
+			behavior += fmt.Sprintf("Every request is held to the declared pin %s first: a list of scalar values it sets is the most the request may name (none named takes the pin's, one outside it is refused); a list of messages or a map it sets is added to the request's, and a scalar replaces it. ", pin)
 		}
 		if route.method.WholeResponse {
 			behavior += "The module's whole response is returned."
