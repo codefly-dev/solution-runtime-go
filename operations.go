@@ -58,6 +58,7 @@ type Operation struct {
 	// Query lists the documented query parameters.
 	Query []QueryParameter
 	// Request is the zero value of the JSON body the operation reads, if any.
+	// RequiredFields wraps it to declare top-level JSON key presence.
 	Request any
 	// Response is the zero value of the body the operation returns on 200;
 	// the artifact's schema is derived from its type. A generated protobuf
@@ -410,8 +411,22 @@ func swaggerDocument(info InterfaceInfo, ops []Operation, audience string) (map[
 			endpoint[OperationExtension] = marker
 		}
 		parameters := []any{}
-		if op.Request != nil {
-			parameters = append(parameters, map[string]any{"name": "body", "in": "body", "required": true, "schema": valueSchema(op.Request, definitions)})
+		if requestValue(op.Request) != nil {
+			schema, err := requestSchema(op.Request, definitions, requiredRequestDefinition(op))
+			if err != nil {
+				return nil, fmt.Errorf("operation %s %s: %w", op.verb(), op.Path, err)
+			}
+			if d, wrapped := op.Request.(RequiredRequest); wrapped && len(d.names) > 0 {
+				// Core records the identity of a published payload definition;
+				// an inline body has none. Keep this operation's copy separate.
+				name := requiredRequestDefinition(op)
+				if _, exists := definitions[name]; exists {
+					return nil, fmt.Errorf("operation %s %s: request definition %q already exists", op.verb(), op.Path, name)
+				}
+				definitions[name] = schema
+				schema = map[string]any{"$ref": "#/definitions/" + name}
+			}
+			parameters = append(parameters, map[string]any{"name": "body", "in": "body", "required": true, "schema": schema})
 		}
 		for _, query := range op.Query {
 			parameters = append(parameters, map[string]any{"name": query.Name, "in": "query", "required": query.Required, "type": "string"})
@@ -530,6 +545,25 @@ func (o Operation) validate() error {
 	}
 	if err := o.Policy.validate(); err != nil {
 		return fmt.Errorf("operation %s %s %w", o.verb(), o.Path, err)
+	}
+	if _, wrapped := o.Response.(RequiredRequest); wrapped {
+		return fmt.Errorf("operation %s %s: RequiredFields belongs in Request, not Response", o.verb(), o.Path)
+	}
+	if _, pointer := o.Request.(*RequiredRequest); pointer {
+		return fmt.Errorf("operation %s %s: use the RequiredFields value directly, not a *RequiredRequest", o.verb(), o.Path)
+	}
+	if _, pointer := o.Response.(*RequiredRequest); pointer {
+		return fmt.Errorf("operation %s %s: RequiredFields belongs in Request, not Response", o.verb(), o.Path)
+	}
+	if d, wrapped := o.Request.(RequiredRequest); wrapped {
+		if _, nested := d.request.(RequiredRequest); nested {
+			return fmt.Errorf("operation %s %s: RequiredFields cannot wrap another RequiredRequest", o.verb(), o.Path)
+		}
+		if len(d.names) > 0 {
+			if _, err := requestSchema(o.Request, map[string]any{}, requiredRequestDefinition(o)); err != nil {
+				return fmt.Errorf("operation %s %s: %w", o.verb(), o.Path, err)
+			}
+		}
 	}
 	return nil
 }
