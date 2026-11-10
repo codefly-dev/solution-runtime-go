@@ -116,3 +116,17 @@ func TestAPinnedListConfinesGroupsExtensionsAndNaNs(t *testing.T) {
 		t.Errorf("the pin itself moved: %v", got)
 	}
 }
+
+// A pin of several fields is described with the same bytes from every binary:
+// protojson's single-line form adds a space after a comma at random per
+// binary, which made a committed interface artifact drift between builds.
+func TestAPinOfSeveralFieldsIsDescribedStably(t *testing.T) {
+	pin := thingMessage("GetThingRequest")
+	setField(pin, "tenant", protoreflect.ValueOfString("t, with a comma"))
+	setField(pin, "page_size", protoreflect.ValueOfInt32(3))
+	pin.Mutable(pin.Descriptor().Fields().ByName("ids")).List().Append(protoreflect.ValueOfString("a"))
+	pin.Mutable(pin.Descriptor().Fields().ByName("ids")).List().Append(protoreflect.ValueOfString("b"))
+	if got, want := pinText(pin), `{"tenant":"t, with a comma","pageSize":3,"ids":["a","b"]}`; got != want {
+		t.Fatalf("the pin is described as %s, want %s", got, want)
+	}
+}

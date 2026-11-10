@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — a pin is described with the same bytes from every binary
+
+- `PassthroughOperations` (and so `InterfaceArtifact`) spelled a route's pin
+  with protojson's single-line form, which adds a space after a comma at
+  random per binary, so a pin of two or more fields made a committed interface
+  artifact drift between builds (`go test` passing, `go test -race` failing
+  on the same tree, #85). The pin is compacted before it is described.
+
 ## Unreleased — a pinned list confines the page's
 
 - **A list of scalars a `ConsumedMethod.Pin` sets is the most the page may
