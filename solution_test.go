@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/codefly-dev/core/solutionhost"
+	"github.com/codefly-dev/authority/libraries/solutionhost/go"
 	"gopkg.in/yaml.v3"
 )
 
