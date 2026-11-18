@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — a test hands over the listener it holds
+
+- `Server.ServeOn(net.Listener)` is `Serve` on a listener the caller already
+  bound, so a consumer's test no longer picks a free port, releases it and
+  hopes the solution binds it first (`listen tcp :63312: bind: address already
+  in use`, once, in core-solutions). The listener must be the resolved
+  endpoint already bound — the resolved port, and a loopback host on a native
+  run — and any other is refused at boot, so it is not a second way to choose
+  an address. Port 0 is still refused.
+
 ## Unreleased — a pin is described with the same bytes from every binary
 
 - `PassthroughOperations` (and so `InterfaceArtifact`) spelled a route's pin

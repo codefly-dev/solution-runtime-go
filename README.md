@@ -86,6 +86,21 @@ the platform owns network admission. A local environment name alone does not
 turn a container listener into a loopback listener. Production admission still
 requires the declared mesh boundary; this change does not qualify that boundary.
 
+### A listener a test already holds
+
+A test cannot be handed a free port without a race: binding port 0, reading
+the number and closing the socket lets the OS give the same port to another
+process before the solution binds it. `Server.ServeOn(ln)` is `Serve` on a
+listener the caller keeps bound instead. The listener does not choose the
+address — it must be the resolved endpoint, already bound: its port is the one
+this service's `http` endpoint (or `PORT`) resolves to, and on a native run its
+host is loopback. A listener bound anywhere else refuses the boot, so a harness
+binds `127.0.0.1:0`, provisions the endpoint with the address the listener
+holds, and hands the listener over. A harness that runs the solution as a
+child process passes the descriptor (`exec.Cmd.ExtraFiles`, then
+`net.FileListener` in the child). `ServeOn` closes the listener when it
+returns.
+
 ## Handler errors
 
 Return `ClientError` for an explicitly public validation message. A Connect

@@ -3,7 +3,10 @@ package solution
 import (
 	"context"
 	"net"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/codefly-dev/core/resources"
 	codefly "github.com/codefly-dev/sdk-go"
@@ -72,5 +75,92 @@ func TestNativeListenerRefusesAnUnresolvedOrNonLoopbackHost(t *testing.T) {
 		if err := c.validate(); err != nil {
 			t.Fatalf("loopback host %q refused: %v", host, err)
 		}
+	}
+}
+
+// TestServeOnServesTheListenerItIsHanded: a harness that needs a port nobody
+// else can be given binds it and hands the listener over, so the port is never
+// released between being chosen and being served on.
+func TestServeOnServesTheListenerItIsHanded(t *testing.T) {
+	bootEnvironment(t)
+	ln := parkedListener
+	parkedListener = nil
+	server := New(Manifest{ID: testSolutionID, Frontend: []byte(testFrontend)})
+	served := make(chan error, 1)
+	go func() { served <- server.ServeOn(ln) }()
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		select {
+		case err := <-served:
+			t.Fatalf("ServeOn returned before serving: %v", err)
+		default:
+		}
+		resp, err := client.Get("http://" + ln.Addr().String() + HealthPath)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the handed listener never answered health: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client.CloseIdleConnections()
+	_ = ln.Close()
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeOn did not return when its listener was closed")
+	}
+}
+
+// TestServeOnRefusesAListenerThatIsNotTheResolvedEndpoint: the listener is the
+// resolved endpoint already bound, never a second way to choose an address. One
+// bound anywhere else — a hardcoded or guessed port — is refused at boot, and
+// so is none at all.
+func TestServeOnRefusesAListenerThatIsNotTheResolvedEndpoint(t *testing.T) {
+	bootEnvironment(t)
+	resolved := parkedListener
+	parkedListener = nil
+	elsewhere, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = elsewhere.Close() })
+	_, resolvedPort, _ := net.SplitHostPort(resolved.Addr().String())
+	_, otherPort, _ := net.SplitHostPort(elsewhere.Addr().String())
+
+	refused := make(chan error, 1)
+	go func() {
+		refused <- New(Manifest{ID: testSolutionID, Frontend: []byte(testFrontend)}).ServeOn(elsewhere)
+	}()
+	select {
+	case err := <-refused:
+		if err == nil || !strings.Contains(err.Error(), resolvedPort) || !strings.Contains(err.Error(), otherPort) {
+			t.Fatalf("a listener on port %s with port %s resolved: %v, want a refusal naming both", otherPort, resolvedPort, err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("a listener off the resolved endpoint was served on")
+	}
+	if _, err := elsewhere.Accept(); err == nil {
+		t.Fatal("the refused listener was left open")
+	}
+
+	if err := New(Manifest{ID: testSolutionID}).ServeOn(nil); err == nil {
+		t.Fatal("ServeOn(nil) was not refused")
+	}
+
+	wildcard, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wildcard.Close() })
+	_, wildcardPort, _ := net.SplitHostPort(wildcard.Addr().String())
+	t.Setenv("PORT", wildcardPort)
+	if err := New(Manifest{ID: testSolutionID, Frontend: []byte(testFrontend)}).ServeOn(wildcard); err == nil || !strings.Contains(err.Error(), "loopback") {
+		t.Fatalf("a native run served a listener on every interface: %v", err)
 	}
 }
