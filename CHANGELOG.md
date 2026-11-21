@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — one pin set with the rest of the branch
+
+- `core` moves to `v0.19.36-0.20261121094328-95a426c5096f`, `sdk-go` to
+  `v0.4.5-0.20261121101950-387a613100c4` (`sdk-go/workcontext` to
+  `v0.1.1-0.20261121101950-387a613100c4`) and the authority's client, hop and
+  solution-host libraries to one commit, `c3d7b090b1a9`; they were at three
+  (`f41cc2ba` for two, `3a7584fe` for the third). No code changes with them.
+
 ## Unreleased — a test hands over the listener it holds
 
 - `Server.ServeOn(net.Listener)` is `Serve` on a listener the caller already

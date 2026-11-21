@@ -4,12 +4,12 @@ go 1.27.4
 
 require (
 	connectrpc.com/connect v1.21.1
-	github.com/codefly-dev/authority/libraries/authority-client/go v0.0.0-20261027012935-f41cc2baa2ec
-	github.com/codefly-dev/authority/libraries/hop/go v0.0.0-20261027012935-f41cc2baa2ec
-	github.com/codefly-dev/authority/libraries/solutionhost/go v0.0.0-20261116214257-3a7584fec856
-	github.com/codefly-dev/core v0.19.34-0.20261116201543-b919b702e8cf
-	github.com/codefly-dev/sdk-go v0.4.1-0.20261018052022-70dc7a546458
-	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261018052022-70dc7a546458
+	github.com/codefly-dev/authority/libraries/authority-client/go v0.2.1-0.20261121111028-c3d7b090b1a9
+	github.com/codefly-dev/authority/libraries/hop/go v0.2.1-0.20261121111028-c3d7b090b1a9
+	github.com/codefly-dev/authority/libraries/solutionhost/go v0.0.0-20261121111028-c3d7b090b1a9
+	github.com/codefly-dev/core v0.19.36-0.20261121094328-95a426c5096f
+	github.com/codefly-dev/sdk-go v0.4.5-0.20261121101950-387a613100c4
+	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261121101950-387a613100c4
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	golang.org/x/tools v0.52.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20261026165753-2ffab32bce7e
@@ -26,6 +26,10 @@ require (
 	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
+	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/analysis v1.0.1 // indirect
 	github.com/go-openapi/errors v0.22.9 // indirect
 	github.com/go-openapi/jsonpointer v1.0.2 // indirect
@@ -47,6 +51,7 @@ require (
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.33.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
@@ -56,6 +61,17 @@ require (
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/yoheimuta/go-protoparser/v4 v4.14.2 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.72.0 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.47.0 // indirect
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.47.0 // indirect
+	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.47.0 // indirect
+	go.opentelemetry.io/otel/log v1.47.0 // indirect
+	go.opentelemetry.io/otel/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
+	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
 	golang.org/x/mod v0.42.0 // indirect
