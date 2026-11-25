@@ -9,10 +9,10 @@
 # moves. The shell service is deliberately absent below — a host that federates
 # the page's remote needs no shell of its own.
 kind: module-package
-schema: codefly/module-package/v2
+schema: codefly/module-package/v1
 id: codefly/base
 version: 0.1.0
-minimum-codefly-version: '>=0.1.0'
+minimum-codefly-version: ">=0.1.261-0 <1.0.0"
 artifact-roots:
   - contracts
   - services
@@ -27,5 +27,5 @@ services:
         path: contracts/api/backend/http/openapi.json
         digest: sha256:f949d2120b23e0b67081636132fb9897a8cc1fd87ee7a245efe96e49337943f0
 contracts:
-  composition: '>=2.0.0 <3.0.0'
+  composition: '>=1.0.0 <2.0.0'
   frontendPlugin: '>=1.0.0 <2.0.0'

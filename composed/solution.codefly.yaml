@@ -10,8 +10,8 @@
 # because of it". `codefly add solution --executor` writes one the day an
 # executor exists; until then every other rule of the schema was checked at
 # generation against a stand-in.
-schema_version: codefly.solution-manifest/v0
-protocol_version: codefly.solution/v0
+schema_version: codefly.solution-manifest/v1
+protocol_version: codefly.solution/v1
 services:
     - id: backend
       name: backend

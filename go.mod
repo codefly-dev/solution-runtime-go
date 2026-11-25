@@ -4,12 +4,12 @@ go 1.27.4
 
 require (
 	connectrpc.com/connect v1.21.1
-	github.com/codefly-dev/authority/libraries/authority-client/go v0.2.1-0.20261125191925-75e89768397f
-	github.com/codefly-dev/authority/libraries/hop/go v0.2.1-0.20261125191925-75e89768397f
-	github.com/codefly-dev/authority/libraries/solutionhost/go v0.0.0-20261125191925-75e89768397f
-	github.com/codefly-dev/core v0.19.38-0.20261125185931-18555ee1d782
-	github.com/codefly-dev/sdk-go v0.4.5-0.20261125191637-e78571827fe5
-	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261125191637-e78571827fe5
+	github.com/codefly-dev/authority/libraries/authority-client/go v0.2.1-0.20261125203304-953f93bcb574
+	github.com/codefly-dev/authority/libraries/hop/go v0.2.1-0.20261125203304-953f93bcb574
+	github.com/codefly-dev/authority/libraries/solutionhost/go v0.0.0-20261125203304-953f93bcb574
+	github.com/codefly-dev/core v0.19.38-0.20261125201822-50c2b2ab29a4
+	github.com/codefly-dev/sdk-go v0.4.5-0.20261125203301-8313d03a6f41
+	github.com/codefly-dev/sdk-go/workcontext v0.1.1-0.20261125203301-8313d03a6f41
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	golang.org/x/tools v0.52.1-0.20261106145633-d407941a339a
 	google.golang.org/genproto/googleapis/api v0.0.0-20261123191846-1e707ab9fbc2

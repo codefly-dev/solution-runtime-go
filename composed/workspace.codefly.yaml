@@ -37,18 +37,18 @@ modules:
     - name: documents
       source: obin-ai/module-document-store
       module: modules/documents
-      version: "325200da49984115c8f27a843f812780ed4db57e"
+      version: "5d160962c42b823d9aced0ab0024db0207eaf9e0"
     - name: model
       source: obin-ai/module-model-gateway
       module: modules/model
-      version: "60dc664b74c8cd138fe9d4341c4a2c5e15bce9aa"
+      version: "94076ae5afc7ea3c5d9b26f2401b72ebcd24a574"
     # Pinned by COMMIT: the authority publishes no module release, and the
     # commit must be one the DEFAULT BRANCH holds. A PR head reads the same
     # here and dies on squash-merge, when the commit it names is on no branch.
     - name: authority
       source: codefly-dev/authority
       module: modules/authority
-      version: "fb5be03374e834aef35ed1b9be81c7422594682f"
+      version: "953f93bcb57473157ac3035c03a74ffbaf3003a0"
 
 environments:
     - name: local
