@@ -70,7 +70,7 @@ type Operation struct {
 	// it: required on every operation the backend serves.
 	Policy *Policy
 	// Exclude keeps the route from every agent, as
-	// codefly.runnable.v0.exclude keeps a module's method: the artifact marks
+	// codefly.runnable.v1.exclude keeps a module's method: the artifact marks
 	// it as no Runnable operation even when its policy is a read. The MCP
 	// route and every relayed route carry it, being a protocol and another
 	// module's call rather than this backend's own operation.
@@ -128,7 +128,7 @@ const PolicyExtension = "x-codefly-authority-policy"
 
 // OperationExtension marks an operation as a Runnable one, and so a tool:
 // core's x-codefly-operation, whose value is the proto3 JSON of
-// codefly.runnable.v0.Operation. `codefly generate runnables` derives a
+// codefly.runnable.v1.Operation. `codefly generate runnables` derives a
 // Runnable package from every operation carrying it, as it does from every
 // method a module serves behind the hop.
 const OperationExtension = corerunnable.OpenAPIOperationMarker

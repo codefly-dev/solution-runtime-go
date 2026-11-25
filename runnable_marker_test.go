@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	basev0 "github.com/codefly-dev/core/generated/go/codefly/base/v0"
-	runnablev0 "github.com/codefly-dev/core/generated/go/codefly/runnable/v0"
+	basev1 "github.com/codefly-dev/core/generated/go/codefly/base/v1"
+	runnablev1 "github.com/codefly-dev/core/generated/go/codefly/runnable/v1"
 	"github.com/codefly-dev/core/resources"
 	corerunnable "github.com/codefly-dev/core/runnable"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -104,7 +104,7 @@ func TestTheArtifactMarksEveryReadAsARunnableOperation(t *testing.T) {
 	}
 
 	owner := corerunnable.ServiceOwner{Module: "releases", Service: "backend", Endpoint: "http",
-		Agent: &basev0.Agent{Kind: basev0.Agent_SERVICE, Name: "go", Version: "0.0.48", Publisher: "codefly.dev"}}
+		Agent: &basev1.Agent{Kind: basev1.Agent_SERVICE, Name: "go", Version: "0.0.48", Publisher: "codefly.dev"}}
 	location := func(name string) *resources.RunnableLocation {
 		return &resources.RunnableLocation{
 			Identity:      &resources.RunnableIdentity{Name: name, Module: "releases", Workspace: "core-solutions", Version: "0.3.0"},
@@ -115,12 +115,12 @@ func TestTheArtifactMarksEveryReadAsARunnableOperation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("core does not derive the published read: %v", err)
 	}
-	if spec.Audience != "releases" || spec.Tool.GetEffect() != runnablev0.ToolExposure_EFFECT_READ_ONLY ||
+	if spec.Audience != "releases" || spec.Tool.GetEffect() != runnablev1.ToolExposure_EFFECT_READ_ONLY ||
 		spec.Tool.GetName() != "Releases_Get_V1_Releases_History" ||
 		spec.Tool.GetDescription() != "Read the recorded tags of one repository and the recorded pins of one component" {
 		t.Fatalf("the derived operation is %+v", spec)
 	}
-	if pkg.GetExecution().GetRecovery() != basev0.RunnableExecution_RECOVERY_RECOMPUTE {
+	if pkg.GetExecution().GetRecovery() != basev1.RunnableExecution_RECOVERY_RECOMPUTE {
 		t.Fatalf("a read is not recomputed: %v", pkg.GetExecution())
 	}
 	fields := pkg.GetContract().GetInput().GetFields()
