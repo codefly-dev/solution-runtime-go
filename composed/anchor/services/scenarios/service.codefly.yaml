@@ -1,0 +1,40 @@
+name: scenarios
+version: 0.0.0
+description: The anchor of the scaffold's composed scenarios (../../../scenarios). It never runs; the test process stands where it would, and its dependencies are what the run starts.
+agent:
+    kind: codefly:service
+    name: go
+    version: 0.0.76
+    publisher: codefly.dev
+service-dependencies:
+    # The browser's origin: every scenario signs a fixture person in here and
+    # calls the solution's backend as its page does.
+    - name: edge
+      module: authority
+      endpoints:
+          - name: http
+    # The session interface, which names the fixture's people.
+    - name: local
+      module: authority
+      endpoints:
+          - name: grpc
+    - name: hop
+      module: authority
+      endpoints:
+          - name: grpc
+          - name: http
+    # The scaffolded solution's backend: what the scenarios exercise.
+    - name: backend
+      module: codefly-base
+      endpoints:
+          - name: http
+    # The one module the solution consumes, behind the hop.
+    - name: documents
+      module: documents
+      endpoints:
+          - name: grpc
+    # The model gateway the store's embedding binding names; never asked.
+    - name: model
+      module: model
+      endpoints:
+          - name: grpc

@@ -1,0 +1,70 @@
+# What this solution asks for (codefly/module-contract/v1). A request, never a
+# grant. Its credentials are issued to the principal below, the id its
+# module-identity services present. This is the ONE declaration of the
+# solution's authority: the CLI renders the signed authority document from
+# these bindings, and refuses a module that asks for authority from both a
+# contract and SCOPED api.consumes — which is why solution.codefly.yaml's
+# api.consumes carries route names only.
+#
+# It asks for nothing at another module yet. Add a binding per module call the
+# solution makes ON A PERSON'S BEHALF, with the audience as a slot into the
+# composition's own group: the audience a module verifies is the composition's
+# to say. A call the authority holds to a person IN PERSON takes no binding
+# here — the page makes it, as the person.
+#
+# ROLES. A solution has a page, and a unit with a page declares exactly two
+# roles, both required: admin, which whoever installs it holds and which
+# administers the installation, and user, what a person does with it day to
+# day. Core refuses any other role name, and roles without either. Both below
+# are scoped to this solution's own page, the one resource a scaffold knows it
+# has. Name the solution's real resource kinds in scope_ceilings and widen the
+# two roles to them. A role may grant a scope only within a ceiling, or
+# through a binding it names, so the two cannot drift apart.
+schema: codefly/module-contract/v1
+principal: codefly-base
+# ADDED TO THE SCAFFOLD: the installation's own agent holds no role. The
+# scaffold leaves this unsaid and its fixture row names the agent's role
+# instead; an administrator installing at the host names none, and the host
+# refuses an install whose contract does not say (role "" is not one
+# codefly-base declares).
+installation_role: none
+owner_aware: true
+namespaces: []
+queues: []
+scope_ceilings:
+    - resource_kind: codefly-base.page
+      actions:
+        - read
+        - write
+roles:
+    # FILLED IN (scaffold step 4): what each role holds at the consumed module,
+    # by the store's own bundles. An admin writes and reads documents; a user
+    # reads them.
+    - name: admin
+      includes:
+        - {module: documents, bundle: write}
+      scopes:
+        - resource_kind: codefly-base.page
+          actions:
+            - read
+            - write
+    - name: user
+      includes:
+        - {module: documents, bundle: read}
+      scopes:
+        - resource_kind: codefly-base.page
+          actions:
+            - read
+            - write
+# FILLED IN (scaffold step 4): the one binding, for the module calls the
+# backend relays on a person's behalf (services/backend/consumes.go).
+bindings:
+    - id: documents
+      operations: [invoke]
+      audience: {from: codefly-base/DOCUMENTS_AUDIENCE}
+      binding_key: {from: codefly-base/DOCUMENTS_BINDING}
+      calls:
+          invoke:
+              - /documents.v1.DocumentsService/GetDocument
+              - /documents.v1.DocumentsService/CreateDocument
+destinations: []

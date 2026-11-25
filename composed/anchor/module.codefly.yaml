@@ -1,0 +1,6 @@
+kind: module
+name: scaffold-scenarios
+# The composed scenarios' own module: it runs nothing. Its one service is the
+# anchor of the run (../scenarios).
+services:
+    - name: scenarios

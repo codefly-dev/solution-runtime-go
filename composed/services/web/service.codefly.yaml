@@ -1,0 +1,18 @@
+name: web
+version: 0.0.0
+agent:
+    kind: codefly:service
+    name: nextjs
+    version: 0.0.171
+    publisher: codefly.dev
+endpoints:
+    - name: http
+      visibility: public
+      exposure: none
+spec:
+    auth-provider: none
+    docker-image: ""
+    execution-profiles: {}
+    hot-reload: true
+    mode: ssr
+    source-dir: ""

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — the scaffolded solution runs on a real composition
+
+- `composed/` is a solution as `codefly add solution` scaffolds it, built on
+  this checkout and run behind the real local authority, edge and hop in front
+  of the real document store (`cd composed && make scenarios`; not part of the
+  gate). Its scenarios: a person seated through a team reads a document through
+  the backend's relay; the team's grant revoked, the same session's next call
+  is refused, and a grant held twice is held until both are gone; a Work
+  Context issued before the revocation, replayed as issued at the backend, is
+  refused, and so is the child the runtime was issued, replayed at the hop;
+  another organisation's document id is refused or not found, in the words an
+  id never written gets; the authority's process stopped, and then ended, the
+  relay and the edge are unavailable and answer nothing; and every route the
+  solution's and the store's contract catalogs declare (74) refuses a revoked
+  role, on the session and on a held Work Context, with each of the 33 no seat
+  reaches named with its reason. Ran green on the nix backend and with the
+  stores in Docker on 25 November; not run with SaaS Accounts as the host.
+- A relayed call is unavailable, by name, once the authority is gone, and the
+  module is not asked: `TestARelayedCallFailsClosedOnceTheAuthorityIsGone`. No
+  code changes: the runtime already held no allow.
+
 ## Unreleased — one pin set with the rest of the branch
 
 - `core` moves to `v0.19.36-0.20261121094328-95a426c5096f`, `sdk-go` to

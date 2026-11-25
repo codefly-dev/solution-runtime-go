@@ -1,0 +1,14 @@
+# The compiled backend
+app
+backend
+
+# Go workspace (keep the module-level go.mod pinned)
+go.work
+go.work.sum
+
+# Test binaries and coverage
+*.test
+*.out
+
+# Codefly local artifacts
+.codefly/

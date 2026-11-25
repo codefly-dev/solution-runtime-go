@@ -1,0 +1,31 @@
+# The solution's package identity. A solution is delivered to a host the way a
+# module is: the render declares its presence from this file, and a solution
+# without one declares no presence, so the host never lists it and nobody can
+# install it. Authority is effective from that presence generation too, so the
+# scopes module.contract.codefly.yaml declares reach no host without it.
+#
+# The id is the identity the solution is published under; the version is the
+# package's, not the repository tag's: it moves when what the package publishes
+# moves. The shell service is deliberately absent below — a host that federates
+# the page's remote needs no shell of its own.
+kind: module-package
+schema: codefly/module-package/v2
+id: codefly/base
+version: 0.1.0
+minimum-codefly-version: '>=0.1.0'
+artifact-roots:
+  - contracts
+  - services
+services:
+  - name: backend
+    endpoints:
+      - http
+    api-contracts:
+      - endpoint: http
+        kind: openapi
+        package: codefly-base solution backend
+        path: contracts/api/backend/http/openapi.json
+        digest: sha256:f949d2120b23e0b67081636132fb9897a8cc1fd87ee7a245efe96e49337943f0
+contracts:
+  composition: '>=2.0.0 <3.0.0'
+  frontendPlugin: '>=1.0.0 <2.0.0'

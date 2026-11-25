@@ -1,0 +1,4 @@
+title: Codefly Base
+order: 50
+exposed_module: ./Page
+host_contract: 1

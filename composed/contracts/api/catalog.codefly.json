@@ -1,0 +1,30 @@
+{
+  "schema": "codefly/module-api-contracts/v1",
+  "package": "codefly/base",
+  "version": "0.1.0",
+  "endpoints": [
+    {
+      "service": "backend",
+      "endpoint": "http",
+      "api": "http",
+      "kind": "openapi",
+      "package": "codefly-base solution backend",
+      "path": "contracts/api/backend/http/openapi.json",
+      "digest": "sha256:f949d2120b23e0b67081636132fb9897a8cc1fd87ee7a245efe96e49337943f0",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/v1/codefly-base/modules/documents/documents.v1.DocumentsService/CreateDocument"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/codefly-base/modules/documents/documents.v1.DocumentsService/GetDocument"
+        },
+        {
+          "method": "GET",
+          "path": "/v1/codefly-base/overview"
+        }
+      ]
+    }
+  ]
+}

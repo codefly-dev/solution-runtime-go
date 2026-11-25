@@ -1,0 +1,14 @@
+kind: module
+name: codefly-base
+service-entry: backend
+interface:
+    endpoints:
+        - service: backend
+          endpoint: http
+          visibility: public
+        - service: web
+          endpoint: http
+          visibility: internal
+services:
+    - name: backend
+    - name: web

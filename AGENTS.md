@@ -466,6 +466,55 @@ credentials, no running composition.
   version and nothing reads it. The tag is what consumers pin, so it is cut
   from a commit whose gate is green.
 
+### The composed scenarios (`composed/`)
+
+The suite above is hermetic by rule, so it cannot show that a real authority
+issues a Work Context or that a composed module accepts one. `composed/` is
+where that is shown, and it is not part of the gate: it is a solution exactly
+as `codefly add solution` scaffolds it, with its one consumed module filled in
+as the scaffold says to, built on **this checkout** (its `go.mod` replaces the
+runtime with `../../..`), and started by Codefly behind the real local
+authority, its edge and its hop, in front of the real document store.
+
+```sh
+cd composed && make scenarios   # needs Docker, a codefly binary and NODE_AUTH_TOKEN
+```
+
+- `composed/scenarios` is its own Go module (build tag `composition`), on the
+  authority's scenario library: one composition for the whole package, every
+  call a fixture person's through the edge, no stand-in anywhere.
+- Every line that is not the scaffold's is marked `ADDED TO THE SCAFFOLD` or
+  `FILLED IN` where it stands. Regenerate the rest with the CLI rather than
+  editing it; a difference from a fresh scaffold that is not marked is a bug.
+- It starts a dozen services; a start takes minutes and the scenarios seconds.
+  Run it when a change touches the passthrough, the authority client or boot.
+- `held_composition_test.go` stands where the edge stands: it asks the
+  authority for a signed-in person's Work Context and sends it to the backend
+  itself, so a context is replayed as issued after a revocation, and it stops
+  the authority's process (SIGSTOP, the outage that answers nothing) to show
+  the relay unavailable. `zz_gone_composition_test.go` ends that process, and
+  is the run's last scenario because nothing starts it again.
+- `tap_composition_test.go` is the one thing this run puts between the backend
+  and the hop: `codefly-base/DOCUMENTS_ENDPOINT` (a composition value, set in
+  `TestMain`) names a listener of the test's that sends every call on to the
+  hop unchanged and keeps it, so the CHILD the runtime was issued is replayed
+  at the hop after a revocation. No scaffold code changes for it.
+- These lean on marked `STOPGAP`s: the scenario library's dependency session
+  is read by reflection (it exports no address but the edge's), and the
+  authority's process is found by the address the run resolved (the library
+  stops a whole run or nothing). They go when the library has the verbs.
+- `matrix_composition_test.go` reads every route from the published contract
+  catalogs and holds each to one revocation per seat, on the session and with
+  a held Work Context. A declared route that no seat reaches must be named in
+  `unshown` with its reason: a route added to either catalog fails the suite
+  until it is shown or named.
+- Every scenario is behind the build tag `composition`. Without the tag the
+  package's one test fails (`tag_test.go`), and `make scenarios` fails a run in
+  which no scenario passed: a gate that ran nothing does not pass.
+- Not shown, on any run: a person taken out of a team (the local authority
+  has no interface that changes a team's members), and anything with SaaS
+  Accounts as the host.
+
 ## Where the depth is
 
 Keep this file short; add depth to the file that owns the subject.
