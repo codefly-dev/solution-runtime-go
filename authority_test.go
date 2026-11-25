@@ -39,6 +39,8 @@ type interfaceAuthority struct {
 	// step, when set, answers a Check at the install step's method: the
 	// authority's dedicated step verifier.
 	step func(*authorityv1.CheckRequest) (*authorityv1.CheckResponse, error)
+	// stop ends the stand-in's server: the authority is gone from here on.
+	stop func()
 }
 
 // edgeContext is the person's Work Context the edge sends the page.
@@ -194,6 +196,7 @@ func interfaceAuthorityAt(t *testing.T) (*interfaceAuthority, string) {
 	g := grpc.NewServer()
 	authorityv1.RegisterAuthorityServiceServer(g, stand)
 	go func() { _ = g.Serve(l) }()
+	stand.stop = g.Stop
 	t.Cleanup(g.Stop)
 	return stand, l.Addr().String()
 }
