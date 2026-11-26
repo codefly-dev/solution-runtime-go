@@ -233,15 +233,22 @@ func pageGrant(t *testing.T, person, role string) grant {
 // therefore arrives with its revocation shown, or with a line here saying
 // why not.
 var unshown = map[string]string{
+	"/documents.v1.DocumentsService/AbortUpload":                      writeThroughABinding,
+	"/documents.v1.DocumentsService/AppendUploadPart":                 writeThroughABinding,
 	"/documents.v1.DocumentsService/ApplyDocumentTransformation":      writeThroughABinding,
 	"/documents.v1.DocumentsService/ApplyPublicationProducer":         ingestOnly,
 	"/documents.v1.DocumentsService/ArchiveDocument":                  writeThroughABinding,
 	"/documents.v1.DocumentsService/AttachExtractor":                  writeThroughABinding,
+	"/documents.v1.DocumentsService/BeginUpload":                      writeThroughABinding,
 	"/documents.v1.DocumentsService/CloseSync":                        ingestOnly,
+	"/documents.v1.DocumentsService/CopyDocument":                     writeThroughABinding,
 	"/documents.v1.DocumentsService/CreateDocument":                   writeThroughABinding,
 	"/documents.v1.DocumentsService/CreateDocumentVersion":            writeThroughABinding,
 	"/documents.v1.DocumentsService/CreateTextDocument":               writeThroughABinding,
+	"/documents.v1.DocumentsService/DeleteDocument":                   deleteThroughABinding,
+	"/documents.v1.DocumentsService/DeleteDocumentVersion":            deleteThroughABinding,
 	"/documents.v1.DocumentsService/EditWorkbook":                     writeThroughABinding,
+	"/documents.v1.DocumentsService/FinishUpload":                     writeThroughABinding,
 	"/documents.v1.DocumentsService/Freeze":                           noRoleHolds,
 	"/documents.v1.DocumentsService/GetDocumentTransformationReceipt": notConfigured,
 	"/documents.v1.DocumentsService/GetPublicationEvidence":           notConfigured,
@@ -250,18 +257,23 @@ var unshown = map[string]string{
 	"/documents.v1.DocumentsService/GetPublicationReceipt":            notConfigured,
 	"/documents.v1.DocumentsService/IngestDocument":                   ingestOnly,
 	"/documents.v1.DocumentsService/ListDeadLetters":                  operatorOnly,
+	"/documents.v1.DocumentsService/ListHolds":                        operatorOnly,
 	"/documents.v1.DocumentsService/ListSyncPage":                     ingestOnly,
 	"/documents.v1.DocumentsService/LookupCloseSync":                  ingestOnly,
 	"/documents.v1.DocumentsService/LookupIngestDocument":             ingestOnly,
 	"/documents.v1.DocumentsService/LookupListSyncPage":               ingestOnly,
 	"/documents.v1.DocumentsService/LookupPlanSyncPages":              ingestOnly,
 	"/documents.v1.DocumentsService/LookupPublicationProducer":        notConfigured,
+	"/documents.v1.DocumentsService/MoveDocument":                     moveThroughABinding,
+	"/documents.v1.DocumentsService/PlaceHold":                        operatorOnly,
 	"/documents.v1.DocumentsService/PlanSyncPages":                    ingestOnly,
 	"/documents.v1.DocumentsService/PrepareDerivedDocument":           noRoleHolds,
 	"/documents.v1.DocumentsService/PublishDerivedDocument":           noRoleHolds,
 	"/documents.v1.DocumentsService/PublishDocumentTransformation":    noRoleHolds,
 	"/documents.v1.DocumentsService/RecordConfirmation":               writeThroughABinding,
 	"/documents.v1.DocumentsService/RedriveDeadLetters":               operatorOnly,
+	"/documents.v1.DocumentsService/ReleaseHold":                      operatorOnly,
+	"/documents.v1.DocumentsService/RestoreDocumentVersion":           writeThroughABinding,
 	"/documents.v1.DocumentsService/Subscribe":                        writeThroughABinding,
 	"/documents.v1.DocumentsService/TransferOwnership":                noRoleHolds,
 	"/documents.v1.DocumentsService/UnarchiveDocument":                writeThroughABinding,
@@ -276,8 +288,10 @@ const (
 	writeThroughABinding = "requires documents:write, which no person's role at the store holds: a write reaches the store through a product's binding, and the one this solution relays is shown at its own CreateDocument route"
 	// documents.ingest and documents:ingest are the store's own runtime
 	// binding's and a publication producer's.
-	ingestOnly = "requires documents.ingest or documents:ingest, which no person holds: it is the store's own sync binding's and a publication producer's"
-	// Dead letters act over every collection of the tenant.
+	ingestOnly            = "requires documents.ingest or documents:ingest, which no person holds: it is the store's own sync binding's and a publication producer's"
+	deleteThroughABinding = "requires documents:delete from the manage bundle, which neither solution role includes"
+	moveThroughABinding   = "requires documents:write and documents.collection:transfer, which neither role holds at the store"
+	// Dead letters and holds require collection administration.
 	operatorOnly = "requires documents.collection:admin, the operator's, which no role holds"
 	// Publish, freeze and transfer: no screen calls them, so no role of the
 	// store holds them, and this solution's roles include neither bundle.
