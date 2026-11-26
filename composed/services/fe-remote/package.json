@@ -14,13 +14,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0",
     "@codefly-dev/saas-plugin-contract": "^2.4.2",
     "@codefly-dev/saas-plugin-react": "^0.4.3",
     "@codefly-dev/saas-sdk": "^0.3.16",
-    "@codefly-dev/saas-ui": "^0.12.5",
-    "@codefly-dev/ui": "^0.12.5"
+    "@codefly-dev/saas-ui": "0.13.6",
+    "@codefly-dev/ui": "0.13.6",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@module-federation/rsbuild-plugin": "2.9.0",

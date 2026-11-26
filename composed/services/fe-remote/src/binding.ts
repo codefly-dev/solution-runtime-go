@@ -21,4 +21,4 @@ import type { SolutionBinding } from "@codefly-dev/saas-ui/solution";
  * this solution serves (operations.go); it is never a constant in this source.
  */
 export type PageProps = Pick<SolutionBinding, "solutionId" | "apiBase"> &
-	Partial<Pick<SolutionBinding, "getAccessToken" | "authedFetch" | "subscribeToken">>;
+	Partial<Pick<SolutionBinding, "getAccessToken" | "authedFetch" | "subscribeToken" | "organizationId">>;

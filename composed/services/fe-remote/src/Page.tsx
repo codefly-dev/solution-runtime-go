@@ -19,12 +19,12 @@ import "./page.css";
 export default function Page(props: PageProps) {
 	// A new viewer gets a new page rather than the previous viewer's state.
 	const epoch = useViewerEpoch(props.getAccessToken, props.subscribeToken);
-	return <SolutionPage key={`${props.apiBase}:${epoch}`} {...props} />;
+	return <SolutionPage key={JSON.stringify([props.apiBase, props.organizationId, epoch])} {...props} />;
 }
 
-function SolutionPage({ apiBase, getAccessToken, authedFetch, subscribeToken }: PageProps) {
+function SolutionPage({ apiBase, getAccessToken, authedFetch, subscribeToken, organizationId }: PageProps) {
 	const token = useAccessToken(getAccessToken, subscribeToken);
-	const organizationId = viewerOrganization(token) ?? "";
+	const organization = organizationId ?? viewerOrganization(token);
 	// A signed-out viewer has no credential, and so no binding to reach
 	// anything with. Build none rather than letting requests go out
 	// anonymously and come back as an ordinary sign-in 401.
@@ -33,7 +33,7 @@ function SolutionPage({ apiBase, getAccessToken, authedFetch, subscribeToken }: 
 		[apiBase, getAccessToken, authedFetch],
 	);
 
-	if (!binding || !organizationId) {
+	if (!binding || !organization) {
 		return (
 			<div className="sol-page">
 				<p className="sol-note">Sign in and select an organization to use Codefly Base.</p>

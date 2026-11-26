@@ -17,6 +17,11 @@ describe("the page a host mounts", () => {
 		expect(screen.getByText(/Sign in/)).toBeTruthy();
 	});
 
+	it("mounts with the organization verified by the cookie-authenticated edge", () => {
+		render(<Page {...props} organizationId="org-from-edge" authedFetch={fetch} />);
+		expect(screen.getByRole("heading", { name: "Codefly Base" })).toBeTruthy();
+	});
+
 	it("carries no installation id in its source", async () => {
 		// Which installation a page is mounted for is read at runtime, from a
 		// route this solution's backend serves — never pasted in. A UUID

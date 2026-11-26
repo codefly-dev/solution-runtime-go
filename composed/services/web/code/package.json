@@ -10,7 +10,7 @@
     "clsx": "^2.1.1",
     "codefly-base-fe-remote": "file:../../fe-remote",
     "lucide-react": "^1.57.0",
-    "next": "16.4.1",
+    "next": "16.4.6",
     "nuqs": "^2.10.2",
     "react": "19.3.1",
     "react-dom": "19.3.1",

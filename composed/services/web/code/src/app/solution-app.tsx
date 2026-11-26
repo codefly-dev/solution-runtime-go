@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { installed, pageModuleApiBase, refusal, signOut, useSession } from "./session";
+import { installed, refusal, signOut, useSession } from "./session";
 
 // The page renders in the browser only, as a host mounts it.
 const SolutionPage = dynamic(() => import("codefly-base-fe-remote/Page"), { ssr: false });
@@ -66,8 +66,6 @@ export default function SolutionApp() {
         getAccessToken={noToken}
         authedFetch={sameOrigin}
         organizationId={session.organizationId}
-        viewerId={session.personId}
-        moduleApiBase={pageModuleApiBase(session)}
       />
     </main>
   );
