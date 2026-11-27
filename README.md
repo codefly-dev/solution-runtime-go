@@ -172,6 +172,10 @@ nothing:
   call (`hop.FileCredential`).
 - **`WorkContext(ctx)`**: the token a gateway acts under, for a caller that
   reaches a module itself — over gRPC through the hop.
+  A request handler can call `Gateway.AuthoringNamespace(ctx)` for the namespace
+  that the authority's Current installation associates with its checked viewer.
+  Use it to identify authored data. Each subsequent read or write still needs
+  its ordinary authorization.
 
 - **The passthrough** (`Consumes`) is served from the same declaration, at
   `/v1/<id>/modules/<as>/<package.Service>/<Method>` (the edge routes a solution
