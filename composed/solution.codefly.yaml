@@ -1,0 +1,36 @@
+# No executor is named. core's schema (solution/manifest, Validate) requires an
+# agent of kind codefly:solution, but core specifies no executor PROTOCOL for one
+# to implement and none is published: codefly.dev/solution-generic, which the
+# shipped manifests name, is a repository with no releases, so naming it resolves
+# to "agent: binary not found" at the first command that runs it (cli#1215).
+#
+# Nothing refuses this file for it. Every reader of a shipped manifest reads the
+# consumption and leaves the rest unread — core's LoadConsumption, whose own doc
+# says a manifest whose agent block does not pass Load "asks for no authority
+# because of it". `codefly add solution --executor` writes one the day an
+# executor exists; until then every other rule of the schema was checked at
+# generation against a stand-in.
+schema_version: codefly.solution-manifest/v1
+protocol_version: codefly.solution/v1
+services:
+    - id: backend
+      name: backend
+    - id: web
+      name: web
+api:
+    exposes:
+        - id: http
+          protocol: http
+    consumes:
+        - id: documents
+          protocol: connect
+          module: documents
+          service: documents
+          endpoint: grpc
+          as: documents
+events: {}
+lifecycle:
+    create: false
+    update: false
+    package: true
+    render: true

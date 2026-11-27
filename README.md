@@ -86,6 +86,21 @@ the platform owns network admission. A local environment name alone does not
 turn a container listener into a loopback listener. Production admission still
 requires the declared mesh boundary; this change does not qualify that boundary.
 
+### A listener a test already holds
+
+A test cannot be handed a free port without a race: binding port 0, reading
+the number and closing the socket lets the OS give the same port to another
+process before the solution binds it. `Server.ServeOn(ln)` is `Serve` on a
+listener the caller keeps bound instead. The listener does not choose the
+address — it must be the resolved endpoint, already bound: its port is the one
+this service's `http` endpoint (or `PORT`) resolves to, and on a native run its
+host is loopback. A listener bound anywhere else refuses the boot, so a harness
+binds `127.0.0.1:0`, provisions the endpoint with the address the listener
+holds, and hands the listener over. A harness that runs the solution as a
+child process passes the descriptor (`exec.Cmd.ExtraFiles`, then
+`net.FileListener` in the child). `ServeOn` closes the listener when it
+returns.
+
 ## Handler errors
 
 Return `ClientError` for an explicitly public validation message. A Connect
@@ -157,6 +172,10 @@ nothing:
   call (`hop.FileCredential`).
 - **`WorkContext(ctx)`**: the token a gateway acts under, for a caller that
   reaches a module itself — over gRPC through the hop.
+  A request handler can call `Gateway.AuthoringNamespace(ctx)` for the namespace
+  that the authority's Current installation associates with its checked viewer.
+  Use it to identify authored data. Each subsequent read or write still needs
+  its ordinary authorization.
 
 - **The passthrough** (`Consumes`) is served from the same declaration, at
   `/v1/<id>/modules/<as>/<package.Service>/<Method>` (the edge routes a solution
@@ -740,7 +759,7 @@ caller's unless a method declares its own `Policy`: see
 **Every read is a Runnable operation, and so a tool.** Beside the policy of
 each operation whose policy requires only `read`, `InterfaceArtifact` writes
 core's `x-codefly-operation` marker — the proto3 JSON of
-`codefly.runnable.v0.Operation` that core itself derives from that policy
+`codefly.runnable.v1.Operation` that core itself derives from that policy
 (`runnable.RouteMarker`): recomputed on an uncertain outcome, core's default
 bounds, invoked under exactly the scopes the policy requires, for the audience
 this runtime's hop checks (`Manifest.ID`), presented as a read-only tool named
@@ -766,7 +785,7 @@ not marked: it is resolved by an effect receipt, read through a receipt route
 this runtime does not serve, so it stays a route its own page calls. Neither is
 a route any checked caller may call, a stream, the MCP route or a relayed route.
 `Operation.Exclude` keeps a read from every agent, as
-`codefly.runnable.v0.exclude` keeps a module's method. Every object the artifact
+`codefly.runnable.v1.exclude` keeps a module's method. Every object the artifact
 defines closes `additionalProperties` — a struct marshals exactly its fields
 and protojson refuses an undeclared one — which is what lets a Runnable
 contract describe it.

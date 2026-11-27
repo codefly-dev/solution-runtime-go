@@ -1,0 +1,87 @@
+# This solution, run on the DEVELOPMENT AUTHORITY: the composition a person
+# opens locally, and the only one this directory describes. In a cell the
+# host's gateway is the origin and issues the Work Contexts; here the
+# authority's edge stands in for it.
+#
+# It composes the authority and nothing else, because this solution consumes
+# no module yet. Add each module it calls here as you add it to
+# solution.codefly.yaml's api.consumes, AND COPY THAT MODULE'S CONFIGURATION
+# GROUP WHOLE: a group is the set its consumers declare, not the modules you
+# call, and trimming one gets "module contract slot cannot be resolved",
+# "slot resolves ambiguously", or "it is not a module this workspace
+# composes".
+name: codefly-base-local
+layout: modules
+
+module-resolution:
+    authority: git
+    documents: git
+    model: git
+
+modules:
+    # THIS DIRECTORY IS THE MODULE. The workspace document sits beside
+    # module.codefly.yaml, as it does in all nine solutions of the fleet, so
+    # the path is "." and not the ".." a separate playground directory would
+    # need. Get it wrong and the run resolves the module one level up and
+    # fails on a module.codefly.yaml that is not there.
+    - name: codefly-base
+      path: .
+    # ADDED TO THE SCAFFOLD (composed scenarios, scenarios/): the anchor of the
+    # scenarios' run, a service that never runs and whose dependencies are what
+    # the run starts.
+    - name: scaffold-scenarios
+      path: anchor
+    # ADDED TO THE SCAFFOLD: the one module this solution consumes, at a pushed
+    # commit, and the model gateway its embedding binding names (composed, never
+    # asked: the scenarios select the store's stub embedder).
+    - name: documents
+      source: obin-ai/module-document-store
+      module: modules/documents
+      version: "5d160962c42b823d9aced0ab0024db0207eaf9e0"
+    - name: model
+      source: obin-ai/module-model-gateway
+      module: modules/model
+      version: "94076ae5afc7ea3c5d9b26f2401b72ebcd24a574"
+    # Pinned by COMMIT: the authority publishes no module release, and the
+    # commit must be one the DEFAULT BRANCH holds. A PR head reads the same
+    # here and dies on squash-merge, when the commit it names is on no branch.
+    - name: authority
+      source: codefly-dev/authority
+      module: modules/authority
+      version: "953f93bcb57473157ac3035c03a74ffbaf3003a0"
+
+environments:
+    - name: local
+      description: Codefly Base on the development authority
+      fixture: local
+      host:
+          coordinate: codefly/local/authority
+          component: authority
+          domain: local
+          audience: https://authority.local.test
+          trust_domain: authority.local
+          delivery: authority/local/grpc
+      service-secrets:
+          generate:
+              # The hop signs each admission it issues with its own seed, and
+              # registers the public half with the authority. Generated per
+              # run; never committed.
+              - scope: service
+                configuration: hop-signing
+                services: [authority/hop]
+                keys: [SEED]
+              # ADDED TO THE SCAFFOLD, as the document store's playground
+              # generates them: the store's collection-cursor key and the model
+              # gateway's own Postgres credentials.
+              - scope: workspace
+                configuration: documents-collection-cursor
+                keys: [SIGNING_KEY]
+              - scope: service
+                configuration: postgres
+                services: [model/store]
+                keys: [POSTGRES_USER]
+                format: identifier
+              - scope: service
+                configuration: postgres
+                services: [model/store]
+                keys: [POSTGRES_PASSWORD, POSTGRES_READ_ONLY_PASSWORD, POSTGRES_READ_WRITE_PASSWORD]

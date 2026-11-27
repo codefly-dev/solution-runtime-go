@@ -1,0 +1,38 @@
+name: backend
+version: 0.0.0
+agent:
+    kind: codefly:service
+    name: solution-go
+    version: 0.0.2
+    publisher: codefly.dev
+spec:
+    debug-symbols: false
+    hot-reload: false
+    race-condition-detection-run: false
+    source-dir: .
+    with-cgo: false
+    with-workspace: false
+endpoints:
+    - name: http
+      visibility: public
+      api: http
+      exposure: none
+      health:
+        readiness:
+            kind: http
+            path: /health
+            statuses:
+                - "200"
+module-identity: true
+service-dependencies:
+    - interface: codefly.dev/authority@>=0.2.0 <0.4.0
+    - name: hop
+      module: authority
+      kind: external
+      endpoints:
+        - name: grpc
+workspace-configuration-dependencies:
+    - authority
+    # FILLED IN: this solution's own slots (consumes.go relayFor), as the
+    # scaffold's base manifest declares them.
+    - codefly-base

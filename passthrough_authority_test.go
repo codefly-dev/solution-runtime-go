@@ -223,6 +223,25 @@ func TestThePassthroughRelaysAsTheViewer(t *testing.T) {
 	}
 }
 
+// The authority gone after a relayed call was answered, the same call from the
+// same viewer is unavailable, by name: the allow of a moment ago is not held,
+// the child issued for it is not sent again, and the module is not asked.
+func TestARelayedCallFailsClosedOnceTheAuthorityIsGone(t *testing.T) {
+	module := &relayedModule{}
+	page, stand := relayedPage(t, passthroughModule(), module, "things-binding")
+	if code, answer := connectCall(t, page.URL+relayedSearchPath, edgeContext, `{"entryId":"e1"}`); code != http.StatusOK {
+		t.Fatalf("with the authority up the call answered %d %v", code, answer)
+	}
+	stand.stop()
+	code, answer := connectCall(t, page.URL+relayedSearchPath, edgeContext, `{"entryId":"e1"}`)
+	if code != http.StatusServiceUnavailable || answer["code"] != "unavailable" || answer["entryId"] != nil {
+		t.Fatalf("with the authority gone the same call answered %d %v, want 503 unavailable and no answer", code, answer)
+	}
+	if calls := module.observed(); len(calls) != 1 {
+		t.Fatalf("the module was called %d times: once while the authority answered, and never after", len(calls))
+	}
+}
+
 // A pinned list of values is the most the page may name: a request naming
 // none takes the pin's, one naming part of it is relayed with that part, and
 // one naming anything else is refused by the field's name before the module

@@ -1,0 +1,14 @@
+# Written by `codefly run`: the gitignored overlay and its receipt.
+codefly.local.resolved.yaml
+codefly.local.yaml
+# The run's local state.
+.codefly/
+# Generated per run, never committed.
+configurations/**/*.secret.env
+# Merged by `codefly run` from every composed module's fragment.
+configurations/local/fixture-composition.yaml
+# The page remote, built by the run or by `make remote`.
+services/fe-remote/node_modules/
+services/fe-remote/dist/
+# The last `make scenarios` run.
+scenarios/scenarios.log

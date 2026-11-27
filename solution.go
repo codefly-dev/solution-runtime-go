@@ -170,8 +170,9 @@ type Server struct {
 	declaredContract ModuleContract
 	contract         effectiveContract
 	// boundListener is a listener this process was handed instead of binding
-	// one itself. Nil in every deployment: the port comes from the SDK and
-	// listen() binds it.
+	// one itself (ServeOn). Nil in every deployment: the port comes from the
+	// SDK and listen() binds it. It never chooses the address: listen() serves
+	// it only when it is bound on the endpoint the SDK resolved.
 	//
 	// It exists because a test harness cannot hand over a free *port* without
 	// a race. Binding :0, reading the number and closing the socket leaves a
@@ -505,6 +506,34 @@ func (s *Server) Serve() error {
 	return s.serve(ctx, ln)
 }
 
+// ServeOn is Serve on a listener the caller already bound, for a harness that
+// needs a port nobody else can be given: binding port 0, reading the number and
+// closing the socket leaves a window in which the OS hands the same port to
+// another process, and a harness that holds the listener instead never
+// releases it. A harness that runs the solution as a child process passes the
+// descriptor (exec.Cmd.ExtraFiles, net.FileListener).
+//
+// The listener does not choose the address. It must be the resolved endpoint,
+// already bound: its port is the one the SDK (or PORT) resolved for this
+// service's http endpoint, and on a native local run its host is loopback.
+// Anything else — a listener bound on a port somebody typed — refuses the boot
+// exactly as an unresolved port does, so the harness names the port it bound in
+// the endpoint it provisions, the way the CLI does. ln is closed when ServeOn
+// returns, refusal included.
+func (s *Server) ServeOn(ln net.Listener) error {
+	if ln == nil {
+		return fmt.Errorf("solution %q: ServeOn was handed no listener; Serve binds the resolved endpoint itself", s.manifest.ID)
+	}
+	s.boundListener = ln
+	ctx := context.Background()
+	bound, err := s.start(ctx)
+	if err != nil {
+		_ = ln.Close()
+		return err
+	}
+	return s.serve(ctx, bound)
+}
+
 // start is the whole boot up to the listener: the declaration checks, the
 // resolved configuration, the authority connection and the relays, the
 // published contract, and the listener on the resolved port. Split from Serve
@@ -643,6 +672,9 @@ func (c config) nativeListener() bool {
 // Work Context each request carries governs route by route.
 func (s *Server) listen() (net.Listener, error) {
 	if s.boundListener != nil {
+		if err := s.cfg.admitBound(s.boundListener.Addr()); err != nil {
+			return nil, err
+		}
 		return s.boundListener, nil
 	}
 	host := ""
@@ -654,6 +686,25 @@ func (s *Server) listen() (net.Listener, error) {
 		return nil, fmt.Errorf("listen on :%s: %w", s.cfg.port, err)
 	}
 	return ln, nil
+}
+
+// admitBound says whether a listener this process was handed is the endpoint
+// it resolved, already bound. The resolved port is the only port this process
+// serves on, whoever bound it; and a native local run serves on loopback alone,
+// which listen() gets by binding the resolved host and a handed listener has to
+// show.
+func (c config) admitBound(addr net.Addr) error {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return fmt.Errorf("the listener handed to ServeOn is bound on %s, which is not a TCP address", addr)
+	}
+	if strconv.Itoa(tcp.Port) != c.port {
+		return fmt.Errorf("the listener handed to ServeOn is bound on port %d, and this service's resolved http endpoint is port %s: a handed listener is the resolved endpoint already bound, never another address — provision the endpoint with the port the listener holds", tcp.Port, c.port)
+	}
+	if c.nativeListener() && !tcp.IP.IsLoopback() {
+		return fmt.Errorf("the listener handed to ServeOn is bound on %s, and a native run serves on the loopback host of its resolved http endpoint only", tcp)
+	}
+	return nil
 }
 
 // inboundHeaderTimeout bounds how long a connection may take to deliver a

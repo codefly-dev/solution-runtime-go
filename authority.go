@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	authorityv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/authority/v1"
+	installationv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/installation/v1"
 	hop "github.com/codefly-dev/authority/libraries/hop/go"
 	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/grpc"
@@ -266,6 +267,31 @@ func refusalStatus(err error) int {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusBadGateway
+}
+
+// AuthoringNamespace resolves the current installation's authored namespace for
+// the checked viewer. The authority owns this identity across installation names
+// and bindings. A delegated child is not the solution's incoming viewer.
+func (g *Gateway) AuthoringNamespace(ctx context.Context) (string, error) {
+	if g == nil || g.host == nil || g.viewer == nil || g.parentContext == "" || g.delegation != nil {
+		return "", ErrNoViewer
+	}
+	credential, err := g.host.outbound.Credential()
+	if err != nil || credential == "" {
+		return "", &GatewayError{StatusCode: http.StatusServiceUnavailable}
+	}
+	ctx, cancel := context.WithTimeout(ctx, authorityCallTimeout)
+	defer cancel()
+	current, err := installationv1.NewInstallationServiceClient(g.host.conn).Current(ctx, &installationv1.CurrentInstallationRequest{
+		ParentToken: g.parentContext, ActorCredential: credential,
+	})
+	if err != nil {
+		return "", &GatewayError{StatusCode: refusalStatus(err)}
+	}
+	if current.GetOrganizationId() != g.orgID || current.GetTarget() != g.id || current.GetId() == "" || strings.TrimSpace(current.GetNamespace()) == "" {
+		return "", &GatewayError{StatusCode: http.StatusBadGateway}
+	}
+	return current.GetNamespace(), nil
 }
 
 // ForParent is the viewer's own call to a module: a child of the Work Context

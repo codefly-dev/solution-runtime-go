@@ -1,0 +1,30 @@
+/*
+ * This remote's own styles, inlined into its JS by rsbuild (injectStyles) —
+ * see rsbuild.config.ts for why a cross-origin stylesheet cannot load at all.
+ *
+ * Keep this file small. The host is the skin authority: colours, type and
+ * spacing come from @codefly-dev/ui's tokens, which the host provides as a
+ * shared singleton, so a value hardcoded here is one that stops matching the
+ * product the first time a skin changes.
+ */
+.sol-page {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+	padding: 1rem;
+}
+
+.sol-header h1 {
+	margin: 0;
+}
+
+.sol-main {
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+}
+
+.sol-note {
+	margin: 0;
+	opacity: 0.8;
+}

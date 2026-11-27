@@ -1,0 +1,18 @@
+# What only this composition states to the local authority
+# (codefly-dev/authority libraries/fixture-composition, schema v1).
+#
+# The solution is NOT installed here: the organisation's administrator
+# installs it at the host, with the consent the authority reviews
+# (../../../scenarios, Options.Install), and the fixture seats its people on
+# the installation's role teams the moment it is active.
+#
+# The document store binds two modules this run does not compose: the runtime
+# its fan-out syncs are admitted by, and tracing, where it exports spans. An
+# install walks the closure of every binding, so each stands in here with the
+# kinds the store's bindings name; no scenario calls either.
+schema: codefly.dev/authority/fixture-composition/v1
+modules:
+  - module: runtime
+    kinds: [{kind: runtime.tasks, actions: [read, start, execute]}]
+  - module: tracing
+    kinds: [{kind: tracing.spans, actions: [export]}]

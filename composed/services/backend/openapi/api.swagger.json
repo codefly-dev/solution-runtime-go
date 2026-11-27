@@ -1,0 +1,559 @@
+{
+  "consumes": [
+    "application/json"
+  ],
+  "definitions": {
+    "DocumentsV1Artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "type": "string"
+        },
+        "derivedFrom": {
+          "items": {
+            "$ref": "#/definitions/DocumentsV1Ref"
+          },
+          "type": "array"
+        },
+        "entryId": {
+          "type": "string"
+        },
+        "entryVersion": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "producer": {
+          "type": "string"
+        },
+        "producerVersion": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1CreateDocumentRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "collectionVisibility": {
+          "enum": [
+            "COLLECTION_VISIBILITY_UNSPECIFIED",
+            "COLLECTION_VISIBILITY_PERSONAL",
+            "COLLECTION_VISIBILITY_SHARED"
+          ],
+          "type": "string"
+        },
+        "contentB64": {
+          "format": "byte",
+          "type": "string"
+        },
+        "contentType": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "producer": {
+          "type": "string"
+        },
+        "staleness": {
+          "$ref": "#/definitions/DocumentsV1Staleness"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1CreateDocumentResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "entryId": {
+          "type": "string"
+        },
+        "ref": {
+          "$ref": "#/definitions/DocumentsV1Ref"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1Document": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "items": {
+            "$ref": "#/definitions/DocumentsV1Artifact"
+          },
+          "type": "array"
+        },
+        "currentVersion": {
+          "$ref": "#/definitions/DocumentsV1Version"
+        },
+        "entry": {
+          "$ref": "#/definitions/DocumentsV1Entry"
+        },
+        "facets": {
+          "items": {
+            "$ref": "#/definitions/DocumentsV1Facet"
+          },
+          "type": "array"
+        },
+        "runs": {
+          "items": {
+            "$ref": "#/definitions/DocumentsV1ProducerRun"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "INGESTION_STATUS_UNSPECIFIED",
+            "INGESTION_STATUS_PENDING",
+            "INGESTION_STATUS_INGESTED",
+            "INGESTION_STATUS_FAILED"
+          ],
+          "type": "string"
+        },
+        "statusDetail": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1Entry": {
+      "additionalProperties": false,
+      "properties": {
+        "archived": {
+          "type": "boolean"
+        },
+        "archivedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "entryId": {
+          "type": "string"
+        },
+        "frozen": {
+          "type": "boolean"
+        },
+        "ownerSubjectId": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "solution": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1Facet": {
+      "additionalProperties": false,
+      "properties": {
+        "entryId": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "precedenceRank": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "producer": {
+          "type": "string"
+        },
+        "valueJson": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1GetDocumentRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "entryId": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1GetDocumentResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "document": {
+          "$ref": "#/definitions/DocumentsV1Document"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1ProducerRun": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "type": "string"
+        },
+        "attempt": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "entryId": {
+          "type": "string"
+        },
+        "entryVersion": {
+          "type": "string"
+        },
+        "lastError": {
+          "type": "string"
+        },
+        "maxAttempts": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "producer": {
+          "type": "string"
+        },
+        "producerVersion": {
+          "type": "string"
+        },
+        "startedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "RUN_STATE_UNSPECIFIED",
+            "RUN_STATE_PENDING",
+            "RUN_STATE_PROCESSING",
+            "RUN_STATE_RETRYING",
+            "RUN_STATE_SUCCEEDED",
+            "RUN_STATE_DEAD_LETTER",
+            "RUN_STATE_CANCELED"
+          ],
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1Ref": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "type": "string"
+        },
+        "entryId": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "REF_KIND_UNSPECIFIED",
+            "REF_KIND_ENTRY",
+            "REF_KIND_VERSION",
+            "REF_KIND_ARTIFACT",
+            "REF_KIND_LOCATOR"
+          ],
+          "type": "string"
+        },
+        "locator": {
+          "type": "string"
+        },
+        "store": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1Staleness": {
+      "additionalProperties": false,
+      "properties": {
+        "staleFormulaCells": {
+          "items": {
+            "$ref": "#/definitions/DocumentsV1WorkbookCell"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1Version": {
+      "additionalProperties": false,
+      "properties": {
+        "backendVersionId": {
+          "type": "string"
+        },
+        "contentHash": {
+          "type": "string"
+        },
+        "contentType": {
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "entryId": {
+          "type": "string"
+        },
+        "originCommit": {
+          "type": "string"
+        },
+        "originRef": {
+          "type": "string"
+        },
+        "originRevision": {
+          "type": "string"
+        },
+        "size": {
+          "format": "int64",
+          "type": "string"
+        },
+        "staleness": {
+          "$ref": "#/definitions/DocumentsV1Staleness"
+        },
+        "version": {
+          "type": "string"
+        },
+        "versionNo": {
+          "format": "int64",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DocumentsV1WorkbookCell": {
+      "additionalProperties": false,
+      "properties": {
+        "cell": {
+          "type": "string"
+        },
+        "sheet": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Error": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "OverviewResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "consumes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "solution": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "info": {
+    "description": "The codefly-base solution's backend under the authority interface, at the route the authority's edge forwards it on: the routes it serves itself, and the module calls the solution runtime relays as the viewer. A relayed call is any checked caller's, because the child the authority issues through this solution's binding for that module, and the module's own method policy, gate it.",
+    "title": "codefly-base solution backend",
+    "version": "0.0.0"
+  },
+  "paths": {
+    "/v1/codefly-base/modules/documents/documents.v1.DocumentsService/CreateDocument": {
+      "post": {
+        "description": "Signed-in people, through the authority's edge. The documents module authorizes every call itself, under a Work Context the authority issues for the viewer through this solution's binding for it (documents:[read,write] documents.collection:[read,create]).\n\nA Connect unary call, relayed to the module's own procedure /documents.v1.DocumentsService/CreateDocument through the authority's hop. The module's whole response is returned.",
+        "operationId": "CodeflyBase_Post_V1_Codefly-base_Modules_Documents_Documents.v1.DocumentsService_CreateDocument",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DocumentsV1CreateDocumentRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DocumentsV1CreateDocumentResponse"
+            }
+          },
+          "401": {
+            "description": "The request carried no Work Context the authority checks for this solution.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "502": {
+            "description": "A call this operation makes to a module failed.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Call documents.v1.DocumentsService.CreateDocument on the documents module as the viewer",
+        "tags": [
+          "codefly-base"
+        ],
+        "x-codefly-authority-policy": {
+          "any_checked_caller": true
+        }
+      }
+    },
+    "/v1/codefly-base/modules/documents/documents.v1.DocumentsService/GetDocument": {
+      "post": {
+        "description": "Signed-in people, through the authority's edge. The documents module authorizes every call itself, under a Work Context the authority issues for the viewer through this solution's binding for it (documents:[read] documents.collection:[read]).\n\nA Connect unary call, relayed to the module's own procedure /documents.v1.DocumentsService/GetDocument through the authority's hop. The module's whole response is returned.",
+        "operationId": "CodeflyBase_Post_V1_Codefly-base_Modules_Documents_Documents.v1.DocumentsService_GetDocument",
+        "parameters": [
+          {
+            "in": "body",
+            "name": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DocumentsV1GetDocumentRequest"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DocumentsV1GetDocumentResponse"
+            }
+          },
+          "401": {
+            "description": "The request carried no Work Context the authority checks for this solution.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "502": {
+            "description": "A call this operation makes to a module failed.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "Call documents.v1.DocumentsService.GetDocument on the documents module as the viewer",
+        "tags": [
+          "codefly-base"
+        ],
+        "x-codefly-authority-policy": {
+          "any_checked_caller": true
+        }
+      }
+    },
+    "/v1/codefly-base/overview": {
+      "get": {
+        "description": "This solution's own page, to show that it is installed and reachable as the viewer\n\nAnswers the solution's id and the `as` name of every module this backend relays, in the order they are declared. Takes no parameters and reads nothing outside this backend",
+        "operationId": "CodeflyBase_Get_V1_Codefly-base_Overview",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/OverviewResponse"
+            }
+          },
+          "401": {
+            "description": "The request carried no Work Context the authority checks for this solution.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          },
+          "502": {
+            "description": "A call this operation makes to a module failed.",
+            "schema": {
+              "$ref": "#/definitions/Error"
+            }
+          }
+        },
+        "summary": "report what this solution is and which modules it can reach",
+        "tags": [
+          "codefly-base"
+        ],
+        "x-codefly-authority-policy": {
+          "requires": [
+            {
+              "resource_kind": "codefly-base.page",
+              "actions": [
+                "read"
+              ]
+            }
+          ]
+        },
+        "x-codefly-operation": {
+          "attempt_timeout": "30s",
+          "audience": "codefly-base",
+          "backoff": "1s",
+          "completion": "COMPLETION_CALL",
+          "invoke_scopes": [
+            {
+              "actions": [
+                "read"
+              ],
+              "resource_kind": "codefly-base.page"
+            }
+          ],
+          "max_attempts": 3,
+          "recovery": "RECOVERY_RECOMPUTE",
+          "retryable_codes": [
+            "503"
+          ],
+          "tool": {
+            "description": "report what this solution is and which modules it can reach",
+            "effect": "EFFECT_READ_ONLY",
+            "name": "CodeflyBase_Get_V1_Codefly-base_Overview"
+          },
+          "total_timeout": "90s"
+        }
+      }
+    }
+  },
+  "produces": [
+    "application/json"
+  ],
+  "security": [
+    {
+      "workContext": []
+    }
+  ],
+  "securityDefinitions": {
+    "workContext": {
+      "description": "The signed-in person's Work Context for this solution, sent by the authority's edge. Every operation requires it.",
+      "in": "header",
+      "name": "x-codefly-work-context",
+      "type": "apiKey"
+    }
+  },
+  "swagger": "2.0"
+}

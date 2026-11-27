@@ -3,7 +3,7 @@ package solution
 import (
 	"fmt"
 
-	"github.com/codefly-dev/core/solutionhost"
+	"github.com/codefly-dev/authority/libraries/solutionhost/go"
 )
 
 // FrontendFileName is the one file a solution declares its frontend in, beside
