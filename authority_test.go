@@ -16,6 +16,7 @@ import (
 	"time"
 
 	authorityv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/authority/v1"
+	installationv1 "github.com/codefly-dev/authority/libraries/authority-client/go/gen/host/installation/v1"
 	codefly "github.com/codefly-dev/sdk-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -195,6 +196,7 @@ func interfaceAuthorityAt(t *testing.T) (*interfaceAuthority, string) {
 	stand := &interfaceAuthority{}
 	g := grpc.NewServer()
 	authorityv1.RegisterAuthorityServiceServer(g, stand)
+	installationv1.RegisterInstallationServiceServer(g, namespaceInstallation{})
 	go func() { _ = g.Serve(l) }()
 	stand.stop = g.Stop
 	t.Cleanup(g.Stop)
@@ -589,5 +591,46 @@ func TestAChildNamesTheOwnerItsParentIsSelectedTo(t *testing.T) {
 		if scope.GetResourceOwnerId() != "" {
 			t.Errorf("a gateway with no checked viewer named owner %q", scope.GetResourceOwnerId())
 		}
+	}
+}
+
+type namespaceInstallation struct {
+	installationv1.UnimplementedInstallationServiceServer
+}
+
+func (namespaceInstallation) Current(_ context.Context, req *installationv1.CurrentInstallationRequest) (*installationv1.CurrentInstallation, error) {
+	if req.GetParentToken() != edgeContext || req.GetActorCredential() != "workload-credential" {
+		return nil, status.Error(codes.PermissionDenied, "wrong credential")
+	}
+	return &installationv1.CurrentInstallation{Id: "installed-page", OrganizationId: "org-from-the-authority", Target: "page", Namespace: "catalog.knowledge"}, nil
+}
+
+func TestAuthoringNamespaceComesFromTheCurrentInstallation(t *testing.T) {
+	server, _ := authorityServer(t)
+	viewer, err := server.viewerGateway(context.Background(), edgeContext, "GET /v1/page/types")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := viewer.AuthoringNamespace(context.Background())
+	if err != nil || got != "catalog.knowledge" {
+		t.Fatalf("namespace %q: %v", got, err)
+	}
+	for _, field := range []string{"org", "target", "delegation", "parent"} {
+		t.Run(field, func(t *testing.T) {
+			other := *viewer
+			switch field {
+			case "org":
+				other.orgID = "another-org"
+			case "target":
+				other.id = "another-solution"
+			case "delegation":
+				other.delegation = &delegation{}
+			case "parent":
+				other.parentContext = ""
+			}
+			if name, err := other.AuthoringNamespace(context.Background()); err == nil || name != "" {
+				t.Fatalf("unexpected namespace %q, %v", name, err)
+			}
+		})
 	}
 }
