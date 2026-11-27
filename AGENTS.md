@@ -437,18 +437,13 @@ against.
 
 ## Build and test
 
-Derived from [`.github/workflows/go.yml`](.github/workflows/go.yml), the only
-gate. It is four commands, and they are the whole local loop:
+Run the same gate as [the Go workflow](.github/workflows/go.yml) from the repository root.
 
 ```sh
-go mod download && go mod verify
-go test -race ./... -count=1 -timeout=5m
-go vet ./...
-test -z "$(gofmt -l .)"
+make verify
 ```
 
-Go comes from `go.mod` (1.27). Nothing else is needed: no Docker, no
-credentials, no running composition.
+Go comes from `go.mod`. A cold cache requires Git read access to the selected modules.
 
 - The suite takes about a minute under `-race` and is hermetic: the authority
   is a gRPC stand-in on `127.0.0.1` answering `Check` and `Issue`, each relayed
